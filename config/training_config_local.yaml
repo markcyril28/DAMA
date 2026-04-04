@@ -51,7 +51,7 @@ selfplay:
   opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
   noise_prob: 0.15                    # Slightly lower noise for faster convergence
   max_moves_per_game: 100             # Maximum moves per game
-  pipeline_mode: "simultaneous"    # "simultaneous" = overlap CPU self-play with GPU training
+  pipeline_mode: "alternate"          # "simultaneous"  = overlap CPU self-play with GPU training
                                       # "alternate"     = generate all data first, then train
 
   # Algo-vs-algo: pure algorithmic games as additional training data.
@@ -59,7 +59,7 @@ selfplay:
   # easy-vs-medium, medium-vs-medium).
   algo_vs_algo:
     enabled: true                     # Include algo-vs-algo games in training data
-    games_per_epoch: 200               # Additional games per self-play epoch
+    games_per_epoch: 300               # Additional games per self-play epoch
     difficulties:                     # Difficulties to combine into matchup pairs
       - "easy"
       - "medium"
