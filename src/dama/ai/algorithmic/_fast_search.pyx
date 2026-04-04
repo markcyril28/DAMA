@@ -112,7 +112,7 @@ cdef struct TTEntry:
     float score
     short depth
     unsigned char flag           # TT_EXACT / TT_LOWERBOUND / TT_UPPERBOUND
-    unsigned char padding
+    unsigned char generation     # Search generation — entries from old generations are stale
 
 # Zobrist keys: 5 piece types × 64 squares, plus side-to-move toggle.
 # Piece indices: 0=EMPTY (unused), 1=P1_MAN, 2=P1_KING, 3=P2_MAN, 4=P2_KING
@@ -121,6 +121,12 @@ cdef unsigned long long ZOBRIST_SIDE
 
 # Module-level TT allocated on first use (persists across searches within a process).
 cdef TTEntry *_tt_table = NULL
+# Generation counter: incremented on each fast_search() call. Entries with a
+# different generation are treated as stale (logically empty) without needing
+# a 16MB memset to physically clear the table. Wraps at 256 — worst case, a
+# 256-search-old entry passes the generation check, which is harmless (just a
+# rare false TT hit that the hash verification catches).
+cdef unsigned char _tt_generation = 0
 
 cdef void _init_zobrist():
     """Initialize Zobrist hash keys with a deterministic PRNG."""
@@ -168,7 +174,7 @@ cdef inline void tt_store(
     entry.score = score
     entry.depth = <short>depth
     entry.flag = <unsigned char>flag
-    entry.padding = 0
+    entry.generation = _tt_generation
 
 cdef inline bint tt_probe(
     unsigned long long hash_key, int depth,
@@ -181,6 +187,8 @@ cdef inline bint tt_probe(
     """
     cdef unsigned long long idx = hash_key & TT_MASK
     cdef TTEntry *entry = &_tt_table[idx]
+    if entry.generation != _tt_generation:
+        return False
     if entry.hash_key != hash_key:
         return False
     if entry.depth < depth:
@@ -891,12 +899,11 @@ def fast_search(
 
     _order_moves(&moves)
 
-    # Allocate TT on first use; clear before each search to avoid stale entries
-    # from prior positions. The table persists within the process to amortize
-    # allocation cost across the ~50 searches in a typical self-play game.
+    # Allocate TT on first use. Bump generation counter to logically invalidate
+    # all stale entries — avoids a 16MB memset (~1ms) per search call.
     _ensure_tt()
-    if _tt_table != NULL:
-        memset(_tt_table, 0, TT_SIZE * sizeof(TTEntry))
+    global _tt_generation
+    _tt_generation = (_tt_generation + 1) & 0xFF
 
     deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
     ss.deadline = deadline
@@ -1029,12 +1036,13 @@ def play_full_game_cy(
     init_standard_board(board)
     player = start_player
 
-    # Allocate TT once; clear once at game start. During the game, TT entries
-    # from prior moves are still useful — positions reached from move N's search
-    # overlap with move N+1's search tree, providing free transposition hits.
+    # Allocate TT once; bump generation once at game start. During the game,
+    # TT entries from prior moves are still useful — positions reached from
+    # move N's search overlap with move N+1's search tree. Same generation
+    # means entries from prior moves in THIS game are accepted (free hits).
     _ensure_tt()
-    if _tt_table != NULL:
-        memset(_tt_table, 0, TT_SIZE * sizeof(TTEntry))
+    global _tt_generation
+    _tt_generation = (_tt_generation + 1) & 0xFF
 
     cdef list entries = []
     cdef list moves_list
