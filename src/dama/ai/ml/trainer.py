@@ -548,9 +548,11 @@ class Trainer:
                 )
                 # Warmup: run a dummy forward pass to trigger actual compilation.
                 # This catches Triton/Inductor failures *before* the training loop.
+                # Use the actual training batch size so CUDAGraph captures the right
+                # shapes — avoids a recompilation on the first real training batch.
                 print("  Running compile warmup (first forward pass)...")
                 sys.stdout.flush()
-                _warmup_bs = min(4, self.config.batch_size)
+                _warmup_bs = self.config.batch_size
                 _warmup_board = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
                 _warmup_moves = torch.randn(_warmup_bs, 64, 8, device=self.device)
                 _warmup_counts = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
