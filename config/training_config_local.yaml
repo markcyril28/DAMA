@@ -53,8 +53,8 @@ selfplay:
   opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
   noise_prob: 0.15                    # Slightly lower noise for faster convergence
   max_moves_per_game: 100             # Maximum moves per game
-  pipeline_mode: "simulataneous"       # CPU self-play overlaps with GPU training — GPU never idles.
-                                      # "alternate" left the GPU idle for 60-120s per self-play cycle.
+  pipeline_mode: "simultaneous"       # "simultaneous" = generate data on CPU while training on GPU (overlapped)
+                                      # "alternate"     = generate all data first, then train (sequential)
 
   # Algo-vs-algo: pure algorithmic games as additional training data.
   # Generates games between all difficulty matchup pairs (e.g., easy-vs-easy,
