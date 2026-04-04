@@ -260,6 +260,9 @@ dataloader:
   pin_memory: true                    # Pinned memory for async HBM2e transfers via CUDAPrefetcher
   prefetch_factor: 2                  # 2 is plenty with RAM cache
   replay_max_entries: 500000          # 1TB RAM — maximize data diversity per epoch
+  clear_replay_after_load: false      # Delete replay JSONL files after loading into memory
+                                      # Frees disk space and prevents re-training on stale data.
+                                      # New self-play data is generated fresh each epoch regardless.
 
   # RAM Caching (1TB DDR4 available)
   ram_cache:

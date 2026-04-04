@@ -41,7 +41,7 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 8                     # 8 of 12 cores — 4 reserved for GPU driver + training I/O.
+  cpu_workers: 6                     # 8 of 12 cores — 4 reserved for GPU driver + training I/O.
                                       # FastBatchIterator needs no DataLoader workers, so all cores go to self-play.
   games_per_epoch: 20                # 2x previous — GPU finishes epochs in ~15s while self-play
                                       # takes 60-120s. More games = fresher data per cycle.
@@ -104,11 +104,14 @@ dataloader:
   pin_memory: true                    # Pin memory for faster GPU transfer
   prefetch_factor: 4                  # Higher prefetch to keep GPU fed
   replay_max_entries: 400000          # Use more of the replay buffer — more batches per epoch, less overfitting between self-play
+  clear_replay_after_load: true      # Delete replay JSONL files after loading into memory
+                                      # Frees disk space and prevents re-training on stale data.
+                                      # New self-play data is generated fresh each epoch regardless.
 
   # RAM Caching (see IMPROVEMENTS.md)
   ram_cache:
     enabled: true                     # Enable RAM caching for pre-tensorized data
-    threshold_gb: 8.0                 # Minimum available RAM (GB) to enable caching
+    threshold_gb: 16.0                 # Minimum available RAM (GB) to enable caching
     cache_file: null                  # Optional: path to save/load cached tensors (.pt)
 
 # -----------------------------------------------------------------------------
