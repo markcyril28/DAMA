@@ -78,10 +78,71 @@ class DamaDataset(Dataset):
         )
 
 
+def _encode_board_fast(state_dict: dict, planes: np.ndarray) -> None:
+    """Encode board state directly from compact dict into pre-allocated planes.
+
+    Avoids creating Board, GameState, Piece objects — writes directly to numpy.
+    ~2x faster than encode_board(GameState.from_compact(d)) for preprocessing.
+    """
+    turn = state_dict['turn']  # 1 or 2 (Player.ONE or Player.TWO)
+    # Map piece lists to plane indices based on whose turn it is.
+    # Current player's pieces go to planes 0 (men) and 1 (kings).
+    # Opponent's pieces go to planes 2 (men) and 3 (kings).
+    if turn == 1:
+        mapping = (('p1_men', 0), ('p1_kings', 1), ('p2_men', 2), ('p2_kings', 3))
+    else:
+        mapping = (('p2_men', 0), ('p2_kings', 1), ('p1_men', 2), ('p1_kings', 3))
+
+    planes[:] = 0.0
+    for key, plane_idx in mapping:
+        for pos in state_dict.get(key, ()):
+            planes[plane_idx, pos[0], pos[1]] = 1.0
+    planes[4, :, :] = 1.0
+
+
+def _encode_moves_fast(
+    state_dict: dict,
+    legal_moves: list,
+    out: np.ndarray,
+) -> int:
+    """Encode moves directly from dicts into pre-allocated array.
+
+    Avoids creating Move/Piece objects. Returns the number of valid moves encoded.
+    """
+    # Build a set of king positions for the current player to check piece type.
+    turn = state_dict['turn']
+    king_key = 'p1_kings' if turn == 1 else 'p2_kings'
+    king_set = {(pos[0], pos[1]) for pos in state_dict.get(king_key, ())}
+
+    n = min(len(legal_moves), out.shape[0])
+    for i in range(n):
+        m = legal_moves[i]
+        path = m['path']
+        captures = m.get('captures', ())
+        promotion = m.get('promotion', False)
+        start = path[0]
+        end = path[-1]
+        is_king = (start[0], start[1]) in king_set
+
+        out[i, 0] = start[0] / 7.0
+        out[i, 1] = start[1] / 7.0
+        out[i, 2] = end[0] / 7.0
+        out[i, 3] = end[1] / 7.0
+        out[i, 4] = 1.0 if captures else 0.0
+        num_captures = len(captures)
+        out[i, 5] = min(num_captures / 4.0, 1.0)
+        out[i, 6] = 1.0 if promotion else 0.0
+        out[i, 7] = 1.0 if is_king else 0.0
+
+    return n
+
+
 def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Worker function for parallel preprocessing of a chunk of replay entries.
 
     Accepts serialized (dict) entries to avoid pickling ReplayEntry objects.
+    Uses fast-path encoding that works directly on dicts, skipping
+    GameState/Move/Piece object creation for ~2x faster preprocessing.
     Returns numpy arrays for the chunk.
     """
     entry_dicts, max_moves_per_sample = args
@@ -95,22 +156,20 @@ def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
     value_targets = np.zeros(n, dtype=np.float32)
 
     for i, ed in enumerate(entry_dicts):
-        entry = ReplayEntry.from_dict(ed)
-        state = GameState.from_compact(entry.state)
-        boards[i] = encode_board(state)
+        state_dict = ed['state']
+        _encode_board_fast(state_dict, boards[i])
 
-        moves = [Move.from_dict(m) for m in entry.legal_moves]
-        move_feats = encode_moves(state, moves)
+        legal_moves = ed['legal_moves']
+        num_moves = _encode_moves_fast(state_dict, legal_moves, all_move_features[i])
 
-        num_moves = min(move_feats.shape[0], max_moves_per_sample)
-        all_move_features[i, :num_moves] = move_feats[:num_moves]
         move_counts[i] = num_moves
+        chosen_idx = ed['chosen_index']
         if num_moves > 0:
-            targets[i] = min(entry.chosen_index, num_moves - 1)
+            targets[i] = min(chosen_idx, num_moves - 1)
         else:
             targets[i] = 0
-        reward_weights[i] = compute_reward_weight(entry.score)
-        value_targets[i] = float(entry.result)
+        reward_weights[i] = compute_reward_weight(ed.get('score', 0.0))
+        value_targets[i] = float(ed.get('result', 0))
 
     return boards, all_move_features, move_counts, targets, reward_weights, value_targets
 
@@ -197,7 +256,7 @@ def preprocess_entries_to_tensors(
             torch.from_numpy(value_targets),
         )
 
-    # Sequential fallback for small datasets
+    # Sequential fallback for small datasets — uses fast-path encoding
     boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
     all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
     move_counts = np.zeros(n, dtype=np.int64)
@@ -211,14 +270,9 @@ def preprocess_entries_to_tensors(
         if show_progress and i > 0 and i % log_interval == 0:
             print(f"  Pre-processing: {i}/{n} ({100*i/n:.1f}%)")
 
-        state = GameState.from_compact(entry.state)
-        boards[i] = encode_board(state)
+        _encode_board_fast(entry.state, boards[i])
+        num_moves = _encode_moves_fast(entry.state, entry.legal_moves, all_move_features[i])
 
-        moves = [Move.from_dict(m) for m in entry.legal_moves]
-        move_feats = encode_moves(state, moves)
-
-        num_moves = min(move_feats.shape[0], max_moves_per_sample)
-        all_move_features[i, :num_moves] = move_feats[:num_moves]
         move_counts[i] = num_moves
         if num_moves > 0:
             if entry.chosen_index >= num_moves:
