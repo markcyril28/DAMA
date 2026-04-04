@@ -338,13 +338,19 @@ class Trainer:
             print(f"GPU: {torch.cuda.get_device_name()}")
             print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-        # Set thread count for CPU operations - optimize for available cores
-        cpu_threads = min(16, max(1, (os.cpu_count() or 1)))  # Cap at 16 for efficiency
+        # Set thread count for CPU operations — scale to hardware.
+        # Use ~50% of cores for intra-op parallelism (tensor ops, preprocessing).
+        # Beyond ~64 threads, contention on shared caches hurts more than it helps.
+        _total_cores = os.cpu_count() or 1
+        cpu_threads = max(4, min(64, _total_cores // 2))
         torch.set_num_threads(cpu_threads)
+        # Inter-op threads for parallel independent ops (e.g. data loading + compute)
+        interop_threads = max(2, min(8, _total_cores // 8))
         try:
-            torch.set_num_interop_threads(min(4, cpu_threads))
+            torch.set_num_interop_threads(interop_threads)
         except Exception:
             pass
+        print(f"CPU threads: {cpu_threads} intra-op, {interop_threads} inter-op (of {_total_cores} cores)")
 
         # Create directories
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -1257,8 +1263,11 @@ class Trainer:
         accum_steps = self.config.gradient_accumulation_steps
         _micro_step = 0  # counts mini-batches within an accumulation window
 
-        # Use CUDA prefetcher for overlapped H2D transfer
-        _use_prefetcher = self.device.type == 'cuda'
+        # Use CUDA prefetcher for overlapped H2D transfer — but skip when data
+        # is already GPU-resident (no transfer to overlap, prefetcher just adds
+        # stream-sync overhead).
+        _data_on_gpu = getattr(dataloader, 'on_gpu', False)
+        _use_prefetcher = self.device.type == 'cuda' and not _data_on_gpu
         if _use_prefetcher:
             iter_loader = CUDAPrefetcher(dataloader, self.device)
         else:
@@ -1284,7 +1293,8 @@ class Trainer:
             _step_start = time.time()
 
             # Move to device — skip when CUDAPrefetcher already transferred
-            if not _use_prefetcher:
+            # or when data is GPU-resident (already on device)
+            if not _use_prefetcher and not _data_on_gpu:
                 boards = boards.to(self.device, non_blocking=True)
                 move_features = move_features.to(self.device, non_blocking=True)
                 move_counts = move_counts.to(self.device, non_blocking=True)
@@ -1292,11 +1302,11 @@ class Trainer:
             # Conditionally load reward weights / value targets
             if not use_scoring:
                 reward_weights = None
-            elif not _use_prefetcher:
+            elif not _use_prefetcher and not _data_on_gpu:
                 reward_weights = reward_weights.to(self.device, non_blocking=True)
             if not self.config.value_head_enabled:
                 value_targets = None
-            elif not _use_prefetcher:
+            elif not _use_prefetcher and not _data_on_gpu:
                 value_targets = value_targets.to(self.device, non_blocking=True)
 
             # Periodic sanity check — avoids CUDA sync on every step
@@ -1436,23 +1446,29 @@ class Trainer:
             # Accumulated enough — clip, step, and reset
             _micro_step = 0
 
+            # Gradient clipping + stats.  clip_grad_norm_ returns the total
+            # (unclipped) grad norm, so we capture it instead of iterating all
+            # parameters a second time in compute_gradient_stats.  Per-layer
+            # norms are only collected at model_health frequency (much lower)
+            # to avoid ~40 .item() CUDA syncs per stats step.
+            _want_grad_stats = (self.stats_collector and
+                                self.step % self.config.stats_record_every == 0)
+
             if self.config.amp and self.scaler is not None:
                 if self.config.grad_clip_norm is not None:
                     self.scaler.unscale_(self.optimizer)
-                    if (self.stats_collector and
-                            self.step % self.config.stats_record_every == 0):
-                        _grad_norm, _grad_norms_per_layer = (
-                            StatsCollector.compute_gradient_stats(self.model))
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                    _clip_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.grad_clip_norm)
+                    if _want_grad_stats:
+                        _grad_norm = _clip_norm.item()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                if (self.stats_collector and
-                        self.step % self.config.stats_record_every == 0):
-                    _grad_norm, _grad_norms_per_layer = (
-                        StatsCollector.compute_gradient_stats(self.model))
                 if self.config.grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                    _clip_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.grad_clip_norm)
+                    if _want_grad_stats:
+                        _grad_norm = _clip_norm.item()
                 self.optimizer.step()
 
             # Accumulate on GPU — no sync. Only .item() when needed for logging.
@@ -1745,10 +1761,12 @@ class Trainer:
             shuffle=True,
             num_workers=effective_workers,
             pin_memory=self.config.pin_memory,
+            device=self.device,
         )
         _is_fast = isinstance(dataloader, FastBatchIterator)
         self._use_padded = _is_fast or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
-        _path_label = " (fast tensor indexing)" if _is_fast else (" (padded training path)" if self._use_padded else "")
+        _gpu_resident = getattr(dataloader, 'on_gpu', False)
+        _path_label = " (GPU-resident)" if _gpu_resident else (" (fast tensor indexing)" if _is_fast else (" (padded training path)" if self._use_padded else ""))
         print(f"DataLoader ready with {len(dataloader)} batches{_path_label}.")
         sys.stdout.flush()
 
@@ -1795,6 +1813,7 @@ class Trainer:
                         batch_size=self.config.batch_size,
                         num_workers=effective_workers,
                         pin_memory=self.config.pin_memory,
+                        device=self.device,
                     )
                     self._use_padded = True
                 else:
@@ -1804,8 +1823,10 @@ class Trainer:
                         shuffle=True,
                         num_workers=effective_workers,
                         pin_memory=self.config.pin_memory,
+                        device=self.device,
                     )
                     self._use_padded = isinstance(dataloader, FastBatchIterator) or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
+                _gpu_resident = getattr(dataloader, 'on_gpu', False)
                 # Immediately start the next batch — keeps CPU busy at all times
                 self._start_background_selfplay(self.config.selfplay_games // 2)
             
