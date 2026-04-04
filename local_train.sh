@@ -43,7 +43,7 @@ echo "=== Filipino Dama - ML Training (Local) ==="
 echo ""
 
 # Verify CUDA is available
-python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available. Training requires GPU.'" || {
+python -W ignore::FutureWarning -c "import torch; assert torch.cuda.is_available(), 'CUDA not available. Training requires GPU.'" || {
     echo ""
     echo "ERROR: CUDA is not available."
     echo ""
@@ -74,4 +74,4 @@ if [ -n "$TRAIN_DURATION" ]; then
     ARGS+=" --train-duration ${TRAIN_DURATION}"
 fi
 
-exec python -m dama.ai.ml.trainer ${ARGS}
+exec python -W ignore::FutureWarning -m dama.ai.ml.trainer ${ARGS}
