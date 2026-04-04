@@ -27,8 +27,12 @@ def encode_board(state: GameState) -> np.ndarray:
     # Initialize planes
     planes = np.zeros((5, 8, 8), dtype=np.float32)
 
+    flip = current == Player.TWO
+
     for pos, piece in board.get_pieces():
         row, col = pos
+        if flip:
+            row = 7 - row
 
         if piece.player == current:
             if piece.is_king:
@@ -47,9 +51,13 @@ def encode_board(state: GameState) -> np.ndarray:
     return planes
 
 
-def encode_move(move: Move, piece: Piece) -> np.ndarray:
+def encode_move(move: Move, piece: Piece, current_player: Player = Player.ONE) -> np.ndarray:
     """
     Encode a move as a feature vector.
+
+    When current_player is Player.TWO, rows are flipped so both sides
+    see the board from the same canonical orientation (pieces at top,
+    advancing downward).
 
     Returns:
         numpy array of shape (8,):
@@ -64,6 +72,10 @@ def encode_move(move: Move, piece: Piece) -> np.ndarray:
     """
     from_row, from_col = move.start
     to_row, to_col = move.end
+
+    if current_player == Player.TWO:
+        from_row = 7 - from_row
+        to_row = 7 - to_row
 
     features = np.array([
         from_row / 7.0,           # Normalize to [0, 1]
@@ -88,11 +100,12 @@ def encode_moves(state: GameState, moves: List[Move]) -> np.ndarray:
     """
     features = []
     board = state.board
+    current_player = state.current_player
 
     for move in moves:
         piece = board.get_piece(move.start)
         if piece is not None:
-            features.append(encode_move(move, piece))
+            features.append(encode_move(move, piece, current_player))
         else:
             # Fallback for edge cases
             features.append(np.zeros(8, dtype=np.float32))

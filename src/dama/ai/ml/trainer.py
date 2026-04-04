@@ -1404,13 +1404,13 @@ class Trainer:
                 new_dicts = getattr(self, '_last_selfplay_dicts', None)
 
                 if new_dicts and _existing_dataset is not None and len(_existing_dataset) > 0:
-                    # Incremental: preprocess only new entries, concatenate with existing
-                    from .replay import ReplayEntry
-                    new_entries = [ReplayEntry.from_dict(d) for d in new_dicts]
-                    print(f"  Incremental preprocessing: {len(new_entries)} new entries "
+                    # Incremental: preprocess only new entries, concatenate with existing.
+                    # from_dicts() skips ReplayEntry.from_dict() round-trip — processes
+                    # raw dicts directly via _preprocess_chunk.
+                    print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
                           f"(existing: {len(_existing_dataset)})")
-                    new_dataset = CachedTensorDataset.from_entries(
-                        new_entries, max_moves_per_sample=64, show_progress=True)
+                    new_dataset = CachedTensorDataset.from_dicts(
+                        new_dicts, max_moves_per_sample=64, show_progress=True)
                     dataset = _existing_dataset.concat(new_dataset, max_entries=_max_entries)
                     print(f"  Merged dataset: {len(dataset)} entries")
                 else:

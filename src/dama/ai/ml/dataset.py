@@ -492,6 +492,46 @@ class CachedTensorDataset(Dataset):
             entries, max_moves_per_sample, show_progress
         )
         return cls(boards, move_features, move_counts, targets, reward_weights, value_targets)
+
+    @classmethod
+    def from_dicts(
+        cls,
+        entry_dicts: List[dict],
+        max_moves_per_sample: int = 64,
+        show_progress: bool = True,
+    ) -> 'CachedTensorDataset':
+        """Create a CachedTensorDataset directly from raw dicts.
+
+        Skips the ReplayEntry.from_dict() → to_dict() round-trip that
+        from_entries() requires when the caller already has dicts (e.g.
+        incremental self-play updates).  Uses _preprocess_chunk which
+        natively accepts dicts.
+        """
+        n = len(entry_dicts)
+        if n == 0:
+            return cls(
+                torch.empty(0, BOARD_PLANES, 8, 8),
+                torch.empty(0, max_moves_per_sample, MOVE_FEATURE_SIZE),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+            )
+
+        if show_progress:
+            print(f"  Pre-processing {n} dicts (direct path)...")
+        boards, mf, mc, tgt, rw, vt = _preprocess_chunk(
+            (entry_dicts, max_moves_per_sample))
+        if show_progress:
+            print(f"  Pre-processing complete: {n} entries")
+        return cls(
+            torch.from_numpy(boards),
+            torch.from_numpy(mf),
+            torch.from_numpy(mc),
+            torch.from_numpy(tgt),
+            torch.from_numpy(rw),
+            torch.from_numpy(vt),
+        )
     
     def save(self, path: str) -> None:
         """Save the cached tensors to a .pt file."""
