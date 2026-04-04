@@ -3,7 +3,7 @@
 import random
 import platform
 import sys
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from ...types import Move, Player
@@ -48,7 +48,7 @@ def play_single_game(
     p1_difficulty: str = None,
     p2_difficulty: str = None,
     return_dicts: bool = False,
-) -> GameRecord:
+) -> Union[GameRecord, List[dict]]:
     """
     Play a single self-play game using the algorithmic AI as teacher.
 
@@ -58,9 +58,10 @@ def play_single_game(
         noise_prob: Probability of playing a random move (for exploration)
         p1_difficulty: Difficulty for Player 1 (overrides difficulty if set)
         p2_difficulty: Difficulty for Player 2 (overrides difficulty if set)
+        return_dicts: If True, return List[dict] directly instead of GameRecord
 
     Returns:
-        GameRecord with all positions and the chosen moves
+        GameRecord (default) or List[dict] when return_dicts=True
     """
     start_player = Player(start_player)
     # Per-player difficulties default to the shared difficulty
