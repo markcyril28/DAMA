@@ -3,6 +3,7 @@
 import os
 import random
 import psutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Iterator, Optional
 import numpy as np
@@ -77,6 +78,43 @@ class DamaDataset(Dataset):
         )
 
 
+def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Worker function for parallel preprocessing of a chunk of replay entries.
+
+    Accepts serialized (dict) entries to avoid pickling ReplayEntry objects.
+    Returns numpy arrays for the chunk.
+    """
+    entry_dicts, max_moves_per_sample = args
+    n = len(entry_dicts)
+
+    boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
+    all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
+    move_counts = np.zeros(n, dtype=np.int64)
+    targets = np.zeros(n, dtype=np.int64)
+    reward_weights = np.zeros(n, dtype=np.float32)
+    value_targets = np.zeros(n, dtype=np.float32)
+
+    for i, ed in enumerate(entry_dicts):
+        entry = ReplayEntry.from_dict(ed)
+        state = GameState.from_compact(entry.state)
+        boards[i] = encode_board(state)
+
+        moves = [Move.from_dict(m) for m in entry.legal_moves]
+        move_feats = encode_moves(state, moves)
+
+        num_moves = min(move_feats.shape[0], max_moves_per_sample)
+        all_move_features[i, :num_moves] = move_feats[:num_moves]
+        move_counts[i] = num_moves
+        if num_moves > 0:
+            targets[i] = min(entry.chosen_index, num_moves - 1)
+        else:
+            targets[i] = 0
+        reward_weights[i] = compute_reward_weight(entry.score)
+        value_targets[i] = float(entry.result)
+
+    return boards, all_move_features, move_counts, targets, reward_weights, value_targets
+
+
 def preprocess_entries_to_tensors(
     entries: List[ReplayEntry],
     max_moves_per_sample: int = 64,
@@ -84,15 +122,15 @@ def preprocess_entries_to_tensors(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pre-process replay entries into pre-computed tensors for fast training.
-    
-    This eliminates the CPU bottleneck of parsing JSON and reconstructing
-    GameState objects during training.
-    
+
+    Uses multiprocessing to parallelize across CPU cores when the dataset
+    is large enough to amortize the IPC overhead.
+
     Args:
         entries: List of replay entries to process
         max_moves_per_sample: Maximum number of moves to pad to (for fixed-size batching)
         show_progress: Whether to print progress updates
-    
+
     Returns:
         Tuple of:
         - boards: (N, BOARD_PLANES, 8, 8) float32 tensor
@@ -112,31 +150,70 @@ def preprocess_entries_to_tensors(
             torch.empty(0, dtype=torch.float32),
             torch.empty(0, dtype=torch.float32),
         )
-    
-    # Pre-allocate arrays
+
+    # Parallelize for large datasets (>5K entries) where IPC cost is amortized.
+    # Use min(cores/2, 16) workers — more than 16 hits diminishing returns
+    # from pickle serialization overhead.
+    num_workers = max(1, min(16, (os.cpu_count() or 1) // 2))
+    use_parallel = n >= 5000 and num_workers > 1
+
+    if use_parallel:
+        if show_progress:
+            print(f"  Pre-processing {n} entries with {num_workers} workers...")
+
+        # Convert to dicts for pickling across processes
+        entry_dicts = [e.to_dict() for e in entries]
+
+        # Split into chunks, one per worker
+        chunk_size = (n + num_workers - 1) // num_workers
+        chunks = []
+        for start in range(0, n, chunk_size):
+            chunk = entry_dicts[start:start + chunk_size]
+            chunks.append((chunk, max_moves_per_sample))
+
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            results = list(pool.map(_preprocess_chunk, chunks))
+
+        # Concatenate all chunks
+        boards = np.concatenate([r[0] for r in results], axis=0)
+        all_move_features = np.concatenate([r[1] for r in results], axis=0)
+        move_counts = np.concatenate([r[2] for r in results])
+        targets = np.concatenate([r[3] for r in results])
+        reward_weights = np.concatenate([r[4] for r in results])
+        value_targets = np.concatenate([r[5] for r in results])
+
+        if show_progress:
+            print(f"  Pre-processing complete: {n} entries")
+
+        return (
+            torch.from_numpy(boards),
+            torch.from_numpy(all_move_features),
+            torch.from_numpy(move_counts),
+            torch.from_numpy(targets),
+            torch.from_numpy(reward_weights),
+            torch.from_numpy(value_targets),
+        )
+
+    # Sequential fallback for small datasets
     boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
     all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
     move_counts = np.zeros(n, dtype=np.int64)
     targets = np.zeros(n, dtype=np.int64)
     reward_weights = np.zeros(n, dtype=np.float32)
     value_targets = np.zeros(n, dtype=np.float32)
-    
+
     log_interval = max(1, n // 20)  # Log every 5%
-    
+
     for i, entry in enumerate(entries):
         if show_progress and i > 0 and i % log_interval == 0:
             print(f"  Pre-processing: {i}/{n} ({100*i/n:.1f}%)")
-        
-        # Reconstruct game state
+
         state = GameState.from_compact(entry.state)
-        
-        # Encode board
         boards[i] = encode_board(state)
-        
-        # Reconstruct moves and encode them
+
         moves = [Move.from_dict(m) for m in entry.legal_moves]
         move_feats = encode_moves(state, moves)
-        
+
         num_moves = min(move_feats.shape[0], max_moves_per_sample)
         all_move_features[i, :num_moves] = move_feats[:num_moves]
         move_counts[i] = num_moves
@@ -146,13 +223,13 @@ def preprocess_entries_to_tensors(
             targets[i] = min(entry.chosen_index, num_moves - 1)
         else:
             print(f"  Warning: entry {i} has zero legal moves — skipping target (move_counts=0 will mask this entry)")
-            targets[i] = 0  # masked by move_counts[i] == 0
+            targets[i] = 0
         reward_weights[i] = compute_reward_weight(entry.score)
-        value_targets[i] = float(entry.result)  # +1 win, -1 loss, 0 draw
-    
+        value_targets[i] = float(entry.result)
+
     if show_progress:
         print(f"  Pre-processing complete: {n} entries")
-    
+
     return (
         torch.from_numpy(boards),
         torch.from_numpy(all_move_features),
@@ -388,6 +465,15 @@ class FastBatchIterator:
     This eliminates per-sample __getitem__, collation, worker IPC, and
     Python type-conversion overhead that DataLoader imposes.
 
+    **GPU-resident mode** (``device`` is a CUDA device): all dataset tensors
+    are moved to GPU once at construction.  Batch indexing then happens on
+    GPU with zero H2D transfer, no pin_memory, and no CUDAPrefetcher.
+    Enabled automatically when the dataset fits comfortably in VRAM.
+
+    **CPU+pin mode** (``pin_memory=True``, no ``device``): output tensors
+    are pinned so that CUDAPrefetcher's ``non_blocking=True`` transfers
+    are truly asynchronous.
+
     Yields the same 6-tuple as collate_padded_batch so the training loop
     works unchanged:
       (boards, move_features, move_counts, targets, reward_weights, value_targets)
@@ -402,6 +488,8 @@ class FastBatchIterator:
         batch_size: int,
         shuffle: bool = True,
         drop_last: bool = True,
+        pin_memory: bool = False,
+        device: Optional[torch.device] = None,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -409,30 +497,76 @@ class FastBatchIterator:
         self.drop_last = drop_last
         self.n = len(dataset)
 
+        # GPU-resident mode: move entire dataset to VRAM once.
+        # Eliminates all pin_memory + CUDAPrefetcher + H2D transfer overhead.
+        self.on_gpu = False
+        if device is not None and device.type == 'cuda':
+            dataset_bytes = sum(
+                t.nelement() * t.element_size() for t in [
+                    dataset.boards, dataset.move_features, dataset.move_counts,
+                    dataset.targets, dataset.reward_weights, dataset.value_targets,
+                ]
+            )
+            total_vram = torch.cuda.get_device_properties(device).total_memory
+            allocated = torch.cuda.memory_allocated(device)
+            available = total_vram - allocated
+            # Use GPU cache if dataset fits in <40% of remaining VRAM
+            # (leave headroom for activations, gradients, optimizer state)
+            if dataset_bytes < available * 0.4:
+                self._boards = dataset.boards.to(device)
+                self._move_features = dataset.move_features.to(device)
+                self._move_counts = dataset.move_counts.to(device)
+                self._targets = dataset.targets.to(device)
+                self._reward_weights = dataset.reward_weights.to(device)
+                self._value_targets = dataset.value_targets.to(device)
+                self.on_gpu = True
+                self._device = device
+                print(f"  GPU-resident dataset: {dataset_bytes / 1e6:.0f}MB on GPU "
+                      f"({available / 1e6:.0f}MB available)")
+            else:
+                print(f"  Dataset too large for GPU cache ({dataset_bytes / 1e6:.0f}MB, "
+                      f"{available / 1e6:.0f}MB available) — using CPU+pin")
+
+        if not self.on_gpu:
+            self._boards = dataset.boards
+            self._move_features = dataset.move_features
+            self._move_counts = dataset.move_counts
+            self._targets = dataset.targets
+            self._reward_weights = dataset.reward_weights
+            self._value_targets = dataset.value_targets
+            self._device = None
+
+        self.pin_memory = pin_memory and torch.cuda.is_available() and not self.on_gpu
+
     def __len__(self) -> int:
         if self.drop_last:
             return self.n // self.batch_size
         return (self.n + self.batch_size - 1) // self.batch_size
 
     def __iter__(self):
+        # Generate indices on the same device as data — GPU randperm is faster
+        _dev = self._boards.device
         if self.shuffle:
-            indices = torch.randperm(self.n)
+            indices = torch.randperm(self.n, device=_dev)
         else:
-            indices = torch.arange(self.n)
+            indices = torch.arange(self.n, device=_dev)
 
         for start in range(0, self.n, self.batch_size):
             end = min(start + self.batch_size, self.n)
             if self.drop_last and (end - start) < self.batch_size:
                 break
             idx = indices[start:end]
-            yield (
-                self.dataset.boards[idx],
-                self.dataset.move_features[idx],
-                self.dataset.move_counts[idx],
-                self.dataset.targets[idx],
-                self.dataset.reward_weights[idx],
-                self.dataset.value_targets[idx],
+            batch = (
+                self._boards[idx],
+                self._move_features[idx],
+                self._move_counts[idx],
+                self._targets[idx],
+                self._reward_weights[idx],
+                self._value_targets[idx],
             )
+            if self.pin_memory:
+                batch = tuple(t.pin_memory() for t in batch)
+            yield batch
 
 
 class StreamingDamaDataset(IterableDataset):
@@ -517,10 +651,11 @@ def create_dataloader(
     pin_memory: bool = True,
     use_ram_cache: bool = True,
     ram_threshold_gb: float = 16.0,
+    device: Optional[torch.device] = None,
 ) -> DataLoader:
     """
     Create a DataLoader from replay entries.
-    
+
     Args:
         entries: List of replay entries
         batch_size: Batch size
@@ -529,7 +664,8 @@ def create_dataloader(
         pin_memory: Whether to pin memory for faster GPU transfer
         use_ram_cache: If True and sufficient RAM available, pre-process to tensors
         ram_threshold_gb: Minimum available RAM (GB) required for caching
-    
+        device: Target device — when CUDA, tries GPU-resident caching for zero H2D overhead
+
     Returns:
         DataLoader instance
     """
@@ -563,11 +699,14 @@ def create_dataloader(
         # FastBatchIterator: bypass DataLoader entirely for pre-tensorized data.
         # Direct tensor[indices] is orders of magnitude faster than per-sample
         # __getitem__ + collation + worker IPC that DataLoader imposes.
+        # When device is CUDA, tries GPU-resident caching for zero H2D overhead.
         return FastBatchIterator(
             cached_dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             drop_last=True,
+            pin_memory=pin_memory,
+            device=device,
         )
     
     # Fall back to standard dataset
@@ -666,18 +805,23 @@ def create_dataloader_from_dataset(
     shuffle: bool = True,
     num_workers: int = 4,
     pin_memory: bool = True,
+    device: Optional[torch.device] = None,
 ) -> FastBatchIterator:
     """Create a fast batch iterator from a pre-built CachedTensorDataset.
 
     Uses direct tensor indexing instead of DataLoader for maximum throughput.
     Used when dataset has been pre-processed in a background thread
     to avoid blocking the training loop.
+
+    When device is CUDA, tries GPU-resident caching for zero H2D overhead.
     """
     return FastBatchIterator(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=True,
+        pin_memory=pin_memory,
+        device=device,
     )
 
 
