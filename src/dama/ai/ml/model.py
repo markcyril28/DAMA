@@ -372,6 +372,39 @@ def create_model(
     )
 
 
+def _infer_arch_from_state_dict(state_dict: dict) -> dict:
+    """Infer architecture params from state_dict tensor shapes.
+
+    Used for old checkpoints that were saved without arch_params metadata.
+    """
+    w = state_dict.get('board_encoder.input_conv.weight')
+    channels = w.shape[0] if w is not None else 64
+
+    num_blocks = 0
+    while f'board_encoder.blocks.{num_blocks}.conv1.weight' in state_dict:
+        num_blocks += 1
+    num_blocks = num_blocks or 4
+
+    b = state_dict.get('board_encoder.fc.bias')
+    embedding_size = b.shape[0] if b is not None else 128
+
+    b2 = state_dict.get('move_scorer.fc2.bias')
+    hidden_size = b2.shape[0] if b2 is not None else 64
+
+    value_head_enabled = 'value_head.fc1.weight' in state_dict
+    vh = state_dict.get('value_head.fc1.bias')
+    value_head_hidden = vh.shape[0] if vh is not None else 128
+
+    return {
+        'channels': channels,
+        'num_blocks': num_blocks,
+        'embedding_size': embedding_size,
+        'hidden_size': hidden_size,
+        'value_head_enabled': value_head_enabled,
+        'value_head_hidden': value_head_hidden,
+    }
+
+
 def load_model(path: str, device: torch.device = None) -> MoveScorerNet:
     """Load a model from a checkpoint."""
     if device is None:
