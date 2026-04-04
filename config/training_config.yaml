@@ -62,6 +62,19 @@ training:
   train_steps: 100000000000           # Total training steps
   checkpoint_every: 2000              # Save checkpoint every N steps
 
+  # Learning rate schedule (enable for better convergence)
+  lr_scheduler:
+    enabled: true                     # Enable LR scheduler
+    type: "cosine_warm_restarts"      # Cosine annealing with warm restarts
+    T_0: 500                          # Steps for first cosine cycle
+    T_mult: 2                         # Cycle length multiplier after each restart
+    eta_min: 1.0e-5                   # Minimum LR
+    warmup_steps: 200                 # Linear warmup from ~0 to base LR
+
+  # Gradient accumulation: effective_batch = batch_size * gradient_accumulation_steps.
+  # Use >1 on memory-constrained hardware to get larger effective batches.
+  gradient_accumulation_steps: 1
+
   # Reward scoring mode for training loss weighting:
   #   "scoring" - always use the scoring system reward weights
   #   "none"    - never use scoring (uniform weights, classic behavior)
@@ -106,7 +119,7 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true                       # Enhanced stats collection (JSON + CSV exports)
-  record_every: 10                    # Record loss/gradients every N steps
+  record_every: 50                    # Record loss/gradients every N steps (lower = more CUDA syncs)
   system_every: 500                   # Record GPU/CPU/RAM metrics every N steps
   model_health_every: 2000            # Record parameter norms every N steps
   score_dist_every: 50                # Record score distribution every N steps
@@ -115,7 +128,18 @@ statistics:
   output_dir: "logs/stats"            # Export directory
 
 # -----------------------------------------------------------------------------
-# Resume Settings  
+# Thermal Protection
+# -----------------------------------------------------------------------------
+# Pauses training when GPU or CPU temperature exceeds the threshold.
+# After resting for the configured duration, training resumes automatically.
+thermal_protection:
+  enabled: false                       # Enable thermal throttle protection
+  temp_limit_c: 90                     # Temperature threshold in Celsius
+  rest_duration: "5m"                  # Rest duration when limit is hit (e.g., "5m", "10m", "1m30s")
+  check_every: 30                      # Check temperature every N seconds (avoid excessive polling)
+
+# -----------------------------------------------------------------------------
+# Resume Settings
 # -----------------------------------------------------------------------------
 resume:
   enabled: true                       # Enable auto-resume from latest checkpoint
@@ -145,35 +169,53 @@ profiles:
       amp:
         enabled: true
         dtype: "bfloat16"
+      compile:
+        mode: "max-autotune"          # MI210 benefits from max-autotune (large VRAM)
     selfplay:
-      cpu_workers: 48
-      games_per_epoch: 2048
+      cpu_workers: 96                 # FastBatchIterator needs no DataLoader workers — reclaim for self-play
+      games_per_epoch: 8192           # Proportional to batch size — keeps GPU fed
     training:
-      batch_size: 1024
-      learning_rate: 1.0e-4
+      batch_size: 8192                # 64GB VRAM has massive headroom (~1.6GB activations)
+      learning_rate: 3.0e-4           # Sqrt-scaled from 2e-4 at 4096 (×√2)
+      gradient_accumulation_steps: 1
+      lr_scheduler:
+        enabled: true
+        warmup_steps: 200
     dataloader:
-      num_workers: 16
+      num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
       ram_cache:
         enabled: true
         threshold_gb: 64.0
 
-  # Local development (NVIDIA RTX, 8GB+ VRAM)
+  # Local development (NVIDIA RTX 5050, 8GB VRAM, 16 CPU threads, 32GB RAM)
   local:
     device:
       type: "cuda"
       amp:
         enabled: true
         dtype: "float16"
+      compile:
+        mode: "max-autotune"          # Small model — autotune overhead amortizes quickly
     selfplay:
-      cpu_workers: 8
-      games_per_epoch: 100
+      cpu_workers: 12                 # FastBatchIterator needs no DataLoader workers — reclaim for self-play
+      games_per_epoch: 512            # Proportional to batch size — keeps GPU fed
     training:
-      batch_size: 512
-      learning_rate: 4.0e-4
+      batch_size: 4096                # ~800MB activations — fits comfortably in 8GB with AMP
+      learning_rate: 8.0e-4           # Sqrt-scaled from 6e-4 at 2048 (×√2)
+      gradient_accumulation_steps: 1
+      lr_scheduler:
+        enabled: true
+        warmup_steps: 100
     dataloader:
-      num_workers: 4
+      num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
       ram_cache:
-        enabled: false
+        enabled: true                 # 32GB RAM is plenty for caching
+        threshold_gb: 8.0
+    thermal_protection:
+      enabled: true                    # RTX 5050 laptop — protect from throttling
+      temp_limit_c: 90
+      rest_duration: "5m"
+      check_every: 30
 
   # CPU-only training
   cpu:

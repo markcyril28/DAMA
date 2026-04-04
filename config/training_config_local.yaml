@@ -116,7 +116,18 @@ statistics:
   output_dir: "logs/stats"            # Export directory
 
 # -----------------------------------------------------------------------------
-# Resume Settings  
+# Thermal Protection
+# -----------------------------------------------------------------------------
+# Pauses training when GPU or CPU temperature exceeds the threshold.
+# After resting for the configured duration, training resumes automatically.
+thermal_protection:
+  enabled: true                        # RTX 5050 laptop — protect from throttling
+  temp_limit_c: 90                     # Temperature threshold in Celsius
+  rest_duration: "5m"                  # Rest duration when limit is hit (e.g., "5m", "10m", "1m30s")
+  check_every: 30                      # Check temperature every N seconds
+
+# -----------------------------------------------------------------------------
+# Resume Settings
 # -----------------------------------------------------------------------------
 resume:
   enabled: true                       # Enable auto-resume from latest checkpoint
