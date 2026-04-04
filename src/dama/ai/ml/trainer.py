@@ -69,6 +69,35 @@ from .dataset import (
 from .stats_collector import StatsCollector
 
 
+def _make_compiled_fwd_loss(model, compile_mode):
+    """Build and compile a fused forward_padded + loss function.
+
+    Keeping forward and loss in one compiled graph lets the inductor fuse
+    kernels across the boundary and capture everything in a single CUDAGraph,
+    eliminating per-kernel launch overhead from separate forward and loss calls.
+    """
+    def _fwd_loss(boards, move_features, move_counts, targets, reward_weights):
+        # Forward — model.forward_padded is inlined by the compiler
+        scores = model.forward_padded(boards, move_features, move_counts)
+
+        # Loss — inlined from _compute_loss_padded for single-graph capture
+        counts = move_counts.long()
+        no_moves = counts == 0
+        stable = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
+        log_probs = nn.functional.log_softmax(stable.float(), dim=1)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+        max_m = scores.shape[1]
+        safe_tgt = targets.long().clamp(0, max_m - 1).unsqueeze(1)
+        chosen_lp = log_probs.gather(1, safe_tgt).squeeze(1)
+        valid = (counts > 0) & (targets.long() >= 0) & (targets.long() < counts)
+        w = reward_weights.float() * valid.float()
+        tw = w.sum().clamp(min=1.0)
+        loss = -(chosen_lp * w).sum() / tw
+        return loss, scores.detach()
+
+    return torch.compile(_fwd_loss, mode=compile_mode, fullgraph=True)
+
+
 def parse_duration(duration_str: Optional[str]) -> Optional[datetime]:
     """Parse duration string and return the stop time.
     
@@ -533,45 +562,64 @@ class Trainer:
         if config.resume:
             self._load_checkpoint(config.resume)
 
-        # Compile after loading checkpoint to avoid state_dict key mismatch.
-        # Compilation is lazy — the real test is the first forward pass.
-        # We run a warmup here so failures are caught early and we can
-        # fall back to eager mode instead of crashing mid-training.
+        # Compile a fused forward+loss function for maximum performance.
+        # Fusing forward and loss in one compiled graph lets the inductor fuse
+        # kernels and capture everything in a single CUDAGraph.
+        # Falls back to model-only compilation if fused compile fails.
+        self._compiled_fwd_loss = None
         if self.config.compile_model and hasattr(torch, "compile"):
+            _warmup_bs = self.config.batch_size
+            _wb = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
+            _wm = torch.randn(_warmup_bs, 64, 8, device=self.device)
+            _wc = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
+
+            # Stage 1: try fused forward+loss compilation
             try:
-                print(f"Enabling torch.compile (mode={self.config.compile_mode}, fullgraph=True)...")
+                print(f"Enabling torch.compile for fused forward+loss "
+                      f"(mode={self.config.compile_mode}, fullgraph=True)...")
                 sys.stdout.flush()
-                compiled_model = torch.compile(
-                    self.model,
-                    mode=self.config.compile_mode,
-                    fullgraph=True,
-                )
-                # Warmup: run a dummy forward pass to trigger actual compilation.
-                # This catches Triton/Inductor failures *before* the training loop.
-                # Use the actual training batch size so CUDAGraph captures the right
-                # shapes — avoids a recompilation on the first real training batch.
-                print("  Running compile warmup (first forward pass)...")
+                self._compiled_fwd_loss = _make_compiled_fwd_loss(
+                    self.model, self.config.compile_mode)
+                print("  Running compile warmup (fused forward+loss)...")
                 sys.stdout.flush()
-                _warmup_bs = self.config.batch_size
-                _warmup_board = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
-                _warmup_moves = torch.randn(_warmup_bs, 64, 8, device=self.device)
-                _warmup_counts = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
+                _wt = torch.zeros(_warmup_bs, dtype=torch.long, device=self.device)
+                _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
                 with torch.no_grad():
                     if self.config.amp:
                         with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                            compiled_model.forward_padded(_warmup_board, _warmup_moves, _warmup_counts)
+                            self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
                     else:
-                        compiled_model.forward_padded(_warmup_board, _warmup_moves, _warmup_counts)
-                del _warmup_board, _warmup_moves, _warmup_counts
-                if self.device.type == 'cuda':
-                    torch.cuda.empty_cache()
-                self.model = compiled_model
-                print("torch.compile warmup OK — compiled model active")
+                        self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                del _wt, _wr
+                print("torch.compile warmup OK — compiled fused forward+loss active")
                 sys.stdout.flush()
             except Exception as e:
-                print(f"torch.compile failed ({e}), falling back to eager mode")
+                print(f"Fused compile failed ({e}), trying model-only compile...")
                 sys.stdout.flush()
-                # model is still the uncompiled version — no action needed
+                self._compiled_fwd_loss = None
+
+                # Stage 2: fall back to model-only compilation
+                try:
+                    compiled_model = torch.compile(
+                        self.model, mode=self.config.compile_mode, fullgraph=True)
+                    print("  Running compile warmup (model forward only)...")
+                    sys.stdout.flush()
+                    with torch.no_grad():
+                        if self.config.amp:
+                            with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                compiled_model.forward_padded(_wb, _wm, _wc)
+                        else:
+                            compiled_model.forward_padded(_wb, _wm, _wc)
+                    self.model = compiled_model
+                    print("torch.compile warmup OK — compiled model active (loss uncompiled)")
+                    sys.stdout.flush()
+                except Exception as e2:
+                    print(f"torch.compile failed ({e2}), falling back to eager mode")
+                    sys.stdout.flush()
+
+            del _wb, _wm, _wc
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Thermal protection
@@ -1227,7 +1275,7 @@ class Trainer:
             try:
                 self.run_selfplay(num_games)
                 train_entries, _ = prepare_training_data(
-                    self.replay_buffer, max_entries=self.config.replay_max_entries)
+                    self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
                 # Pre-process to tensors in background to avoid GPU idle time
                 dataset = CachedTensorDataset.from_entries(
                     train_entries, max_moves_per_sample=64, show_progress=True,
@@ -1407,6 +1455,18 @@ class Trainer:
         _sanity_interval = self._SANITY_CHECK_INTERVAL
         _thermal_enabled = _cfg.thermal_enabled
 
+        # Compiled fwd+loss: use when available, padded, and no value head
+        _compiled_fwd_loss = self._compiled_fwd_loss
+        _use_compiled = (_compiled_fwd_loss is not None and _use_padded
+                         and not _value_head_enabled)
+
+        # Pre-allocate uniform weights for non-scoring epochs so the compiled
+        # path always receives a tensor (never None).
+        if _use_compiled and not use_scoring:
+            _uniform_rw = torch.ones(_cfg.batch_size, dtype=torch.float32, device=_device)
+        else:
+            _uniform_rw = None
+
         # Use CUDA prefetcher for overlapped H2D transfer — but skip when data
         # is already GPU-resident (no transfer to overlap, prefetcher just adds
         # stream-sync overhead).
@@ -1450,7 +1510,8 @@ class Trainer:
                 targets = targets.to(_device, non_blocking=True)
             # Conditionally load reward weights / value targets
             if not use_scoring:
-                reward_weights = None
+                # Compiled path needs a tensor (never None); reuse pre-allocated ones
+                reward_weights = _uniform_rw if _uniform_rw is not None else None
             elif not _use_prefetcher and not _data_on_gpu:
                 reward_weights = reward_weights.to(_device, non_blocking=True)
             if not _value_head_enabled:
@@ -1478,7 +1539,36 @@ class Trainer:
             _grad_norms_per_layer = None
             _current_scores = None
 
-            if _use_amp:
+            if _use_compiled:
+                # ── Compiled path: fused forward+loss in single CUDAGraph ──
+                if _use_amp:
+                    with autocast(device_type='cuda', dtype=_amp_dtype):
+                        loss, _current_scores = _compiled_fwd_loss(
+                            boards, move_features, move_counts, targets, reward_weights)
+                else:
+                    loss, _current_scores = _compiled_fwd_loss(
+                        boards, move_features, move_counts, targets, reward_weights)
+
+                if _do_sanity:
+                    if (torch.isnan(_current_scores).any()
+                            or (_current_scores == float('inf')).any()
+                            or not torch.isfinite(loss)):
+                        print("  Warning: non-finite values detected; skipping batch")
+                        if _stats_collector:
+                            _stats_collector.record_non_finite_event(
+                                self.step, 'compiled_fwd_loss', 'Non-finite output')
+                        continue
+
+                if accum_steps > 1:
+                    loss = loss / accum_steps
+
+                if _scaler is not None:
+                    _scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            elif _use_amp:
+                # ── AMP path (fallback: value head or non-padded) ──
                 with autocast(device_type='cuda', dtype=_amp_dtype):
                     if _use_padded:
                         if _value_head_enabled:
@@ -1493,7 +1583,6 @@ class Trainer:
                             scores = _model(boards, move_features, move_counts)
                             value_preds = None
                     if _do_sanity:
-                        # Padded scores have intentional -inf; only flag NaN or +inf
                         if _use_padded:
                             _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
                         else:
@@ -1510,22 +1599,15 @@ class Trainer:
                     else:
                         policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
 
-                    # Value head loss (MSE between predicted value and game result)
                     if value_preds is not None and value_targets is not None:
                         value_loss = nn.functional.mse_loss(value_preds, value_targets)
                         loss = policy_loss + _value_weight * value_loss
                     else:
                         loss = policy_loss
 
-                # Scale loss for gradient accumulation
                 if accum_steps > 1:
                     loss = loss / accum_steps
 
-                # Periodic loss sanity check — `not tensor` calls .item() which
-                # forces a CUDA sync (~20-100μs).  GradScaler already handles
-                # NaN/Inf by skipping the optimizer step, so this is informational
-                # only.  Checking every _SANITY_CHECK_INTERVAL steps instead of
-                # every step eliminates a major pipeline stall.
                 if _do_sanity and not torch.isfinite(loss):
                     print("  Warning: non-finite loss detected; skipping batch")
                     if _stats_collector:
@@ -1537,7 +1619,9 @@ class Trainer:
                     _scaler.scale(loss).backward()
                 else:
                     loss.backward()
+
             else:
+                # ── No-AMP path ──
                 if _use_padded:
                     if _value_head_enabled:
                         scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
@@ -1891,9 +1975,9 @@ class Trainer:
 
         # Prepare data
         print("\nPreparing training data...")
-        train_entries, val_entries = prepare_training_data(
-            self.replay_buffer, max_entries=self.config.replay_max_entries)
-        print(f"Training: {len(train_entries)}, Validation: {len(val_entries)}")
+        train_entries, _ = prepare_training_data(
+            self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
+        print(f"Training entries: {len(train_entries)}")
 
         if not train_entries:
             print("ERROR: No training data available")
@@ -1989,7 +2073,7 @@ class Trainer:
                 print("Running self-play (alternate mode)...")
                 self.run_selfplay(self.config.selfplay_games)
                 train_entries, _ = prepare_training_data(
-                    self.replay_buffer, max_entries=self.config.replay_max_entries)
+                    self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
                 if train_entries:
                     dataset = CachedTensorDataset.from_entries(
                         train_entries, max_moves_per_sample=64, show_progress=True,

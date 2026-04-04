@@ -15,7 +15,7 @@ from ...game_state import GameState
 from ...board import Board
 from .replay import ReplayBuffer, ReplayEntry
 from .move_encoder import encode_board, encode_moves, MOVE_FEATURE_SIZE, BOARD_PLANES
-from .scoring import compute_reward_weight
+from .scoring import compute_reward_weight, compute_reward_weights_batch
 
 
 def get_available_ram_gb() -> float:
@@ -155,6 +155,9 @@ def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
     reward_weights = np.zeros(n, dtype=np.float32)
     value_targets = np.zeros(n, dtype=np.float32)
 
+    # Collect scores for batch reward weight computation.
+    scores_arr = np.zeros(n, dtype=np.float32)
+
     for i, ed in enumerate(entry_dicts):
         state_dict = ed['state']
         _encode_board_fast(state_dict, boards[i])
@@ -168,8 +171,63 @@ def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
             targets[i] = min(chosen_idx, num_moves - 1)
         else:
             targets[i] = 0
-        reward_weights[i] = compute_reward_weight(ed.get('score', 0.0))
+        scores_arr[i] = ed.get('score', 0.0)
         value_targets[i] = float(ed.get('result', 0))
+
+    # Vectorized reward weight computation — single numpy call for the whole chunk.
+    reward_weights[:] = compute_reward_weights_batch(scores_arr)
+
+    return boards, all_move_features, move_counts, targets, reward_weights, value_targets
+
+
+# ---------------------------------------------------------------------------
+# Fork-optimized preprocessing: zero-serialization input path
+# ---------------------------------------------------------------------------
+# On Linux with fork start method, child processes inherit the parent's
+# memory via copy-on-write.  We store the entries list in a module global
+# and send only (start, end) index ranges to workers — no to_dict()
+# conversion, no pickle of entry data.  Workers read entries directly from
+# the inherited list.  Output arrays are still pickled back (numpy arrays
+# serialize as raw bytes, which is fast).
+# ---------------------------------------------------------------------------
+_fork_entries: Optional[list] = None
+_fork_max_moves: int = 64
+
+
+def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Worker that reads entries from fork-inherited global (zero input serialization)."""
+    start_idx, end_idx = args
+    entries = _fork_entries
+    max_moves_per_sample = _fork_max_moves
+    n = end_idx - start_idx
+
+    boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
+    all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
+    move_counts = np.zeros(n, dtype=np.int64)
+    targets = np.zeros(n, dtype=np.int64)
+    reward_weights = np.zeros(n, dtype=np.float32)
+    value_targets = np.zeros(n, dtype=np.float32)
+
+    scores_arr = np.zeros(n, dtype=np.float32)
+
+    for i in range(n):
+        entry = entries[start_idx + i]
+        state_dict = entry.state
+        _encode_board_fast(state_dict, boards[i])
+
+        num_moves = _encode_moves_fast(state_dict, entry.legal_moves, all_move_features[i])
+
+        move_counts[i] = num_moves
+        chosen_idx = entry.chosen_index
+        if num_moves > 0:
+            targets[i] = min(chosen_idx, num_moves - 1)
+        else:
+            targets[i] = 0
+        scores_arr[i] = entry.score
+        value_targets[i] = float(entry.result)
+
+    # Vectorized reward weight computation — single numpy call for the whole chunk.
+    reward_weights[:] = compute_reward_weights_batch(scores_arr)
 
     return boards, all_move_features, move_counts, targets, reward_weights, value_targets
 
@@ -223,18 +281,43 @@ def preprocess_entries_to_tensors(
         if show_progress:
             print(f"  Pre-processing {n} entries with {num_workers} workers...")
 
-        # Convert to dicts for pickling across processes
-        entry_dicts = [e.to_dict() for e in entries]
+        # Detect fork start method: workers inherit parent memory via COW,
+        # so we can pass index ranges instead of serializing all entry data.
+        import multiprocessing as _mp
+        _use_fork = False
+        try:
+            _use_fork = _mp.get_start_method() == 'fork'
+        except RuntimeError:
+            pass
 
-        # Split into chunks, one per worker
-        chunk_size = (n + num_workers - 1) // num_workers
-        chunks = []
-        for start in range(0, n, chunk_size):
-            chunk = entry_dicts[start:start + chunk_size]
-            chunks.append((chunk, max_moves_per_sample))
+        if _use_fork:
+            # Fork path: zero input serialization — workers read from inherited global.
+            global _fork_entries, _fork_max_moves
+            _fork_entries = entries
+            _fork_max_moves = max_moves_per_sample
 
-        with ProcessPoolExecutor(max_workers=num_workers) as pool:
-            results = list(pool.map(_preprocess_chunk, chunks))
+            chunk_size = (n + num_workers - 1) // num_workers
+            args = [
+                (start, min(start + chunk_size, n))
+                for start in range(0, n, chunk_size)
+            ]
+
+            with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                results = list(pool.map(_preprocess_chunk_fork, args))
+
+            _fork_entries = None  # Release reference
+        else:
+            # Spawn path: serialize entries to dicts for pickling across processes.
+            entry_dicts = [e.to_dict() for e in entries]
+
+            chunk_size = (n + num_workers - 1) // num_workers
+            chunks = []
+            for start in range(0, n, chunk_size):
+                chunk = entry_dicts[start:start + chunk_size]
+                chunks.append((chunk, max_moves_per_sample))
+
+            with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                results = list(pool.map(_preprocess_chunk, chunks))
 
         # Concatenate all chunks
         boards = np.concatenate([r[0] for r in results], axis=0)
@@ -261,7 +344,7 @@ def preprocess_entries_to_tensors(
     all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
     move_counts = np.zeros(n, dtype=np.int64)
     targets = np.zeros(n, dtype=np.int64)
-    reward_weights = np.zeros(n, dtype=np.float32)
+    scores_arr = np.zeros(n, dtype=np.float32)
     value_targets = np.zeros(n, dtype=np.float32)
 
     log_interval = max(1, n // 20)  # Log every 5%
@@ -281,8 +364,11 @@ def preprocess_entries_to_tensors(
         else:
             print(f"  Warning: entry {i} has zero legal moves — skipping target (move_counts=0 will mask this entry)")
             targets[i] = 0
-        reward_weights[i] = compute_reward_weight(entry.score)
+        scores_arr[i] = entry.score
         value_targets[i] = float(entry.result)
+
+    # Vectorized reward weight computation.
+    reward_weights = compute_reward_weights_batch(scores_arr)
 
     if show_progress:
         print(f"  Pre-processing complete: {n} entries")

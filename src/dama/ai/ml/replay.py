@@ -1,6 +1,5 @@
 """Replay buffer management for training data."""
 
-import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -8,6 +7,22 @@ from pathlib import Path
 from typing import List, Iterator, Optional, Dict, Any
 from dataclasses import dataclass
 import random
+
+# Use orjson (Rust-backed, 3-5x faster) when available, fall back to stdlib json.
+try:
+    import orjson as _json_mod
+
+    def _json_loads(s):
+        return _json_mod.loads(s)
+
+    def _json_dumps(obj) -> str:
+        # orjson.dumps returns bytes; decode for JSONL text lines.
+        return _json_mod.dumps(obj).decode('utf-8')
+except ImportError:
+    import json as _json_mod
+
+    _json_loads = _json_mod.loads
+    _json_dumps = _json_mod.dumps
 
 
 @dataclass
@@ -61,6 +76,9 @@ class ReplayBuffer:
         self.max_files = max_files
         self._current_file = None
         self._current_writer = None
+        # Incremental file cache: {path: (mtime, [ReplayEntry, ...])}
+        # Avoids re-parsing unchanged JSONL files across epochs.
+        self._file_cache: Dict[Path, tuple] = {}
 
     def start_new_file(self) -> Path:
         """Start a new replay file."""
@@ -80,16 +98,16 @@ class ReplayBuffer:
         if self._current_writer is None:
             self.start_new_file()
 
-        line = json.dumps(entry.to_dict())
+        line = _json_dumps(entry.to_dict())
         self._current_writer.write(line + '\n')
 
     def add_entries(self, entries: List[ReplayEntry]) -> None:
         """Add multiple entries and flush once."""
         if self._current_writer is None:
             self.start_new_file()
-        for entry in entries:
-            line = json.dumps(entry.to_dict())
-            self._current_writer.write(line + '\n')
+        # Build all lines then write once — reduces syscall overhead.
+        lines = [_json_dumps(entry.to_dict()) for entry in entries]
+        self._current_writer.write('\n'.join(lines) + '\n')
         self._current_writer.flush()
 
     def _close_current(self) -> None:
@@ -152,16 +170,109 @@ class ReplayBuffer:
             with open(filepath, 'r') as f:
                 for line in f:
                     if line.strip():
-                        data = json.loads(line)
+                        data = _json_loads(line)
                         yield ReplayEntry.from_dict(data)
 
-    def sample_entries(self, n: int) -> List[ReplayEntry]:
-        """Sample n random entries from the buffer."""
-        # First, collect file sizes
+    def _load_file_cached(self, path: Path) -> List[ReplayEntry]:
+        """Load entries from a single file, using mtime cache to skip unchanged files."""
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return []
+
+        cached = self._file_cache.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+
+        # Cache miss — parse from disk.
+        entries = []
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(ReplayEntry.from_dict(_json_loads(line)))
+        self._file_cache[path] = (mtime, entries)
+        return entries
+
+    def load_all_entries(self) -> List[ReplayEntry]:
+        """Load all entries from all files in parallel (single-pass).
+
+        Uses an mtime-based cache: unchanged files are returned from memory
+        instantly, only new/modified files are re-parsed from disk.
+        """
         files = self.get_replay_files()
         if not files:
             return []
 
+        # Prune cache: remove entries for files that no longer exist.
+        live_set = set(files)
+        for stale in list(self._file_cache.keys()):
+            if stale not in live_set:
+                del self._file_cache[stale]
+
+        # Separate cached (instant) from uncached (need I/O).
+        uncached_files = []
+        all_entries: List[ReplayEntry] = []
+        for f in files:
+            cached = self._file_cache.get(f)
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if cached is not None and cached[0] == mtime:
+                all_entries.extend(cached[1])
+            else:
+                uncached_files.append(f)
+
+        if uncached_files:
+            # Parallel load only the files that changed.
+            num_workers = min(16, max(1, len(uncached_files)))
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(self._load_file_cached, p): p for p in uncached_files}
+                for future in as_completed(futures):
+                    try:
+                        all_entries.extend(future.result())
+                    except Exception:
+                        pass
+
+        return all_entries
+
+    def sample_entries(self, n: int) -> List[ReplayEntry]:
+        """Sample n random entries from the buffer.
+
+        Uses single-pass bulk loading when n is large relative to total
+        entries (avoids the separate counting pass). Falls back to
+        index-based sampling for selective reads when n << total.
+        """
+        files = self.get_replay_files()
+        if not files:
+            return []
+
+        # Estimate total entries from file sizes (~500 bytes per JSONL line).
+        # This avoids a full file scan just for counting.
+        estimated_total = 0
+        file_sizes = []
+        for f in files:
+            try:
+                sz = f.stat().st_size
+                file_sizes.append((f, sz))
+                estimated_total += sz
+            except OSError:
+                file_sizes.append((f, 0))
+        avg_line_bytes = 500  # conservative estimate
+        estimated_entries = max(1, estimated_total // avg_line_bytes)
+
+        # If we need ≥40% of estimated entries, load all in one pass then subsample.
+        # One pass (load all + random.sample) is faster than two passes (count + selective read)
+        # because it avoids re-reading files and leverages parallel I/O.
+        if n >= estimated_entries * 0.4:
+            all_entries = self.load_all_entries()
+            if len(all_entries) <= n:
+                return all_entries
+            return random.sample(all_entries, n)
+
+        # For small n relative to total, use the two-pass approach:
+        # count lines (fast, no JSON parsing) then selectively load sampled indices.
         def _count_file(path: Path) -> int:
             with open(path, 'r') as f:
                 return sum(1 for _ in f)
@@ -198,7 +309,7 @@ class ReplayBuffer:
             with open(path, 'r') as f:
                 for i, line in enumerate(f):
                     if i in indices_set and line.strip():
-                        data = json.loads(line)
+                        data = _json_loads(line)
                         loaded.append(ReplayEntry.from_dict(data))
             return loaded
 

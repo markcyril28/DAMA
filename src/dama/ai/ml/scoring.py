@@ -15,6 +15,7 @@ winning strategies, and less from losing or drawing moves.
 """
 
 import math
+import numpy as np
 from typing import Optional, Dict, Any, Tuple
 
 from ...types import Player, PieceType
@@ -316,6 +317,22 @@ def compute_reward_weight(score: float) -> float:
 
     # Clamp to configured range
     return max(REWARD_WEIGHT_MIN, min(REWARD_WEIGHT_MAX, normalized))
+
+
+def compute_reward_weights_batch(scores: np.ndarray) -> np.ndarray:
+    """Vectorized batch version of compute_reward_weight.
+
+    Operates on an entire numpy array at once using vectorized exp/clip,
+    avoiding Python-level per-element function call overhead.
+
+    Args:
+        scores: 1-D float32 numpy array of per-move scores.
+
+    Returns:
+        1-D float32 numpy array of weights in [REWARD_WEIGHT_MIN, REWARD_WEIGHT_MAX].
+    """
+    normalized = 2.0 / (1.0 + np.exp(-scores / 5.0))
+    return np.clip(normalized, REWARD_WEIGHT_MIN, REWARD_WEIGHT_MAX).astype(np.float32)
 
 
 def score_game_entries(
