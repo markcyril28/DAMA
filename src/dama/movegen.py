@@ -109,8 +109,12 @@ def generate_captures_from_position(
     """
     Recursively generate all capture sequences from a position.
 
+    Uses in-place board mutation with undo/redo to avoid O(num_pieces)
+    dict copies per capture branch. The board is always restored before
+    returning, so the caller sees no mutation.
+
     Args:
-        board: The current board state.
+        board: The current board state (mutated temporarily, restored on return).
         pos: Current position of the piece.
         piece: The piece making the capture.
         already_captured: Set of positions already captured in this sequence.
@@ -125,6 +129,8 @@ def generate_captures_from_position(
 
     directions = get_capture_directions(piece, config)
     captures_found = []
+    # Direct dict access for speed in hot loop
+    _pieces = board._pieces
 
     for dr, dc in directions:
         if piece.is_king and config.game.rules.king_flying_capture:
@@ -141,36 +147,41 @@ def generate_captures_from_position(
             land_row, land_col = row + 2 * dr, col + 2 * dc
             land_pos = (land_row, land_col)
 
-            if not Board.in_bounds(land_row, land_col):
+            if not (0 <= land_row < 8 and 0 <= land_col < 8):
                 continue
 
             if capture_pos in already_captured:
                 continue
 
-            captured_piece = board.get_piece(capture_pos)
+            captured_piece = _pieces.get(capture_pos)
             if captured_piece is None or captured_piece.player == piece.player:
                 continue
 
-            if not board.is_empty(land_pos) and land_pos != path[0]:
+            if land_pos in _pieces and land_pos != path[0]:
                 continue
 
-            # Valid capture found - recursively look for more
+            # Valid capture found — mutate board in-place, recurse, then undo
             new_path = path + [land_pos]
             new_captured = already_captured | {capture_pos}
 
-            temp_board = board.clone()
-            temp_board.remove_piece(pos)
-            temp_board.remove_piece(capture_pos)
-            temp_board.set_piece(land_pos, piece)
+            # Apply: move piece from pos to land_pos, remove captured
+            _pieces.pop(pos, None)
+            _pieces.pop(capture_pos, None)
+            _pieces[land_pos] = piece
 
             further_captures = generate_captures_from_position(
-                temp_board,
+                board,
                 land_pos,
                 piece,
                 new_captured,
                 new_path,
                 config,
             )
+
+            # Undo: restore board to pre-mutation state
+            _pieces.pop(land_pos, None)
+            _pieces[pos] = piece
+            _pieces[capture_pos] = captured_piece
 
             if further_captures:
                 captures_found.extend(further_captures)
@@ -200,82 +211,90 @@ def _generate_flying_king_captures(
 ) -> List[Move]:
     """
     Generate captures for a flying king along a single diagonal direction.
-    
+
+    Uses in-place board mutation with undo/redo to avoid board cloning.
+
     A flying king can:
     - Move any number of squares along a diagonal
     - Capture an enemy piece at any distance
     - Land on any empty square beyond the captured piece
-    
+
     Args:
-        board: The current board state.
+        board: The current board state (mutated temporarily, restored on return).
         pos: Current position of the king.
         piece: The king piece.
         dr, dc: Direction to scan.
         already_captured: Set of positions already captured in this sequence.
         path: Path taken so far.
-    
+
     Returns:
         List of capture moves from this direction.
     """
     row, col = pos
     captures_found = []
-    
+    _pieces = board._pieces
+
     # Scan along the diagonal to find an enemy piece
     distance = 1
     while True:
         scan_row, scan_col = row + distance * dr, col + distance * dc
         scan_pos = (scan_row, scan_col)
-        
-        if not Board.in_bounds(scan_row, scan_col):
+
+        if not (0 <= scan_row < 8 and 0 <= scan_col < 8):
             break
-        
-        scanned_piece = board.get_piece(scan_pos)
-        
+
+        scanned_piece = _pieces.get(scan_pos)
+
         if scanned_piece is not None:
             # Found a piece - check if it's capturable
             if scanned_piece.player == piece.player:
                 # Friendly piece blocks the path
                 break
-            
+
             if scan_pos in already_captured:
                 # Already captured in this sequence - blocks further movement
                 break
-            
+
             # Enemy piece found - look for landing squares beyond it
             land_distance = 1
             while True:
                 land_row = scan_row + land_distance * dr
                 land_col = scan_col + land_distance * dc
                 land_pos = (land_row, land_col)
-                
-                if not Board.in_bounds(land_row, land_col):
+
+                if not (0 <= land_row < 8 and 0 <= land_col < 8):
                     break
-                
+
                 # Check if landing square is valid
-                if not board.is_empty(land_pos) and land_pos != path[0]:
+                if land_pos in _pieces and land_pos != path[0]:
                     # Blocked by another piece
                     break
-                
-                if board.is_empty(land_pos) or land_pos == path[0]:
-                    # Valid landing square - create capture
+
+                if land_pos not in _pieces or land_pos == path[0]:
+                    # Valid landing square — mutate in-place, recurse, undo
                     new_path = path + [land_pos]
                     new_captured = already_captured | {scan_pos}
-                    
-                    temp_board = board.clone()
-                    temp_board.remove_piece(pos)
-                    temp_board.remove_piece(scan_pos)
-                    temp_board.set_piece(land_pos, piece)
-                    
+
+                    # Apply
+                    _pieces.pop(pos, None)
+                    _pieces.pop(scan_pos, None)
+                    _pieces[land_pos] = piece
+
                     # Look for further captures
                     further_captures = generate_captures_from_position(
-                        temp_board,
+                        board,
                         land_pos,
                         piece,
                         new_captured,
                         new_path,
                         config,
                     )
-                    
+
+                    # Undo
+                    _pieces.pop(land_pos, None)
+                    _pieces[pos] = piece
+                    _pieces[scan_pos] = scanned_piece
+
                     if further_captures:
                         captures_found.extend(further_captures)
                     else:
@@ -285,14 +304,14 @@ def _generate_flying_king_captures(
                             captures=tuple(new_captured),
                             promotion=False,  # Kings don't promote
                         ))
-                
+
                 land_distance += 1
-            
+
             # After finding an enemy piece, stop scanning in this direction
             break
-        
+
         distance += 1
-    
+
     return captures_found
 
 
@@ -317,7 +336,11 @@ def generate_all_moves(board: Board, player: Player) -> List[Move]:
     capture_moves = []
     config = get_config()
 
-    for pos, piece in board.get_pieces(player):
+    # Materialize pieces list: capture generation now mutates the board
+    # temporarily (undo/redo), so iterating a live generator would break.
+    pieces = list(board.get_pieces(player))
+
+    for pos, piece in pieces:
         # Generate captures for this piece
         captures = generate_captures(board, pos, piece, config)
         capture_moves.extend(captures)
@@ -341,8 +364,11 @@ def has_legal_moves(board: Board, player: Player) -> bool:
 
     config = get_config()
 
+    # Materialize pieces list: capture generation mutates board temporarily.
+    pieces = list(board.get_pieces(player))
+
     # Check for at least one legal move
-    for pos, piece in board.get_pieces(player):
+    for pos, piece in pieces:
         # Check for captures
         if generate_captures(board, pos, piece, config):
             return True
