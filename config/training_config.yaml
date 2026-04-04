@@ -134,10 +134,10 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true                       # Enhanced stats collection (JSON + CSV exports)
-  record_every: 100                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
-  system_every: 1000                  # Record GPU/CPU/RAM metrics every N steps
+  record_every: 500                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
+  system_every: 2000                  # Record GPU/CPU/RAM metrics every N steps
   model_health_every: 5000            # Record parameter norms every N steps
-  score_dist_every: 100               # Record score distribution every N steps
+  score_dist_every: 500               # Record score distribution every N steps
   buffer_size: 50000                  # Ring buffer size
   flush_every: 5000                   # Flush incremental stats every N steps
   output_dir: "logs/stats"            # Export directory
@@ -187,18 +187,18 @@ profiles:
       compile:
         mode: "max-autotune"          # MI210 benefits from max-autotune (large VRAM)
     selfplay:
-      cpu_workers: 96                 # FastBatchIterator needs no DataLoader workers — reclaim for self-play
-      games_per_epoch: 8192           # Proportional to batch size — keeps GPU fed
+      cpu_workers: 112                # 128 cores − 16 reserved for training I/O + preprocessing
+      games_per_epoch: 16384          # Proportional to batch size — keeps GPU fed
     training:
-      batch_size: 8192                # 64GB VRAM has massive headroom (~1.6GB activations)
-      learning_rate: 3.0e-4           # Sqrt-scaled from 2e-4 at 4096 (×√2)
+      batch_size: 16384               # 64GB VRAM has massive headroom (~3.2GB activations)
+      learning_rate: 4.0e-4           # Sqrt-scaled from 3e-4 at 8192 (��√2)
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: true
-        warmup_steps: 200
+        warmup_steps: 300             # Longer warmup for larger batch
     dataloader:
       num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
-      replay_max_entries: 500000      # 1TB RAM — use all available replay data
+      replay_max_entries: 1000000     # 1TB RAM — maximize replay data for diversity
       ram_cache:
         enabled: true
         threshold_gb: 64.0
