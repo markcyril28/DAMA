@@ -153,7 +153,7 @@ def play_single_game(
 
     if return_dicts:
         # Dict path — update results and score via dict-native scoring
-        winner_int = int(winner) if winner is not None else 0
+        winner_int = int(winner) if winner is not None else None
         for entry in entries:
             turn = entry['state']['turn']
             if winner is None:

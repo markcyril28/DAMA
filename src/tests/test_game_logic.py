@@ -28,7 +28,7 @@ class TestBoard:
         """Test that initial board has correct piece placement."""
         board = Board.initial()
         
-        # Check Player 1 (white) pieces at bottom
+        # Check Player 1 pieces at top (rows 0-2)
         for row in range(3):
             for col in range(8):
                 if (row + col) % 2 == 1:  # Dark squares only
@@ -37,7 +37,7 @@ class TestBoard:
                     assert piece.player == Player.ONE
                     assert piece.is_king is False
         
-        # Check Player 2 (black) pieces at top
+        # Check Player 2 pieces at bottom (rows 5-7)
         for row in range(5, 8):
             for col in range(8):
                 if (row + col) % 2 == 1:  # Dark squares only

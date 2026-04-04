@@ -1203,13 +1203,13 @@ class FastBatchIterator:
                 # Buffer is large enough — shift old data left, append new.
                 # GPU→GPU copy: ~10× faster than equivalent CPU→GPU transfer.
                 if offset > 0 and keep_old > 0:
-                    # Non-overlapping when offset > 0 (destination starts before source)
-                    self._boards[:keep_old] = self._boards[offset:offset + keep_old]
-                    self._move_features[:keep_old] = self._move_features[offset:offset + keep_old]
-                    self._move_counts[:keep_old] = self._move_counts[offset:offset + keep_old]
-                    self._targets[:keep_old] = self._targets[offset:offset + keep_old]
-                    self._reward_weights[:keep_old] = self._reward_weights[offset:offset + keep_old]
-                    self._value_targets[:keep_old] = self._value_targets[offset:offset + keep_old]
+                    # Source and destination overlap — clone to avoid in-place aliasing error
+                    self._boards[:keep_old] = self._boards[offset:offset + keep_old].clone()
+                    self._move_features[:keep_old] = self._move_features[offset:offset + keep_old].clone()
+                    self._move_counts[:keep_old] = self._move_counts[offset:offset + keep_old].clone()
+                    self._targets[:keep_old] = self._targets[offset:offset + keep_old].clone()
+                    self._reward_weights[:keep_old] = self._reward_weights[offset:offset + keep_old].clone()
+                    self._value_targets[:keep_old] = self._value_targets[offset:offset + keep_old].clone()
 
                 # Upload only new entries (small PCIe transfer)
                 self._boards[keep_old:total] = new_dataset.boards.to(
