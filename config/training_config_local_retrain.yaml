@@ -57,11 +57,16 @@ model:
 # algo_vs_algo provides high-quality baseline data from day one.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 6                     # 6 of 12 cores for self-play workers
-  games_per_epoch: 100                  # ML-vs-algo games per cycle.
-                                        # 100 games x ~40 moves = ~4K entries/cycle.
-                                        # [Part 2 fix]: 10 was 0.07% of training data —
-                                        # too little ML signal vs 576K algo entries.
+  cpu_workers: 8                     # 8 of 12 cores for self-play workers.
+                                     # Simultaneous mode: GPU trains while CPU
+                                     # generates. 8 workers improves data throughput;
+                                     # 4 remaining cores handle system/GPU driver.
+  games_per_epoch: 200                  # ML-vs-algo games per cycle.
+                                        # 200 games x ~40 moves = ~8K entries/cycle.
+                                        # [Pass 16]: Doubled from 100. At 100 games with
+                                        # 14400 algo games, ML signal was only 0.69% of
+                                        # data — too diluted for the model to learn from
+                                        # its own play. 200 games + 3600 algo = ~24% ML.
   difficulties:
     - "easy"                            # Start with easy — learnable signal for
     - "medium"                          # a random model. Medium adds challenge.
@@ -69,18 +74,22 @@ selfplay:
   focus_side: "both"                    # Equal P1/P2 exposure from the start
   opponent_focus: "algorithm"           # 100% algorithmic teachers. A random model
                                         # playing itself generates pure noise.
-  noise_prob: 0.20                      # Higher noise for fresh model — more
-                                        # exploration of the move space early on.
+  noise_prob: 0.18                      # [Pass 15]: Reduced from 0.20. Model has 2K
+                                        # steps — slightly less noise is appropriate.
+                                        # Still above 0.15 "established" threshold.
   max_moves_per_game: 150               # Allow endgame play
-  pipeline_mode: "alternate"       # Sequential: self-play then training.
-                                        # Trainer auto-generates initial data if
-                                        # replay buffer has < batch_size*10 entries.
+  pipeline_mode: "simultaneous"     # [Pass 15 fix]: Buffer is populated (600K entries).
+                                        # GPU trains on existing data while CPU generates
+                                        # new games in background. Was "alternate" for
+                                        # initial empty-buffer phase (auto-generates data
+                                        # if buffer < batch_size*10).
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 14400               # Cython fast path: ~3ms/easy, ~378ms/hard.
-                                        # Fills replay buffer quickly with high-quality
-                                        # data. ~97K entries/epoch from algo games.
+    games_per_epoch: 3600                # [Pass 16]: Reduced from 14400. Was drowning
+                                        # ML signal (0.69%). Now ~25K algo entries/cycle
+                                        # vs ~8K ML entries = 24% ML ratio. Still fast:
+                                        # Cython ~3ms/easy, ~378ms/hard, ~2 min total.
     difficulties:                       # Exclude super_hard — per pass 8 analysis,
       - "easy"                          # super_hard matchups cause 60% longer cycles
       - "medium"                        # (~39min → ~15min). Cython TT helps but
@@ -91,7 +100,7 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 7200                       # VRAM budget: 8GB total,
+  batch_size: 3600                       # VRAM budget: 8GB total,
                                         # ~1.8GB dataset (600K, GPU-resident via 55%
                                         # threshold), ~1.5GB activations, ~0.5GB other
                                         # ≈ 3.8GB peak. Maximizes tensor core occupancy.
@@ -138,7 +147,7 @@ dataloader:
   ram_cache:
     enabled: true
     threshold_gb: 8.0                   # 32GB system — 8GB leaves headroom for
-                                        # OS + 6 self-play workers + dataloader.
+                                        # OS + 8 self-play workers + dataloader.
     cache_file: null
 
 # -----------------------------------------------------------------------------
@@ -150,7 +159,10 @@ testing:
   enabled: true
   every_n_steps: 1000                   # Test every 1000 steps
   num_games: 30                         # 30 games — fast eval, directional signal
-  difficulty: "medium"                  # Benchmark target
+  difficulty: "easy"                    # [Pass 15 fix]: Was "medium" — 0% WR at 2K steps
+                                        # gives no signal. Test vs easy first to detect
+                                        # early progress. Switch to "medium" once model
+                                        # beats easy at >50% consistently.
 
 # -----------------------------------------------------------------------------
 # Paths
@@ -167,14 +179,18 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 100                     # [Part 1 fix]: 500 gave only 4 data points
-                                        # in 2K steps — too coarse for plateau diagnosis.
+  record_every: 200                     # [Pass 17]: 100 was excessive — each record
+                                        # triggers .item() CUDA sync. 200 gives 2-3
+                                        # gradient records per flush (flush_every=500).
   system_every: 5000
-  model_health_every: 2000              # Monitor embedding magnitudes closely
+  model_health_every: 1000              # [Pass 17]: Embedding explosion was root cause
+                                        # of original degeneration. Monitor closely.
   score_dist_every: 500                 # Track score distributions to verify
                                         # the model is actually differentiating moves.
   buffer_size: 50000
-  flush_every: 5000
+  flush_every: 500                      # [Pass 15 fix]: Was 5000 — exceeded the 2K
+                                        # steps trained, so logs/stats/ was empty.
+                                        # 500 ensures stats are written every 500 steps.
   output_dir: "logs/stats"
 
 # -----------------------------------------------------------------------------
@@ -189,11 +205,13 @@ thermal_protection:
 # -----------------------------------------------------------------------------
 # Resume Settings
 # -----------------------------------------------------------------------------
-# DISABLED — fresh training from random initialization.
+# [Pass 15]: Enabled — resuming from step 2000 checkpoint.
 # -----------------------------------------------------------------------------
 resume:
-  enabled: false
-  checkpoint_path: null
+  enabled: true                         # [Pass 15 fix]: Model at step 2000 is learning
+                                        # (loss 1.435, below random ~1.95). Continue
+                                        # training rather than restarting from scratch.
+  checkpoint_path: "models/checkpoints/model_step_002000.pt"
   skip_corrupted: true
 
 # -----------------------------------------------------------------------------

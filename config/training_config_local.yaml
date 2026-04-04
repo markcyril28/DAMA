@@ -177,7 +177,7 @@ statistics:
   model_health_every: 5000
   score_dist_every: 1000
   buffer_size: 50000
-  flush_every: 5000
+  flush_every: 500                      # [Pass 17 fix]: 5000 loses stats on short runs
   output_dir: "logs/stats"
 
 # -----------------------------------------------------------------------------
@@ -194,7 +194,9 @@ thermal_protection:
 # -----------------------------------------------------------------------------
 resume:
   enabled: true
-  checkpoint_path: "models/checkpoints/model_step_050000.pt"  # Roll back to 43% WR peak
+  checkpoint_path: null                  # [Pass 17 fix]: model_step_050000.pt no longer
+                                        # exists. Set null for auto-detect, or provide
+                                        # a valid path when a good checkpoint is available.
   skip_corrupted: true
 
 # -----------------------------------------------------------------------------

@@ -230,17 +230,18 @@ profiles:
         - "hard"
       pipeline_mode: "simultaneous"
       algo_vs_algo:
-        games_per_epoch: 200
+        games_per_epoch: 900              # [Pass 17 fix]: Was 200 (stale). Matches local.yaml.
         difficulties:                     # Exclude super_hard for local hardware
           - "easy"
           - "medium"
           - "hard"
     training:
-      batch_size: 8192                  # 8GB VRAM — ~5.5GB peak with 128ch/8blocks model
+      batch_size: 4096                  # [Pass 17 fix]: Was 8192 (stale). Matches local.yaml.
       learning_rate: 1.5e-4
       gradient_accumulation_steps: 1
       lr_scheduler:
-        enabled: true
+        enabled: false                  # [Pass 17 fix]: Was true (fell through from base).
+                                        # LR scheduler caused catastrophic regression in prior run.
         warmup_steps: 100
     dataloader:
       num_workers: 0

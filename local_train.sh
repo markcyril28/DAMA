@@ -36,7 +36,7 @@ export PYTHONPATH="${PROJECT_DIR}/src:${PYTHONPATH:-}"
 
 # Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
 # The training thread uses GPU for all compute; these libraries would otherwise
-# spawn threads that compete with the 11 self-play worker processes.
+# spawn threads that compete with the 6 self-play worker processes.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
