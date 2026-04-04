@@ -250,8 +250,12 @@ class MoveScorerNet(nn.Module):
         """
         Score moves using padded move features (training-optimized path).
 
-        Only computes MoveScorer for valid (non-padding) move slots,
-        reducing MLP compute by ~84% (avg ~10 legal moves vs 64 padded slots).
+        Runs MLP on ALL padded positions (including padding slots) using 3D
+        nn.Linear ops (batched matmul), then masks invalid slots to -inf.
+        This keeps all tensor shapes fixed, enabling torch.compile to capture
+        the full forward pass in CUDAGraphs — eliminating kernel launch overhead.
+        The MLP is <10% of total compute (CNN dominates), so computing padding
+        slots costs less than the dynamic-shape overhead of skipping them.
 
         Args:
             board: (batch_size, BOARD_PLANES, 8, 8)
@@ -264,34 +268,24 @@ class MoveScorerNet(nn.Module):
         batch_size = board.shape[0]
         max_moves = move_features.shape[1]
 
-        board_embeddings = self.board_encoder(board)
+        board_embeddings = self.board_encoder(board)  # (batch, emb)
 
-        # Build validity mask once
-        arange = torch.arange(max_moves, device=board.device)
-        valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)  # (batch, max_moves)
-
-        # Extract only valid move slots — avoids 6x wasted MLP compute on padding
-        flat_mask = valid_mask.reshape(-1)  # (batch * max_moves,)
-
-        # NOTE: No `if flat_mask.sum() == 0` guard here — that forces a CUDA sync
-        # (.item() on the sum) which breaks torch.compile graph tracing.
-        # Training batches always have legal moves; empty indexing is a safe no-op.
-
-        # Expand board embeddings and flatten
+        # Expand board embeddings to (batch, max_moves, emb) — strided view, no copy.
+        # nn.Linear natively supports (..., features) via batched matmul,
+        # so we can work in 3D without reshape/contiguous.
         expanded = board_embeddings.unsqueeze(1).expand(-1, max_moves, -1)
-        expanded_flat = expanded.reshape(-1, expanded.shape[-1])  # (batch*max_moves, emb)
-        moves_flat = move_features.reshape(-1, move_features.shape[-1])  # (batch*max_moves, feat)
+        combined = torch.cat([expanded, move_features], dim=-1)  # (batch, max_moves, emb+feat)
 
-        # Index only valid positions into the MLP
-        valid_emb = expanded_flat[flat_mask]    # (total_valid, emb)
-        valid_moves = moves_flat[flat_mask]     # (total_valid, feat)
-        valid_scores = self.move_scorer(valid_emb, valid_moves).squeeze(-1)  # (total_valid,)
+        # MLP on all positions — fixed shapes, CUDAGraph-friendly
+        x = F.relu(self.move_scorer.fc1(combined))
+        x = F.relu(self.move_scorer.fc2(x))
+        x = self.move_scorer.fc3(x)
+        scores = torch.clamp(x.squeeze(-1), min=-50.0, max=50.0)  # (batch, max_moves)
 
-        # Scatter back into padded output
-        scores = torch.full((batch_size * max_moves,), float('-inf'),
-                            device=board.device, dtype=valid_scores.dtype)
-        scores[flat_mask] = valid_scores
-        scores = scores.reshape(batch_size, max_moves)
+        # Mask invalid (padding) slots to -inf
+        arange = torch.arange(max_moves, device=board.device)
+        valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
+        scores = scores.masked_fill(~valid_mask, float('-inf'))
 
         return scores
 
@@ -303,31 +297,26 @@ class MoveScorerNet(nn.Module):
     ) -> tuple:
         """Padded forward with value head (training-optimized path).
 
-        Uses masked MoveScorer — only computes valid move slots.
+        Fixed-size MLP on all positions — CUDAGraph-friendly.
+        See forward_padded docstring for rationale.
         """
         batch_size = board.shape[0]
         max_moves = move_features.shape[1]
 
         board_embeddings = self.board_encoder(board)
 
-        # Build validity mask
+        # Full-pad MLP (fixed shapes, no boolean indexing)
+        expanded = board_embeddings.unsqueeze(1).expand(-1, max_moves, -1)
+        combined = torch.cat([expanded, move_features], dim=-1)
+
+        x = F.relu(self.move_scorer.fc1(combined))
+        x = F.relu(self.move_scorer.fc2(x))
+        x = self.move_scorer.fc3(x)
+        scores = torch.clamp(x.squeeze(-1), min=-50.0, max=50.0)
+
         arange = torch.arange(max_moves, device=board.device)
         valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
-        flat_mask = valid_mask.reshape(-1)
-
-        # No total_valid==0 guard — avoids CUDA sync that breaks torch.compile.
-        expanded = board_embeddings.unsqueeze(1).expand(-1, max_moves, -1)
-        expanded_flat = expanded.reshape(-1, expanded.shape[-1])
-        moves_flat = move_features.reshape(-1, move_features.shape[-1])
-
-        valid_emb = expanded_flat[flat_mask]
-        valid_moves = moves_flat[flat_mask]
-        valid_scores = self.move_scorer(valid_emb, valid_moves).squeeze(-1)
-
-        scores = torch.full((batch_size * max_moves,), float('-inf'),
-                            device=board.device, dtype=valid_scores.dtype)
-        scores[flat_mask] = valid_scores
-        scores = scores.reshape(batch_size, max_moves)
+        scores = scores.masked_fill(~valid_mask, float('-inf'))
 
         if self.value_head is not None:
             values = self.value_head(board_embeddings)
