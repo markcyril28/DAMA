@@ -40,6 +40,13 @@ torch.set_float32_matmul_precision('medium')
 # One-time benchmark cost on first forward pass, then faster for all subsequent.
 torch.backends.cudnn.benchmark = True
 
+# Allow FP16 accumulation in matmuls for faster tensor core throughput.
+# Minimal precision impact for this model (scores are clamped to [-50, 50]).
+try:
+    torch.backends.cuda.matmul.allow_fp16_reduction = True
+except AttributeError:
+    pass  # Older PyTorch versions
+
 # Configure torch.compile CUDAGraph settings to avoid overhead from dynamic shapes
 # This prevents recording too many graphs for varying input sizes
 try:
@@ -577,19 +584,23 @@ class Trainer:
         # Falls back to model-only compilation if fused compile fails.
         self._compiled_fwd_loss = None
         if self.config.compile_model and hasattr(torch, "compile"):
-            # Guard: skip torch.compile on GPUs with insufficient SMs.
-            # Triton's autotuner segfaults on small GPUs (e.g. RTX 5050, ~32 SMs)
-            # when reduce-overhead mode triggers max_autotune_gemm.
+            # Guard: Triton's autotuner segfaults on small GPUs (e.g. RTX 5050)
+            # when reduce-overhead/max-autotune modes trigger CUDAGraph recording.
+            # Fall back to 'default' mode which still provides inductor operator
+            # fusion without CUDAGraphs — significant speedup vs eager mode.
             _MIN_SM_COUNT = 64  # safe threshold; MI210=104, A100=108, RTX 4090=128
             _skip_compile = False
             if self.device.type == 'cuda':
                 _props = torch.cuda.get_device_properties(self.device)
                 _sm_count = _props.multi_processor_count
-                if _sm_count < _MIN_SM_COUNT:
-                    print(f"Skipping torch.compile: GPU has {_sm_count} SMs "
-                          f"(need ≥{_MIN_SM_COUNT} to avoid Triton autotuner crash)")
+                if _sm_count < _MIN_SM_COUNT and self.config.compile_mode in (
+                        'reduce-overhead', 'max-autotune'):
+                    print(f"GPU has {_sm_count} SMs (< {_MIN_SM_COUNT}): "
+                          f"using torch.compile mode='default' instead of "
+                          f"'{self.config.compile_mode}' "
+                          f"(avoids Triton autotuner crash)")
                     sys.stdout.flush()
-                    _skip_compile = True
+                    self.config.compile_mode = 'default'
 
             if not _skip_compile:
                 _warmup_bs = self.config.batch_size
