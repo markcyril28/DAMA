@@ -171,6 +171,7 @@ class ReplayBuffer:
             except OSError:
                 pass
         self._file_cache.clear()
+        self._session_entries.clear()
         return deleted
 
     def count_entries(self) -> int:
