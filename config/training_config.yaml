@@ -219,15 +219,15 @@ profiles:
       games_per_epoch: 512            # Proportional to batch size — keeps GPU fed
       pipeline_mode: "simultaneous"   # Overlap CPU self-play with GPU training
     training:
-      batch_size: 4096                # ~570MB activations at AMP fp16 — fits in 8GB with headroom
-      learning_rate: 5.6e-4           # Sqrt-scaled from 4e-4 at 2048 (x1.41)
+      batch_size: 8192                # ~1.1GB activations at AMP fp16 — model is tiny, GPU has 6GB headroom
+      learning_rate: 7.9e-4           # Sqrt-scaled from 5.6e-4 at 4096 (x1.41)
       gradient_accumulation_steps: 1  # No accumulation — batch fits, saves the extra fwd/bwd pass
       lr_scheduler:
         enabled: true
-        warmup_steps: 150             # Longer warmup for larger batch
+        warmup_steps: 200             # Longer warmup for larger batch
     dataloader:
       num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
-      replay_max_entries: 400000      # 32GB RAM — ~1.4GB, better data diversity
+      replay_max_entries: 500000      # 32GB RAM — ~1.75GB, better data diversity at larger batch
       ram_cache:
         enabled: true                 # 32GB RAM is plenty for caching
         threshold_gb: 8.0

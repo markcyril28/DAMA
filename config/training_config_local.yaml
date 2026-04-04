@@ -41,9 +41,9 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                     # 10 of 12 cores — 2 reserved for GPU driver + training I/O.
+  cpu_workers: 8                     # 10 of 12 cores — 2 reserved for GPU driver + training I/O.
                                       # FastBatchIterator needs no DataLoader workers, so all cores go to self-play.
-  games_per_epoch: 200                # 2x previous — GPU finishes epochs in ~15s while self-play
+  games_per_epoch: 20                # 2x previous — GPU finishes epochs in ~15s while self-play
                                       # takes 60-120s. More games = fresher data per cycle.
   difficulties:                       # List of difficulties to cycle through
     #- "easy"
@@ -53,7 +53,7 @@ selfplay:
   opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
   noise_prob: 0.15                    # Slightly lower noise for faster convergence
   max_moves_per_game: 100             # Maximum moves per game
-  pipeline_mode: "alternate"       # CPU self-play overlaps with GPU training — GPU never idles.
+  pipeline_mode: "simulataneous"       # CPU self-play overlaps with GPU training — GPU never idles.
                                       # "alternate" left the GPU idle for 60-120s per self-play cycle.
 
   # Algo-vs-algo: pure algorithmic games as additional training data.
