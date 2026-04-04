@@ -1,6 +1,7 @@
 """Model vs Algorithm self-play testing."""
 
 import json
+import multiprocessing as mp
 import time
 from datetime import datetime
 from pathlib import Path
@@ -330,9 +331,11 @@ class ModelVsAlgoTester:
         total_moves = 0
         total_time_ms = 0.0
         
-        # Run games
+        # Run games — use 'spawn' context so child processes don't inherit
+        # the parent's CUDA state (fork + CUDA = "Cannot re-initialize CUDA")
+        spawn_ctx = mp.get_context('spawn')
         try:
-            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=spawn_ctx) as executor:
                 futures = [executor.submit(_play_single_test_game, args) for args in args_list]
                 
                 for future in as_completed(futures):
