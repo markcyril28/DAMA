@@ -345,6 +345,72 @@ def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarra
     return boards, all_move_features, move_counts, targets, reward_weights, value_targets
 
 
+def _preprocess_dicts_fork_shm(args: Tuple[int, int]) -> None:
+    """Fork worker for dict entries with SharedMemory output.
+
+    Same as _preprocess_chunk_fork_shm but reads dict entries (from
+    _fork_entries stored as dicts) using key access instead of attribute
+    access.  Used by CachedTensorDataset.from_dicts() on Linux.
+    """
+    from multiprocessing.shared_memory import SharedMemory as _SHM
+
+    start_idx, end_idx = args
+    entries = _fork_entries
+    max_moves_per_sample = _fork_max_moves
+    n = end_idx - start_idx
+    total_n = _fork_total_n
+    names = _fork_shm_names
+
+    shm_boards = _SHM(name=names['boards'], create=False)
+    shm_mf = _SHM(name=names['move_features'], create=False)
+    shm_mc = _SHM(name=names['move_counts'], create=False)
+    shm_tgt = _SHM(name=names['targets'], create=False)
+    shm_rw = _SHM(name=names['reward_weights'], create=False)
+    shm_vt = _SHM(name=names['value_targets'], create=False)
+
+    boards = np.ndarray((total_n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)
+    all_mf = np.ndarray((total_n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)
+    move_counts = np.ndarray(total_n, dtype=np.int64, buffer=shm_mc.buf)
+    targets = np.ndarray(total_n, dtype=np.int64, buffer=shm_tgt.buf)
+    reward_weights = np.ndarray(total_n, dtype=np.float32, buffer=shm_rw.buf)
+    value_targets = np.ndarray(total_n, dtype=np.float32, buffer=shm_vt.buf)
+
+    b_slice = boards[start_idx:end_idx]
+    mf_slice = all_mf[start_idx:end_idx]
+    mc_slice = move_counts[start_idx:end_idx]
+    tgt_slice = targets[start_idx:end_idx]
+    vt_slice = value_targets[start_idx:end_idx]
+
+    scores_arr = np.zeros(n, dtype=np.float32)
+
+    # Cython preprocess_chunk_cy handles both ReplayEntry and dict entries
+    if _HAS_CYTHON:
+        _cy_preprocess_chunk(
+            entries, start_idx, end_idx, max_moves_per_sample,
+            b_slice, mf_slice, mc_slice, tgt_slice, scores_arr, vt_slice,
+        )
+    else:
+        for i in range(n):
+            ed = entries[start_idx + i]
+            state_dict = ed['state']
+            _encode_board_fast(state_dict, b_slice[i])
+            num_moves = _encode_moves_fast(state_dict, ed['legal_moves'], mf_slice[i])
+            mc_slice[i] = num_moves
+            chosen_idx = ed['chosen_index']
+            tgt_slice[i] = min(chosen_idx, num_moves - 1) if num_moves > 0 else 0
+            scores_arr[i] = ed.get('score', 0.0)
+            vt_slice[i] = float(ed.get('result', 0))
+
+    reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
+
+    shm_boards.close()
+    shm_mf.close()
+    shm_mc.close()
+    shm_tgt.close()
+    shm_rw.close()
+    shm_vt.close()
+
+
 def preprocess_entries_to_tensors(
     entries: List[ReplayEntry],
     max_moves_per_sample: int = 64,
@@ -694,21 +760,111 @@ class CachedTensorDataset(Dataset):
                 torch.empty(0, dtype=torch.float32),
             )
 
-        # For large dict batches, parallelize using the chunk-based path.
-        # Each chunk is a slice of the dicts list — workers process independently.
-        # Threshold is higher than fork path (5000 vs 2000) because dict chunks
-        # must be pickled across processes (no fork-inherited globals for raw dicts).
-        _PARALLEL_THRESHOLD = 5000
-        if n >= _PARALLEL_THRESHOLD:
+        # Check if fork start method is available for zero-copy input
+        import multiprocessing as _mp
+        _use_fork = False
+        try:
+            _use_fork = _mp.get_start_method() == 'fork'
+        except RuntimeError:
+            pass
+        _parallel_threshold = 2000 if _use_fork else 5000
+
+        if n >= _parallel_threshold:
             _cores = os.cpu_count() or 1
-            num_workers = max(1, min(16, _cores // 2))
+            _worker_cap = 48 if _cores >= 96 else (24 if _cores >= 48 else 16)
+            num_workers = max(1, min(_worker_cap, _cores // 2))
             _MIN_CHUNK = 500
             chunk_size = max(_MIN_CHUNK, (n + num_workers - 1) // num_workers)
             num_workers = min(num_workers, (n + chunk_size - 1) // chunk_size)
 
             if show_progress:
-                print(f"  Pre-processing {n} dicts with {num_workers} workers...")
+                print(f"  Pre-processing {n} dicts with {num_workers} workers"
+                      f" ({'fork+shm' if _use_fork else 'spawn'})...")
 
+            if _use_fork:
+                # Fork path: zero input serialization + SharedMemory output
+                global _fork_entries, _fork_max_moves, _fork_shm_names, _fork_total_n
+                _fork_entries = entry_dicts
+                _fork_max_moves = max_moves_per_sample
+                _fork_total_n = n
+
+                args = [
+                    (start, min(start + chunk_size, n))
+                    for start in range(0, n, chunk_size)
+                ]
+
+                _shm_ok = True
+                try:
+                    from multiprocessing.shared_memory import SharedMemory as _SHM
+                except ImportError:
+                    _shm_ok = False
+
+                if _shm_ok:
+                    _boards_sz = n * BOARD_PLANES * 8 * 8 * 4
+                    _mf_sz = n * max_moves_per_sample * MOVE_FEATURE_SIZE * 4
+                    _mc_sz = n * 8
+                    _tgt_sz = n * 8
+                    _rw_sz = n * 4
+                    _vt_sz = n * 4
+
+                    shm_list = []
+                    try:
+                        shm_boards = _SHM(create=True, size=max(1, _boards_sz))
+                        shm_mf = _SHM(create=True, size=max(1, _mf_sz))
+                        shm_mc = _SHM(create=True, size=max(1, _mc_sz))
+                        shm_tgt = _SHM(create=True, size=max(1, _tgt_sz))
+                        shm_rw = _SHM(create=True, size=max(1, _rw_sz))
+                        shm_vt = _SHM(create=True, size=max(1, _vt_sz))
+                        shm_list = [shm_boards, shm_mf, shm_mc, shm_tgt, shm_rw, shm_vt]
+
+                        _fork_shm_names = {
+                            'boards': shm_boards.name,
+                            'move_features': shm_mf.name,
+                            'move_counts': shm_mc.name,
+                            'targets': shm_tgt.name,
+                            'reward_weights': shm_rw.name,
+                            'value_targets': shm_vt.name,
+                        }
+
+                        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                            list(pool.map(_preprocess_dicts_fork_shm, args))
+
+                        boards = torch.from_numpy(np.ndarray(
+                            (n, BOARD_PLANES, 8, 8), dtype=np.float32,
+                            buffer=shm_boards.buf)).clone()
+                        mf = torch.from_numpy(np.ndarray(
+                            (n, max_moves_per_sample, MOVE_FEATURE_SIZE),
+                            dtype=np.float32, buffer=shm_mf.buf)).clone()
+                        mc = torch.from_numpy(np.ndarray(
+                            n, dtype=np.int64, buffer=shm_mc.buf)).clone()
+                        tgt = torch.from_numpy(np.ndarray(
+                            n, dtype=np.int64, buffer=shm_tgt.buf)).clone()
+                        rw = torch.from_numpy(np.ndarray(
+                            n, dtype=np.float32, buffer=shm_rw.buf)).clone()
+                        vt = torch.from_numpy(np.ndarray(
+                            n, dtype=np.float32, buffer=shm_vt.buf)).clone()
+
+                        if show_progress:
+                            print(f"  Pre-processing complete: {n} entries")
+                        return cls(boards, mf, mc, tgt, rw, vt)
+
+                    except Exception as e:
+                        if show_progress:
+                            print(f"  SharedMemory failed ({e}), using spawn path...")
+                        _shm_ok = False
+                    finally:
+                        _fork_shm_names = None
+                        _fork_entries = None
+                        for shm in shm_list:
+                            try:
+                                shm.close()
+                                shm.unlink()
+                            except Exception:
+                                pass
+
+                _fork_entries = None
+
+            # Spawn path: pickle dict chunks across processes
             chunks = [
                 (entry_dicts[i:i + chunk_size], max_moves_per_sample)
                 for i in range(0, n, chunk_size)
