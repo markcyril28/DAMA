@@ -57,7 +57,7 @@ model:
 # algo_vs_algo provides high-quality baseline data from day one.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                     # 10 of 12 cores for self-play workers
+  cpu_workers: 6                     # 10 of 12 cores for self-play workers
   games_per_epoch: 100                  # ML-vs-algo games per cycle.
                                         # 100 games x ~40 moves = ~4K entries/cycle.
   difficulties:
