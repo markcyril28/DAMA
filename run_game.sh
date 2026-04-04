@@ -15,7 +15,7 @@ QT_PLATFORM="xcb"                # Qt platform: "xcb" for X11, "wayland" for Way
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
 
 # Change to project directory so relative paths work correctly
 cd "$PROJECT_DIR"
