@@ -99,7 +99,7 @@ dataloader:
   num_workers: 0                      # FastBatchIterator bypasses DataLoader — workers unused
   pin_memory: true                    # Pin memory for faster GPU transfer
   prefetch_factor: 4                  # Higher prefetch to keep GPU fed
-  replay_max_entries: 200000          # Use more of the 877K+ replay buffer — more batches per epoch
+  replay_max_entries: 400000          # Use more of the replay buffer — more batches per epoch, less overfitting between self-play
 
   # RAM Caching (see IMPROVEMENTS.md)
   ram_cache:
@@ -131,10 +131,10 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true                       # Enhanced stats collection (JSON + CSV exports)
-  record_every: 100                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
-  system_every: 500                   # Record GPU/CPU/RAM metrics every N steps
-  model_health_every: 2000            # Record parameter norms every N steps
-  score_dist_every: 100               # Record score distribution every N steps
+  record_every: 500                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
+  system_every: 2000                  # Record GPU/CPU/RAM metrics every N steps
+  model_health_every: 5000            # Record parameter norms every N steps
+  score_dist_every: 500               # Record score distribution every N steps
   buffer_size: 50000                  # Ring buffer size
   flush_every: 5000                   # Flush incremental stats every N steps
   output_dir: "logs/stats"            # Export directory
