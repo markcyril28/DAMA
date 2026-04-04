@@ -1228,7 +1228,7 @@ class Trainer:
             if ml_as_p1 > 0:
                 games_per_diff = ml_as_p1 // len(algo_difficulties)
                 remainder = ml_as_p1 % len(algo_difficulties)
-                
+
                 for i, diff in enumerate(algo_difficulties):
                     games_this_diff = games_per_diff + (1 if i < remainder else 0)
                     if games_this_diff > 0:
@@ -1243,13 +1243,16 @@ class Trainer:
                             model_path=str(temp_model_path),
                             device=self.device,
                         )
-                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total))
+                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total),
+                                                   collect_dicts=collect_dicts)
+                        if collect_dicts and hasattr(runner, 'collected_dicts'):
+                            _collected.extend(runner.collected_dicts)
                         completed_total += games_this_diff
 
             if ml_as_p2 > 0:
                 games_per_diff = ml_as_p2 // len(algo_difficulties)
                 remainder = ml_as_p2 % len(algo_difficulties)
-                
+
                 for i, diff in enumerate(algo_difficulties):
                     games_this_diff = games_per_diff + (1 if i < remainder else 0)
                     if games_this_diff > 0:
@@ -1264,7 +1267,10 @@ class Trainer:
                             model_path=str(temp_model_path),
                             device=self.device,
                         )
-                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total))
+                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total),
+                                                   collect_dicts=collect_dicts)
+                        if collect_dicts and hasattr(runner, 'collected_dicts'):
+                            _collected.extend(runner.collected_dicts)
                         completed_total += games_this_diff
 
         # --- Algo-vs-algo games (pure algorithmic, no ML model needed) ---
