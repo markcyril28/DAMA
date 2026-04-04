@@ -36,19 +36,27 @@ def play_single_game(
     p2_policy: str = 'algorithmic',
     model_path: str = 'models/latest.pt',
     device=None,
+    p1_difficulty: str = None,
+    p2_difficulty: str = None,
 ) -> GameRecord:
     """
     Play a single self-play game using the algorithmic AI as teacher.
 
     Args:
-        difficulty: AI difficulty level
+        difficulty: Default AI difficulty level (used when p1/p2_difficulty not set)
         max_moves: Maximum moves before declaring draw
         noise_prob: Probability of playing a random move (for exploration)
+        p1_difficulty: Difficulty for Player 1 (overrides difficulty if set)
+        p2_difficulty: Difficulty for Player 2 (overrides difficulty if set)
 
     Returns:
         GameRecord with all positions and the chosen moves
     """
     start_player = Player(start_player)
+    # Per-player difficulties default to the shared difficulty
+    _p1_diff = p1_difficulty or difficulty
+    _p2_diff = p2_difficulty or difficulty
+
     state = GameState(
         board=Board.initial(),
         current_player=start_player,
@@ -58,7 +66,7 @@ def play_single_game(
     move_count = 0
     player_captures = {Player.ONE: 0, Player.TWO: 0}
 
-    def _select_move(policy: str, legal_moves: List[Move]) -> Move:
+    def _select_move(policy: str, legal_moves: List[Move], player_diff: str) -> Move:
         if random.random() < noise_prob and len(legal_moves) > 1:
             return random.choice(legal_moves)
         if policy == 'ml' and get_ml_move is not None:
@@ -69,7 +77,7 @@ def play_single_game(
             except Exception:
                 pass
             return random.choice(legal_moves)
-        chosen = get_best_move(state, difficulty)
+        chosen = get_best_move(state, player_diff)
         if chosen is None:
             return random.choice(legal_moves)
         return chosen
@@ -80,7 +88,8 @@ def play_single_game(
             break
 
         policy = p1_policy if state.current_player == Player.ONE else p2_policy
-        chosen_move = _select_move(policy, legal_moves)
+        cur_diff = _p1_diff if state.current_player == Player.ONE else _p2_diff
+        chosen_move = _select_move(policy, legal_moves, cur_diff)
 
         # Find the index of chosen move
         try:
@@ -173,6 +182,24 @@ def _play_game_worker_full(
         p2_policy=p2_policy,
         model_path=model_path,
         device='cpu',  # Force CPU in worker processes
+    )
+    return [e.to_dict() for e in record.entries]
+
+
+def _play_game_worker_algo_vs_algo(
+    args: Tuple[str, str, int, float, int]
+) -> List[dict]:
+    """Worker function for algo-vs-algo self-play with per-player difficulties."""
+    p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player = args
+    record = play_single_game(
+        difficulty=p1_difficulty,
+        max_moves=max_moves,
+        noise_prob=noise_prob,
+        start_player=start_player,
+        p1_policy='algorithmic',
+        p2_policy='algorithmic',
+        p1_difficulty=p1_difficulty,
+        p2_difficulty=p2_difficulty,
     )
     return [e.to_dict() for e in record.entries]
 
