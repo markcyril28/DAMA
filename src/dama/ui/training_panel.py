@@ -1003,11 +1003,19 @@ class TestPanel(QWidget):
             self._test_worker.stop()
             self._test_worker.wait()
             self._test_worker = None
-        
+
+        # Drain the status queue before terminating to avoid corrupted pipe state
+        if self._test_status_queue:
+            try:
+                while not self._test_status_queue.empty():
+                    self._test_status_queue.get_nowait()
+            except Exception:
+                pass
+
         if self._test_process and self._test_process.is_alive():
             self._test_process.terminate()
             self._test_process.join(timeout=5)
-        
+
         self._test_process = None
         self._test_control_queue = None
         self._test_status_queue = None

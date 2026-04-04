@@ -330,103 +330,69 @@ class ModelVsAlgoTester:
         
         total_moves = 0
         total_time_ms = 0.0
-        
+
+        def _ingest_result(record_data: Dict[str, Any]) -> None:
+            """Update stats from a single completed game."""
+            nonlocal total_moves, total_time_ms
+            record = GameTestRecord.from_dict(record_data)
+
+            stats.total_games += 1
+            total_moves += record.num_moves
+            total_time_ms += record.game_time_ms
+
+            if record.result == TestResult.ML_WIN:
+                stats.ml_wins += 1
+                if record.ml_player == Player.ONE:
+                    stats.ml_as_p1_wins += 1
+                else:
+                    stats.ml_as_p2_wins += 1
+            elif record.result == TestResult.ALGO_WIN:
+                stats.algo_wins += 1
+                if record.ml_player == Player.ONE:
+                    stats.ml_as_p1_losses += 1
+                else:
+                    stats.ml_as_p2_losses += 1
+            else:
+                stats.draws += 1
+                if record.ml_player == Player.ONE:
+                    stats.ml_as_p1_draws += 1
+                else:
+                    stats.ml_as_p2_draws += 1
+
+            stats.games.append(record_data)
+            self._games_completed += 1
+
+            stats.avg_game_length = total_moves / stats.total_games
+            stats.avg_game_time_ms = total_time_ms / stats.total_games
+
+            if callback:
+                callback(self._games_completed, num_games, stats)
+
         # Run games — use 'spawn' context so child processes don't inherit
         # the parent's CUDA state (fork + CUDA = "Cannot re-initialize CUDA")
         spawn_ctx = mp.get_context('spawn')
         try:
             with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=spawn_ctx) as executor:
                 futures = [executor.submit(_play_single_test_game, args) for args in args_list]
-                
+
                 for future in as_completed(futures):
                     if not self._running:
                         break
-                    
+
                     try:
-                        record_data = future.result()
-                        record = GameTestRecord.from_dict(record_data)
-                        
-                        # Update statistics
-                        stats.total_games += 1
-                        total_moves += record.num_moves
-                        total_time_ms += record.game_time_ms
-                        
-                        if record.result == TestResult.ML_WIN:
-                            stats.ml_wins += 1
-                            if record.ml_player == Player.ONE:
-                                stats.ml_as_p1_wins += 1
-                            else:
-                                stats.ml_as_p2_wins += 1
-                        elif record.result == TestResult.ALGO_WIN:
-                            stats.algo_wins += 1
-                            if record.ml_player == Player.ONE:
-                                stats.ml_as_p1_losses += 1
-                            else:
-                                stats.ml_as_p2_losses += 1
-                        else:
-                            stats.draws += 1
-                            if record.ml_player == Player.ONE:
-                                stats.ml_as_p1_draws += 1
-                            else:
-                                stats.ml_as_p2_draws += 1
-                        
-                        stats.games.append(record_data)
-                        
-                        self._games_completed += 1
-                        
-                        # Update averages
-                        stats.avg_game_length = total_moves / stats.total_games
-                        stats.avg_game_time_ms = total_time_ms / stats.total_games
-                        
-                        if callback:
-                            callback(self._games_completed, num_games, stats)
-                    
+                        _ingest_result(future.result())
                     except Exception as e:
                         print(f"Test game error: {e}")
-        
+
         except Exception as e:
             print(f"Parallel testing failed ({e}), falling back to sequential")
             # Sequential fallback
             for args in args_list:
                 if not self._running:
                     break
-                
+
                 try:
-                    record_data = _play_single_test_game(args)
-                    record = GameTestRecord.from_dict(record_data)
-                    
-                    stats.total_games += 1
-                    total_moves += record.num_moves
-                    total_time_ms += record.game_time_ms
-                    
-                    if record.result == TestResult.ML_WIN:
-                        stats.ml_wins += 1
-                        if record.ml_player == Player.ONE:
-                            stats.ml_as_p1_wins += 1
-                        else:
-                            stats.ml_as_p2_wins += 1
-                    elif record.result == TestResult.ALGO_WIN:
-                        stats.algo_wins += 1
-                        if record.ml_player == Player.ONE:
-                            stats.ml_as_p1_losses += 1
-                        else:
-                            stats.ml_as_p2_losses += 1
-                    else:
-                        stats.draws += 1
-                        if record.ml_player == Player.ONE:
-                            stats.ml_as_p1_draws += 1
-                        else:
-                            stats.ml_as_p2_draws += 1
-                    
-                    stats.games.append(record_data)
-                    self._games_completed += 1
-                    
-                    stats.avg_game_length = total_moves / stats.total_games
-                    stats.avg_game_time_ms = total_time_ms / stats.total_games
-                    
-                    if callback:
-                        callback(self._games_completed, num_games, stats)
-                
+                    _ingest_result(_play_single_test_game(args))
                 except Exception as e:
                     print(f"Test game error: {e}")
         

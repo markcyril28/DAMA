@@ -323,7 +323,7 @@ class TrainingConfig:
     grad_clip_norm: Optional[float] = 1.0
 
     # Model testing settings
-    test_vs_algo: bool = True
+    test_vs_algo: bool = False
     test_every: int = 5000  # Run tests every N steps
     test_games: int = 50  # Number of test games per evaluation
     test_difficulty: str = 'medium'
@@ -555,6 +555,7 @@ class Trainer:
                 'dataloader_workers': config.dataloader_workers,
                 'ram_cache_enabled': config.ram_cache_enabled,
                 'ram_cache_threshold_gb': config.ram_cache_threshold_gb,
+                'test_vs_algo': config.test_vs_algo,
                 'test_every': config.test_every,
                 'test_games': config.test_games,
                 'test_difficulty': config.test_difficulty,
@@ -1485,6 +1486,7 @@ class Trainer:
                 'algo_wins': stats.algo_wins,
                 'draws': stats.draws,
                 'ml_win_rate': stats.ml_win_rate,
+                'draw_rate': stats.draw_rate,
                 'ml_as_p1_win_rate': stats.ml_as_p1_win_rate,
                 'ml_as_p2_win_rate': stats.ml_as_p2_win_rate,
                 'avg_game_length': stats.avg_game_length,
@@ -2184,8 +2186,9 @@ class Trainer:
         sys.stdout.flush()
         start_time = time.time()
 
-        # Track last test step
-        last_test_step = 0
+        # Track last test step (init to current step so resumed runs don't
+        # immediately trigger a test before the first test_every interval)
+        last_test_step = self.step
         loss = 0.0  # Initialize loss in case loop doesn't run
         _consecutive_dead_epochs = 0  # epochs where all batches were skipped (non-finite)
         _DEAD_EPOCH_RECOVERY_THRESHOLD = 3  # trigger checkpoint rollback after this many
