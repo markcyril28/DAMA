@@ -2277,7 +2277,7 @@ class Trainer:
             loss = self.train_epoch(dataloader, use_scoring=self._should_use_scoring())
             self.epoch += 1
             self.stats.epochs_completed = self.epoch
-            scoring_label = "scoring" if self._should_use_scoring_for_epoch(self.epoch - 1) else "no-scoring"
+            scoring_label = "scoring" if self._should_use_scoring_for_epoch(self.epoch) else "no-scoring"
             current_lr = (self.scheduler.get_last_lr()[0]
                           if self.scheduler is not None
                           else self.config.learning_rate)
@@ -2658,8 +2658,8 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         thermal_temp_limit_c=thermal_cfg.get('temp_limit_c', 90),
         thermal_rest_seconds=_parse_rest_duration(thermal_cfg.get('rest_duration', '5m')),
         thermal_check_every=thermal_cfg.get('check_every', 30),
-        # Resume
-        resume=resume_cfg.get('checkpoint_path'),
+        # Resume (respect the enabled flag — don't resume when disabled even if path is set)
+        resume=resume_cfg.get('checkpoint_path') if resume_cfg.get('enabled', False) else None,
         stop_time=stop_time,
     )
 
