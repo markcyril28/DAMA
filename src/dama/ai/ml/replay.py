@@ -79,6 +79,10 @@ class ReplayBuffer:
         # Incremental file cache: {path: (mtime, [ReplayEntry, ...])}
         # Avoids re-parsing unchanged JSONL files across epochs.
         self._file_cache: Dict[Path, tuple] = {}
+        # In-memory entries written during the current session, keyed by file path.
+        # Promoted to _file_cache on close() so the next load_all_entries() skips
+        # re-parsing the file we just wrote.
+        self._session_entries: Dict[Path, List[ReplayEntry]] = {}
 
     def start_new_file(self) -> Path:
         """Start a new replay file."""
