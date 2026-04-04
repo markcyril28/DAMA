@@ -13,6 +13,13 @@ from ...game_state import GameState
 from ...config import get_config
 from .eval import evaluate, quick_evaluate, set_custom_weights
 
+# Try to import Cython-accelerated search (100-200x faster than Python)
+try:
+    from ._fast_search import fast_search as _fast_search
+    _HAS_FAST_SEARCH = True
+except ImportError:
+    _HAS_FAST_SEARCH = False
+
 
 # Time budgets for difficulty levels (seconds)
 TIME_BUDGETS = {
@@ -448,6 +455,24 @@ def get_best_move(state: GameState, difficulty: str = 'medium',
     Returns:
         The best move, or None if no legal moves exist.
     """
+    # Fast path: use Cython search for standard (non-custom) difficulties.
+    # ~100-200x faster than Python — massive speedup for self-play workers.
+    if _HAS_FAST_SEARCH and difficulty != 'custom':
+        time_budget = TIME_BUDGETS.get(difficulty, TIME_BUDGETS['medium'])
+        max_depth = MAX_DEPTHS.get(difficulty, MAX_DEPTHS['medium'])
+        try:
+            result_dict = _fast_search(
+                state, difficulty,
+                time_budget_override=time_budget,
+                max_depth_override=max_depth,
+            )
+            move_dict = result_dict.get('move')
+            if move_dict is not None:
+                return Move.from_dict(move_dict)
+            return None
+        except Exception:
+            pass  # Fall through to Python search
+
     if difficulty == 'custom':
         # Use custom parameters from config or provided params
         if custom_params:
@@ -487,13 +512,13 @@ def get_best_move(state: GameState, difficulty: str = 'medium',
     # Use parallel search for better performance on multi-core systems
     if use_parallel and NUM_THREADS > 1:
         search = ParallelAlphaBetaSearch(
-            time_budget=time_budget, 
+            time_budget=time_budget,
             max_depth=max_depth,
             num_threads=num_threads or NUM_THREADS
         )
     else:
         search = AlphaBetaSearch(time_budget=time_budget, max_depth=max_depth)
-    
+
     result = search.search(state)
 
     return result.move
