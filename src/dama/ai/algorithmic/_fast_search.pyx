@@ -1029,8 +1029,12 @@ def play_full_game_cy(
     init_standard_board(board)
     player = start_player
 
-    # Allocate TT once; clear before each per-move search inside the loop.
+    # Allocate TT once; clear once at game start. During the game, TT entries
+    # from prior moves are still useful — positions reached from move N's search
+    # overlap with move N+1's search tree, providing free transposition hits.
     _ensure_tt()
+    if _tt_table != NULL:
+        memset(_tt_table, 0, TT_SIZE * sizeof(TTEntry))
 
     cdef list entries = []
     cdef list moves_list
@@ -1071,10 +1075,8 @@ def play_full_game_cy(
             else:
                 time_budget = 0.8; max_depth = 5
 
-            # Clear TT before each move's search (different root position)
-            if _tt_table != NULL:
-                memset(_tt_table, 0, TT_SIZE * sizeof(TTEntry))
-
+            # TT is NOT cleared between moves — entries from prior searches are
+            # still valid (same game, related positions) and provide free hits.
             ss.deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
             ss.nodes = 0
             ss.timeout = False
