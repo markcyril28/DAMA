@@ -392,8 +392,11 @@ def load_model(path: str, device: torch.device = None) -> MoveScorerNet:
         for k, v in state_dict.items()
     }
 
-    # Read architecture params from checkpoint (backward compat: defaults match original model)
-    arch = checkpoint.get('arch_params', {})
+    # Read architecture params from checkpoint, or infer from state_dict shapes
+    # for old checkpoints saved before arch_params was introduced.
+    arch = checkpoint.get('arch_params', None)
+    if not arch:
+        arch = _infer_arch_from_state_dict(state_dict)
     model = create_model(
         embedding_size=arch.get('embedding_size', 128),
         num_blocks=arch.get('num_blocks', 4),
