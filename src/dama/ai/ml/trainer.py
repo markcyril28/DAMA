@@ -766,7 +766,7 @@ class Trainer:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
-        self.scaler = GradScaler() if self.config.amp else None
+        self.scaler = GradScaler() if (self.config.amp and self.amp_dtype == torch.float16) else None
         self.step = 0
         self.epoch = 0
         self.best_loss = float('inf')
@@ -1075,6 +1075,7 @@ class Trainer:
         temp_model_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             'model_state_dict': self.model.state_dict(),
+            'arch_params': getattr(self.model, 'arch_params', {}),
             'step': self.step,
         }, temp_model_path)
 
@@ -1347,6 +1348,7 @@ class Trainer:
         
         torch.save({
             'model_state_dict': self.model.state_dict(),
+            'arch_params': getattr(self.model, 'arch_params', {}),
             'step': self.step,
         }, temp_path)
         
@@ -1571,7 +1573,7 @@ class Trainer:
 
                 if _do_sanity:
                     if (torch.isnan(_current_scores).any()
-                            or (_current_scores == float('inf')).any()
+                            or torch.isinf(_current_scores).any()
                             or not torch.isfinite(loss)):
                         print("  Warning: non-finite values detected; skipping batch")
                         if _stats_collector:
@@ -1632,7 +1634,7 @@ class Trainer:
                         raise
                 if _do_sanity:
                     if _use_padded:
-                        _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
+                        _bad = torch.isnan(scores).any() or torch.isinf(scores).any()
                     else:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
@@ -1684,7 +1686,7 @@ class Trainer:
                         value_preds = None
                 if _do_sanity:
                     if _use_padded:
-                        _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
+                        _bad = torch.isnan(scores).any() or torch.isinf(scores).any()
                     else:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
@@ -1820,7 +1822,7 @@ class Trainer:
 
             # Checkpoint
             if _step % _checkpoint_every == 0:
-                avg_loss = (total_loss_acc / num_batches).item()
+                avg_loss = (total_loss_acc / max(num_batches, 1)).item()
                 self._save_checkpoint(avg_loss)
 
                 # Log metrics

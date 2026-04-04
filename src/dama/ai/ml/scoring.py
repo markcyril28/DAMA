@@ -506,6 +506,86 @@ def score_game_entries(
     return entries
 
 
+def _compute_game_score_from_compact(
+    player_int: int,
+    winner_int,
+    total_moves: int,
+    max_moves: int,
+    final_state_dict: dict,
+    captures_made: int = 0,
+) -> float:
+    """Compute game score directly from compact dict (no GameState/Board objects).
+
+    Drop-in replacement for compute_game_score that works with the output of
+    play_full_game_cy.
+    """
+    score = 0.0
+
+    if winner_int is None:
+        score += DRAW_SCORE
+    elif winner_int == player_int:
+        score += WIN_SCORE
+    else:
+        score += LOSS_SCORE
+
+    if winner_int == player_int:
+        decay = math.exp(-total_moves / QUICK_WIN_HALF_MOVES * math.log(2))
+        score += QUICK_WIN_BONUS_MAX * decay
+
+        final_adv = _material_advantage_from_compact(final_state_dict, player_int)
+        if final_adv > 3:
+            score += DOMINATION_BONUS * min(final_adv / 6.0, 1.0)
+
+        score += captures_made * CAPTURE_EFFICIENCY
+
+    elif winner_int is not None:
+        final_adv = _material_advantage_from_compact(final_state_dict, player_int)
+        score += final_adv * 0.2
+
+    pos_score = _positional_score_from_compact(final_state_dict, player_int)
+    score += pos_score * 0.3
+
+    return score
+
+
+def score_game_dicts(
+    entry_dicts: list,
+    winner_int,
+    total_moves: int,
+    max_moves: int,
+    final_state_dict: dict,
+    p1_captures: int = 0,
+    p2_captures: int = 0,
+) -> None:
+    """Score a list of entry dicts in place (no ReplayEntry or GameState needed).
+
+    Works with the output of play_full_game_cy. Modifies each dict's 'score'
+    key using the same scoring logic as score_game_entries.
+    """
+    game_scores = {}
+    for pi in (1, 2):
+        caps = p1_captures if pi == 1 else p2_captures
+        game_scores[pi] = _compute_game_score_from_compact(
+            player_int=pi,
+            winner_int=winner_int,
+            total_moves=total_moves,
+            max_moves=max_moves,
+            final_state_dict=final_state_dict,
+            captures_made=caps,
+        )
+
+    for i, ed in enumerate(entry_dicts):
+        player_int = ed['state']['turn']
+        ed['score'] = _per_move_score_fast(
+            state_dict=ed['state'],
+            legal_moves=ed['legal_moves'],
+            player_int=player_int,
+            game_score=game_scores[player_int],
+            move_index=i,
+            total_moves=total_moves,
+        )
+
+
 def get_scoring_config() -> Dict[str, Any]:
     """Return the current scoring configuration as a dict (for logging)."""
     return {

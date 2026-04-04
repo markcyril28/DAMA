@@ -214,7 +214,8 @@ def _play_single_test_game(args: Tuple[str, str, int, int]) -> Dict[str, Any]:
                 chosen_move = get_ml_move(state, model_path)
                 if chosen_move is None:
                     chosen_move = random.choice(legal_moves)
-            except Exception:
+            except Exception as e:
+                print(f"  Warning: ML inference failed in test game, using random move: {e}")
                 chosen_move = random.choice(legal_moves)
             ml_moves += 1
         else:

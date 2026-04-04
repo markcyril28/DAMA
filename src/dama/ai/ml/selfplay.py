@@ -10,13 +10,22 @@ from ...types import Move, Player
 from ...game_state import GameState
 from ...board import Board
 from ...ai.algorithmic.search import get_best_move
-from .scoring import score_game_entries
+from .scoring import score_game_entries, score_game_dicts
 
 try:
     from .inference import get_ml_move
 except ImportError:
     get_ml_move = None
 from .replay import ReplayEntry, ReplayBuffer
+
+# Cython-accelerated full game loop — runs entire algo-vs-algo games in C.
+# Eliminates all Python object creation (GameState, Board, Move, Piece) during
+# gameplay. Falls back to Python play_single_game if extension not built.
+try:
+    from ...ai.algorithmic._fast_search import play_full_game_cy
+    _HAS_FAST_GAME = True
+except ImportError:
+    _HAS_FAST_GAME = False
 
 
 @dataclass
@@ -74,8 +83,8 @@ def play_single_game(
                 chosen = get_ml_move(state, model_path=model_path, device=device)
                 if chosen is not None:
                     return chosen
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  Warning: ML inference failed, using random move: {e}")
             return random.choice(legal_moves)
         # use_parallel=False: self-play already parallelizes at the game level
         # via ProcessPoolExecutor. Creating threads per move per worker causes
@@ -155,6 +164,29 @@ def play_single_game(
     return GameRecord(entries=entries, winner=winner, num_moves=move_count)
 
 
+def _play_game_worker_cy(args: Tuple[str, int, float, int]) -> List[dict]:
+    """Cython-accelerated worker — runs entire game in C (algo-vs-algo, same difficulty)."""
+    difficulty, max_moves, noise_prob, start_player = args
+    from .scoring import score_game_dicts as _score
+    result = play_full_game_cy(
+        p1_difficulty=difficulty,
+        p2_difficulty=difficulty,
+        max_moves=max_moves,
+        noise_prob=noise_prob,
+        start_player=start_player,
+    )
+    _score(
+        entry_dicts=result['entries'],
+        winner_int=result['winner'],
+        total_moves=result['num_moves'],
+        max_moves=max_moves,
+        final_state_dict=result['final_state'],
+        p1_captures=result['p1_captures'],
+        p2_captures=result['p2_captures'],
+    )
+    return result['entries']
+
+
 def _play_game_worker(args: Tuple[str, int, float, int]) -> List[dict]:
     """Worker function for parallel self-play."""
     difficulty, max_moves, noise_prob, start_player = args
@@ -167,6 +199,38 @@ def _play_game_worker(args: Tuple[str, int, float, int]) -> List[dict]:
         p2_policy='algorithmic',
     )
     return [e.to_dict() for e in record.entries]
+
+
+def _play_games_batch_worker(batch_args: list) -> List[dict]:
+    """Run multiple algo-only games in one worker call to reduce IPC overhead.
+
+    Instead of 1 game per task (high per-task pickle + scheduling overhead),
+    each worker processes a batch of games and returns all entries at once.
+    Reduces IPC from N_games submissions to N_workers submissions.
+    """
+    all_entries = []
+    for difficulty, max_moves, noise_prob, start_player in batch_args:
+        record = play_single_game(
+            difficulty, max_moves, noise_prob, start_player,
+            p1_policy='algorithmic', p2_policy='algorithmic',
+        )
+        all_entries.extend(e.to_dict() for e in record.entries)
+    return all_entries
+
+
+def _play_games_batch_worker_full(batch_args: list) -> List[dict]:
+    """Batched worker for ML-policy games."""
+    all_entries = []
+    for (difficulty, max_moves, noise_prob, start_player,
+         p1_policy, p2_policy, model_path, _device) in batch_args:
+        record = play_single_game(
+            difficulty=difficulty, max_moves=max_moves,
+            noise_prob=noise_prob, start_player=start_player,
+            p1_policy=p1_policy, p2_policy=p2_policy,
+            model_path=model_path, device='cpu',
+        )
+        all_entries.extend(e.to_dict() for e in record.entries)
+    return all_entries
 
 
 def _play_game_worker_full(
@@ -191,6 +255,31 @@ def _play_game_worker_full(
     return [e.to_dict() for e in record.entries]
 
 
+def _play_game_worker_algo_vs_algo_cy(
+    args: Tuple[str, str, int, float, int]
+) -> List[dict]:
+    """Cython-accelerated algo-vs-algo worker with per-player difficulties."""
+    p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player = args
+    from .scoring import score_game_dicts as _score
+    result = play_full_game_cy(
+        p1_difficulty=p1_difficulty,
+        p2_difficulty=p2_difficulty,
+        max_moves=max_moves,
+        noise_prob=noise_prob,
+        start_player=start_player,
+    )
+    _score(
+        entry_dicts=result['entries'],
+        winner_int=result['winner'],
+        total_moves=result['num_moves'],
+        max_moves=max_moves,
+        final_state_dict=result['final_state'],
+        p1_captures=result['p1_captures'],
+        p2_captures=result['p2_captures'],
+    )
+    return result['entries']
+
+
 def _play_game_worker_algo_vs_algo(
     args: Tuple[str, str, int, float, int]
 ) -> List[dict]:
@@ -207,6 +296,21 @@ def _play_game_worker_algo_vs_algo(
         p2_difficulty=p2_difficulty,
     )
     return [e.to_dict() for e in record.entries]
+
+
+def _play_games_batch_worker_algo(batch_args: list) -> List[dict]:
+    """Batched worker for algo-vs-algo games with per-player difficulties."""
+    all_entries = []
+    for p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player in batch_args:
+        record = play_single_game(
+            difficulty=p1_difficulty,
+            max_moves=max_moves, noise_prob=noise_prob,
+            start_player=start_player,
+            p1_policy='algorithmic', p2_policy='algorithmic',
+            p1_difficulty=p1_difficulty, p2_difficulty=p2_difficulty,
+        )
+        all_entries.extend(e.to_dict() for e in record.entries)
+    return all_entries
 
 
 class SelfPlayRunner:

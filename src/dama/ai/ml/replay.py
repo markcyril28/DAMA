@@ -169,12 +169,12 @@ class ReplayBuffer:
 
         total = 0
         with ThreadPoolExecutor(max_workers=min(8, len(files))) as executor:
-            futures = [executor.submit(_count_file, p) for p in files]
+            futures = {executor.submit(_count_file, p): p for p in files}
             for future in as_completed(futures):
                 try:
                     total += future.result()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"  Warning: failed to count replay file {futures[future]}: {e}")
         return total
 
     def iterate_entries(self, shuffle_files: bool = True) -> Iterator[ReplayEntry]:
@@ -250,8 +250,8 @@ class ReplayBuffer:
                 for future in as_completed(futures):
                     try:
                         all_entries.extend(future.result())
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"  Warning: failed to load replay file {futures[future]}: {e}")
 
         return all_entries
 
@@ -340,12 +340,12 @@ class ReplayBuffer:
             current_idx += count
 
         with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as executor:
-            futures = [executor.submit(_load_entries, p, idxs) for p, idxs in tasks]
+            futures = {executor.submit(_load_entries, p, idxs): p for p, idxs in tasks}
             for future in as_completed(futures):
                 try:
                     entries.extend(future.result())
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"  Warning: failed to sample replay file {futures[future]}: {e}")
 
         return entries
 

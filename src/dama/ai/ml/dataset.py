@@ -879,15 +879,18 @@ def create_dataloader(
         # Direct tensor[indices] is orders of magnitude faster than per-sample
         # __getitem__ + collation + worker IPC that DataLoader imposes.
         # When device is CUDA, tries GPU-resident caching for zero H2D overhead.
+        # Only drop incomplete last batch when there are at least 2 full batches;
+        # otherwise the single partial batch would be dropped → 0 batches.
+        _drop = len(cached_dataset) > batch_size
         return FastBatchIterator(
             cached_dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            drop_last=True,
+            drop_last=_drop,
             pin_memory=pin_memory,
             device=device,
         )
-    
+
     # Fall back to standard dataset
     print(f"Using standard dataset (available RAM: {available_ram:.1f}GB)")
     dataset = DamaDataset(entries)
@@ -917,7 +920,7 @@ def create_dataloader(
         pin_memory=pin_memory and num_workers > 0,
         persistent_workers=use_persistent,
         prefetch_factor=prefetch,
-        drop_last=True,  # Drop incomplete last batch for consistent batch size
+        drop_last=len(entries) > batch_size,
     )
 
 
@@ -974,7 +977,7 @@ def create_cached_dataloader(
         pin_memory=pin_memory and effective_workers > 0,
         persistent_workers=effective_workers > 0,
         prefetch_factor=3 if effective_workers > 0 else None,
-        drop_last=True,
+        drop_last=len(cached_dataset) > batch_size,
     )
 
 
@@ -998,7 +1001,7 @@ def create_dataloader_from_dataset(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        drop_last=True,
+        drop_last=len(dataset) > batch_size,
         pin_memory=pin_memory,
         device=device,
     )

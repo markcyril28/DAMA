@@ -99,6 +99,7 @@ class MetricBuffer:
     def __init__(self, maxlen: int = 50000):
         self._data: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
         self._total_count: int = 0
+        self._finite_count: int = 0
         self._running_sum: float = 0.0
         self._running_min: float = float('inf')
         self._running_max: float = float('-inf')
@@ -108,6 +109,7 @@ class MetricBuffer:
         self._data.append(entry)
         self._total_count += 1
         if math.isfinite(value):
+            self._finite_count += 1
             self._running_sum += value
             self._running_min = min(self._running_min, value)
             self._running_max = max(self._running_max, value)
@@ -118,7 +120,7 @@ class MetricBuffer:
 
     @property
     def running_mean(self) -> float:
-        return self._running_sum / self._total_count if self._total_count > 0 else 0.0
+        return self._running_sum / self._finite_count if self._finite_count > 0 else 0.0
 
     @property
     def running_min(self) -> float:
@@ -1195,7 +1197,8 @@ class StatsCollector:
 
         all_steps = sorted(set(
             list(gpu_entries.keys()) + list(cpu_entries.keys()) +
-            list(ram_entries.keys())
+            list(ram_entries.keys()) + list(gpu_util_entries.keys()) +
+            list(gpu_reserved.keys())
         ))
 
         if not all_steps:
