@@ -806,3 +806,199 @@ def fast_generate_moves(object state) -> list:
     for i in range(moves.count):
         result.append(cmove_to_dict(&moves.moves[i]))
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Full game simulation (for self-play)
+# ═══════════════════════════════════════════════════════════════════════
+# Runs entire algo-vs-algo games in C, avoiding all GameState/Board/Piece/
+# Move Python object creation. Only the output (compact dicts for replay)
+# touches Python. This eliminates the #1 remaining self-play bottleneck
+# after fast_search: the Python game loop overhead.
+
+cdef void init_standard_board(signed char *board) noexcept nogil:
+    """Initialize board with the standard Filipino Dama starting position."""
+    cdef int r, c
+    memset(board, 0, 64)
+    # Player 1 on rows 0-2, dark squares
+    for r in range(3):
+        for c in range(8):
+            if (r + c) % 2 == 1:
+                board[r * 8 + c] = P1_MAN
+    # Player 2 on rows 5-7, dark squares
+    for r in range(5, 8):
+        for c in range(8):
+            if (r + c) % 2 == 1:
+                board[r * 8 + c] = P2_MAN
+
+
+cdef dict board_to_compact_dict(signed char *board, int player, int move_count):
+    """Convert flat board array to compact Python dict (same as Board.to_compact + turn)."""
+    cdef list p1_men = [], p1_kings = [], p2_men = [], p2_kings = []
+    cdef int r, c, piece
+    for r in range(8):
+        for c in range(8):
+            if (r + c) % 2 != 1:
+                continue
+            piece = board[r * 8 + c]
+            if piece == P1_MAN:
+                p1_men.append([r, c])
+            elif piece == P1_KING:
+                p1_kings.append([r, c])
+            elif piece == P2_MAN:
+                p2_men.append([r, c])
+            elif piece == P2_KING:
+                p2_kings.append([r, c])
+    return {
+        'p1_men': p1_men,
+        'p1_kings': p1_kings,
+        'p2_men': p2_men,
+        'p2_kings': p2_kings,
+        'turn': player,
+        'move_count': move_count,
+    }
+
+
+def play_full_game_cy(
+    str p1_difficulty = 'medium',
+    str p2_difficulty = 'medium',
+    int max_moves = 100,
+    double noise_prob = 0.1,
+    int start_player = 1,
+) -> dict:
+    """Play a complete algorithmic game entirely in C.
+
+    Both players use iterative-deepening alpha-beta search. The entire game
+    loop stays in C — no GameState, Board, Move, or Piece Python objects are
+    created during gameplay. Only the output (compact dicts) touches Python.
+
+    Returns:
+        dict with 'entries' (list of replay-entry dicts), 'winner' (1/2/None),
+        'num_moves', 'p1_captures', 'p2_captures', 'final_state' (compact dict).
+    """
+    import random as _rng
+
+    cdef signed char board[64]
+    cdef signed char new_board[64]
+    cdef CMoveList moves
+    cdef Rules rules
+    cdef int player, chosen_idx, move_num, depth, idx, i
+    cdef double time_budget
+    cdef int max_depth, best_idx
+    cdef SearchState ss
+    cdef int p1_caps = 0, p2_caps = 0
+    cdef bint game_over = False
+
+    rules = _load_rules()
+    init_standard_board(board)
+    player = start_player
+
+    cdef list entries = []
+    cdef list moves_list
+    cdef dict state_dict
+    cdef int actual_moves = 0
+    cdef str cur_diff
+
+    for move_num in range(max_moves):
+        # Generate legal moves in C
+        moves.count = 0
+        generate_all_moves_c(board, player, &rules, &moves)
+
+        if moves.count == 0:
+            game_over = True
+            break
+
+        # Order moves for search efficiency + consistent ordering
+        _order_moves(&moves)
+
+        # Convert board and moves to Python dicts for replay recording
+        state_dict = board_to_compact_dict(board, player, move_num)
+        moves_list = []
+        for i in range(moves.count):
+            moves_list.append(cmove_to_dict(&moves.moves[i]))
+
+        # Choose move: noise (exploration) or alpha-beta search
+        if moves.count == 1:
+            chosen_idx = 0
+        elif _rng.random() < noise_prob:
+            chosen_idx = _rng.randint(0, moves.count - 1)
+        else:
+            cur_diff = p1_difficulty if player == PLAYER_ONE else p2_difficulty
+
+            if cur_diff == 'easy':
+                time_budget = 0.2; max_depth = 3
+            elif cur_diff == 'hard':
+                time_budget = 2.5; max_depth = 8
+            else:
+                time_budget = 0.8; max_depth = 5
+
+            ss.deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
+            ss.nodes = 0
+            ss.timeout = False
+
+            best_idx = 0
+            for depth in range(1, max_depth + 1):
+                ss.timeout = False
+                idx = search_root(board, player, &moves, depth, &rules, &ss)
+                if not ss.timeout:
+                    best_idx = idx
+                if ss.timeout or _check_deadline(&ss):
+                    break
+            chosen_idx = best_idx
+
+        # Track captures per player
+        if moves.moves[chosen_idx].num_captures > 0:
+            if player == PLAYER_ONE:
+                p1_caps += moves.moves[chosen_idx].num_captures
+            else:
+                p2_caps += moves.moves[chosen_idx].num_captures
+
+        # Record entry (format matches ReplayEntry.to_dict())
+        entries.append({
+            'state': state_dict,
+            'legal_moves': moves_list,
+            'chosen_index': chosen_idx,
+            'result': 0,
+            'score': 0.0,
+        })
+
+        # Apply move in C (board → new_board, then copy back)
+        apply_move_c(board, new_board, &moves.moves[chosen_idx], player)
+        memcpy(board, new_board, 64)
+        player = opponent(player)
+        actual_moves += 1
+
+    # Determine winner
+    cdef int winner_int = 0  # 0 = no winner (draw)
+    if game_over:
+        # Current player had no moves — opponent wins
+        winner_int = opponent(player)
+    elif actual_moves >= max_moves:
+        # Max moves reached — check if current player is stuck
+        moves.count = 0
+        generate_all_moves_c(board, player, &rules, &moves)
+        if moves.count == 0:
+            winner_int = opponent(player)
+
+    # Set results for each entry
+    winner_py = winner_int if winner_int != 0 else None
+    for entry_d in entries:
+        turn = entry_d['state']['turn']
+        if winner_int == 0:
+            entry_d['result'] = 0  # Draw
+        elif turn == winner_int:
+            entry_d['result'] = 1  # Win
+        else:
+            entry_d['result'] = -1  # Loss
+
+    # Final state for scoring
+    final_state_dict = board_to_compact_dict(board, player, actual_moves)
+
+    return {
+        'entries': entries,
+        'winner': winner_py,
+        'num_moves': actual_moves,
+        'p1_captures': p1_caps,
+        'p2_captures': p2_caps,
+        'final_state': final_state_dict,
+    }
