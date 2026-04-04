@@ -44,11 +44,11 @@ selfplay:
   cpu_workers: 12                     # All 12 cores — FastBatchIterator needs no DataLoader workers
   games_per_epoch: 100                # Smaller batches for faster iteration on local
   difficulties:                       # List of difficulties to cycle through
-    - "easy"
+    #- "easy"
     - "medium"
-    #- "hard"
+    - "hard"
   focus_side: "black"                  # "white", "black", or "both"
-  opponent_focus: "both"              # "ml", "algorithm", or "both"
+  opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
   noise_prob: 0.15                    # Slightly lower noise for faster convergence
   max_moves_per_game: 100             # Maximum moves per game
   pipeline_mode: "simultaneous"    # "simultaneous" = overlap CPU self-play with GPU training
@@ -59,11 +59,11 @@ selfplay:
   # easy-vs-medium, medium-vs-medium).
   algo_vs_algo:
     enabled: true                     # Include algo-vs-algo games in training data
-    games_per_epoch: 60               # Additional games per self-play epoch
+    games_per_epoch: 200               # Additional games per self-play epoch
     difficulties:                     # Difficulties to combine into matchup pairs
       - "easy"
       - "medium"
-      #- "hard"
+      - "hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
@@ -90,7 +90,7 @@ training:
   #   "scoring" - always use the scoring system reward weights
   #   "none"    - never use scoring (uniform weights, classic behavior)
   #   "cycle"   - alternate epochs: odd=scoring, even=uniform (default)
-  reward_mode: "cycle"
+  reward_mode: "scoring"
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
