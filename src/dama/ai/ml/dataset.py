@@ -307,6 +307,134 @@ def collate_cached_batch(
     )
 
 
+def collate_padded_batch(
+    batch: List[Tuple[torch.Tensor, torch.Tensor, int, int, float, float]]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fast collate for padded training path.
+
+    Keeps move_features at (batch, max_moves, MOVE_FEATURE_SIZE) instead of
+    flattening to (total_moves, MOVE_FEATURE_SIZE). Eliminates per-sample
+    slicing and torch.cat, enabling forward_padded in the model.
+
+    Returns:
+    - boards: (batch_size, BOARD_PLANES, 8, 8)
+    - move_features: (batch_size, max_moves, MOVE_FEATURE_SIZE) padded
+    - move_counts: (batch_size,)
+    - targets: (batch_size,)
+    - reward_weights: (batch_size,)
+    - value_targets: (batch_size,)
+    """
+    boards, move_feats, move_counts, targets, rws, vts = zip(*batch)
+    return (
+        torch.stack(boards),
+        torch.stack(move_feats),
+        torch.tensor(move_counts, dtype=torch.long),
+        torch.tensor(targets, dtype=torch.long),
+        torch.tensor(rws, dtype=torch.float32),
+        torch.tensor(vts, dtype=torch.float32),
+    )
+
+
+class CUDAPrefetcher:
+    """Prefetches next batch to GPU in a separate CUDA stream.
+
+    Overlaps H2D data transfer with GPU computation for the current batch,
+    eliminating transfer latency from the critical path.
+    """
+
+    def __init__(self, dataloader, device):
+        self.dataloader = dataloader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+
+    def __iter__(self):
+        self._iter = iter(self.dataloader)
+        self._prefetch()
+        return self
+
+    def _prefetch(self):
+        try:
+            self._next_batch = next(self._iter)
+        except StopIteration:
+            self._next_batch = None
+            return
+        with torch.cuda.stream(self.stream):
+            self._next_batch = tuple(
+                t.to(self.device, non_blocking=True) if isinstance(t, torch.Tensor) else t
+                for t in self._next_batch
+            )
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self._next_batch
+        if batch is None:
+            raise StopIteration
+        for t in batch:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(torch.cuda.current_stream())
+        self._prefetch()
+        return batch
+
+    def __len__(self):
+        return len(self.dataloader)
+
+
+class FastBatchIterator:
+    """Direct tensor-indexing batch iterator for CachedTensorDataset.
+
+    Bypasses DataLoader entirely — shuffles indices once per epoch and
+    slices contiguous tensors with a single fancy-index per field.
+    This eliminates per-sample __getitem__, collation, worker IPC, and
+    Python type-conversion overhead that DataLoader imposes.
+
+    Yields the same 6-tuple as collate_padded_batch so the training loop
+    works unchanged:
+      (boards, move_features, move_counts, targets, reward_weights, value_targets)
+
+    Exposes a `.dataset` attribute for compatibility with trainer code that
+    checks ``isinstance(loader.dataset, CachedTensorDataset)``.
+    """
+
+    def __init__(
+        self,
+        dataset: CachedTensorDataset,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = True,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.n = len(dataset)
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return self.n // self.batch_size
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        if self.shuffle:
+            indices = torch.randperm(self.n)
+        else:
+            indices = torch.arange(self.n)
+
+        for start in range(0, self.n, self.batch_size):
+            end = min(start + self.batch_size, self.n)
+            if self.drop_last and (end - start) < self.batch_size:
+                break
+            idx = indices[start:end]
+            yield (
+                self.dataset.boards[idx],
+                self.dataset.move_features[idx],
+                self.dataset.move_counts[idx],
+                self.dataset.targets[idx],
+                self.dataset.reward_weights[idx],
+                self.dataset.value_targets[idx],
+            )
+
+
 class StreamingDamaDataset(IterableDataset):
     """
     Streaming dataset that reads from replay files on-the-fly.
@@ -425,28 +553,20 @@ def create_dataloader(
     if should_cache:
         print(f"RAM Caching enabled ({available_ram:.1f}GB available, {estimated_size_gb:.2f}GB needed)")
         print("Pre-processing entries to tensors...")
-        
+
         cached_dataset = CachedTensorDataset.from_entries(
-            entries, 
-            max_moves_per_sample=64, 
+            entries,
+            max_moves_per_sample=64,
             show_progress=True
         )
-        
-        # With cached data, preprocessing is eliminated but collate_cached_batch
-        # still slices variable-length moves and concatenates per batch.
-        # 4 workers keeps the GPU fed without excessive memory duplication;
-        # the collate is lightweight so more workers would add diminishing returns.
-        effective_workers = min(num_workers, 4) if num_workers > 0 else 0
 
-        return DataLoader(
+        # FastBatchIterator: bypass DataLoader entirely for pre-tensorized data.
+        # Direct tensor[indices] is orders of magnitude faster than per-sample
+        # __getitem__ + collation + worker IPC that DataLoader imposes.
+        return FastBatchIterator(
             cached_dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=effective_workers,
-            collate_fn=collate_cached_batch,
-            pin_memory=pin_memory and effective_workers > 0,
-            persistent_workers=effective_workers > 0 and len(entries) > batch_size * 100,
-            prefetch_factor=3 if effective_workers > 0 else None,
             drop_last=True,
         )
     
@@ -536,6 +656,27 @@ def create_cached_dataloader(
         pin_memory=pin_memory and effective_workers > 0,
         persistent_workers=effective_workers > 0,
         prefetch_factor=3 if effective_workers > 0 else None,
+        drop_last=True,
+    )
+
+
+def create_dataloader_from_dataset(
+    dataset: CachedTensorDataset,
+    batch_size: int = 64,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+) -> FastBatchIterator:
+    """Create a fast batch iterator from a pre-built CachedTensorDataset.
+
+    Uses direct tensor indexing instead of DataLoader for maximum throughput.
+    Used when dataset has been pre-processed in a background thread
+    to avoid blocking the training loop.
+    """
+    return FastBatchIterator(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
         drop_last=True,
     )
 
