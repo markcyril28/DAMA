@@ -378,13 +378,15 @@ class SelfPlayRunner:
         self._running = False
         self._games_completed = 0
 
-    def run_games(self, num_games: int, callback=None) -> int:
+    def run_games(self, num_games: int, callback=None, collect_dicts: bool = False) -> int:
         """
         Run self-play games and store in replay buffer.
 
         Args:
             num_games: Number of games to play
             callback: Optional callback(games_completed, total_games)
+            collect_dicts: If True, also store raw dicts in self.collected_dicts
+                for incremental preprocessing (avoids re-loading from replay).
 
         Returns:
             Total number of training entries generated
@@ -392,6 +394,8 @@ class SelfPlayRunner:
         self._running = True
         self._games_completed = 0
         total_entries = 0
+        if collect_dicts:
+            self.collected_dicts = []
 
         # Start new replay file
         self.replay_buffer.start_new_file()
@@ -463,6 +467,8 @@ class SelfPlayRunner:
                             # Write dicts directly — skip dict→ReplayEntry→dict round-trip
                             self.replay_buffer.add_entry_dicts(entries_data)
                             total_entries += len(entries_data)
+                            if collect_dicts:
+                                self.collected_dicts.extend(entries_data)
 
                             batch_idx = future_to_batch[future]
                             games_in_batch = len(batches[batch_idx])
