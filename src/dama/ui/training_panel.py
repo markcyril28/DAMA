@@ -65,6 +65,11 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
             train_steps=args.get('train_steps', 10000),
             checkpoint_every=args.get('checkpoint_every', 1000),
             resume=args.get('resume'),
+            pipeline_mode=args.get('pipeline_mode', 'simultaneous'),
+            # Algo-vs-algo settings
+            algo_vs_algo_enabled=args.get('algo_vs_algo_enabled', False),
+            algo_vs_algo_games=args.get('algo_vs_algo_games', 100),
+            algo_vs_algo_difficulties=args.get('algo_vs_algo_difficulties', ['easy', 'medium', 'hard']),
             # Model testing settings
             test_vs_algo=args.get('test_vs_algo', True),
             test_every=args.get('test_every', 5000),
