@@ -29,9 +29,20 @@ def play_single_game(
     max_moves: int = 200,
     noise_prob: float = 0.1,
     start_player: int = 1,
+    p1_difficulty: str = None,
+    p2_difficulty: str = None,
 ) -> list:
-    """Play a single game and return entries as dicts."""
+    """Play a single game and return entries as dicts.
+
+    Args:
+        difficulty: Default difficulty (used when p1/p2_difficulty not set)
+        p1_difficulty: Difficulty for Player 1 (overrides difficulty if set)
+        p2_difficulty: Difficulty for Player 2 (overrides difficulty if set)
+    """
     start_player = Player(start_player)
+    _p1_diff = p1_difficulty or difficulty
+    _p2_diff = p2_difficulty or difficulty
+
     state = GameState(
         board=Board.initial(),
         current_player=start_player,
@@ -45,11 +56,13 @@ def play_single_game(
         if not legal_moves:
             break
 
+        cur_diff = _p1_diff if state.current_player == Player.ONE else _p2_diff
+
         # Select move with optional noise for exploration
         if random.random() < noise_prob and len(legal_moves) > 1:
             chosen_move = random.choice(legal_moves)
         else:
-            chosen_move = get_best_move(state, difficulty)
+            chosen_move = get_best_move(state, cur_diff)
             if chosen_move is None:
                 chosen_move = random.choice(legal_moves)
 
@@ -100,39 +113,48 @@ def main():
     parser = argparse.ArgumentParser(description='Self-play worker for GNU Parallel')
     parser.add_argument('--games', type=int, default=10, help='Number of games to play')
     parser.add_argument('--output', type=str, required=True, help='Output JSONL file')
-    parser.add_argument('--difficulty', type=str, default='medium', 
+    parser.add_argument('--difficulty', type=str, default='medium',
                         choices=['easy', 'medium', 'hard'], help='AI difficulty')
+    parser.add_argument('--p1-difficulty', type=str, default=None,
+                        choices=['easy', 'medium', 'hard'],
+                        help='Player 1 difficulty (overrides --difficulty)')
+    parser.add_argument('--p2-difficulty', type=str, default=None,
+                        choices=['easy', 'medium', 'hard'],
+                        help='Player 2 difficulty (overrides --difficulty)')
     parser.add_argument('--max-moves', type=int, default=200, help='Max moves per game')
     parser.add_argument('--noise-prob', type=float, default=0.1, help='Random move probability')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
     args = parser.parse_args()
-    
+
     if args.seed is not None:
         random.seed(args.seed)
-    
+
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     total_entries = 0
-    
+
     with open(output_path, 'w') as f:
         for game_idx in range(args.games):
             # Alternate starting player
             start_player = 1 if game_idx % 2 == 0 else 2
-            
+
             entries = play_single_game(
                 difficulty=args.difficulty,
                 max_moves=args.max_moves,
                 noise_prob=args.noise_prob,
                 start_player=start_player,
+                p1_difficulty=args.p1_difficulty,
+                p2_difficulty=args.p2_difficulty,
             )
-            
+
             for entry in entries:
                 f.write(json.dumps(entry) + '\n')
-            
+
             total_entries += len(entries)
-    
-    print(f"Generated {total_entries} entries from {args.games} games -> {output_path}")
+
+    mode = "algo-vs-algo" if args.p1_difficulty or args.p2_difficulty else args.difficulty
+    print(f"Generated {total_entries} entries from {args.games} games ({mode}) -> {output_path}")
 
 
 if __name__ == '__main__':
