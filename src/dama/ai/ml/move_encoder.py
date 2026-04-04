@@ -127,19 +127,23 @@ def decode_board(planes: np.ndarray, current_player: Player = Player.ONE) -> Gam
     Returns:
         GameState
     """
+    # Un-flip rows for P2 before mapping back to board positions
+    flip = current_player == Player.TWO
+
     board = Board()
     opponent = current_player.opponent()
 
     for row in range(8):
         for col in range(8):
+            board_row = 7 - row if flip else row
             if planes[0, row, col] > 0.5:
-                board.set_piece((row, col), Piece(current_player, PieceType.MAN))
+                board.set_piece((board_row, col), Piece(current_player, PieceType.MAN))
             elif planes[1, row, col] > 0.5:
-                board.set_piece((row, col), Piece(current_player, PieceType.KING))
+                board.set_piece((board_row, col), Piece(current_player, PieceType.KING))
             elif planes[2, row, col] > 0.5:
-                board.set_piece((row, col), Piece(opponent, PieceType.MAN))
+                board.set_piece((board_row, col), Piece(opponent, PieceType.MAN))
             elif planes[3, row, col] > 0.5:
-                board.set_piece((row, col), Piece(opponent, PieceType.KING))
+                board.set_piece((board_row, col), Piece(opponent, PieceType.KING))
 
     return GameState(board, current_player)
 

@@ -105,10 +105,13 @@ def _encode_board_fast(state_dict: dict, planes: np.ndarray) -> None:
     else:
         mapping = (('p2_men', 0), ('p2_kings', 1), ('p1_men', 2), ('p1_kings', 3))
 
+    flip = turn == 2
+
     planes[:] = 0.0
     for key, plane_idx in mapping:
         for pos in state_dict.get(key, ()):
-            planes[plane_idx, pos[0], pos[1]] = 1.0
+            row = 7 - pos[0] if flip else pos[0]
+            planes[plane_idx, row, pos[1]] = 1.0
     planes[4, :, :] = 1.0
 
 
