@@ -515,11 +515,16 @@ class Trainer:
         # Compile after loading checkpoint to avoid state_dict key mismatch
         if self.config.compile_model and hasattr(torch, "compile"):
             try:
-                print(f"Enabling torch.compile (mode={self.config.compile_mode})...")
+                print(f"Enabling torch.compile (mode={self.config.compile_mode}, fullgraph=True)...")
                 sys.stdout.flush()
-                # mode="reduce-overhead" compiles faster than default while still being fast
-                # Other options: "default" (balanced), "max-autotune" (slowest compile, fastest run)
-                self.model = torch.compile(self.model, mode=self.config.compile_mode)
+                # fullgraph=True: forward_padded uses only fixed-size ops (no boolean
+                # indexing), so the entire graph can be captured without breaks.
+                # This enables CUDAGraph capture for zero kernel-launch overhead.
+                self.model = torch.compile(
+                    self.model,
+                    mode=self.config.compile_mode,
+                    fullgraph=True,
+                )
                 print("torch.compile enabled - model will be compiled on first forward pass")
                 sys.stdout.flush()
             except Exception as e:
