@@ -518,6 +518,44 @@ class CachedTensorDataset(Dataset):
             data.get('value_targets', None),   # Backward compat with old caches
         )
 
+    def concat(self, other: 'CachedTensorDataset', max_entries: int = 0) -> 'CachedTensorDataset':
+        """Concatenate another dataset onto this one, returning a new dataset.
+
+        When max_entries > 0, keeps the most recent entries (tail) by trimming
+        the oldest (head) entries from self.  New entries from ``other`` are
+        always kept in full.
+
+        This enables incremental dataset updates: preprocess only new self-play
+        entries and concatenate with the existing preprocessed dataset instead of
+        re-preprocessing the entire replay buffer.
+        """
+        # How many old entries to keep (trim oldest from self)
+        if max_entries > 0 and len(self) + len(other) > max_entries:
+            keep_old = max(0, max_entries - len(other))
+            offset = len(self) - keep_old
+            old_boards = self.boards[offset:]
+            old_mf = self.move_features[offset:]
+            old_mc = self.move_counts[offset:]
+            old_t = self.targets[offset:]
+            old_rw = self.reward_weights[offset:]
+            old_vt = self.value_targets[offset:]
+        else:
+            old_boards = self.boards
+            old_mf = self.move_features
+            old_mc = self.move_counts
+            old_t = self.targets
+            old_rw = self.reward_weights
+            old_vt = self.value_targets
+
+        return CachedTensorDataset(
+            boards=torch.cat([old_boards, other.boards], dim=0),
+            move_features=torch.cat([old_mf, other.move_features], dim=0),
+            move_counts=torch.cat([old_mc, other.move_counts], dim=0),
+            targets=torch.cat([old_t, other.targets], dim=0),
+            reward_weights=torch.cat([old_rw, other.reward_weights], dim=0),
+            value_targets=torch.cat([old_vt, other.value_targets], dim=0),
+        )
+
 
 def collate_cached_batch(
     batch: List[Tuple[torch.Tensor, torch.Tensor, int, int, float, float]]
