@@ -83,6 +83,9 @@ class ReplayBuffer:
         # Promoted to _file_cache on close() so the next load_all_entries() skips
         # re-parsing the file we just wrote.
         self._session_entries: Dict[Path, List[ReplayEntry]] = {}
+        # Raw dicts from add_entry_dicts() — defers ReplayEntry creation to close().
+        # Merged into _session_entries on _close_current() to avoid per-call overhead.
+        self._session_dicts: Dict[Path, List[dict]] = {}
 
     def start_new_file(self) -> Path:
         """Start a new replay file."""
@@ -122,7 +125,7 @@ class ReplayBuffer:
 
         Self-play workers already return dicts (serialized for IPC). Writing
         them directly to JSONL skips one to_dict() call per entry. ReplayEntry
-        objects are created once for the session cache (needed by load_all_entries).
+        conversion is deferred to _close_current() to avoid per-call overhead.
         """
         if not dicts:
             return
@@ -131,8 +134,8 @@ class ReplayBuffer:
         lines = [_json_dumps(d) for d in dicts]
         self._current_writer.write('\n'.join(lines) + '\n')
         self._current_writer.flush()
-        entries = [ReplayEntry.from_dict(d) for d in dicts]
-        self._session_entries.setdefault(self._current_file, []).extend(entries)
+        # Store raw dicts — ReplayEntry creation deferred to _close_current()
+        self._session_dicts.setdefault(self._current_file, []).extend(dicts)
 
     def _close_current(self) -> None:
         """Close the current file and promote session entries to file cache."""
@@ -141,12 +144,18 @@ class ReplayBuffer:
             # Promote in-memory entries to file cache so load_all_entries()
             # skips re-parsing the file we just wrote.
             path = self._current_file
-            if path is not None and path in self._session_entries:
-                try:
-                    mtime = path.stat().st_mtime
-                    self._file_cache[path] = (mtime, self._session_entries.pop(path))
-                except OSError:
-                    self._session_entries.pop(path, None)
+            if path is not None:
+                # Convert any deferred dicts to ReplayEntry now (bulk conversion)
+                deferred = self._session_dicts.pop(path, None)
+                if deferred:
+                    entries = [ReplayEntry.from_dict(d) for d in deferred]
+                    self._session_entries.setdefault(path, []).extend(entries)
+                if path in self._session_entries:
+                    try:
+                        mtime = path.stat().st_mtime
+                        self._file_cache[path] = (mtime, self._session_entries.pop(path))
+                    except OSError:
+                        self._session_entries.pop(path, None)
             self._current_writer = None
             self._current_file = None
 
@@ -189,6 +198,7 @@ class ReplayBuffer:
                 pass
         self._file_cache.clear()
         self._session_entries.clear()
+        self._session_dicts.clear()
         return deleted
 
     def count_entries(self) -> int:
@@ -206,8 +216,10 @@ class ReplayBuffer:
         uncached_files = []
         for f in files:
             # Check session entries first (not yet promoted to file cache)
-            if f in self._session_entries:
-                total += len(self._session_entries[f])
+            session_count = len(self._session_entries.get(f, ()))
+            session_count += len(self._session_dicts.get(f, ()))
+            if session_count > 0:
+                total += session_count
                 continue
             # Check file cache (promoted after close)
             cached = self._file_cache.get(f)

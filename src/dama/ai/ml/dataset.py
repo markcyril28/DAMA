@@ -707,15 +707,28 @@ class FastBatchIterator:
                       f"{available / 1e6:.0f}MB available) — using CPU+pin")
 
         if not self.on_gpu:
-            self._boards = dataset.boards
-            self._move_features = dataset.move_features
-            self._move_counts = dataset.move_counts
-            self._targets = dataset.targets
-            self._reward_weights = dataset.reward_weights
-            self._value_targets = dataset.value_targets
+            # Pin memory once at construction — eliminates per-batch pin_memory()
+            # overhead (~5μs/tensor/batch).  Pinned pages enable truly asynchronous
+            # H2D transfers via CUDAPrefetcher's non_blocking=True.
+            _should_pin = pin_memory and torch.cuda.is_available()
+            if _should_pin:
+                self._boards = dataset.boards.pin_memory()
+                self._move_features = dataset.move_features.pin_memory()
+                self._move_counts = dataset.move_counts.pin_memory()
+                self._targets = dataset.targets.pin_memory()
+                self._reward_weights = dataset.reward_weights.pin_memory()
+                self._value_targets = dataset.value_targets.pin_memory()
+            else:
+                self._boards = dataset.boards
+                self._move_features = dataset.move_features
+                self._move_counts = dataset.move_counts
+                self._targets = dataset.targets
+                self._reward_weights = dataset.reward_weights
+                self._value_targets = dataset.value_targets
             self._device = None
 
-        self.pin_memory = pin_memory and torch.cuda.is_available() and not self.on_gpu
+        # Already pinned at construction (or GPU-resident) — no per-batch pinning needed
+        self.pin_memory = False
 
     def __len__(self) -> int:
         if self.drop_last:
@@ -735,7 +748,7 @@ class FastBatchIterator:
             if self.drop_last and (end - start) < self.batch_size:
                 break
             idx = indices[start:end]
-            batch = (
+            yield (
                 self._boards[idx],
                 self._move_features[idx],
                 self._move_counts[idx],
@@ -743,9 +756,6 @@ class FastBatchIterator:
                 self._reward_weights[idx],
                 self._value_targets[idx],
             )
-            if self.pin_memory:
-                batch = tuple(t.pin_memory() for t in batch)
-            yield batch
 
 
 class StreamingDamaDataset(IterableDataset):
