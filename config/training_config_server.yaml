@@ -156,8 +156,22 @@ selfplay:
                                       # WR is improving; marginal exploration helps further.
                                       # 88% of moves still come from the algorithmic teacher.
   max_moves_per_game: 80              # Increased from 40 (was cutting games too short).
+  pipeline_mode: "simultaneous"       # "simultaneous" = overlap CPU self-play with GPU training
+                                      # "alternate"     = generate all data first, then train
                                       # Allow endgame patterns: king promotion, piece
                                       # advantage conversion, and closing out wins.
+
+  # Algo-vs-algo: pure algorithmic games as additional training data.
+  # Generates games between all difficulty matchup pairs (e.g., easy-vs-medium,
+  # easy-vs-hard, medium-vs-hard, plus same-difficulty mirrors).
+  # These provide high-quality training positions from strong play at all levels.
+  algo_vs_algo:
+    enabled: true                     # Include algo-vs-algo games in training data
+    games_per_epoch: 256              # Additional games per self-play epoch
+    difficulties:                     # Difficulties to combine into matchup pairs
+      - "easy"
+      - "medium"
+      - "hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
@@ -245,6 +259,7 @@ dataloader:
   num_workers: 0                      # FastBatchIterator bypasses DataLoader — workers unused.
   pin_memory: true                    # Pinned memory for async HBM2e transfers via CUDAPrefetcher
   prefetch_factor: 2                  # 2 is plenty with RAM cache
+  replay_max_entries: 500000          # 1TB RAM — maximize data diversity per epoch
 
   # RAM Caching (1TB DDR4 available)
   ram_cache:

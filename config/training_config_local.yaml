@@ -20,8 +20,8 @@ device:
     enabled: true                     # Enable automatic mixed precision
     dtype: "float16"                  # float16 with GradScaler for RTX 5050 (bfloat16 is for MI210)
   compile:
-    enabled: false                    # Disabled: RTX 5050 Triton kernel compilation fails
-    mode: "reduce-overhead"           # "default", "reduce-overhead", "max-autotune"
+    enabled: true                     # Warmup tests compilation; auto-falls back to eager on failure
+    mode: "reduce-overhead"           # CUDAGraph capture — avoid "max-autotune" (Triton may fail on RTX 5050)
   matmul_precision: "medium"          # "highest", "high", "medium" - medium enables TF32
 
 # -----------------------------------------------------------------------------
@@ -41,27 +41,50 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                     # 10 of 12 cores — leave 2 for dataloader + system
+  cpu_workers: 12                     # All 12 cores — FastBatchIterator needs no DataLoader workers
   games_per_epoch: 100                # Smaller batches for faster iteration on local
   difficulties:                       # List of difficulties to cycle through
     - "easy"
     - "medium"
     #- "hard"
-  focus_side: "both"                  # "white", "black", or "both"
+  focus_side: "black"                  # "white", "black", or "both"
   opponent_focus: "both"              # "ml", "algorithm", or "both"
-  noise_prob: 0.20                    # Probability of random move for exploration
+  noise_prob: 0.15                    # Slightly lower noise for faster convergence
   max_moves_per_game: 100             # Maximum moves per game
+  pipeline_mode: "simultaneous"    # "simultaneous" = overlap CPU self-play with GPU training
+                                      # "alternate"     = generate all data first, then train
+
+  # Algo-vs-algo: pure algorithmic games as additional training data.
+  # Generates games between all difficulty matchup pairs (e.g., easy-vs-easy,
+  # easy-vs-medium, medium-vs-medium).
+  algo_vs_algo:
+    enabled: true                     # Include algo-vs-algo games in training data
+    games_per_epoch: 60               # Additional games per self-play epoch
+    difficulties:                     # Difficulties to combine into matchup pairs
+      - "easy"
+      - "medium"
+      #- "hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 512                     # Smaller batch — fits 8.5GB VRAM with AMP headroom
-  learning_rate: 4.0e-4               # Higher LR for smaller batch
+  batch_size: 2048                    # GPU-resident dataset + AMP: fits in 8.5GB VRAM
+  learning_rate: 4.0e-4               # Higher LR for larger effective batch
   weight_decay: 1.0e-5                # Weight decay for regularization
   grad_clip_norm: 1.0                 # Gradient clipping norm (null to disable)
   train_steps: 100000000000           # Total training steps
   checkpoint_every: 2000              # Save checkpoint every N steps
+  gradient_accumulation_steps: 1
+
+  # Learning rate schedule
+  lr_scheduler:
+    enabled: true
+    type: "cosine_warm_restarts"
+    T_0: 500
+    T_mult: 2
+    eta_min: 1.0e-5
+    warmup_steps: 100
 
   # Reward scoring mode for training loss weighting:
   #   "scoring" - always use the scoring system reward weights
@@ -73,14 +96,15 @@ training:
 # DataLoader Settings
 # -----------------------------------------------------------------------------
 dataloader:
-  num_workers: 2                      # With RAM caching, 2 workers suffice (just memory copies)
+  num_workers: 0                      # FastBatchIterator bypasses DataLoader — workers unused
   pin_memory: true                    # Pin memory for faster GPU transfer
   prefetch_factor: 4                  # Higher prefetch to keep GPU fed
-  
+  replay_max_entries: 200000          # Use more of the 877K+ replay buffer — more batches per epoch
+
   # RAM Caching (see IMPROVEMENTS.md)
   ram_cache:
     enabled: true                     # Enable RAM caching for pre-tensorized data
-    threshold_gb: 16.0                # Minimum available RAM (GB) to enable caching
+    threshold_gb: 8.0                 # Minimum available RAM (GB) to enable caching
     cache_file: null                  # Optional: path to save/load cached tensors (.pt)
 
 # -----------------------------------------------------------------------------
@@ -107,10 +131,10 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true                       # Enhanced stats collection (JSON + CSV exports)
-  record_every: 10                    # Record loss/gradients every N steps
+  record_every: 100                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
   system_every: 500                   # Record GPU/CPU/RAM metrics every N steps
   model_health_every: 2000            # Record parameter norms every N steps
-  score_dist_every: 50                # Record score distribution every N steps
+  score_dist_every: 100               # Record score distribution every N steps
   buffer_size: 50000                  # Ring buffer size
   flush_every: 5000                   # Flush incremental stats every N steps
   output_dir: "logs/stats"            # Export directory

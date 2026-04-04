@@ -51,6 +51,19 @@ selfplay:
   opponent_focus: "both"              # "ml", "algorithm", or "both"
   noise_prob: 0.20                    # Probability of random move for exploration
   max_moves_per_game: 100             # Maximum moves per game
+  pipeline_mode: "simultaneous"       # "simultaneous" = generate data on CPU while training on GPU (overlapped)
+                                      # "alternate"     = generate all data first, then train (sequential)
+
+  # Algo-vs-algo: pure algorithmic games as additional training data.
+  # Generates games between all difficulty matchup pairs (e.g., easy-vs-easy,
+  # easy-vs-medium, easy-vs-hard, medium-vs-medium, medium-vs-hard, hard-vs-hard).
+  algo_vs_algo:
+    enabled: true                     # Include algo-vs-algo games in training data
+    games_per_epoch: 200              # Additional games per self-play epoch
+    difficulties:                     # Difficulties to combine into matchup pairs
+      - "easy"
+      - "medium"
+      - "hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
@@ -89,6 +102,7 @@ dataloader:
   num_workers: 16                     # Number of dataloader worker processes
   pin_memory: true                    # Pin memory for faster GPU transfer
   prefetch_factor: 3                  # Batches to prefetch per worker
+  replay_max_entries: 100000          # Max entries sampled from replay buffer per epoch
   
   # RAM Caching (see IMPROVEMENTS.md)
   ram_cache:
@@ -121,8 +135,8 @@ paths:
 statistics:
   enabled: true                       # Enhanced stats collection (JSON + CSV exports)
   record_every: 100                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
-  system_every: 500                   # Record GPU/CPU/RAM metrics every N steps
-  model_health_every: 2000            # Record parameter norms every N steps
+  system_every: 1000                  # Record GPU/CPU/RAM metrics every N steps
+  model_health_every: 5000            # Record parameter norms every N steps
   score_dist_every: 100               # Record score distribution every N steps
   buffer_size: 50000                  # Ring buffer size
   flush_every: 5000                   # Flush incremental stats every N steps
@@ -184,6 +198,7 @@ profiles:
         warmup_steps: 200
     dataloader:
       num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
+      replay_max_entries: 500000      # 1TB RAM — use all available replay data
       ram_cache:
         enabled: true
         threshold_gb: 64.0
@@ -196,7 +211,8 @@ profiles:
         enabled: true
         dtype: "float16"
       compile:
-        mode: "max-autotune"          # Small model — autotune overhead amortizes quickly
+        enabled: true                 # Warmup auto-falls back to eager on failure
+        mode: "reduce-overhead"       # CUDAGraphs — avoid max-autotune (Triton may fail on RTX 5050)
     selfplay:
       cpu_workers: 12                 # FastBatchIterator needs no DataLoader workers — reclaim for self-play
       games_per_epoch: 512            # Proportional to batch size — keeps GPU fed
@@ -209,6 +225,7 @@ profiles:
         warmup_steps: 100
     dataloader:
       num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
+      replay_max_entries: 200000      # 32GB RAM — use more of the replay buffer
       ram_cache:
         enabled: true                 # 32GB RAM is plenty for caching
         threshold_gb: 8.0
