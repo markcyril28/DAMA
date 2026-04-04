@@ -561,7 +561,11 @@ def score_game_dicts(
 
     Works with the output of play_full_game_cy. Modifies each dict's 'score'
     key using the same scoring logic as score_game_entries.
+
+    Inlines the entire scoring chain (material, positional, mobility, blend)
+    into a single loop to eliminate ~7 Python function calls per entry.
     """
+    # Pre-compute game-level scores for both players (2 calls, outside the loop)
     game_scores = {}
     for pi in (1, 2):
         caps = p1_captures if pi == 1 else p2_captures
@@ -574,16 +578,84 @@ def score_game_dicts(
             captures_made=caps,
         )
 
+    # Cache constants as locals to avoid global lookups in the tight loop
+    _MAN_VALUE = MAN_VALUE
+    _KING_VALUE = KING_VALUE
+    _CENTER_BONUS = CENTER_BONUS
+    _ADVANCE_PER_ROW = ADVANCE_BONUS_PER_ROW
+    _BACK_ROW = BACK_ROW_BONUS
+    _EDGE_PEN = EDGE_PENALTY
+    _MOB_W = MOBILITY_WEIGHT
+    _CAP_BONUS = CAPTURE_MOVE_BONUS
+    _KING_MOB = KING_MOBILITY_WEIGHT
+    _inv_total = 1.0 / total_moves if total_moves > 0 else 0.0
+
     for i, ed in enumerate(entry_dicts):
-        player_int = ed['state']['turn']
-        ed['score'] = _per_move_score_fast(
-            state_dict=ed['state'],
-            legal_moves=ed['legal_moves'],
-            player_int=player_int,
-            game_score=game_scores[player_int],
-            move_index=i,
-            total_moves=total_moves,
-        )
+        state_dict = ed['state']
+        player_int = state_dict['turn']
+        game_score = game_scores[player_int]
+        legal_moves = ed['legal_moves']
+
+        # ── Inline material ──
+        if player_int == 1:
+            my_men_list = state_dict.get('p1_men', ())
+            my_kings_list = state_dict.get('p1_kings', ())
+            opp_men_n = len(state_dict.get('p2_men', ()))
+            opp_kings_n = len(state_dict.get('p2_kings', ()))
+        else:
+            my_men_list = state_dict.get('p2_men', ())
+            my_kings_list = state_dict.get('p2_kings', ())
+            opp_men_n = len(state_dict.get('p1_men', ()))
+            opp_kings_n = len(state_dict.get('p1_kings', ()))
+
+        my_mat = len(my_men_list) * _MAN_VALUE + len(my_kings_list) * _KING_VALUE
+        opp_mat = opp_men_n * _MAN_VALUE + opp_kings_n * _KING_VALUE
+        material_adv = my_mat - opp_mat
+
+        # ── Inline positional ──
+        pos_score = 0.0
+        start_row = 0 if player_int == 1 else 7
+        for pos in my_men_list:
+            row = pos[0]; col = pos[1]
+            if 2 <= row <= 5 and 2 <= col <= 5:
+                pos_score += _CENTER_BONUS
+            pos_score += (row if player_int == 1 else 7 - row) * _ADVANCE_PER_ROW
+            if row == start_row:
+                pos_score += _BACK_ROW
+            if col == 0 or col == 7:
+                pos_score += _EDGE_PEN
+
+        king_set = set()
+        for pos in my_kings_list:
+            row = pos[0]; col = pos[1]
+            king_set.add((row, col))
+            if 2 <= row <= 5 and 2 <= col <= 5:
+                pos_score += _CENTER_BONUS
+            if row == start_row:
+                pos_score += _BACK_ROW
+            if col == 0 or col == 7:
+                pos_score += _EDGE_PEN
+
+        # ── Inline mobility ──
+        mob_score = 0.0
+        for m in legal_moves:
+            captures = m.get('captures', ())
+            if captures:
+                n_cap = len(captures)
+                mob_score += _CAP_BONUS + (n_cap - 1) * _CAP_BONUS * 0.5
+            else:
+                mob_score += _MOB_W
+            start = m['path'][0]
+            if (start[0], start[1]) in king_set:
+                mob_score += _KING_MOB
+
+        # ── Combine position total ──
+        total_pos = my_mat + material_adv * 0.5 + pos_score + mob_score
+
+        # ── Blend with game outcome ──
+        progress = i * _inv_total if total_moves > 0 else 0.5
+        outcome_weight = 0.3 + 0.7 * progress
+        ed['score'] = (1.0 - outcome_weight) * total_pos + outcome_weight * game_score
 
 
 def get_scoring_config() -> Dict[str, Any]:
