@@ -414,6 +414,8 @@ class SelfPlayRunner:
             try:
                 with ProcessPoolExecutor(max_workers=effective_workers) as executor:
                     futures = [executor.submit(batch_worker_fn, b) for b in batches]
+                    # O(1) future→batch lookup (was O(n) via list.index)
+                    future_to_batch = {f: i for i, f in enumerate(futures)}
                     print(f"  Submitted {len(futures)} batch tasks...")
                     sys.stdout.flush()
 
@@ -422,14 +424,12 @@ class SelfPlayRunner:
                             break
 
                         try:
-                            # Each future returns entries from multiple games
                             entries_data = future.result(timeout=300 * batch_size)
-                            entries = [ReplayEntry.from_dict(d) for d in entries_data]
-                            self.replay_buffer.add_entries(entries)
-                            total_entries += len(entries)
+                            # Write dicts directly — skip dict→ReplayEntry→dict round-trip
+                            self.replay_buffer.add_entry_dicts(entries_data)
+                            total_entries += len(entries_data)
 
-                            # Count completed games from this batch by batch index
-                            batch_idx = futures.index(future)
+                            batch_idx = future_to_batch[future]
                             games_in_batch = len(batches[batch_idx])
                             self._games_completed += games_in_batch
                             if callback:
