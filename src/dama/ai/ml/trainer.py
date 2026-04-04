@@ -41,7 +41,7 @@ torch.set_float32_matmul_precision('medium')
 torch.backends.cudnn.benchmark = True
 
 # Allow FP16 accumulation in matmuls for faster tensor core throughput.
-# Minimal precision impact for this model (scores are clamped to [-50, 50]).
+# Minimal precision impact for this model's score magnitudes.
 try:
     torch.backends.cuda.matmul.allow_fp16_reduction = True
 except AttributeError:
