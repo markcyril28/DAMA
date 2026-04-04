@@ -432,10 +432,12 @@ def create_dataloader(
             show_progress=True
         )
         
-        # With cached data, we can reduce workers since the bottleneck is eliminated
-        # Memory copy is faster than Python object creation
-        effective_workers = min(num_workers, 2) if num_workers > 0 else 0
-        
+        # With cached data, preprocessing is eliminated but collate_cached_batch
+        # still slices variable-length moves and concatenates per batch.
+        # 4 workers keeps the GPU fed without excessive memory duplication;
+        # the collate is lightweight so more workers would add diminishing returns.
+        effective_workers = min(num_workers, 4) if num_workers > 0 else 0
+
         return DataLoader(
             cached_dataset,
             batch_size=batch_size,
@@ -444,7 +446,7 @@ def create_dataloader(
             collate_fn=collate_cached_batch,
             pin_memory=pin_memory and effective_workers > 0,
             persistent_workers=effective_workers > 0 and len(entries) > batch_size * 100,
-            prefetch_factor=2 if effective_workers > 0 else None,
+            prefetch_factor=3 if effective_workers > 0 else None,
             drop_last=True,
         )
     
@@ -522,9 +524,9 @@ def create_cached_dataloader(
         if cache_path:
             cached_dataset.save(cache_path)
     
-    # Reduce workers since data is already in memory
-    effective_workers = min(num_workers, 2)
-    
+    # Collate still does variable-length slicing — 4 workers keeps GPU fed
+    effective_workers = min(num_workers, 4)
+
     return DataLoader(
         cached_dataset,
         batch_size=batch_size,
@@ -533,7 +535,7 @@ def create_cached_dataloader(
         collate_fn=collate_cached_batch,
         pin_memory=pin_memory and effective_workers > 0,
         persistent_workers=effective_workers > 0,
-        prefetch_factor=2 if effective_workers > 0 else None,
+        prefetch_factor=3 if effective_workers > 0 else None,
         drop_last=True,
     )
 

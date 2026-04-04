@@ -216,12 +216,18 @@ class TrainingConfig:
     #   'cycle'    - alternate epochs: odd epochs use scoring, even epochs don't
     reward_mode: str = 'cycle'
 
+    # Gradient accumulation: effective batch = batch_size * gradient_accumulation_steps.
+    # Allows larger effective batches on memory-constrained hardware without
+    # increasing VRAM usage.  Optimizer steps every N mini-batches.
+    gradient_accumulation_steps: int = 1
+
     # Learning rate scheduler
     lr_scheduler_enabled: bool = False
     lr_scheduler_type: str = 'cosine_warm_restarts'  # CosineAnnealingWarmRestarts
     lr_scheduler_T0: int = 500       # Steps for first cosine cycle
     lr_scheduler_T_mult: int = 2     # Cycle length multiplier after each restart
     lr_scheduler_eta_min: float = 1e-5  # Minimum LR
+    lr_warmup_steps: int = 0         # Linear warmup from 0 to base LR over N steps
 
     # Value head / TD learning
     value_head_enabled: bool = False
@@ -346,21 +352,40 @@ class Trainer:
         # GradScaler only needed for float16, not bfloat16
         self.scaler = GradScaler() if (config.amp and self.amp_dtype == torch.float16) else None
 
-        # Learning rate scheduler
+        # Learning rate scheduler with optional warmup
         self.scheduler = None
         if config.lr_scheduler_enabled:
+            main_scheduler = None
             if config.lr_scheduler_type == 'cosine_warm_restarts':
-                self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                main_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     self.optimizer,
                     T_0=config.lr_scheduler_T0,
                     T_mult=config.lr_scheduler_T_mult,
                     eta_min=config.lr_scheduler_eta_min,
                 )
-                print(f"LR Scheduler: CosineAnnealingWarmRestarts "
-                      f"(T_0={config.lr_scheduler_T0}, T_mult={config.lr_scheduler_T_mult}, "
-                      f"eta_min={config.lr_scheduler_eta_min})")
+                sched_desc = (f"CosineAnnealingWarmRestarts "
+                              f"(T_0={config.lr_scheduler_T0}, T_mult={config.lr_scheduler_T_mult}, "
+                              f"eta_min={config.lr_scheduler_eta_min})")
             else:
                 print(f"Warning: Unknown LR scheduler type '{config.lr_scheduler_type}'")
+
+            if main_scheduler is not None:
+                if config.lr_warmup_steps > 0:
+                    warmup_scheduler = optim.lr_scheduler.LinearLR(
+                        self.optimizer,
+                        start_factor=1e-3,  # start at 0.1% of base LR
+                        end_factor=1.0,
+                        total_iters=config.lr_warmup_steps,
+                    )
+                    self.scheduler = optim.lr_scheduler.SequentialLR(
+                        self.optimizer,
+                        schedulers=[warmup_scheduler, main_scheduler],
+                        milestones=[config.lr_warmup_steps],
+                    )
+                    print(f"LR Scheduler: {config.lr_warmup_steps}-step warmup → {sched_desc}")
+                else:
+                    self.scheduler = main_scheduler
+                    print(f"LR Scheduler: {sched_desc}")
 
         self.replay_buffer = ReplayBuffer(config.replay_dir)
 
@@ -1045,28 +1070,36 @@ class Trainer:
         """Determine whether to use the scoring system for the upcoming epoch."""
         return self._should_use_scoring_for_epoch(self.epoch + 1)
 
+    # Interval for expensive sanity checks (isfinite on large tensors).
+    # Each check forces a CUDA sync (~20-100μs). Checking every step wastes
+    # GPU pipeline throughput; periodic checks still catch numerical issues.
+    _SANITY_CHECK_INTERVAL = 100
+
     def train_epoch(self, dataloader, use_scoring: bool = True) -> float:
         """Train for one epoch, returns average loss.
-        
+
         Args:
             dataloader: Training data loader
             use_scoring: If True, apply reward weights from the scoring system.
                          If False, use uniform weights (classic behavior).
         """
         self.model.train()
-        total_loss = 0.0
+        # Accumulate loss on GPU to avoid per-step CUDA sync from .item()
+        total_loss_acc = torch.tensor(0.0, device=self.device)
         num_batches = 0
         total_batches = len(dataloader)
         first_batch = True
         epoch_start_time = time.time()
         _step_start = time.time()
+        accum_steps = self.config.gradient_accumulation_steps
+        _micro_step = 0  # counts mini-batches within an accumulation window
 
         for boards, move_features, move_counts, targets, reward_weights, value_targets in dataloader:
             if first_batch:
                 print(f"  First batch loaded. Processing {total_batches} batches...")
                 sys.stdout.flush()
                 first_batch = False
-            
+
             if self._stopped:
                 break
 
@@ -1093,14 +1126,20 @@ class Trainer:
             else:
                 value_targets = None
 
-            if not torch.isfinite(boards).all() or not torch.isfinite(move_features).all():
-                print("  Warning: non-finite inputs detected; skipping batch")
-                if self.stats_collector:
-                    self.stats_collector.record_non_finite_event(
-                        self.step, 'input_data', 'Non-finite board or move features')
-                continue
+            # Periodic sanity check — avoids CUDA sync on every step
+            _do_sanity = (self.step % self._SANITY_CHECK_INTERVAL == 0)
+            if _do_sanity:
+                if not torch.isfinite(boards).all() or not torch.isfinite(move_features).all():
+                    print("  Warning: non-finite inputs detected; skipping batch")
+                    if self.stats_collector:
+                        self.stats_collector.record_non_finite_event(
+                            self.step, 'input_data', 'Non-finite board or move features')
+                    continue
 
-            self.optimizer.zero_grad()
+            # Only zero gradients at the start of an accumulation window
+            if _micro_step == 0:
+                # set_to_none=True avoids a memset, letting PyTorch deallocate instead
+                self.optimizer.zero_grad(set_to_none=True)
 
             # --- Forward + backward ---
             _grad_norm = None
@@ -1114,7 +1153,7 @@ class Trainer:
                     else:
                         scores = self.model(boards, move_features, move_counts)
                         value_preds = None
-                    if not torch.isfinite(scores).all():
+                    if _do_sanity and not torch.isfinite(scores).all():
                         print("  Warning: non-finite scores detected; skipping batch")
                         if self.stats_collector:
                             self.stats_collector.record_non_finite_event(
@@ -1122,7 +1161,7 @@ class Trainer:
                         continue
                     _current_scores = scores.detach()
                     policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
-                    
+
                     # Value head loss (MSE between predicted value and game result)
                     if value_preds is not None and value_targets is not None:
                         value_loss = nn.functional.mse_loss(value_preds, value_targets)
@@ -1130,6 +1169,11 @@ class Trainer:
                     else:
                         loss = policy_loss
 
+                # Scale loss for gradient accumulation
+                if accum_steps > 1:
+                    loss = loss / accum_steps
+
+                # Loss is a scalar — isfinite check is cheap (no large-tensor sync)
                 if not torch.isfinite(loss):
                     print("  Warning: non-finite loss detected; skipping batch")
                     if self.stats_collector:
@@ -1138,36 +1182,16 @@ class Trainer:
                     continue
 
                 if self.scaler is not None:
-                    # Float16 path with GradScaler
                     self.scaler.scale(loss).backward()
-                    if self.config.grad_clip_norm is not None:
-                        self.scaler.unscale_(self.optimizer)
-                        # Capture gradient norms before clipping
-                        if (self.stats_collector and
-                                self.step % self.config.stats_record_every == 0):
-                            _grad_norm, _grad_norms_per_layer = (
-                                StatsCollector.compute_gradient_stats(self.model))
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
                 else:
-                    # BFloat16 path without GradScaler
                     loss.backward()
-                    # Capture gradient norms before clipping
-                    if (self.stats_collector and
-                            self.step % self.config.stats_record_every == 0):
-                        _grad_norm, _grad_norms_per_layer = (
-                            StatsCollector.compute_gradient_stats(self.model))
-                    if self.config.grad_clip_norm is not None:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-                    self.optimizer.step()
             else:
                 if self.config.value_head_enabled:
                     scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
                 else:
                     scores = self.model(boards, move_features, move_counts)
                     value_preds = None
-                if not torch.isfinite(scores).all():
+                if _do_sanity and not torch.isfinite(scores).all():
                     print("  Warning: non-finite scores detected; skipping batch")
                     if self.stats_collector:
                         self.stats_collector.record_non_finite_event(
@@ -1180,6 +1204,10 @@ class Trainer:
                     loss = policy_loss + self.config.value_weight * value_loss
                 else:
                     loss = policy_loss
+
+                if accum_steps > 1:
+                    loss = loss / accum_steps
+
                 if not torch.isfinite(loss):
                     print("  Warning: non-finite loss detected; skipping batch")
                     if self.stats_collector:
@@ -1187,7 +1215,30 @@ class Trainer:
                             self.step, 'loss', 'Non-finite loss value (FP32)')
                     continue
                 loss.backward()
-                # Capture gradient norms before clipping
+
+            _micro_step += 1
+
+            # --- Optimizer step: only after accumulating enough gradients ---
+            if _micro_step < accum_steps:
+                # Accumulate loss for reporting (unscaled)
+                total_loss_acc += loss.detach() * accum_steps
+                num_batches += 1
+                continue
+
+            # Accumulated enough — clip, step, and reset
+            _micro_step = 0
+
+            if self.config.amp and self.scaler is not None:
+                if self.config.grad_clip_norm is not None:
+                    self.scaler.unscale_(self.optimizer)
+                    if (self.stats_collector and
+                            self.step % self.config.stats_record_every == 0):
+                        _grad_norm, _grad_norms_per_layer = (
+                            StatsCollector.compute_gradient_stats(self.model))
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
                 if (self.stats_collector and
                         self.step % self.config.stats_record_every == 0):
                     _grad_norm, _grad_norms_per_layer = (
@@ -1196,7 +1247,9 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
                 self.optimizer.step()
 
-            total_loss += loss.item()
+            # Accumulate on GPU — no sync. Only .item() when needed for logging.
+            # Undo the /accum_steps scaling so total_loss_acc reflects true loss.
+            total_loss_acc += loss.detach() * accum_steps
             num_batches += 1
             self.step += 1
             _step_elapsed = time.time() - _step_start
@@ -1210,9 +1263,17 @@ class Trainer:
                           if self.scheduler is not None
                           else self.config.learning_rate)
 
+            # Only call loss.item() (CUDA sync) when we actually need the scalar
+            _need_loss_val = (
+                self.step % self.config.stats_record_every == 0
+                or self.step % self.config.checkpoint_every == 0
+                or self.step % 100 == 0
+            )
+            _loss_val = loss.item() if _need_loss_val else None
+
             # Record step stats every N steps (to avoid excessive memory usage)
-            if self.step % self.config.stats_record_every == 0:
-                self._record_step_stats(loss.item(), current_lr)
+            if _loss_val is not None and self.step % self.config.stats_record_every == 0:
+                self._record_step_stats(_loss_val, current_lr)
 
                 # Enhanced stats collection
                 if self.stats_collector:
@@ -1225,7 +1286,7 @@ class Trainer:
 
                     self.stats_collector.record_training_step(
                         step=self.step,
-                        loss=loss.item(),
+                        loss=_loss_val,
                         lr=current_lr,
                         batch_size=boards.shape[0],
                         step_time=_step_elapsed,
@@ -1246,7 +1307,7 @@ class Trainer:
 
             # Checkpoint
             if self.step % self.config.checkpoint_every == 0:
-                avg_loss = total_loss / num_batches
+                avg_loss = (total_loss_acc / num_batches).item()
                 self._save_checkpoint(avg_loss)
 
                 # Log metrics
@@ -1260,16 +1321,17 @@ class Trainer:
 
             # Progress
             if self.step % 100 == 0:
-                print(f"  Step {self.step}, Loss: {loss.item():.4f}")
+                _print_loss = _loss_val if _loss_val is not None else loss.item()
+                print(f"  Step {self.step}, Loss: {_print_loss:.4f}")
 
             if self.step >= self.config.train_steps:
                 break
 
         epoch_time = time.time() - epoch_start_time
 
-        # Record epoch in stats collector
+        # Record epoch in stats collector — single sync for the whole epoch
         if self.stats_collector:
-            avg = total_loss / max(num_batches, 1)
+            avg = (total_loss_acc / max(num_batches, 1)).item()
             self.stats_collector.record_epoch(
                 epoch=self.epoch + 1,  # will be incremented by caller
                 step=self.step,
@@ -1278,7 +1340,13 @@ class Trainer:
                 epoch_time_sec=epoch_time,
             )
 
-        return total_loss / max(num_batches, 1)
+        return (total_loss_acc / max(num_batches, 1)).item()
+
+    # Fixed pad width for the loss scatter matrix.  Avoids a CUDA sync from
+    # counts.max().item() on every step.  64 matches CachedTensorDataset's
+    # max_moves_per_sample; any position with more legal moves is safely
+    # clamped (impossible in standard Dama — max legal moves is ~20).
+    _LOSS_PAD_SIZE = 64
 
     def _compute_loss(
         self,
@@ -1299,8 +1367,15 @@ class Trainer:
         """
         batch_size = move_counts.shape[0]
         counts = move_counts.long()
-        max_moves = int(counts.max().item())
-        if max_moves == 0:
+
+        # Use fixed pad size to avoid counts.max().item() CUDA sync every step.
+        # -inf padding slots get zero probability from log_softmax, so over-padding
+        # is harmless (just a small allocation overhead: batch_size * 64 floats).
+        max_moves = self._LOSS_PAD_SIZE
+
+        # Fast check: if total moves is zero, return zero loss (no sync needed —
+        # scores.shape[0] is determined before the GPU kernel, by the collate).
+        if scores.shape[0] == 0:
             return scores.sum() * 0
 
         # Build scatter indices without a Python loop.
@@ -1314,6 +1389,9 @@ class Trainer:
             - exclusive_cumsum[row_idx]
         )                                                      # (total_moves,)
 
+        # Clamp col_idx to pad size (safety — should never trigger in practice)
+        col_idx = col_idx.clamp(max=max_moves - 1)
+
         # Scatter scores into a padded matrix; -inf for unused (padding) slots.
         # float32 for numerical stability regardless of AMP dtype.
         padded = torch.full(
@@ -1326,8 +1404,9 @@ class Trainer:
         # Set those rows to 0 so softmax gives uniform output — their weight (w=0)
         # ensures they never contribute to the loss regardless.
         no_moves = counts == 0
-        if no_moves.any():
-            padded[no_moves] = 0.0
+        padded = torch.where(
+            no_moves.unsqueeze(1).expand_as(padded), torch.zeros_like(padded), padded
+        )
 
         # log_softmax handles numerical stability internally; -inf pads → 0 prob.
         log_probs = torch.nn.functional.log_softmax(padded, dim=1)  # (batch_size, max_moves)
@@ -1346,9 +1425,9 @@ class Trainer:
         else:
             w = valid.float()
 
-        total_weight = w.sum()
-        if total_weight == 0:
-            return scores.sum() * 0
+        # Avoid sync from `if total_weight == 0` — use max(sum, 1) instead.
+        # When all weights are zero the numerator is also zero, so result = 0.
+        total_weight = w.sum().clamp(min=1.0)
 
         return -(chosen_log_probs * w).sum() / total_weight
 
@@ -1367,6 +1446,10 @@ class Trainer:
         print(f"Reward mode: {self.config.reward_mode}")
         if self.config.reward_mode == 'cycle':
             print("  (Odd epochs use scoring, even epochs use uniform weights)")
+        accum = self.config.gradient_accumulation_steps
+        if accum > 1:
+            effective_bs = self.config.batch_size * accum
+            print(f"Gradient accumulation: {accum} steps (effective batch size: {effective_bs})")
 
         # Set start time for stats
         if not self.stats.start_time:
@@ -1666,6 +1749,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         learning_rate=training_cfg.get('learning_rate', 3e-4),
         weight_decay=training_cfg.get('weight_decay', 1e-5),
         grad_clip_norm=training_cfg.get('grad_clip_norm'),
+        gradient_accumulation_steps=training_cfg.get('gradient_accumulation_steps', 1),
         train_steps=training_cfg.get('train_steps', 10000),
         checkpoint_every=training_cfg.get('checkpoint_every', 1000),
         reward_mode=training_cfg.get('reward_mode', 'cycle'),
@@ -1675,6 +1759,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         lr_scheduler_T0=lr_sched_cfg.get('T_0', 500),
         lr_scheduler_T_mult=lr_sched_cfg.get('T_mult', 2),
         lr_scheduler_eta_min=lr_sched_cfg.get('eta_min', 1e-5),
+        lr_warmup_steps=lr_sched_cfg.get('warmup_steps', 0),
         # Value head / TD learning
         value_head_enabled=value_head_cfg.get('enabled', False),
         value_head_hidden=value_head_cfg.get('hidden_size', 128),
@@ -1766,6 +1851,8 @@ def main():
     parser.add_argument('--reward-mode', type=str, default='cycle',
                        choices=['scoring', 'none', 'cycle'],
                        help='Reward scoring mode: scoring (always use), none (never use), cycle (alternate epochs)')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
+                       help='Gradient accumulation steps (effective batch = batch_size * N)')
 
     # DataLoader settings
     parser.add_argument('--dataloader-workers', type=int, default=4,
@@ -1812,6 +1899,7 @@ def main():
             'learning_rate': 'learning_rate',
             'weight_decay': 'weight_decay',
             'grad_clip_norm': 'grad_clip_norm',
+            'gradient_accumulation_steps': 'gradient_accumulation_steps',
             'train_steps': 'train_steps',
             'checkpoint_every': 'checkpoint_every',
             'reward_mode': 'reward_mode',
@@ -1918,6 +2006,7 @@ def main():
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             train_steps=args.train_steps,
             checkpoint_every=args.checkpoint_every,
             reward_mode=args.reward_mode,
