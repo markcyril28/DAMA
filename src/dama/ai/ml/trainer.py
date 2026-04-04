@@ -46,18 +46,20 @@ try:
     import torch._inductor.config as inductor_config
     inductor_config.triton.cudagraph_skip_dynamic_graphs = True
     inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
-    # Silence the "skipping cudagraphs" info messages
+    # Silence inductor/dynamo info and warning messages
     import logging
-    logging.getLogger("torch._inductor.compile_fx").setLevel(logging.WARNING)
-    logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
+    logging.getLogger("torch._inductor.compile_fx").setLevel(logging.ERROR)
+    logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
+    logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 except (ImportError, AttributeError):
     pass  # Older PyTorch versions may not have this config
 
-# Suppress torch.compile inductor warnings
+# Suppress torch.compile inductor warnings and pynvml deprecation
 warnings.filterwarnings('ignore', message='.*TensorFloat32.*')
 warnings.filterwarnings('ignore', message='.*max_autotune_gemm.*')
 warnings.filterwarnings('ignore', message='.*CUDAGraph.*dynamic shapes.*')
 warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
+warnings.filterwarnings('ignore', message='.*pynvml package is deprecated.*')
 
 from .model import MoveScorerNet, create_model, save_model, load_model
 from .replay import ReplayBuffer
@@ -578,6 +580,8 @@ class Trainer:
             _wc = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
 
             # Stage 1: try fused forward+loss compilation
+            # Use a timeout to prevent hangs on GPUs with insufficient SMs
+            _compile_timeout = 300  # 5 minutes max for compile warmup
             try:
                 print(f"Enabling torch.compile for fused forward+loss "
                       f"(mode={self.config.compile_mode}, fullgraph=True)...")
@@ -588,12 +592,28 @@ class Trainer:
                 sys.stdout.flush()
                 _wt = torch.zeros(_warmup_bs, dtype=torch.long, device=self.device)
                 _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
-                with torch.no_grad():
-                    if self.config.amp:
-                        with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                            self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
-                    else:
-                        self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+
+                _warmup_exc = [None]
+                def _run_fused_warmup():
+                    try:
+                        with torch.no_grad():
+                            if self.config.amp:
+                                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                    self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                            else:
+                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                    except Exception as exc:
+                        _warmup_exc[0] = exc
+
+                _t = threading.Thread(target=_run_fused_warmup, daemon=True)
+                _t.start()
+                _t.join(timeout=_compile_timeout)
+                if _t.is_alive():
+                    raise TimeoutError(
+                        f"compile warmup exceeded {_compile_timeout}s timeout")
+                if _warmup_exc[0] is not None:
+                    raise _warmup_exc[0]
+
                 del _wt, _wr
                 print("torch.compile warmup OK — compiled fused forward+loss active")
                 sys.stdout.flush()
@@ -612,14 +632,30 @@ class Trainer:
                     # not the 3D padded tensor. Flatten to match the expected shape.
                     _total_moves = int(_wc.sum().item())
                     _wm_flat = torch.randn(_total_moves, _wm.shape[-1], device=self.device)
-                    with torch.no_grad():
-                        if self.config.amp:
-                            with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                                compiled_model.forward_padded(_wb, _wm, _wc)
-                                compiled_model(_wb, _wm_flat, _wc)
-                        else:
-                            compiled_model.forward_padded(_wb, _wm, _wc)
-                            compiled_model(_wb, _wm_flat, _wc)
+
+                    _warmup_exc2 = [None]
+                    def _run_model_warmup():
+                        try:
+                            with torch.no_grad():
+                                if self.config.amp:
+                                    with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                        compiled_model.forward_padded(_wb, _wm, _wc)
+                                        compiled_model(_wb, _wm_flat, _wc)
+                                else:
+                                    compiled_model.forward_padded(_wb, _wm, _wc)
+                                    compiled_model(_wb, _wm_flat, _wc)
+                        except Exception as exc:
+                            _warmup_exc2[0] = exc
+
+                    _t2 = threading.Thread(target=_run_model_warmup, daemon=True)
+                    _t2.start()
+                    _t2.join(timeout=_compile_timeout)
+                    if _t2.is_alive():
+                        raise TimeoutError(
+                            f"compile warmup exceeded {_compile_timeout}s timeout")
+                    if _warmup_exc2[0] is not None:
+                        raise _warmup_exc2[0]
+
                     del _wm_flat
                     self.model = compiled_model
                     print("torch.compile warmup OK — compiled model active (loss uncompiled)")
@@ -1255,14 +1291,15 @@ class Trainer:
             try:
                 with ProcessPoolExecutor(max_workers=effective_workers) as executor:
                     futures = [executor.submit(_play_games_batch_worker_algo, b) for b in ava_batches]
+                    # O(1) future→batch lookup
+                    future_to_batch = {f: i for i, f in enumerate(futures)}
                     for future in _as_completed(futures):
                         try:
                             entries_data = future.result(timeout=300 * ava_batch_size)
-                            from .replay import ReplayEntry
-                            ava_entries = [ReplayEntry.from_dict(d) for d in entries_data]
-                            self.replay_buffer.add_entries(ava_entries)
-                            entries += len(ava_entries)
-                            batch_idx = futures.index(future)
+                            # Write dicts directly — skip ReplayEntry round-trip
+                            self.replay_buffer.add_entry_dicts(entries_data)
+                            entries += len(entries_data)
+                            batch_idx = future_to_batch[future]
                             completed_total += len(ava_batches[batch_idx])
                             if callback:
                                 callback(completed_total, grand_total)
@@ -1274,10 +1311,9 @@ class Trainer:
                 for task_a in ava_task_args:
                     try:
                         entries_data = _play_game_worker_algo_vs_algo(task_a)
-                        from .replay import ReplayEntry
-                        ava_entries = [ReplayEntry.from_dict(d) for d in entries_data]
-                        self.replay_buffer.add_entries(ava_entries)
-                        entries += len(ava_entries)
+                        # Write dicts directly
+                        self.replay_buffer.add_entry_dicts(entries_data)
+                        entries += len(entries_data)
                         completed_total += 1
                         if callback:
                             callback(completed_total, grand_total)
