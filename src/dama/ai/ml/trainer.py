@@ -416,6 +416,9 @@ class Trainer:
             value_head_hidden=config.value_head_hidden,
         )
         self.model.to(self.device)
+        # NHWC memory format for conv weights — cuDNN selects faster kernels
+        if self.device.type == 'cuda':
+            self.model = self.model.to(memory_format=torch.channels_last)
 
         # Use fused AdamW for faster training on CUDA (PyTorch 2.0+)
         use_fused = config.device == 'cuda' and hasattr(optim.AdamW, 'fused')
@@ -815,6 +818,8 @@ class Trainer:
             value_head_hidden=self.config.value_head_hidden,
         )
         self.model.to(self.device)
+        if self.device.type == 'cuda':
+            self.model = self.model.to(memory_format=torch.channels_last)
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.config.learning_rate,

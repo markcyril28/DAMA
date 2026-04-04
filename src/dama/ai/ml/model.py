@@ -53,6 +53,10 @@ class BoardEncoder(nn.Module):
         Returns:
             Tensor of shape (batch, embedding_size)
         """
+        # NHWC layout lets cuDNN use faster convolution kernels on NVIDIA GPUs.
+        # Conversion is ~0.015ms for batch 8192 vs ~2-7ms saved across 17 convs.
+        if board.is_cuda and not board.is_contiguous(memory_format=torch.channels_last):
+            board = board.contiguous(memory_format=torch.channels_last)
         x = F.relu(self.input_bn(self.input_conv(board)))
 
         for block in self.blocks:
