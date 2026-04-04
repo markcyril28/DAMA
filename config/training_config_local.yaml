@@ -37,10 +37,10 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 11                       # 11 of 12 cores = 92%. GPU training barely uses CPU
-                                        # (compiled fwd+loss, GPU-resident data). 1 core suffices
+  cpu_workers: 10                       # 10 of 12 cores. GPU training barely uses CPU
+                                        # (compiled fwd+loss, GPU-resident data). 2 core suffices
                                         # for GPU driver + training thread.
-  games_per_epoch: 200                  # Was 20. Generates ~10,800 entries/epoch at avg 54 moves/game.
+  games_per_epoch: 100                  # 
   difficulties:
     - "easy"
     - "medium"
