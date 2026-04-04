@@ -46,7 +46,7 @@ selfplay:
   difficulties:                       # List of difficulties to cycle through
     - "easy"
     - "medium"
-    - "hard"
+    #- "hard"
   focus_side: "both"                  # "white", "black", or "both"
   opponent_focus: "both"              # "ml", "algorithm", or "both"
   noise_prob: 0.20                    # Probability of random move for exploration
