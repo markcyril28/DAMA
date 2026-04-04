@@ -22,6 +22,7 @@ device:
   compile:
     enabled: true                     # Enable torch.compile for faster training
     mode: "reduce-overhead"           # "default", "reduce-overhead", "max-autotune"
+                                      # forward_padded uses fixed-size ops → fullgraph=True + CUDAGraphs
   matmul_precision: "medium"          # "highest", "high", "medium" - medium enables TF32
 
 # -----------------------------------------------------------------------------
@@ -119,10 +120,10 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true                       # Enhanced stats collection (JSON + CSV exports)
-  record_every: 50                    # Record loss/gradients every N steps (lower = more CUDA syncs)
+  record_every: 100                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
   system_every: 500                   # Record GPU/CPU/RAM metrics every N steps
   model_health_every: 2000            # Record parameter norms every N steps
-  score_dist_every: 50                # Record score distribution every N steps
+  score_dist_every: 100               # Record score distribution every N steps
   buffer_size: 50000                  # Ring buffer size
   flush_every: 5000                   # Flush incremental stats every N steps
   output_dir: "logs/stats"            # Export directory
