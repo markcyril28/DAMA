@@ -206,23 +206,105 @@ def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
 
 
 # ---------------------------------------------------------------------------
-# Fork-optimized preprocessing: zero-serialization input path
+# Fork-optimized preprocessing: zero-serialization I/O
 # ---------------------------------------------------------------------------
 # On Linux with fork start method, child processes inherit the parent's
 # memory via copy-on-write.  We store the entries list in a module global
 # and send only (start, end) index ranges to workers — no to_dict()
 # conversion, no pickle of entry data.  Workers read entries directly from
-# the inherited list.  Output arrays are still pickled back (numpy arrays
-# serialize as raw bytes, which is fast).
+# the inherited list.
+#
+# Output uses multiprocessing.shared_memory: the parent pre-allocates
+# SharedMemory blocks for all output arrays, workers write directly to
+# their slices, and the parent wraps the result as numpy arrays with zero
+# copy.  This eliminates:
+#   - pickle serialization of output arrays (~120MB per chunk)
+#   - np.concatenate across chunks (~2GB memcpy for 600K entries)
+#   - peak 2× memory (worker arrays + concatenated arrays → 1× shared)
 # ---------------------------------------------------------------------------
 _fork_entries: Optional[list] = None
 _fork_max_moves: int = 64
 
+# Shared-memory output globals (set by parent before forking)
+_fork_shm_names: Optional[dict] = None  # {'boards': name, 'move_features': name, ...}
+_fork_shm_shapes: Optional[dict] = None  # shapes for each array
+_fork_total_n: int = 0  # total dataset size
+
+
+def _preprocess_chunk_fork_shm(args: Tuple[int, int]) -> None:
+    """Worker that reads from fork-inherited global and writes to shared memory.
+
+    Zero input serialization (fork-inherited entries) AND zero output
+    serialization (writes directly to SharedMemory).  Returns nothing —
+    parent reads from the same shared memory after workers finish.
+    """
+    from multiprocessing.shared_memory import SharedMemory as _SHM
+
+    start_idx, end_idx = args
+    entries = _fork_entries
+    max_moves_per_sample = _fork_max_moves
+    n = end_idx - start_idx
+    total_n = _fork_total_n
+    names = _fork_shm_names
+
+    # Attach to parent's shared memory blocks and create numpy views
+    shm_boards = _SHM(name=names['boards'], create=False)
+    shm_mf = _SHM(name=names['move_features'], create=False)
+    shm_mc = _SHM(name=names['move_counts'], create=False)
+    shm_tgt = _SHM(name=names['targets'], create=False)
+    shm_rw = _SHM(name=names['reward_weights'], create=False)
+    shm_vt = _SHM(name=names['value_targets'], create=False)
+
+    boards = np.ndarray((total_n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)
+    all_mf = np.ndarray((total_n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)
+    move_counts = np.ndarray(total_n, dtype=np.int64, buffer=shm_mc.buf)
+    targets = np.ndarray(total_n, dtype=np.int64, buffer=shm_tgt.buf)
+    reward_weights = np.ndarray(total_n, dtype=np.float32, buffer=shm_rw.buf)
+    value_targets = np.ndarray(total_n, dtype=np.float32, buffer=shm_vt.buf)
+
+    # Slice views for this worker's chunk (writes go directly to shared memory)
+    b_slice = boards[start_idx:end_idx]
+    mf_slice = all_mf[start_idx:end_idx]
+    mc_slice = move_counts[start_idx:end_idx]
+    tgt_slice = targets[start_idx:end_idx]
+    vt_slice = value_targets[start_idx:end_idx]
+
+    scores_arr = np.zeros(n, dtype=np.float32)
+
+    if _HAS_CYTHON:
+        _cy_preprocess_chunk(
+            entries, start_idx, end_idx, max_moves_per_sample,
+            b_slice, mf_slice, mc_slice, tgt_slice, scores_arr, vt_slice,
+        )
+    else:
+        for i in range(n):
+            entry = entries[start_idx + i]
+            state_dict = entry.state
+            _encode_board_fast(state_dict, b_slice[i])
+
+            num_moves = _encode_moves_fast(state_dict, entry.legal_moves, mf_slice[i])
+
+            mc_slice[i] = num_moves
+            chosen_idx = entry.chosen_index
+            tgt_slice[i] = min(chosen_idx, num_moves - 1) if num_moves > 0 else 0
+            scores_arr[i] = entry.score
+            vt_slice[i] = float(entry.result)
+
+    reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
+
+    # Close (detach) shared memory handles — parent still owns them
+    shm_boards.close()
+    shm_mf.close()
+    shm_mc.close()
+    shm_tgt.close()
+    shm_rw.close()
+    shm_vt.close()
+
 
 def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Worker that reads entries from fork-inherited global (zero input serialization).
+    """Legacy fork worker — returns arrays via pickle.
 
-    Uses Cython-accelerated encoding when available (~6-7x faster per entry).
+    Kept as fallback when SharedMemory is unavailable (e.g., older Python).
     """
     start_idx, end_idx = args
     entries = _fork_entries
@@ -238,7 +320,6 @@ def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarra
     scores_arr = np.zeros(n, dtype=np.float32)
 
     if _HAS_CYTHON:
-        # Single Cython call processes the entire chunk — minimal Python overhead.
         _cy_preprocess_chunk(
             entries, start_idx, end_idx, max_moves_per_sample,
             boards, all_move_features, move_counts, targets, scores_arr, value_targets,
@@ -260,7 +341,6 @@ def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarra
             scores_arr[i] = entry.score
             value_targets[i] = float(entry.result)
 
-    # Vectorized reward weight computation — single numpy call for the whole chunk.
     reward_weights[:] = compute_reward_weights_batch(scores_arr)
 
     return boards, all_move_features, move_counts, targets, reward_weights, value_targets
@@ -302,49 +382,134 @@ def preprocess_entries_to_tensors(
             torch.empty(0, dtype=torch.float32),
         )
 
-    # Parallelize for large datasets (>5K entries) where IPC cost is amortized.
-    # Scale workers with core count: cap at 48 on high-core servers (128+ cores),
-    # 16 on typical desktops. Beyond ~48 workers, pickle serialization of numpy
-    # arrays and process startup overhead dominate over compute gains.
+    # Parallelize for large datasets where IPC cost is amortized.
+    # Scale workers with core count, tiered caps to avoid IPC bottlenecks:
+    #   128+ cores → 48 workers, 48+ → 24, else → 16.
+    # Beyond ~48 workers, pickle serialization and scheduling overhead
+    # dominate over compute gains.
     _cores = os.cpu_count() or 1
-    _worker_cap = 48 if _cores >= 64 else 16
+    _worker_cap = 48 if _cores >= 96 else (24 if _cores >= 48 else 16)
     num_workers = max(1, min(_worker_cap, _cores // 2))
-    use_parallel = n >= 5000 and num_workers > 1
+
+    # Fork path (Linux) has near-zero serialization cost — lower threshold.
+    # Spawn path (Windows/macOS) has pickle overhead — keep higher threshold.
+    import multiprocessing as _mp
+    _use_fork = False
+    try:
+        _use_fork = _mp.get_start_method() == 'fork'
+    except RuntimeError:
+        pass
+    _parallel_threshold = 2000 if _use_fork else 5000
+    use_parallel = n >= _parallel_threshold and num_workers > 1
 
     if use_parallel:
+        # Ensure minimum chunk size (500) to avoid tiny chunks when n is
+        # barely above threshold and num_workers is high.
+        _MIN_CHUNK = 500
+        chunk_size = max(_MIN_CHUNK, (n + num_workers - 1) // num_workers)
+        # Reduce worker count if chunks are large enough to need fewer workers
+        num_workers = min(num_workers, (n + chunk_size - 1) // chunk_size)
+
         if show_progress:
             print(f"  Pre-processing {n} entries with {num_workers} workers...")
 
-        # Detect fork start method: workers inherit parent memory via COW,
-        # so we can pass index ranges instead of serializing all entry data.
-        import multiprocessing as _mp
-        _use_fork = False
-        try:
-            _use_fork = _mp.get_start_method() == 'fork'
-        except RuntimeError:
-            pass
-
         if _use_fork:
-            # Fork path: zero input serialization — workers read from inherited global.
-            global _fork_entries, _fork_max_moves
+            # Fork path: zero input AND output serialization via SharedMemory.
+            # Workers read entries from inherited global, write to pre-allocated
+            # shared memory blocks.  No pickle, no concatenate.
+            global _fork_entries, _fork_max_moves, _fork_shm_names, _fork_total_n
             _fork_entries = entries
             _fork_max_moves = max_moves_per_sample
+            _fork_total_n = n
 
-            chunk_size = (n + num_workers - 1) // num_workers
             args = [
                 (start, min(start + chunk_size, n))
                 for start in range(0, n, chunk_size)
             ]
 
-            with ProcessPoolExecutor(max_workers=num_workers) as pool:
-                results = list(pool.map(_preprocess_chunk_fork, args))
+            _shm_ok = True
+            try:
+                from multiprocessing.shared_memory import SharedMemory as _SHM
+            except ImportError:
+                _shm_ok = False
+            _shm_tensors = False  # set True if shm path produces tensors directly
+
+            if _shm_ok:
+                # Pre-allocate shared memory for all output arrays
+                _boards_sz = n * BOARD_PLANES * 8 * 8 * 4  # float32
+                _mf_sz = n * max_moves_per_sample * MOVE_FEATURE_SIZE * 4
+                _mc_sz = n * 8  # int64
+                _tgt_sz = n * 8
+                _rw_sz = n * 4  # float32
+                _vt_sz = n * 4
+
+                shm_list = []
+                try:
+                    shm_boards = _SHM(create=True, size=max(1, _boards_sz))
+                    shm_mf = _SHM(create=True, size=max(1, _mf_sz))
+                    shm_mc = _SHM(create=True, size=max(1, _mc_sz))
+                    shm_tgt = _SHM(create=True, size=max(1, _tgt_sz))
+                    shm_rw = _SHM(create=True, size=max(1, _rw_sz))
+                    shm_vt = _SHM(create=True, size=max(1, _vt_sz))
+                    shm_list = [shm_boards, shm_mf, shm_mc, shm_tgt, shm_rw, shm_vt]
+
+                    _fork_shm_names = {
+                        'boards': shm_boards.name,
+                        'move_features': shm_mf.name,
+                        'move_counts': shm_mc.name,
+                        'targets': shm_tgt.name,
+                        'reward_weights': shm_rw.name,
+                        'value_targets': shm_vt.name,
+                    }
+
+                    # Workers write directly to shared memory — return nothing
+                    with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                        list(pool.map(_preprocess_chunk_fork_shm, args))
+
+                    # Create torch tensors from shared memory views, then clone
+                    # to own memory.  clone() is one copy (shm → tensor); the
+                    # alternative (np.copy + from_numpy) would be two copies
+                    # (shm → numpy copy → tensor share).
+                    boards = torch.from_numpy(np.ndarray((n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)).clone()
+                    all_move_features = torch.from_numpy(np.ndarray((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)).clone()
+                    move_counts = torch.from_numpy(np.ndarray(n, dtype=np.int64, buffer=shm_mc.buf)).clone()
+                    targets = torch.from_numpy(np.ndarray(n, dtype=np.int64, buffer=shm_tgt.buf)).clone()
+                    reward_weights = torch.from_numpy(np.ndarray(n, dtype=np.float32, buffer=shm_rw.buf)).clone()
+                    value_targets = torch.from_numpy(np.ndarray(n, dtype=np.float32, buffer=shm_vt.buf)).clone()
+                    # Mark as using shm path — skip from_numpy below
+                    _shm_tensors = True
+
+                except Exception as e:
+                    # SharedMemory failed — fall back to legacy fork path
+                    if show_progress:
+                        print(f"  SharedMemory failed ({e}), using legacy fork path...")
+                    _shm_ok = False
+                finally:
+                    _fork_shm_names = None
+                    for shm in shm_list:
+                        try:
+                            shm.close()
+                            shm.unlink()
+                        except Exception:
+                            pass
+
+            if not _shm_ok:
+                # Legacy fork path: workers return arrays via pickle
+                with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                    results = list(pool.map(_preprocess_chunk_fork, args))
+
+                boards = np.concatenate([r[0] for r in results], axis=0)
+                all_move_features = np.concatenate([r[1] for r in results], axis=0)
+                move_counts = np.concatenate([r[2] for r in results])
+                targets = np.concatenate([r[3] for r in results])
+                reward_weights = np.concatenate([r[4] for r in results])
+                value_targets = np.concatenate([r[5] for r in results])
 
             _fork_entries = None  # Release reference
         else:
             # Spawn path: serialize entries to dicts for pickling across processes.
             entry_dicts = [e.to_dict() for e in entries]
 
-            chunk_size = (n + num_workers - 1) // num_workers
             chunks = []
             for start in range(0, n, chunk_size):
                 chunk = entry_dicts[start:start + chunk_size]
@@ -353,17 +518,19 @@ def preprocess_entries_to_tensors(
             with ProcessPoolExecutor(max_workers=num_workers) as pool:
                 results = list(pool.map(_preprocess_chunk, chunks))
 
-        # Concatenate all chunks
-        boards = np.concatenate([r[0] for r in results], axis=0)
-        all_move_features = np.concatenate([r[1] for r in results], axis=0)
-        move_counts = np.concatenate([r[2] for r in results])
-        targets = np.concatenate([r[3] for r in results])
-        reward_weights = np.concatenate([r[4] for r in results])
-        value_targets = np.concatenate([r[5] for r in results])
+            boards = np.concatenate([r[0] for r in results], axis=0)
+            all_move_features = np.concatenate([r[1] for r in results], axis=0)
+            move_counts = np.concatenate([r[2] for r in results])
+            targets = np.concatenate([r[3] for r in results])
+            reward_weights = np.concatenate([r[4] for r in results])
+            value_targets = np.concatenate([r[5] for r in results])
 
         if show_progress:
             print(f"  Pre-processing complete: {n} entries")
 
+        # shm path already produced torch tensors; numpy paths need conversion
+        if _use_fork and _shm_tensors:
+            return (boards, all_move_features, move_counts, targets, reward_weights, value_targets)
         return (
             torch.from_numpy(boards),
             torch.from_numpy(all_move_features),
@@ -513,6 +680,9 @@ class CachedTensorDataset(Dataset):
         from_entries() requires when the caller already has dicts (e.g.
         incremental self-play updates).  Uses _preprocess_chunk which
         natively accepts dicts.
+
+        For large batches (>5000 dicts), parallelizes across CPU cores
+        using ProcessPoolExecutor with chunk splitting.
         """
         n = len(entry_dicts)
         if n == 0:
@@ -525,10 +695,40 @@ class CachedTensorDataset(Dataset):
                 torch.empty(0, dtype=torch.float32),
             )
 
-        if show_progress:
-            print(f"  Pre-processing {n} dicts (direct path)...")
-        boards, mf, mc, tgt, rw, vt = _preprocess_chunk(
-            (entry_dicts, max_moves_per_sample))
+        # For large dict batches, parallelize using the chunk-based path.
+        # Each chunk is a slice of the dicts list — workers process independently.
+        # Threshold is higher than fork path (5000 vs 2000) because dict chunks
+        # must be pickled across processes (no fork-inherited globals for raw dicts).
+        _PARALLEL_THRESHOLD = 5000
+        if n >= _PARALLEL_THRESHOLD:
+            _cores = os.cpu_count() or 1
+            num_workers = max(1, min(16, _cores // 2))
+            _MIN_CHUNK = 500
+            chunk_size = max(_MIN_CHUNK, (n + num_workers - 1) // num_workers)
+            num_workers = min(num_workers, (n + chunk_size - 1) // chunk_size)
+
+            if show_progress:
+                print(f"  Pre-processing {n} dicts with {num_workers} workers...")
+
+            chunks = [
+                (entry_dicts[i:i + chunk_size], max_moves_per_sample)
+                for i in range(0, n, chunk_size)
+            ]
+            with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                results = list(pool.map(_preprocess_chunk, chunks))
+
+            boards = np.concatenate([r[0] for r in results], axis=0)
+            mf = np.concatenate([r[1] for r in results], axis=0)
+            mc = np.concatenate([r[2] for r in results])
+            tgt = np.concatenate([r[3] for r in results])
+            rw = np.concatenate([r[4] for r in results])
+            vt = np.concatenate([r[5] for r in results])
+        else:
+            if show_progress:
+                print(f"  Pre-processing {n} dicts (direct path)...")
+            boards, mf, mc, tgt, rw, vt = _preprocess_chunk(
+                (entry_dicts, max_moves_per_sample))
+
         if show_progress:
             print(f"  Pre-processing complete: {n} entries")
         return cls(
@@ -604,77 +804,6 @@ class CachedTensorDataset(Dataset):
         )
 
 
-def collate_cached_batch(
-    batch: List[Tuple[torch.Tensor, torch.Tensor, int, int, float, float]]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Collate function for CachedTensorDataset.
-    
-    Handles variable-length move features by using the pre-padded tensors.
-    
-    Returns:
-    - boards: (batch_size, BOARD_PLANES, 8, 8)
-    - all_move_features: (total_moves, MOVE_FEATURE_SIZE) - flattened
-    - move_counts: (batch_size,) - number of moves per sample
-    - targets: (batch_size,) - index of chosen move for each sample
-    - reward_weights: (batch_size,) - reward-based weights for loss
-    - value_targets: (batch_size,) - game result for value head
-    """
-    boards = []
-    all_move_features = []
-    move_counts = []
-    targets = []
-    reward_weights = []
-    value_targets = []
-    
-    for board, move_feats, move_count, target, rw, vt in batch:
-        boards.append(board)
-        # Only take the valid moves (up to move_count)
-        all_move_features.append(move_feats[:move_count])
-        move_counts.append(move_count)
-        targets.append(target)
-        reward_weights.append(rw)
-        value_targets.append(vt)
-    
-    return (
-        torch.stack(boards),
-        torch.cat(all_move_features, dim=0).contiguous(),
-        torch.tensor(move_counts, dtype=torch.long),
-        torch.tensor(targets, dtype=torch.long),
-        torch.tensor(reward_weights, dtype=torch.float32),
-        torch.tensor(value_targets, dtype=torch.float32),
-    )
-
-
-def collate_padded_batch(
-    batch: List[Tuple[torch.Tensor, torch.Tensor, int, int, float, float]]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fast collate for padded training path.
-
-    Keeps move_features at (batch, max_moves, MOVE_FEATURE_SIZE) instead of
-    flattening to (total_moves, MOVE_FEATURE_SIZE). Eliminates per-sample
-    slicing and torch.cat, enabling forward_padded in the model.
-
-    Returns:
-    - boards: (batch_size, BOARD_PLANES, 8, 8)
-    - move_features: (batch_size, max_moves, MOVE_FEATURE_SIZE) padded
-    - move_counts: (batch_size,)
-    - targets: (batch_size,)
-    - reward_weights: (batch_size,)
-    - value_targets: (batch_size,)
-    """
-    boards, move_feats, move_counts, targets, rws, vts = zip(*batch)
-    return (
-        torch.stack(boards),
-        torch.stack(move_feats),
-        torch.tensor(move_counts, dtype=torch.long),
-        torch.tensor(targets, dtype=torch.long),
-        torch.tensor(rws, dtype=torch.float32),
-        torch.tensor(vts, dtype=torch.float32),
-    )
-
-
 class CUDAPrefetcher:
     """Prefetches next batch to GPU in a separate CUDA stream.
 
@@ -736,8 +865,7 @@ class FastBatchIterator:
     are pinned so that CUDAPrefetcher's ``non_blocking=True`` transfers
     are truly asynchronous.
 
-    Yields the same 6-tuple as collate_padded_batch so the training loop
-    works unchanged:
+    Yields a 6-tuple so the training loop works unchanged:
       (boards, move_features, move_counts, targets, reward_weights, value_targets)
 
     Exposes a `.dataset` attribute for compatibility with trainer code that
@@ -777,7 +905,10 @@ class FastBatchIterator:
             # headroom is for activations + gradients which scale with batch_size.
             # 55% leaves ample room for batch_size up to 32K on 64GB GPUs.
             if dataset_bytes < available * 0.55:
-                self._boards = dataset.boards.to(device)
+                # Store boards in channels_last (NHWC) format — cuDNN selects
+                # faster convolution kernels and BoardEncoder.forward() skips
+                # its per-batch is_contiguous check + conversion.
+                self._boards = dataset.boards.to(device, memory_format=torch.channels_last)
                 self._move_features = dataset.move_features.to(device)
                 self._move_counts = dataset.move_counts.to(device)
                 self._targets = dataset.targets.to(device)
@@ -786,7 +917,7 @@ class FastBatchIterator:
                 self.on_gpu = True
                 self._device = device
                 print(f"  GPU-resident dataset: {dataset_bytes / 1e6:.0f}MB on GPU "
-                      f"({available / 1e6:.0f}MB available)")
+                      f"({available / 1e6:.0f}MB available, boards=channels_last)")
             else:
                 print(f"  Dataset too large for GPU cache ({dataset_bytes / 1e6:.0f}MB, "
                       f"{available / 1e6:.0f}MB available) — using CPU+pin")
@@ -1016,63 +1147,6 @@ def create_dataloader(
         persistent_workers=use_persistent,
         prefetch_factor=prefetch,
         drop_last=len(entries) > batch_size,
-    )
-
-
-def create_cached_dataloader(
-    entries: List[ReplayEntry],
-    batch_size: int = 64,
-    shuffle: bool = True,
-    num_workers: int = 2,
-    pin_memory: bool = True,
-    cache_path: Optional[str] = None,
-) -> DataLoader:
-    """
-    Create a DataLoader with forced RAM caching.
-    
-    This function always pre-processes data into tensors, regardless of
-    available RAM. Use when you know you have sufficient memory.
-    
-    Args:
-        entries: List of replay entries
-        batch_size: Batch size
-        shuffle: Whether to shuffle data
-        num_workers: Number of worker processes (reduced automatically)
-        pin_memory: Whether to pin memory
-        cache_path: Optional path to save/load cached tensors
-    
-    Returns:
-        DataLoader instance
-    """
-    # Try to load from cache first
-    if cache_path and Path(cache_path).exists():
-        print(f"Loading cached dataset from {cache_path}")
-        cached_dataset = CachedTensorDataset.load(cache_path)
-    else:
-        print("Pre-processing entries to tensors (forced RAM caching)...")
-        cached_dataset = CachedTensorDataset.from_entries(
-            entries,
-            max_moves_per_sample=64,
-            show_progress=True,
-        )
-        
-        # Save cache if path provided
-        if cache_path:
-            cached_dataset.save(cache_path)
-    
-    # Collate still does variable-length slicing — 4 workers keeps GPU fed
-    effective_workers = min(num_workers, 4)
-
-    return DataLoader(
-        cached_dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=effective_workers,
-        collate_fn=collate_cached_batch,
-        pin_memory=pin_memory and effective_workers > 0,
-        persistent_workers=effective_workers > 0,
-        prefetch_factor=3 if effective_workers > 0 else None,
-        drop_last=len(cached_dataset) > batch_size,
     )
 
 

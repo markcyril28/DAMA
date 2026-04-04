@@ -47,6 +47,7 @@ def play_single_game(
     device=None,
     p1_difficulty: str = None,
     p2_difficulty: str = None,
+    return_dicts: bool = False,
 ) -> GameRecord:
     """
     Play a single self-play game using the algorithmic AI as teacher.
@@ -122,14 +123,24 @@ def play_single_game(
         if chosen_move.is_capture:
             player_captures[state.current_player] += chosen_move.num_captures
 
-        # Record the position
-        entry = ReplayEntry(
-            state=state.to_compact(),
-            legal_moves=[m.to_dict() for m in legal_moves],
-            chosen_index=chosen_index,
-            result=0,  # Will be filled after game ends
-            score=0.0,  # Will be filled by scoring system
-        )
+        # Record the position — build dicts directly when return_dicts=True
+        # to skip ReplayEntry construction + to_dict() roundtrip
+        if return_dicts:
+            entry = {
+                'state': state.to_compact(),
+                'legal_moves': [m.to_dict() for m in legal_moves],
+                'chosen_index': chosen_index,
+                'result': 0,
+                'score': 0.0,
+            }
+        else:
+            entry = ReplayEntry(
+                state=state.to_compact(),
+                legal_moves=[m.to_dict() for m in legal_moves],
+                chosen_index=chosen_index,
+                result=0,  # Will be filled after game ends
+                score=0.0,  # Will be filled by scoring system
+            )
         entries.append(entry)
 
         # Apply the move
@@ -139,29 +150,48 @@ def play_single_game(
     # Determine winner
     winner = state.winner()
 
-    # Update results from each player's perspective
-    for i, entry in enumerate(entries):
-        turn = entry.state['turn']
-        player = Player(turn)
+    if return_dicts:
+        # Dict path — update results and score via dict-native scoring
+        winner_int = int(winner) if winner is not None else 0
+        for entry in entries:
+            turn = entry['state']['turn']
+            if winner is None:
+                entry['result'] = 0
+            elif turn == winner_int:
+                entry['result'] = 1
+            else:
+                entry['result'] = -1
+        score_game_dicts(
+            entry_dicts=entries,
+            winner_int=winner_int,
+            total_moves=move_count,
+            max_moves=max_moves,
+            final_state_dict=state.to_compact(),
+            p1_captures=player_captures[Player.ONE],
+            p2_captures=player_captures[Player.TWO],
+        )
+        return entries  # Return list of dicts directly
+    else:
+        # ReplayEntry path — original behavior
+        for i, entry in enumerate(entries):
+            turn = entry.state['turn']
+            player = Player(turn)
+            if winner is None:
+                entry.result = 0
+            elif winner == player:
+                entry.result = 1
+            else:
+                entry.result = -1
 
-        if winner is None:
-            entry.result = 0  # Draw
-        elif winner == player:
-            entry.result = 1  # Win
-        else:
-            entry.result = -1  # Loss
-
-    # Compute detailed scores using the scoring system
-    score_game_entries(
-        entries=entries,
-        winner=winner,
-        total_moves=move_count,
-        max_moves=max_moves,
-        final_state=state,
-        player_captures=player_captures,
-    )
-
-    return GameRecord(entries=entries, winner=winner, num_moves=move_count)
+        score_game_entries(
+            entries=entries,
+            winner=winner,
+            total_moves=move_count,
+            max_moves=max_moves,
+            final_state=state,
+            player_captures=player_captures,
+        )
+        return GameRecord(entries=entries, winner=winner, num_moves=move_count)
 
 
 def _play_game_worker_cy(args: Tuple[str, int, float, int]) -> List[dict]:
@@ -235,17 +265,22 @@ def _play_games_batch_worker(batch_args: list) -> List[dict]:
 
 
 def _play_games_batch_worker_full(batch_args: list) -> List[dict]:
-    """Batched worker for ML-policy games."""
+    """Batched worker for ML-policy games.
+
+    Uses return_dicts=True to skip ReplayEntry construction + to_dict()
+    roundtrip — builds dicts directly in the game loop.
+    """
     all_entries = []
     for (difficulty, max_moves, noise_prob, start_player,
          p1_policy, p2_policy, model_path, _device) in batch_args:
-        record = play_single_game(
+        entry_dicts = play_single_game(
             difficulty=difficulty, max_moves=max_moves,
             noise_prob=noise_prob, start_player=start_player,
             p1_policy=p1_policy, p2_policy=p2_policy,
             model_path=model_path, device='cpu',
+            return_dicts=True,
         )
-        all_entries.extend(e.to_dict() for e in record.entries)
+        all_entries.extend(entry_dicts)
     return all_entries
 
 
@@ -258,7 +293,7 @@ def _play_game_worker_full(
     """
     (difficulty, max_moves, noise_prob, start_player, p1_policy,
      p2_policy, model_path, _device) = args
-    record = play_single_game(
+    return play_single_game(
         difficulty=difficulty,
         max_moves=max_moves,
         noise_prob=noise_prob,
@@ -266,9 +301,9 @@ def _play_game_worker_full(
         p1_policy=p1_policy,
         p2_policy=p2_policy,
         model_path=model_path,
-        device='cpu',  # Force CPU in worker processes
+        device='cpu',
+        return_dicts=True,
     )
-    return [e.to_dict() for e in record.entries]
 
 
 def _play_game_worker_algo_vs_algo_cy(

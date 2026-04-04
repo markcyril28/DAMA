@@ -71,8 +71,8 @@ warnings.filterwarnings('ignore', message='.*pynvml package is deprecated.*')
 from .model import MoveScorerNet, create_model, save_model, load_model
 from .replay import ReplayBuffer
 from .selfplay import (
-    SelfPlayRunner, _play_game_worker_algo_vs_algo,
-    _play_games_batch_worker_algo,
+    _play_game_worker_algo_vs_algo,
+    _play_games_batch_worker_algo, _play_games_batch_worker_full,
 )
 from .dataset import (
     create_dataloader, create_dataloader_from_dataset, prepare_training_data,
@@ -273,7 +273,6 @@ class TrainingConfig:
     selfplay_opponent_focus: str = 'both'  # ml, algorithm, both
     selfplay_noise_prob: float = 0.1  # Probability of random move for exploration
     selfplay_max_moves: int = 200  # Maximum moves per game
-    selfplay_every: int = 5000  # Run self-play data refresh every N steps
     pipeline_mode: str = 'simultaneous'  # 'simultaneous' or 'alternate'
 
     # Algo-vs-algo data generation (pure algorithmic games as training data)
@@ -549,7 +548,6 @@ class Trainer:
                 'selfplay_difficulties': config.selfplay_difficulties,
                 'selfplay_noise_prob': config.selfplay_noise_prob,
                 'selfplay_max_moves': config.selfplay_max_moves,
-                'selfplay_every': config.selfplay_every,
                 'pipeline_mode': config.pipeline_mode,
                 'algo_vs_algo_enabled': config.algo_vs_algo_enabled,
                 'algo_vs_algo_games': config.algo_vs_algo_games,
@@ -1162,188 +1160,169 @@ class Trainer:
             'step': self.step,
         }, temp_model_path)
 
-        completed_total = 0
-
-        def make_progress(base: int):
-            def _progress(completed, _total):
-                overall = base + completed
-                if callback:
-                    callback(overall, grand_total)
-                if overall % 50 == 0:
-                    print(f"  Games: {overall}/{grand_total}")
-            return _progress
-
         entries = 0
+        completed_total = 0
         difficulties = self.config.selfplay_difficulties or ['medium']
-        num_difficulties = len(difficulties)
-
-        def get_difficulty_for_batch(batch_idx: int) -> str:
-            """Cycle through difficulties for each batch of games."""
-            diff = difficulties[batch_idx % num_difficulties]
-            # 'self' means ML self-play, use 'medium' as base difficulty
-            return 'medium' if diff == 'self' else diff
-
-        def is_self_play_batch(batch_idx: int) -> bool:
-            """Check if this batch should be ML self-play."""
-            return difficulties[batch_idx % num_difficulties] == 'self'
 
         # Log difficulties being used
         print(f"  Cycling through difficulties: {difficulties}")
 
+        # ==================================================================
+        # Build ALL task arguments upfront, then submit to ONE executor.
+        # Previous approach created 4-6+ sequential ProcessPoolExecutors
+        # (one per SelfPlayRunner + one for algo-vs-algo). Unified pool:
+        #   - eliminates repeated process creation/teardown overhead
+        #   - allows ML and algo games to run concurrently
+        #   - better CPU utilization (no idle gaps between phases)
+        # ==================================================================
+
+        from itertools import combinations_with_replacement
+        from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed
+
+        _max_moves = self.config.selfplay_max_moves
+        _noise_prob = self.config.selfplay_noise_prob
+        _model_path_str = str(temp_model_path)
+
+        # --- ML task args: (diff, max_moves, noise, start, p1_pol, p2_pol, model_path, device) ---
+        all_ml_tasks = []
+
         if ml_self_games > 0:
-            # For ML self-play, use medium difficulty as base
-            runner = SelfPlayRunner(
-                replay_buffer=self.replay_buffer,
-                num_workers=self.config.cpu_workers,
-                difficulty='medium',
-                max_moves=self.config.selfplay_max_moves,
-                noise_prob=self.config.selfplay_noise_prob,
-                p1_policy='ml',
-                p2_policy='ml',
-                model_path=str(temp_model_path),
-                device=self.device,
-            )
-            entries += runner.run_games(ml_self_games, callback=make_progress(completed_total),
-                                       collect_dicts=collect_dicts)
-            if collect_dicts and hasattr(runner, 'collected_dicts'):
-                _collected.extend(runner.collected_dicts)
-            completed_total += ml_self_games
+            for g in range(ml_self_games):
+                start = 1 if g % 2 == 0 else 2
+                all_ml_tasks.append((
+                    'medium', _max_moves, _noise_prob, start,
+                    'ml', 'ml', _model_path_str, self.device,
+                ))
 
         if vs_algo_games > 0:
             if side_focus == 'white':
-                ml_as_p1 = vs_algo_games
-                ml_as_p2 = 0
+                ml_as_p1, ml_as_p2 = vs_algo_games, 0
             elif side_focus == 'black':
-                ml_as_p1 = 0
-                ml_as_p2 = vs_algo_games
+                ml_as_p1, ml_as_p2 = 0, vs_algo_games
             else:
                 ml_as_p1 = vs_algo_games // 2
                 ml_as_p2 = vs_algo_games - ml_as_p1
 
-            # Split games across difficulties (excluding 'self' which is handled separately)
-            algo_difficulties = [d for d in difficulties if d != 'self']
-            if not algo_difficulties:
-                algo_difficulties = ['medium']
+            algo_difficulties = [d for d in difficulties if d != 'self'] or ['medium']
 
-            if ml_as_p1 > 0:
-                games_per_diff = ml_as_p1 // len(algo_difficulties)
-                remainder = ml_as_p1 % len(algo_difficulties)
-
+            for side_count, p1_pol, p2_pol in [
+                (ml_as_p1, 'ml', 'algorithmic'),
+                (ml_as_p2, 'algorithmic', 'ml'),
+            ]:
+                if side_count <= 0:
+                    continue
+                gpd = side_count // len(algo_difficulties)
+                rem = side_count % len(algo_difficulties)
                 for i, diff in enumerate(algo_difficulties):
-                    games_this_diff = games_per_diff + (1 if i < remainder else 0)
-                    if games_this_diff > 0:
-                        runner = SelfPlayRunner(
-                            replay_buffer=self.replay_buffer,
-                            num_workers=self.config.cpu_workers,
-                            difficulty=diff,
-                            max_moves=self.config.selfplay_max_moves,
-                            noise_prob=self.config.selfplay_noise_prob,
-                            p1_policy='ml',
-                            p2_policy='algorithmic',
-                            model_path=str(temp_model_path),
-                            device=self.device,
-                        )
-                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total),
-                                                   collect_dicts=collect_dicts)
-                        if collect_dicts and hasattr(runner, 'collected_dicts'):
-                            _collected.extend(runner.collected_dicts)
-                        completed_total += games_this_diff
+                    n = gpd + (1 if i < rem else 0)
+                    for g in range(n):
+                        start = 1 if g % 2 == 0 else 2
+                        all_ml_tasks.append((
+                            diff, _max_moves, _noise_prob, start,
+                            p1_pol, p2_pol, _model_path_str, self.device,
+                        ))
 
-            if ml_as_p2 > 0:
-                games_per_diff = ml_as_p2 // len(algo_difficulties)
-                remainder = ml_as_p2 % len(algo_difficulties)
+        random.shuffle(all_ml_tasks)
 
-                for i, diff in enumerate(algo_difficulties):
-                    games_this_diff = games_per_diff + (1 if i < remainder else 0)
-                    if games_this_diff > 0:
-                        runner = SelfPlayRunner(
-                            replay_buffer=self.replay_buffer,
-                            num_workers=self.config.cpu_workers,
-                            difficulty=diff,
-                            max_moves=self.config.selfplay_max_moves,
-                            noise_prob=self.config.selfplay_noise_prob,
-                            p1_policy='algorithmic',
-                            p2_policy='ml',
-                            model_path=str(temp_model_path),
-                            device=self.device,
-                        )
-                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total),
-                                                   collect_dicts=collect_dicts)
-                        if collect_dicts and hasattr(runner, 'collected_dicts'):
-                            _collected.extend(runner.collected_dicts)
-                        completed_total += games_this_diff
+        # --- Algo-vs-algo task args: (p1_diff, p2_diff, max_moves, noise, start) ---
+        all_algo_tasks = []
 
-        # --- Algo-vs-algo games (pure algorithmic, no ML model needed) ---
         if algo_vs_algo_games > 0:
-            from itertools import combinations_with_replacement
-            from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed
-
             ava_diffs = self.config.algo_vs_algo_difficulties or ['medium']
-            # Generate all matchup pairs (including same-difficulty mirrors)
             matchups = list(combinations_with_replacement(ava_diffs, 2))
-            games_per_matchup = algo_vs_algo_games // len(matchups)
-            remainder = algo_vs_algo_games % len(matchups)
+            gpmu = algo_vs_algo_games // len(matchups)
+            rem = algo_vs_algo_games % len(matchups)
 
             print(f"  Algo-vs-algo: {algo_vs_algo_games} games across matchups {matchups}")
 
-            # Build task args: (p1_diff, p2_diff, max_moves, noise_prob, start_player)
-            ava_task_args = []
             for idx, (d1, d2) in enumerate(matchups):
-                n = games_per_matchup + (1 if idx < remainder else 0)
+                n = gpmu + (1 if idx < rem else 0)
                 for g in range(n):
-                    start = 1 if g % 2 == 0 else 2  # Player.ONE=1, Player.TWO=2
-                    ava_task_args.append((
-                        d1, d2,
-                        self.config.selfplay_max_moves,
-                        self.config.selfplay_noise_prob,
-                        start,
-                    ))
-            random.shuffle(ava_task_args)
+                    start = 1 if g % 2 == 0 else 2
+                    all_algo_tasks.append((d1, d2, _max_moves, _noise_prob, start))
 
-            effective_workers = min(self.config.cpu_workers, 8) if platform.system() == 'Windows' else self.config.cpu_workers
+            random.shuffle(all_algo_tasks)
 
-            # Batch games per worker to reduce IPC overhead
-            ava_batch_size = max(1, (len(ava_task_args) + effective_workers - 1) // effective_workers)
-            ava_batches = [
-                ava_task_args[i:i + ava_batch_size]
-                for i in range(0, len(ava_task_args), ava_batch_size)
-            ]
-            try:
-                with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                    futures = [executor.submit(_play_games_batch_worker_algo, b) for b in ava_batches]
-                    # O(1) future→batch lookup
-                    future_to_batch = {f: i for i, f in enumerate(futures)}
-                    for future in _as_completed(futures):
-                        try:
-                            entries_data = future.result(timeout=300 * ava_batch_size)
-                            # Write dicts directly — skip ReplayEntry round-trip
-                            self.replay_buffer.add_entry_dicts(entries_data)
-                            entries += len(entries_data)
-                            if _collected is not None:
-                                _collected.extend(entries_data)
-                            batch_idx = future_to_batch[future]
-                            completed_total += len(ava_batches[batch_idx])
-                            if callback:
-                                callback(completed_total, grand_total)
-                            print(f"  Games: {completed_total}/{grand_total}")
-                        except Exception as e:
-                            print(f"Algo-vs-algo error: {e}")
-            except Exception as e:
-                print(f"Algo-vs-algo parallel failed ({e}), falling back to sequential")
-                for task_a in ava_task_args:
+        # --- Batch tasks for the unified pool ---
+        effective_workers = (
+            min(self.config.cpu_workers, 8)
+            if platform.system() == 'Windows'
+            else self.config.cpu_workers
+        )
+
+        # Cap per-batch game count for finer-grained load balancing.
+        # Without a cap, 3600 algo games / 10 workers = 360 per batch — one slow
+        # batch (e.g., heavy on hard matchups) starves other workers.  Cap at 50
+        # games gives 72 batches; workers pick up the next batch as each finishes,
+        # naturally balancing fast and slow matchups.
+        _ALGO_BATCH_CAP = 50
+        _ML_BATCH_CAP = 10  # ML games are slower — smaller batches for balance
+
+        def _make_batches(tasks, cap):
+            # Target ~1 batch per worker, but cap per batch for load balancing
+            if not tasks:
+                return []
+            bs = max(1, min(cap, (len(tasks) + effective_workers - 1) // effective_workers))
+            return [tasks[i:i + bs] for i in range(0, len(tasks), bs)]
+
+        ml_batches = _make_batches(all_ml_tasks, _ML_BATCH_CAP)
+        algo_batches = _make_batches(all_algo_tasks, _ALGO_BATCH_CAP)
+
+        total_batches = len(ml_batches) + len(algo_batches)
+        if ml_batches:
+            print(f"  ML games: {len(all_ml_tasks)} in {len(ml_batches)} batches")
+        if algo_batches:
+            print(f"  Algo games: {len(all_algo_tasks)} in {len(algo_batches)} batches")
+        print(f"  Unified pool: {effective_workers} workers, {total_batches} batches")
+        sys.stdout.flush()
+
+        # --- Open one replay file for the entire self-play cycle ---
+        self.replay_buffer.start_new_file()
+
+        # --- Submit ALL to one ProcessPoolExecutor ---
+        try:
+            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                # future → (task_type, num_games_in_batch)
+                future_meta = {}
+                for batch in ml_batches:
+                    f = executor.submit(_play_games_batch_worker_full, batch)
+                    future_meta[f] = ('ml', len(batch))
+                for batch in algo_batches:
+                    f = executor.submit(_play_games_batch_worker_algo, batch)
+                    future_meta[f] = ('algo', len(batch))
+
+                for future in _as_completed(future_meta):
+                    task_type, batch_game_count = future_meta[future]
                     try:
-                        entries_data = _play_game_worker_algo_vs_algo(task_a)
-                        # Write dicts directly
+                        entries_data = future.result(timeout=600)
                         self.replay_buffer.add_entry_dicts(entries_data)
                         entries += len(entries_data)
                         if _collected is not None:
                             _collected.extend(entries_data)
-                        completed_total += 1
+                        completed_total += batch_game_count
                         if callback:
                             callback(completed_total, grand_total)
+                        if completed_total % 100 == 0 or completed_total == grand_total:
+                            print(f"  Games: {completed_total}/{grand_total}")
                     except Exception as e:
-                        print(f"Algo-vs-algo error: {e}")
+                        print(f"Self-play error ({task_type}): {e}")
+        except Exception as e:
+            print(f"Unified pool failed ({e}), falling back to sequential")
+            # Sequential fallback for algo-vs-algo only (ML fallback is rarely needed)
+            for task_a in all_algo_tasks:
+                try:
+                    entries_data = _play_game_worker_algo_vs_algo(task_a)
+                    self.replay_buffer.add_entry_dicts(entries_data)
+                    entries += len(entries_data)
+                    if _collected is not None:
+                        _collected.extend(entries_data)
+                    completed_total += 1
+                    if callback:
+                        callback(completed_total, grand_total)
+                except Exception as e:
+                    print(f"Sequential fallback error: {e}")
 
+        self.replay_buffer.close()
         print(f"Generated {entries} training entries")
 
         # Store collected dicts for incremental preprocessing
@@ -2539,7 +2518,6 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         selfplay_difficulties=selfplay_cfg.get('difficulties', ['medium']),
         selfplay_noise_prob=selfplay_cfg.get('noise_prob', 0.1),
         selfplay_max_moves=selfplay_cfg.get('max_moves_per_game', 200),
-        selfplay_every=selfplay_cfg.get('selfplay_every', 5000),
         pipeline_mode=selfplay_cfg.get('pipeline_mode', 'simultaneous'),
         # Algo-vs-algo settings
         algo_vs_algo_enabled=algo_vs_algo_cfg.get('enabled', False),

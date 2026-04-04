@@ -55,6 +55,8 @@ def get_model(model_path: str, device: Optional[torch.device] = None) -> MoveSco
     """
     global _model_cache
 
+    if isinstance(device, str):
+        device = torch.device(device)
     if device is None:
         if torch.cuda.is_available():
             device = torch.device('cuda')
@@ -121,7 +123,7 @@ def get_ml_move(
     move_tensor = torch.from_numpy(encode_moves(state, moves))
 
     # Move to device (skip no-op .to() when already on CPU)
-    if device is None:
+    if device is None or isinstance(device, str):
         device = next(model.parameters()).device
     if device.type != 'cpu':
         board_tensor = board_tensor.to(device)
@@ -167,7 +169,7 @@ def get_move_scores(
     move_tensor = torch.from_numpy(encode_moves(state, moves))
 
     # Move to device (skip no-op .to() when already on CPU)
-    if device is None:
+    if device is None or isinstance(device, str):
         device = next(model.parameters()).device
     if device.type != 'cpu':
         board_tensor = board_tensor.to(device)
