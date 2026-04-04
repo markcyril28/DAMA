@@ -77,7 +77,12 @@ def play_single_game(
             except Exception:
                 pass
             return random.choice(legal_moves)
-        chosen = get_best_move(state, player_diff)
+        # use_parallel=False: self-play already parallelizes at the game level
+        # via ProcessPoolExecutor. Creating threads per move per worker causes
+        # massive oversubscription (N_workers × CPU_COUNT threads).
+        # With Cython fast search, this is moot (runs in C, single-threaded),
+        # but the flag prevents thread storms if falling back to Python search.
+        chosen = get_best_move(state, player_diff, use_parallel=False)
         if chosen is None:
             return random.choice(legal_moves)
         return chosen
