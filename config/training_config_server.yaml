@@ -136,10 +136,8 @@ selfplay:
                                       # for training. Gains ~135 steps per 6h session (+16%).
                                       # 512 × ~41 moves = ~21K new positions per cycle.
                                       # Dataset already has 561K positions (105 replay files).
-  selfplay_every: 500                 # Refresh every 500 steps.
-                                      # At 20s/step → ~167 min of training between refreshes.
-                                      # Total cycle: 167 min train + 45 min self-play = 212 min.
-                                      # 6h session → ~1.7 complete cycles → ~945 training steps.
+                                      # In simultaneous mode, self-play runs continuously in background.
+                                      # GPU trains on existing data while CPU generates fresh data.
   difficulties:                       # Train against medium difficulty only.
     - "medium"                        #   Medium: 0.8s/move, depth 5 — optimal learning signal.
     # - "super_hard"                  #   5.0s/move, depth 12 — enable when model beats hard

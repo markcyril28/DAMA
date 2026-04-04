@@ -62,8 +62,6 @@ selfplay:
   games_per_epoch: 200                  # [Part 2] Doubled from 100. More ML-vs-algo data per cycle.
                                         # 200 games x ~42 moves = ~8.4K entries/cycle from ML games.
                                         # With algo-vs-algo, total ~57K entries/cycle.
-  selfplay_every: 5000                  # Explicit — matches trainer default. In alternate mode,
-                                        # self-play runs every epoch regardless, but set for clarity.
   difficulties:
     - "easy"
     - "medium"
@@ -90,11 +88,10 @@ selfplay:
                                         # 900 algo + 200 ML = ~82% algo. Better balance.
                                         # ~48K algo entries + ~8.4K ML entries = ~57K per cycle.
                                         # Cython fast path: ~3ms/easy, ~378ms/hard. Total ~60s.
-    difficulties:
-      - "easy"
-      - "medium"
+    difficulties:                     # Exclude super_hard — matches selfplay decision.
+      - "easy"                        # super_hard ~1s/move even with Cython TT,
+      - "medium"                      # causes 60% longer cycles (pass 8 analysis).
       - "hard"
-      - "super_hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters

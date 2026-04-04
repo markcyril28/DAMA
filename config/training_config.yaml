@@ -62,10 +62,9 @@ selfplay:
     enabled: true                     # Include algo-vs-algo games in training data
     games_per_epoch: 200              # Additional games per self-play epoch
     difficulties:                     # Difficulties to combine into matchup pairs
-      - "easy"
-      - "medium"
-      - "hard"
-      - "super_hard"
+      - "easy"                        # Exclude super_hard: ~60% longer cycles per
+      - "medium"                      # pass 8 analysis (39min → 15min on local hw).
+      - "hard"                        # Re-enable for server only when needed.
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters

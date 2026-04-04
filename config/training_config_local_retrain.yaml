@@ -33,7 +33,7 @@ device:
   compile:
     enabled: true                       # SM-count guard in trainer.py auto-downgrades
                                         # to mode='default' on small GPUs (RTX 5050).
-                                        # Shapes are fixed (batch=8192, board=5x8x8,
+                                        # Shapes are fixed (batch=16384, board=5x8x8,
                                         # moves=64x8) so no recompilation churn.
   matmul_precision: "medium"            # TF32 enabled
 
@@ -57,7 +57,7 @@ model:
 # algo_vs_algo provides high-quality baseline data from day one.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                      # 10 of 12 cores for self-play workers
+  cpu_workers: 10                     # 10 of 12 cores for self-play workers
   games_per_epoch: 100                  # ML-vs-algo games per cycle.
                                         # 100 games x ~40 moves = ~4K entries/cycle.
   difficulties:
@@ -70,7 +70,7 @@ selfplay:
   noise_prob: 0.20                      # Higher noise for fresh model — more
                                         # exploration of the move space early on.
   max_moves_per_game: 150               # Allow endgame play
-  pipeline_mode: "simultaneous"         # Overlaps CPU self-play with GPU training.
+  pipeline_mode: "simultaneous"       # Overlaps CPU self-play with GPU training.
                                         # Trainer auto-generates initial data if
                                         # replay buffer has < batch_size*10 entries.
 
@@ -79,22 +79,25 @@ selfplay:
     games_per_epoch: 3600               # Cython fast path: ~3ms/easy, ~378ms/hard.
                                         # Fills replay buffer quickly with high-quality
                                         # data. ~97K entries/epoch from algo games.
-    difficulties:
-      - "easy"
-      - "medium"
-      - "hard"
-      - "super_hard"
+    difficulties:                       # Exclude super_hard — per pass 8 analysis,
+      - "easy"                          # super_hard matchups cause 60% longer cycles
+      - "medium"                        # (~39min → ~15min). Cython TT helps but
+      - "hard"                          # super_hard still ~1s/move, not worth it.
+      # - "super_hard"                   # Excluded: ~1s/move, 60% longer cycles
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 8192                      # VRAM budget: 8GB total, ~1.8GB dataset (600K),
-                                        # ~3.2GB activations (128ch/8blocks), ~0.5GB other
-                                        # = ~5.5GB peak. 2x GPU kernel utilization vs 4096.
-                                        # ~73 batches/epoch at 600K buffer.
+  batch_size: 16384                     # Doubled from 8192. VRAM budget: 8GB total,
+                                        # ~1.8GB dataset (600K, GPU-resident via 55%
+                                        # threshold), ~3.5GB activations, ~0.5GB other
+                                        # ≈ 5.8GB peak. Maximizes tensor core occupancy.
+                                        # ~36 batches/epoch at 600K buffer.
   learning_rate: 3.0e-4                 # Standard rate for fresh training with
                                         # Adam. Not too aggressive, not too slow.
+                                        # Effective batch is 32768 (grad_accum=2),
+                                        # but LR stays the same — Adam is scale-invariant.
   weight_decay: 1.0e-4                  # 10x higher than before — helps prevent
                                         # embedding magnitude explosion that caused
                                         # the original degeneration.
@@ -103,7 +106,8 @@ training:
   checkpoint_every: 1000                # More frequent saves for fresh training —
                                         # lets eval_checkpoints.sh track progress
                                         # at fine granularity.
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2        # Effective batch 32768. Doubles compute per
+                                        # optimizer step without extra VRAM peak.
 
   lr_scheduler:
     enabled: true
@@ -186,7 +190,7 @@ thermal_protection:
 # DISABLED — fresh training from random initialization.
 # -----------------------------------------------------------------------------
 resume:
-  enabled: true
+  enabled: false
   checkpoint_path: null
   skip_corrupted: true
 
@@ -195,4 +199,4 @@ resume:
 # -----------------------------------------------------------------------------
 time_limit:
   enabled: true
-  duration: "4h"
+  duration: "6h"
