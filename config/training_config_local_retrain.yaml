@@ -32,7 +32,7 @@ device:
     dtype: "float16"                    # float16 + GradScaler for RTX 5050
   compile:
     enabled: true                       # SM-count guard in trainer.py auto-downgrades
-                                        # to mode='default' on small GPUs (RTX 5050).
+    mode: "reduce-overhead"             # to mode='default' on small GPUs (RTX 5050).
                                         # Shapes are fixed (batch=7200, board=5x8x8,
                                         # moves=64x8) so no recompilation churn.
   matmul_precision: "medium"            # TF32 enabled
@@ -58,8 +58,10 @@ model:
 # -----------------------------------------------------------------------------
 selfplay:
   cpu_workers: 6                     # 6 of 12 cores for self-play workers
-  games_per_epoch: 10                  # ML-vs-algo games per cycle.
-                                        # 10 games x ~40 moves = ~400 entries/cycle.
+  games_per_epoch: 100                  # ML-vs-algo games per cycle.
+                                        # 100 games x ~40 moves = ~4K entries/cycle.
+                                        # [Part 2 fix]: 10 was 0.07% of training data —
+                                        # too little ML signal vs 576K algo entries.
   difficulties:
     - "easy"                            # Start with easy — learnable signal for
     - "medium"                          # a random model. Medium adds challenge.
@@ -76,7 +78,7 @@ selfplay:
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 14400                # Cython fast path: ~3ms/easy, ~378ms/hard.
+    games_per_epoch: 14400               # Cython fast path: ~3ms/easy, ~378ms/hard.
                                         # Fills replay buffer quickly with high-quality
                                         # data. ~97K entries/epoch from algo games.
     difficulties:                       # Exclude super_hard — per pass 8 analysis,
@@ -128,7 +130,6 @@ training:
 dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
-  prefetch_factor: 4
   replay_max_entries: 600000            # 600K entries x ~3.5KB = ~2.1GB RAM.
                                         # GPU-resident: ~1.8GB VRAM (fits in 55% threshold).
                                         # More data diversity = less overfitting on stale data.
@@ -136,7 +137,8 @@ dataloader:
 
   ram_cache:
     enabled: true
-    threshold_gb: 8.0
+    threshold_gb: 8.0                   # 32GB system — 8GB leaves headroom for
+                                        # OS + 6 self-play workers + dataloader.
     cache_file: null
 
 # -----------------------------------------------------------------------------
@@ -165,8 +167,8 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 500                     # More frequent for fresh training —
-                                        # want to catch problems early.
+  record_every: 100                     # [Part 1 fix]: 500 gave only 4 data points
+                                        # in 2K steps — too coarse for plateau diagnosis.
   system_every: 5000
   model_health_every: 2000              # Monitor embedding magnitudes closely
   score_dist_every: 500                 # Track score distributions to verify
