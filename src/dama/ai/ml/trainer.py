@@ -574,95 +574,76 @@ class Trainer:
         # Falls back to model-only compilation if fused compile fails.
         self._compiled_fwd_loss = None
         if self.config.compile_model and hasattr(torch, "compile"):
-            _warmup_bs = self.config.batch_size
-            _wb = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
-            _wm = torch.randn(_warmup_bs, 64, 8, device=self.device)
-            _wc = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
+            # Guard: skip torch.compile on GPUs with insufficient SMs.
+            # Triton's autotuner segfaults on small GPUs (e.g. RTX 5050, ~32 SMs)
+            # when reduce-overhead mode triggers max_autotune_gemm.
+            _MIN_SM_COUNT = 64  # safe threshold; MI210=104, A100=108, RTX 4090=128
+            _skip_compile = False
+            if self.device.type == 'cuda':
+                _props = torch.cuda.get_device_properties(self.device)
+                _sm_count = _props.multi_processor_count
+                if _sm_count < _MIN_SM_COUNT:
+                    print(f"Skipping torch.compile: GPU has {_sm_count} SMs "
+                          f"(need ≥{_MIN_SM_COUNT} to avoid Triton autotuner crash)")
+                    sys.stdout.flush()
+                    _skip_compile = True
 
-            # Stage 1: try fused forward+loss compilation
-            # Use a timeout to prevent hangs on GPUs with insufficient SMs
-            _compile_timeout = 300  # 5 minutes max for compile warmup
-            try:
-                print(f"Enabling torch.compile for fused forward+loss "
-                      f"(mode={self.config.compile_mode}, fullgraph=True)...")
-                sys.stdout.flush()
-                self._compiled_fwd_loss = _make_compiled_fwd_loss(
-                    self.model, self.config.compile_mode)
-                print("  Running compile warmup (fused forward+loss)...")
-                sys.stdout.flush()
-                _wt = torch.zeros(_warmup_bs, dtype=torch.long, device=self.device)
-                _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
+            if not _skip_compile:
+                _warmup_bs = self.config.batch_size
+                _wb = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
+                _wm = torch.randn(_warmup_bs, 64, 8, device=self.device)
+                _wc = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
 
-                _warmup_exc = [None]
-                def _run_fused_warmup():
+                # Stage 1: try fused forward+loss compilation
+                try:
+                    print(f"Enabling torch.compile for fused forward+loss "
+                          f"(mode={self.config.compile_mode}, fullgraph=True)...")
+                    sys.stdout.flush()
+                    self._compiled_fwd_loss = _make_compiled_fwd_loss(
+                        self.model, self.config.compile_mode)
+                    print("  Running compile warmup (fused forward+loss)...")
+                    sys.stdout.flush()
+                    _wt = torch.zeros(_warmup_bs, dtype=torch.long, device=self.device)
+                    _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
+                    with torch.no_grad():
+                        if self.config.amp:
+                            with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                        else:
+                            self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                    del _wt, _wr
+                    print("torch.compile warmup OK — compiled fused forward+loss active")
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"Fused compile failed ({e}), trying model-only compile...")
+                    sys.stdout.flush()
+                    self._compiled_fwd_loss = None
+
+                    # Stage 2: fall back to model-only compilation
                     try:
+                        compiled_model = torch.compile(
+                            self.model, mode=self.config.compile_mode, fullgraph=True)
+                        print("  Running compile warmup (model forward only)...")
+                        sys.stdout.flush()
+                        # Non-padded forward() expects 2D move_features (total_moves, feat_size),
+                        # not the 3D padded tensor. Flatten to match the expected shape.
+                        _total_moves = int(_wc.sum().item())
+                        _wm_flat = torch.randn(_total_moves, _wm.shape[-1], device=self.device)
                         with torch.no_grad():
                             if self.config.amp:
                                 with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                                    self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
-                            else:
-                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
-                    except Exception as exc:
-                        _warmup_exc[0] = exc
-
-                _t = threading.Thread(target=_run_fused_warmup, daemon=True)
-                _t.start()
-                _t.join(timeout=_compile_timeout)
-                if _t.is_alive():
-                    raise TimeoutError(
-                        f"compile warmup exceeded {_compile_timeout}s timeout")
-                if _warmup_exc[0] is not None:
-                    raise _warmup_exc[0]
-
-                del _wt, _wr
-                print("torch.compile warmup OK — compiled fused forward+loss active")
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"Fused compile failed ({e}), trying model-only compile...")
-                sys.stdout.flush()
-                self._compiled_fwd_loss = None
-
-                # Stage 2: fall back to model-only compilation
-                try:
-                    compiled_model = torch.compile(
-                        self.model, mode=self.config.compile_mode, fullgraph=True)
-                    print("  Running compile warmup (model forward only)...")
-                    sys.stdout.flush()
-                    # Non-padded forward() expects 2D move_features (total_moves, feat_size),
-                    # not the 3D padded tensor. Flatten to match the expected shape.
-                    _total_moves = int(_wc.sum().item())
-                    _wm_flat = torch.randn(_total_moves, _wm.shape[-1], device=self.device)
-
-                    _warmup_exc2 = [None]
-                    def _run_model_warmup():
-                        try:
-                            with torch.no_grad():
-                                if self.config.amp:
-                                    with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                                        compiled_model.forward_padded(_wb, _wm, _wc)
-                                        compiled_model(_wb, _wm_flat, _wc)
-                                else:
                                     compiled_model.forward_padded(_wb, _wm, _wc)
                                     compiled_model(_wb, _wm_flat, _wc)
-                        except Exception as exc:
-                            _warmup_exc2[0] = exc
-
-                    _t2 = threading.Thread(target=_run_model_warmup, daemon=True)
-                    _t2.start()
-                    _t2.join(timeout=_compile_timeout)
-                    if _t2.is_alive():
-                        raise TimeoutError(
-                            f"compile warmup exceeded {_compile_timeout}s timeout")
-                    if _warmup_exc2[0] is not None:
-                        raise _warmup_exc2[0]
-
-                    del _wm_flat
-                    self.model = compiled_model
-                    print("torch.compile warmup OK — compiled model active (loss uncompiled)")
-                    sys.stdout.flush()
-                except Exception as e2:
-                    print(f"torch.compile failed ({e2}), falling back to eager mode")
-                    sys.stdout.flush()
+                            else:
+                                compiled_model.forward_padded(_wb, _wm, _wc)
+                                compiled_model(_wb, _wm_flat, _wc)
+                        del _wm_flat
+                        self.model = compiled_model
+                        print("torch.compile warmup OK — compiled model active (loss uncompiled)")
+                        sys.stdout.flush()
+                    except Exception as e2:
+                        print(f"torch.compile failed ({e2}), falling back to eager mode")
+                        sys.stdout.flush()
 
             del _wb, _wm, _wc
             if self.device.type == 'cuda':
