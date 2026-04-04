@@ -118,9 +118,18 @@ class ReplayBuffer:
         self._session_entries.setdefault(self._current_file, []).extend(entries)
 
     def _close_current(self) -> None:
-        """Close the current file."""
+        """Close the current file and promote session entries to file cache."""
         if self._current_writer is not None:
             self._current_writer.close()
+            # Promote in-memory entries to file cache so load_all_entries()
+            # skips re-parsing the file we just wrote.
+            path = self._current_file
+            if path is not None and path in self._session_entries:
+                try:
+                    mtime = path.stat().st_mtime
+                    self._file_cache[path] = (mtime, self._session_entries.pop(path))
+                except OSError:
+                    self._session_entries.pop(path, None)
             self._current_writer = None
             self._current_file = None
 
