@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import time
+import random
 import argparse
 import tempfile
 import warnings
@@ -60,7 +61,7 @@ warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
 
 from .model import MoveScorerNet, create_model, save_model, load_model
 from .replay import ReplayBuffer
-from .selfplay import SelfPlayRunner
+from .selfplay import SelfPlayRunner, _play_game_worker_algo_vs_algo
 from .dataset import (
     create_dataloader, create_dataloader_from_dataset, prepare_training_data,
     CachedTensorDataset, CUDAPrefetcher, FastBatchIterator,
@@ -232,6 +233,12 @@ class TrainingConfig:
     selfplay_noise_prob: float = 0.1  # Probability of random move for exploration
     selfplay_max_moves: int = 200  # Maximum moves per game
     selfplay_every: int = 5000  # Run self-play data refresh every N steps
+    pipeline_mode: str = 'simultaneous'  # 'simultaneous' or 'alternate'
+
+    # Algo-vs-algo data generation (pure algorithmic games as training data)
+    algo_vs_algo_enabled: bool = False
+    algo_vs_algo_games: int = 100  # Games per self-play epoch
+    algo_vs_algo_difficulties: list = field(default_factory=lambda: ['easy', 'medium', 'hard'])
 
     # Training settings
     batch_size: int = 256
@@ -267,6 +274,9 @@ class TrainingConfig:
     # DataLoader settings
     dataloader_workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 2)))
     pin_memory: bool = True
+    ram_cache_enabled: bool = True
+    ram_cache_threshold_gb: float = 8.0
+    replay_max_entries: int = 100000  # Max entries to sample from replay buffer per epoch
 
     # Stability
     grad_clip_norm: Optional[float] = 1.0
@@ -339,13 +349,18 @@ class Trainer:
             print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
         # Set thread count for CPU operations — scale to hardware.
-        # Use ~50% of cores for intra-op parallelism (tensor ops, preprocessing).
-        # Beyond ~64 threads, contention on shared caches hurts more than it helps.
+        # Keep intra-op threads low when training on GPU: most compute is on
+        # the GPU and background self-play workers (separate processes) need
+        # the physical cores.  25% of cores is enough for CPU-side tensor ops
+        # (loss casting, collation, etc.) without starving self-play workers.
         _total_cores = os.cpu_count() or 1
-        cpu_threads = max(4, min(64, _total_cores // 2))
+        if self.device.type == 'cuda':
+            cpu_threads = max(2, min(16, _total_cores // 4))
+        else:
+            cpu_threads = max(4, min(64, _total_cores // 2))
         torch.set_num_threads(cpu_threads)
         # Inter-op threads for parallel independent ops (e.g. data loading + compute)
-        interop_threads = max(2, min(8, _total_cores // 8))
+        interop_threads = max(2, min(4, _total_cores // 16))
         try:
             torch.set_num_interop_threads(interop_threads)
         except Exception:
@@ -490,7 +505,13 @@ class Trainer:
                 'selfplay_noise_prob': config.selfplay_noise_prob,
                 'selfplay_max_moves': config.selfplay_max_moves,
                 'selfplay_every': config.selfplay_every,
+                'pipeline_mode': config.pipeline_mode,
+                'algo_vs_algo_enabled': config.algo_vs_algo_enabled,
+                'algo_vs_algo_games': config.algo_vs_algo_games,
+                'algo_vs_algo_difficulties': config.algo_vs_algo_difficulties,
                 'dataloader_workers': config.dataloader_workers,
+                'ram_cache_enabled': config.ram_cache_enabled,
+                'ram_cache_threshold_gb': config.ram_cache_threshold_gb,
                 'test_every': config.test_every,
                 'test_games': config.test_games,
                 'test_difficulty': config.test_difficulty,
@@ -512,23 +533,43 @@ class Trainer:
         if config.resume:
             self._load_checkpoint(config.resume)
 
-        # Compile after loading checkpoint to avoid state_dict key mismatch
+        # Compile after loading checkpoint to avoid state_dict key mismatch.
+        # Compilation is lazy — the real test is the first forward pass.
+        # We run a warmup here so failures are caught early and we can
+        # fall back to eager mode instead of crashing mid-training.
         if self.config.compile_model and hasattr(torch, "compile"):
             try:
                 print(f"Enabling torch.compile (mode={self.config.compile_mode}, fullgraph=True)...")
                 sys.stdout.flush()
-                # fullgraph=True: forward_padded uses only fixed-size ops (no boolean
-                # indexing), so the entire graph can be captured without breaks.
-                # This enables CUDAGraph capture for zero kernel-launch overhead.
-                self.model = torch.compile(
+                compiled_model = torch.compile(
                     self.model,
                     mode=self.config.compile_mode,
                     fullgraph=True,
                 )
-                print("torch.compile enabled - model will be compiled on first forward pass")
+                # Warmup: run a dummy forward pass to trigger actual compilation.
+                # This catches Triton/Inductor failures *before* the training loop.
+                print("  Running compile warmup (first forward pass)...")
+                sys.stdout.flush()
+                _warmup_bs = min(4, self.config.batch_size)
+                _warmup_board = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
+                _warmup_moves = torch.randn(_warmup_bs, 64, 8, device=self.device)
+                _warmup_counts = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
+                with torch.no_grad():
+                    if self.config.amp:
+                        with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                            compiled_model.forward_padded(_warmup_board, _warmup_moves, _warmup_counts)
+                    else:
+                        compiled_model.forward_padded(_warmup_board, _warmup_moves, _warmup_counts)
+                del _warmup_board, _warmup_moves, _warmup_counts
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                self.model = compiled_model
+                print("torch.compile warmup OK — compiled model active")
                 sys.stdout.flush()
             except Exception as e:
-                print(f"torch.compile unavailable: {e}")
+                print(f"torch.compile failed ({e}), falling back to eager mode")
+                sys.stdout.flush()
+                # model is still the uncompiled version — no action needed
 
     # ------------------------------------------------------------------
     # Thermal protection
@@ -932,6 +973,11 @@ class Trainer:
         opponent_focus = self.config.selfplay_opponent_focus
         side_focus = self.config.selfplay_focus_side
 
+        # Algo-vs-algo games are additional (on top of regular self-play)
+        algo_vs_algo_games = (
+            self.config.algo_vs_algo_games if self.config.algo_vs_algo_enabled else 0
+        )
+
         if opponent_focus == 'ml':
             ml_self_games = total_games
             vs_algo_games = 0
@@ -942,15 +988,19 @@ class Trainer:
             ml_self_games = total_games // 2
             vs_algo_games = total_games - ml_self_games
 
+        grand_total = total_games + algo_vs_algo_games
+
         if opponent_focus == 'ml':
             focus_desc = "ML self-play"
         elif opponent_focus == 'algorithm':
             focus_desc = "ML vs algorithm"
         else:
             focus_desc = "half ML self-play, half vs algorithm"
+        if algo_vs_algo_games > 0:
+            focus_desc += f" + {algo_vs_algo_games} algo-vs-algo"
 
         print(
-            f"\nGenerating {num_games} self-play games "
+            f"\nGenerating {grand_total} self-play games "
             f"({focus_desc}; focus side: {side_focus})..."
         )
 
@@ -968,9 +1018,9 @@ class Trainer:
             def _progress(completed, _total):
                 overall = base + completed
                 if callback:
-                    callback(overall, total_games)
+                    callback(overall, grand_total)
                 if overall % 50 == 0:
-                    print(f"  Games: {overall}/{total_games}")
+                    print(f"  Games: {overall}/{grand_total}")
             return _progress
 
         entries = 0
@@ -1064,6 +1114,66 @@ class Trainer:
                         entries += runner.run_games(games_this_diff, callback=make_progress(completed_total))
                         completed_total += games_this_diff
 
+        # --- Algo-vs-algo games (pure algorithmic, no ML model needed) ---
+        if algo_vs_algo_games > 0:
+            from itertools import combinations_with_replacement
+            from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed
+
+            ava_diffs = self.config.algo_vs_algo_difficulties
+            # Generate all matchup pairs (including same-difficulty mirrors)
+            matchups = list(combinations_with_replacement(ava_diffs, 2))
+            games_per_matchup = algo_vs_algo_games // len(matchups)
+            remainder = algo_vs_algo_games % len(matchups)
+
+            print(f"  Algo-vs-algo: {algo_vs_algo_games} games across matchups {matchups}")
+
+            # Build task args: (p1_diff, p2_diff, max_moves, noise_prob, start_player)
+            ava_task_args = []
+            for idx, (d1, d2) in enumerate(matchups):
+                n = games_per_matchup + (1 if idx < remainder else 0)
+                for g in range(n):
+                    start = 1 if g % 2 == 0 else 2  # Player.ONE=1, Player.TWO=2
+                    ava_task_args.append((
+                        d1, d2,
+                        self.config.selfplay_max_moves,
+                        self.config.selfplay_noise_prob,
+                        start,
+                    ))
+            random.shuffle(ava_task_args)
+
+            effective_workers = min(self.config.cpu_workers, 8) if platform.system() == 'Windows' else self.config.cpu_workers
+            try:
+                with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                    futures = [executor.submit(_play_game_worker_algo_vs_algo, a) for a in ava_task_args]
+                    for future in _as_completed(futures):
+                        try:
+                            entries_data = future.result(timeout=300)
+                            from .replay import ReplayEntry
+                            ava_entries = [ReplayEntry.from_dict(d) for d in entries_data]
+                            self.replay_buffer.add_entries(ava_entries)
+                            entries += len(ava_entries)
+                            completed_total += 1
+                            if callback:
+                                callback(completed_total, grand_total)
+                            if completed_total % 50 == 0:
+                                print(f"  Games: {completed_total}/{grand_total}")
+                        except Exception as e:
+                            print(f"Algo-vs-algo error: {e}")
+            except Exception as e:
+                print(f"Algo-vs-algo parallel failed ({e}), falling back to sequential")
+                for task_a in ava_task_args:
+                    try:
+                        entries_data = _play_game_worker_algo_vs_algo(task_a)
+                        from .replay import ReplayEntry
+                        ava_entries = [ReplayEntry.from_dict(d) for d in entries_data]
+                        self.replay_buffer.add_entries(ava_entries)
+                        entries += len(ava_entries)
+                        completed_total += 1
+                        if callback:
+                            callback(completed_total, grand_total)
+                    except Exception as e:
+                        print(f"Algo-vs-algo error: {e}")
+
         print(f"Generated {entries} training entries")
 
         # Record self-play stats
@@ -1072,7 +1182,7 @@ class Trainer:
             self.stats_collector.record_selfplay_epoch(
                 step=self.step,
                 epoch=self.epoch,
-                num_games=total_games,
+                num_games=grand_total,
                 num_entries=entries,
                 elapsed_sec=_selfplay_elapsed,
             )
@@ -1114,7 +1224,8 @@ class Trainer:
         def _worker():
             try:
                 self.run_selfplay(num_games)
-                train_entries, _ = prepare_training_data(self.replay_buffer)
+                train_entries, _ = prepare_training_data(
+                    self.replay_buffer, max_entries=self.config.replay_max_entries)
                 # Pre-process to tensors in background to avoid GPU idle time
                 dataset = CachedTensorDataset.from_entries(
                     train_entries, max_moves_per_sample=64, show_progress=True,
@@ -1247,7 +1358,9 @@ class Trainer:
     # Interval for expensive sanity checks (isfinite on large tensors).
     # Each check forces a CUDA sync (~20-100μs). Checking every step wastes
     # GPU pipeline throughput; periodic checks still catch numerical issues.
-    _SANITY_CHECK_INTERVAL = 100
+    # Numerical instability evolves gradually (over hundreds of steps), so
+    # checking every 500 steps catches problems well before they cascade.
+    _SANITY_CHECK_INTERVAL = 500
 
     def train_epoch(self, dataloader, use_scoring: bool = True) -> float:
         """Train for one epoch, returns average loss.
@@ -1492,11 +1605,12 @@ class Trainer:
                           if self.scheduler is not None
                           else self.config.learning_rate)
 
-            # Only call loss.item() (CUDA sync) when we actually need the scalar
+            # Only call loss.item() (CUDA sync) when we actually need the scalar.
+            # Avoid hardcoded intervals — piggyback on stats_record_every to
+            # eliminate extra CUDA sync points on the critical path.
             _need_loss_val = (
                 self.step % self.config.stats_record_every == 0
                 or self.step % self.config.checkpoint_every == 0
-                or self.step % 100 == 0
             )
             _loss_val = loss.item() if _need_loss_val else None
 
@@ -1556,14 +1670,10 @@ class Trainer:
                     'gpu_mem_mb': gpu_mem,
                 })
 
-            # Progress — avoid .item() fallback that would force a CUDA sync.
-            # Use the GPU accumulator when _loss_val wasn't already computed.
-            if self.step % 100 == 0:
-                if _loss_val is not None:
-                    _print_loss = _loss_val
-                else:
-                    _print_loss = (total_loss_acc / max(num_batches, 1)).item()
-                print(f"  Step {self.step}, Loss: {_print_loss:.4f}")
+            # Progress — print at the stats interval (which already computed .item()).
+            # Avoids extra CUDA syncs from a separate hardcoded interval.
+            if _loss_val is not None and self.step % self.config.stats_record_every == 0:
+                print(f"  Step {self.step}, Loss: {_loss_val:.4f}")
 
             if self.step >= self.config.train_steps:
                 break
@@ -1735,6 +1845,9 @@ class Trainer:
             rest_min = self.config.thermal_rest_seconds / 60
             print(f"Thermal protection: ON (limit={self.config.thermal_temp_limit_c}°C, "
                   f"rest={rest_min:.0f}m, check every {self.config.thermal_check_every}s)")
+        _simultaneous = self.config.pipeline_mode == 'simultaneous'
+        print(f"Pipeline mode: {self.config.pipeline_mode} "
+              f"({'CPU self-play overlaps GPU training' if _simultaneous else 'generate data first, then train'})")
 
         # Set start time for stats
         if not self.stats.start_time:
@@ -1748,7 +1861,8 @@ class Trainer:
 
         # Prepare data
         print("\nPreparing training data...")
-        train_entries, val_entries = prepare_training_data(self.replay_buffer)
+        train_entries, val_entries = prepare_training_data(
+            self.replay_buffer, max_entries=self.config.replay_max_entries)
         print(f"Training: {len(train_entries)}, Validation: {len(val_entries)}")
 
         if not train_entries:
@@ -1766,6 +1880,8 @@ class Trainer:
             shuffle=True,
             num_workers=effective_workers,
             pin_memory=self.config.pin_memory,
+            use_ram_cache=self.config.ram_cache_enabled,
+            ram_threshold_gb=self.config.ram_cache_threshold_gb,
             device=self.device,
         )
         _is_fast = isinstance(dataloader, FastBatchIterator)
@@ -1785,8 +1901,11 @@ class Trainer:
         last_test_step = 0
         loss = 0.0  # Initialize loss in case loop doesn't run
 
-        # Start continuous background self-play immediately so CPU is never idle
-        self._start_background_selfplay(self.config.selfplay_games // 2)
+        # Start continuous background self-play immediately so CPU is never idle.
+        # Full game count (not half) — GPU epochs are ~100x faster than self-play,
+        # so generating more data per cycle improves data freshness.
+        if _simultaneous:
+            self._start_background_selfplay(self.config.selfplay_games)
 
         while self.step < self.config.train_steps:
             if self._stopped:
@@ -1807,33 +1926,53 @@ class Trainer:
             print(f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
                   f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
 
-            # Continuous background self-play: swap data when ready, restart immediately
-            bg_entries, bg_dataset = self._collect_background_selfplay()
-            if bg_entries is not None:
-                print("Background self-play complete — refreshing DataLoader...")
-                if bg_dataset is not None:
-                    # Dataset pre-built in background — instant DataLoader creation
+            if _simultaneous:
+                # Continuous background self-play: swap data when ready, restart immediately
+                bg_entries, bg_dataset = self._collect_background_selfplay()
+                if bg_entries is not None:
+                    print("Background self-play complete — refreshing DataLoader...")
+                    if bg_dataset is not None:
+                        # Dataset pre-built in background — instant DataLoader creation
+                        dataloader = create_dataloader_from_dataset(
+                            bg_dataset,
+                            batch_size=self.config.batch_size,
+                            num_workers=effective_workers,
+                            pin_memory=self.config.pin_memory,
+                            device=self.device,
+                        )
+                        self._use_padded = True
+                    else:
+                        dataloader = create_dataloader(
+                            bg_entries,
+                            batch_size=self.config.batch_size,
+                            shuffle=True,
+                            num_workers=effective_workers,
+                            pin_memory=self.config.pin_memory,
+                            device=self.device,
+                        )
+                        self._use_padded = isinstance(dataloader, FastBatchIterator) or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
+                    _gpu_resident = getattr(dataloader, 'on_gpu', False)
+                    # Immediately start the next batch — keeps CPU busy at all times
+                    self._start_background_selfplay(self.config.selfplay_games)
+            else:
+                # Alternate mode: generate data synchronously, then rebuild dataloader
+                print("Running self-play (alternate mode)...")
+                self.run_selfplay(self.config.selfplay_games)
+                train_entries, _ = prepare_training_data(
+                    self.replay_buffer, max_entries=self.config.replay_max_entries)
+                if train_entries:
+                    dataset = CachedTensorDataset.from_entries(
+                        train_entries, max_moves_per_sample=64, show_progress=True,
+                    )
                     dataloader = create_dataloader_from_dataset(
-                        bg_dataset,
+                        dataset,
                         batch_size=self.config.batch_size,
                         num_workers=effective_workers,
                         pin_memory=self.config.pin_memory,
                         device=self.device,
                     )
                     self._use_padded = True
-                else:
-                    dataloader = create_dataloader(
-                        bg_entries,
-                        batch_size=self.config.batch_size,
-                        shuffle=True,
-                        num_workers=effective_workers,
-                        pin_memory=self.config.pin_memory,
-                        device=self.device,
-                    )
-                    self._use_padded = isinstance(dataloader, FastBatchIterator) or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
-                _gpu_resident = getattr(dataloader, 'on_gpu', False)
-                # Immediately start the next batch — keeps CPU busy at all times
-                self._start_background_selfplay(self.config.selfplay_games // 2)
+                    _gpu_resident = getattr(dataloader, 'on_gpu', False)
             
             # Periodic model testing vs algorithm
             if (self.config.test_vs_algo and 
@@ -1846,7 +1985,7 @@ class Trainer:
                     print(f"Test vs algorithm failed: {e}")
 
         # Wait for any background self-play to finish before exit
-        if self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
+        if _simultaneous and self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
             print("Waiting for background self-play to finish...")
             self._bg_selfplay_thread.join(timeout=60)
 
@@ -2011,6 +2150,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     """
     device_cfg = yaml_config.get('device', {})
     selfplay_cfg = yaml_config.get('selfplay', {})
+    algo_vs_algo_cfg = selfplay_cfg.get('algo_vs_algo', {})
     training_cfg = yaml_config.get('training', {})
     dataloader_cfg = yaml_config.get('dataloader', {})
     testing_cfg = yaml_config.get('testing', {})
@@ -2049,6 +2189,11 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         selfplay_noise_prob=selfplay_cfg.get('noise_prob', 0.1),
         selfplay_max_moves=selfplay_cfg.get('max_moves_per_game', 200),
         selfplay_every=selfplay_cfg.get('selfplay_every', 5000),
+        pipeline_mode=selfplay_cfg.get('pipeline_mode', 'simultaneous'),
+        # Algo-vs-algo settings
+        algo_vs_algo_enabled=algo_vs_algo_cfg.get('enabled', False),
+        algo_vs_algo_games=algo_vs_algo_cfg.get('games_per_epoch', 100),
+        algo_vs_algo_difficulties=algo_vs_algo_cfg.get('difficulties', ['easy', 'medium', 'hard']),
         # Training settings
         batch_size=training_cfg.get('batch_size', 256),
         learning_rate=training_cfg.get('learning_rate', 3e-4),
@@ -2072,6 +2217,9 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         # DataLoader settings
         dataloader_workers=dataloader_cfg.get('num_workers', 4),
         pin_memory=dataloader_cfg.get('pin_memory', True),
+        ram_cache_enabled=dataloader_cfg.get('ram_cache', {}).get('enabled', True),
+        ram_cache_threshold_gb=dataloader_cfg.get('ram_cache', {}).get('threshold_gb', 8.0),
+        replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
         # Testing settings
         test_vs_algo=testing_cfg.get('enabled', True),
         test_every=testing_cfg.get('every_n_steps', 5000),
@@ -2144,6 +2292,17 @@ def main():
                        help='Probability of random move for exploration (0.0 to 1.0)')
     parser.add_argument('--max-moves', type=int, default=200,
                        help='Maximum moves per game before declaring draw')
+    parser.add_argument('--pipeline-mode', type=str, default='simultaneous',
+                       choices=['simultaneous', 'alternate'],
+                       help='Pipeline mode: simultaneous (overlap CPU/GPU) or alternate (sequential)')
+
+    # Algo-vs-algo settings
+    parser.add_argument('--algo-vs-algo', action='store_true', default=False,
+                       help='Enable algo-vs-algo games as additional training data')
+    parser.add_argument('--algo-vs-algo-games', type=int, default=100,
+                       help='Number of algo-vs-algo games per self-play epoch')
+    parser.add_argument('--algo-vs-algo-difficulties', type=str, default='easy,medium,hard',
+                       help='Comma-separated difficulties for algo-vs-algo matchups')
 
     # Training settings
     parser.add_argument('--batch-size', type=int, default=256,
@@ -2219,6 +2378,7 @@ def main():
             'opponent_focus': 'selfplay_opponent_focus',
             'noise_prob': 'selfplay_noise_prob',
             'max_moves': 'selfplay_max_moves',
+            'pipeline_mode': 'pipeline_mode',
             'dataloader_workers': 'dataloader_workers',
             'test_every': 'test_every',
             'test_games': 'test_games',
@@ -2240,6 +2400,12 @@ def main():
             config.test_vs_algo = args.test_vs_algo
         if 'selfplay_difficulties' in explicit:
             config.selfplay_difficulties = [d.strip() for d in args.selfplay_difficulties.split(',')]
+        if 'algo_vs_algo' in explicit:
+            config.algo_vs_algo_enabled = args.algo_vs_algo
+        if 'algo_vs_algo_games' in explicit:
+            config.algo_vs_algo_games = args.algo_vs_algo_games
+        if 'algo_vs_algo_difficulties' in explicit:
+            config.algo_vs_algo_difficulties = [d.strip() for d in args.algo_vs_algo_difficulties.split(',')]
         if 'grad_clip_norm' in explicit:
             config.grad_clip_norm = args.grad_clip_norm if args.grad_clip_norm > 0 else None
 
@@ -2311,6 +2477,10 @@ def main():
             selfplay_difficulties=[d.strip() for d in args.selfplay_difficulties.split(',')],
             selfplay_noise_prob=args.noise_prob,
             selfplay_max_moves=args.max_moves,
+            # Algo-vs-algo settings
+            algo_vs_algo_enabled=args.algo_vs_algo,
+            algo_vs_algo_games=args.algo_vs_algo_games,
+            algo_vs_algo_difficulties=[d.strip() for d in args.algo_vs_algo_difficulties.split(',')],
             # Training settings
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
