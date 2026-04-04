@@ -186,7 +186,7 @@ thermal_protection:
 # DISABLED — fresh training from random initialization.
 # -----------------------------------------------------------------------------
 resume:
-  enabled: false
+  enabled: true
   checkpoint_path: null
   skip_corrupted: true
 
