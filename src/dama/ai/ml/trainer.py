@@ -383,19 +383,19 @@ class Trainer:
             print(f"GPU: {torch.cuda.get_device_name()}")
             print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-        # Set thread count for CPU operations — scale to hardware.
-        # Keep intra-op threads low when training on GPU: most compute is on
-        # the GPU and background self-play workers (separate processes) need
-        # the physical cores.  25% of cores is enough for CPU-side tensor ops
-        # (loss casting, collation, etc.) without starving self-play workers.
+        # Set thread count for CPU operations — minimize to free cores for self-play.
+        # With GPU training (compiled forward+loss, GPU-resident data), the training
+        # thread does almost zero CPU work. 1 thread is sufficient for the rare
+        # CPU-side tensor ops (loss casting, index creation). Every extra thread here
+        # steals a core from self-play workers that need them.
         _total_cores = os.cpu_count() or 1
         if self.device.type == 'cuda':
-            cpu_threads = max(2, min(16, _total_cores // 4))
+            cpu_threads = 1  # GPU handles all compute; 1 CPU thread for housekeeping
         else:
             cpu_threads = max(4, min(64, _total_cores // 2))
         torch.set_num_threads(cpu_threads)
         # Inter-op threads for parallel independent ops (e.g. data loading + compute)
-        interop_threads = max(2, min(4, _total_cores // 16))
+        interop_threads = 1 if self.device.type == 'cuda' else max(2, min(4, _total_cores // 16))
         try:
             torch.set_num_interop_threads(interop_threads)
         except Exception:
@@ -1086,12 +1086,24 @@ class Trainer:
         with open(self.log_file, 'a') as f:
             f.write(json.dumps(data) + '\n')
 
-    def run_selfplay(self, num_games: int, callback=None) -> int:
-        """Run self-play to generate training data."""
+    def run_selfplay(self, num_games: int, callback=None,
+                     collect_dicts: bool = False) -> int:
+        """Run self-play to generate training data.
+
+        Args:
+            num_games: Number of games to generate.
+            callback: Progress callback.
+            collect_dicts: If True, also store raw dicts in self._collected_dicts
+                for incremental preprocessing (avoids re-loading from replay).
+
+        Returns:
+            Total number of training entries generated.
+        """
         _selfplay_start = time.time()
         total_games = max(0, num_games)
         opponent_focus = self.config.selfplay_opponent_focus
         side_focus = self.config.selfplay_focus_side
+        _collected = [] if collect_dicts else None
 
         # Algo-vs-algo games are additional (on top of regular self-play)
         algo_vs_algo_games = (
@@ -1174,7 +1186,10 @@ class Trainer:
                 model_path=str(temp_model_path),
                 device=self.device,
             )
-            entries += runner.run_games(ml_self_games, callback=make_progress(completed_total))
+            entries += runner.run_games(ml_self_games, callback=make_progress(completed_total),
+                                       collect_dicts=collect_dicts)
+            if collect_dicts and hasattr(runner, 'collected_dicts'):
+                _collected.extend(runner.collected_dicts)
             completed_total += ml_self_games
 
         if vs_algo_games > 0:
@@ -1492,8 +1507,9 @@ class Trainer:
     # Each check forces a CUDA sync (~20-100μs). Checking every step wastes
     # GPU pipeline throughput; periodic checks still catch numerical issues.
     # Numerical instability evolves gradually (over hundreds of steps), so
-    # checking every 500 steps catches problems well before they cascade.
-    _SANITY_CHECK_INTERVAL = 500
+    # checking every 2000 steps catches problems well before they cascade
+    # while minimizing GPU pipeline stalls from forced CUDA syncs.
+    _SANITY_CHECK_INTERVAL = 2000
 
     def train_epoch(self, dataloader, use_scoring: bool = True) -> float:
         """Train for one epoch, returns average loss.
