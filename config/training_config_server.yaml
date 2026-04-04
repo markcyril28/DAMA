@@ -1,0 +1,293 @@
+# =============================================================================
+# Micro Training Configuration - SERVER (v5)
+# =============================================================================
+# Hardware: AMD Instinct MI210 (64GB HBM2e) + 64 CPU threads + 1TB DDR4 RAM
+# Platform: ROCm 6.x, gfx90a (CDNA2)
+#
+# Thread Allocation (64 total):
+#   - Self-play workers:   52 (~81%)  ← game generation (NOTE: GIL limits true
+#                                        parallelism; actual ~5x speedup observed)
+#   - DataLoader workers:   8 (~13%)  ← data loading
+#   - PyTorch threads:      4 ( ~6%)  ← CPU tensor ops (GPU-bound for inference)
+#
+# GPU VRAM: batch_size=32768 BF16 uses ~9.7 GB of 64 GB (model+activations+optimizer).
+# _compute_loss() is fully vectorized — 3 GPU kernels for the entire batch regardless
+# of size. Step time expected well below the old ~20s (which was Python-loop-bound).
+#
+# Usage:
+#   python -m dama.ai.ml.trainer --config config/training_config_server.yaml
+#
+# Override any setting via command line:
+#   python -m dama.ai.ml.trainer --config config/training_config_server.yaml --batch-size 512
+#
+#
+# =============================================================================
+# POST-MORTEM v4 (Mar 8–9, 2026 — steps 37,575→39,108 — 1,533 steps, 2 epochs):
+# =============================================================================
+# v4 changes (medium-only, max_moves=80, noise=10%, T_0=100, T_mult=1)
+# produced the first clear upward WR trend seen in training:
+#
+#   - Win rate IMPROVING: 15.5% (v3 end) → 16.75% (400-game reliable test).
+#     Step-by-step: 17.5% → 20.5% → 21.5% (200-game) → 16.75% (400-game).
+#     The 400-game test is reliable (±5% CI); 200-game was inflated (±7% CI).
+#   - Loss: oscillating 1.59–1.63 (no improvement). Best ever: 1.31.
+#     Loss trend doesn't predict WR. The model IS learning strategy.
+#   - Self-play blocking: ~5,400s (~90 min) per cycle. Python GIL limits
+#     parallel efficiency. 52 configured workers ≈ 5 effective workers.
+#     Each 6h session: ~810 training steps (most time lost to self-play wait).
+#   - Dataset: 105 replay files, ~561K positions. V3-era data dominates.
+#
+# DIAGNOSIS:
+#   1. LR SCHEDULER BROKEN — critical bug. LR decayed below eta_min=1e-4
+#      to 6.4e-5 and still falling. Root cause: PyTorch scheduler.load_state_dict()
+#      overwrites self.eta_min with the v3 checkpoint value (1e-5), allowing
+#      LR to continue decaying past the configured floor. Changing T_0/T_mult
+#      in config does NOT fix this when resuming — old state is restored.
+#      FIX: Disable scheduler entirely. LR stays fixed at optimizer's saved
+#      value (~6.4e-5). A code-level fix (reset optimizer LR after load_state_dict)
+#      would be ideal but requires trainer.py changes.
+#   2. Self-play overhead dominates session time. 1,024 games at ~90 min each
+#      cycle leaves only ~167 min for training in a 265-min cycle. Halving games
+#      to 512 (~45 min self-play) adds ~135 extra training steps per 6h session.
+#   3. 200-game tests too noisy (±7% CI). 400-game tests required (±5% CI).
+#      The 21.5% reading was statistical noise; true WR ≈ 16.75%.
+#   4. avg_game_length ≈ 41 moves — games end naturally before the 80-move cap.
+#      max_moves_per_game=80 is not constraining; endgame patterns ARE visible.
+#
+# CHANGES for v5:
+#   1. lr_scheduler DISABLED. Stops the runaway LR decay. LR fixed at ~6.4e-5
+#      from optimizer checkpoint. Prevents further decay toward 1e-5.
+#      FIXED (v5+): trainer now resets param_groups['lr'] to config.learning_rate
+#      after load_state_dict(), so the config value wins on every resume.
+#   2. games_per_epoch 1024 → 512: Halves self-play blocking time (~90→~45 min).
+#      Gains ~135 extra training steps per 6h session (+16% throughput).
+#      Dataset has 561K positions already; data diversity is sufficient.
+#   3. testing num_games 200 → 400: Eliminates the ±7% CI noise that caused
+#      false 21.5% reading. 400 games gives ±5% CI for reliable WR tracking.
+#   4. weight_decay 5e-5 → 1e-5: Model is underfitting (loss=1.59 vs best=1.31).
+#      Strong regularization is counterproductive; reduce further.
+#   5. noise_prob 10% → 12%: Marginal exploration increase. WR improving but
+#      model may still benefit from broader positional variety.
+#   6. checkpoint_every 500 → 1000: Training is stable; halve checkpoint I/O.
+#      At 20s/step, saves every ~5.6h. Adequate safety net.
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Time-based Stopping
+# -----------------------------------------------------------------------------
+time_limit:
+  enabled: true
+  duration: "6h"                      # 6h per session.
+
+# -----------------------------------------------------------------------------
+# Device Settings
+# -----------------------------------------------------------------------------
+device:
+  type: "cuda"                        # "cuda" maps to ROCm/HIP on AMD
+  amp:
+    enabled: true                     # ENABLED: MI210 CDNA2 has native bfloat16 ALUs
+                                      # No GradScaler needed with bfloat16. ~2x throughput.
+    dtype: "bfloat16"                 # bfloat16 — native on MI210, same exponent range as FP32
+  compile:
+    enabled: true                     # torch.compile for kernel fusion
+    mode: "max-autotune"              # "max-autotune" = maximum GPU optimization.
+                                      # Slower to compile (~5 min), but faster execution.
+                                      # Board is always 8x8, so autotuning pays off.
+                                      # option: reduce-overhead
+  matmul_precision: "medium"          # TF32-equivalent for float32 matmuls (when not using AMP)
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+# 128ch/8blk/256emb/128hid = ~4.5M params → ~18MB FP32, ~9MB BF16
+# Inference VRAM: <50MB (trivially fits in 8GB laptop).
+# Training VRAM:  ~2-3GB at batch_size=4096 with BF16 (of 64GB available).
+# Architecture is fine — the bottleneck is data quality and optimization,
+# not model capacity.
+# -----------------------------------------------------------------------------
+model:
+  channels: 128                       # CNN channels. 128 → rich feature extraction.
+  num_blocks: 8                       # Residual blocks. 8 → multi-level pattern recognition.
+  embedding_size: 256                 # Board embedding → 256-dim board representation.
+  hidden_size: 128                    # MoveScorer MLP hidden → adequate for move eval.
+
+# -----------------------------------------------------------------------------
+# Self-Play Settings
+# -----------------------------------------------------------------------------
+# Algorithm-only opponents (medium difficulty). Pure algorithmic teacher
+# provides consistent, strong moves. At 16.75% WR, ML self-play still
+# produces mostly losing games that would teach losing patterns.
+#
+# Actual timing (empirical, v4 era):
+#   512 games × 41 avg moves × ~0.26s/move / ~5 effective workers ≈ 45 min
+#   Training 500 steps × 20s/step = 167 min
+#   Total cycle: ~212 min. 6h session ≈ 1.7 cycles ≈ 945 training steps.
+# -----------------------------------------------------------------------------
+selfplay:
+  cpu_workers: 52                     # 52 of 64 threads — maximize game generation.
+  games_per_epoch: 512                # *** Reduced from 1024 ***
+                                      # Self-play blocks training for ~90 min per cycle
+                                      # (GIL limits effective parallelism to ~5 workers).
+                                      # 512 games ≈ 45 min self-play, freeing 45 min more
+                                      # for training. Gains ~135 steps per 6h session (+16%).
+                                      # 512 × ~41 moves = ~21K new positions per cycle.
+                                      # Dataset already has 561K positions (105 replay files).
+  selfplay_every: 500                 # Refresh every 500 steps.
+                                      # At 20s/step → ~167 min of training between refreshes.
+                                      # Total cycle: 167 min train + 45 min self-play = 212 min.
+                                      # 6h session → ~1.7 complete cycles → ~945 training steps.
+  difficulties:                       # Train against medium difficulty only.
+    - "medium"                        #   Medium: 0.8s/move, depth 5 — optimal learning signal.
+                                      #   v3 tried hard (depth 8) but model copied moves without
+                                      #   understanding. Medium provides consistent, learnable
+                                      #   patterns. The goal is to beat medium, not match hard.
+  focus_side: "both"                  # Train as both White and Black — essential for generalization
+  opponent_focus: "algorithm"         # *** KEY CHANGE *** 100% algorithmic opponents.
+                                      # Was "both" (50% ML self-play). At 12% WR, ML self-play
+                                      # produces losing games that teach losing patterns.
+                                      # Pure algorithmic teachers provide consistent, strong moves
+                                      # for the model to imitate.
+  noise_prob: 0.12                    # *** Increased from 10% ***
+                                      # Slight increase from 10% for broader positional variety.
+                                      # WR is improving; marginal exploration helps further.
+                                      # 88% of moves still come from the algorithmic teacher.
+  max_moves_per_game: 80              # Increased from 40 (was cutting games too short).
+                                      # Allow endgame patterns: king promotion, piece
+                                      # advantage conversion, and closing out wins.
+
+# -----------------------------------------------------------------------------
+# Training Hyperparameters
+# -----------------------------------------------------------------------------
+# Model: 4.5M params, ~9MB BF16.
+# _compute_loss() is fully vectorized — batch size no longer bottlenecks through Python.
+# batch_size=32768 uses ~9.7 GB VRAM BF16 (of 64 GB). Step time expected to drop
+# significantly vs the old ~20s/step (which was Python-loop-bound, not GPU-bound).
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 32768                   # *** Increased from 4096 ***
+                                      # _compute_loss() is now vectorized; the entire
+                                      # batch runs in 3 GPU kernel calls (scatter,
+                                      # log_softmax, gather) regardless of size.
+                                      # 8× larger batch → better GPU CU occupancy.
+                                      # VRAM at 32768 BF16: ~9.7 GB (of 64 GB).
+                                      # 32768 × ~22 batches/epoch = ~4 batches per epoch.
+  learning_rate: 2.0e-4               # *** Updated from 5.0e-4 ***
+                                      # Sqrt-scaled from previous effective LR 6.4e-5:
+                                      #   lr_new = 6.4e-5 × sqrt(32768/4096) ≈ 1.81e-4
+                                      #   rounded to 2.0e-4.
+                                      # The LR reset fix in trainer.py now ensures this
+                                      # config value is applied on every resume (previously
+                                      # the checkpoint's saved LR overrode this).
+  weight_decay: 1.0e-5                # *** Reduced from 5e-5 ***
+                                      # Model still underfitting (loss=1.59 vs best=1.31).
+                                      # Regularization is working against us; minimize it.
+  grad_clip_norm: 1.0                 # Stable with algorithm-only data (no distribution spikes).
+                                      # Allows full gradient steps for efficient learning.
+  train_steps: 100000000000           # Effectively unlimited (time_limit controls stopping)
+  checkpoint_every: 1000              # At new step speed, revisit this after first run.
+                                      # Old ~20s/step (Python-loop-bound) → saves every ~5.6h.
+                                      # New step time will be much lower (GPU-bound).
+                                      # May need to increase to 5000–10000 once benchmarked.
+
+  # Reward scoring mode for training loss weighting:
+  #   "scoring" - always use the scoring system reward weights
+  #   "none"    - never use scoring (uniform weights, classic behavior)
+  #   "cycle"   - alternate epochs: odd=scoring, even=uniform
+  reward_mode: "scoring"              # Consistent reward signal every epoch.
+                                      # Winning teacher moves get 2x weight (reward=2.0).
+                                      # Proven effective in v4 (WR improved from 14%→16.75%).
+
+  # Learning rate scheduler: DISABLED for v5.
+  #
+  # BUG (historical): PyTorch scheduler.load_state_dict() restores ALL internal
+  # attributes, including self.eta_min, from the checkpoint. The v3 checkpoint had
+  # eta_min=1e-5 (trainer default). After loading, the scheduler ignored the config's
+  # eta_min=1e-4 and allowed LR to decay through 1e-4 down to 6.4e-5.
+  # Disabling the scheduler stops this decay cold.
+  #
+  # LR is now controlled entirely by config.learning_rate (2.0e-4). The trainer
+  # was fixed to reset param_groups['lr'] after load_state_dict(), so the config
+  # value is applied on every resume regardless of checkpoint state.
+  lr_scheduler:
+    enabled: false                    # *** DISABLED — keep off until scheduler bug is resolved.
+    type: "cosine_warm_restarts"      # (Inactive — kept for reference)
+    T_0: 100
+    T_mult: 1
+    eta_min: 1.0e-4
+
+# -----------------------------------------------------------------------------
+# Value Head / TD Learning Settings
+# -----------------------------------------------------------------------------
+# Value head de-emphasized: 85% policy gradient, 15% value. The auxiliary
+# value signal helps the encoder learn positional concepts (winning/losing
+# board states) without overshadowing the move selection objective.
+# -----------------------------------------------------------------------------
+value_head:
+  enabled: true
+  hidden_size: 128                    # Hidden layer size for value MLP
+  value_weight: 0.15                  # 85% policy / 15% value gradient split.
+                                      # Proven effective in v4; keep unchanged.
+
+# -----------------------------------------------------------------------------
+# DataLoader Settings
+# -----------------------------------------------------------------------------
+# With RAM caching, I/O is trivial. Keep conservative worker count.
+# The real bottleneck is the Python per-position loop in _compute_loss().
+# -----------------------------------------------------------------------------
+dataloader:
+  num_workers: 8                      # 8 of 64 threads for data loading.
+  pin_memory: true                    # Pinned memory for faster HBM2e transfers
+  prefetch_factor: 2                  # 2 is plenty with RAM cache
+
+  # RAM Caching (1TB DDR4 available)
+  ram_cache:
+    enabled: true                     # Pre-tensorize all data in RAM
+    threshold_gb: 64.0                # 64GB threshold (dataset is ~0.2-0.6GB, 1TB avail)
+    cache_file: null                  # null = in-memory only
+
+# -----------------------------------------------------------------------------
+# Model Testing Settings (ML vs Algorithm)
+# -----------------------------------------------------------------------------
+# Test every 750 steps (~4.2h) for feedback without excessive overhead.
+# 400 games gives ±5% CI — necessary after discovering the 200-game test
+# produced an inflated 21.5% reading (true WR was 16.75% per 400-game test).
+# Each test cycle: ~18 min (400 medium games with effective ~5 workers).
+# -----------------------------------------------------------------------------
+testing:
+  enabled: true
+  every_n_steps: 750                  # Test every 750 steps. At 20s/step → ~4.2h between tests.
+  num_games: 100                      # 
+  difficulty: "medium"                # Benchmark against medium — the target to beat
+
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
+paths:
+  checkpoint_dir: "models/checkpoints"
+  latest_model: "models/latest.pt"
+  replay_dir: "data/replay"
+  log_dir: "logs"
+  stats_file: "models/training_stats.json"
+
+# -----------------------------------------------------------------------------
+# Statistics Collection
+# -----------------------------------------------------------------------------
+statistics:
+  enabled: true
+  record_every: 10                    # Loss/gradients every 10 steps
+  system_every: 300                   # GPU/CPU/RAM metrics every 300 steps
+  model_health_every: 500             # Parameter norms every 500 steps
+  score_dist_every: 50                # Score distribution every 50 steps
+  buffer_size: 100000                 # Large ring buffer — 1TB RAM is abundant
+  flush_every: 1000                   # Flush to disk every 1000 steps
+  output_dir: "logs/stats"
+
+# -----------------------------------------------------------------------------
+# Resume Settings
+# -----------------------------------------------------------------------------
+resume:
+  enabled: true                       # Auto-resume from latest valid checkpoint
+  checkpoint_path: null               # null = auto-detect latest
+  skip_corrupted: true                # Skip checkpoints with NaN/Inf
+

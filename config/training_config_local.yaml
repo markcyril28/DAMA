@@ -1,0 +1,195 @@
+# =============================================================================
+# Micro Training Configuration
+# =============================================================================
+# This is the centralized configuration file for training hyperparameters.
+# It consolidates settings from train_server.sh, local_train.sh, and trainer.py.
+#
+# Usage:
+#   python -m dama.ai.ml.trainer --config config/training_config.yaml
+#
+# Override any setting via command line:
+#   python -m dama.ai.ml.trainer --config config/training_config.yaml --batch-size 512
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Device Settings
+# -----------------------------------------------------------------------------
+device:
+  type: "cuda"                        # "cuda" (ROCm/HIP or CUDA) or "cpu"
+  amp:
+    enabled: true                     # Enable automatic mixed precision
+    dtype: "float16"                  # float16 with GradScaler for RTX 5050 (bfloat16 is for MI210)
+  compile:
+    enabled: false                    # Disabled: RTX 5050 Triton kernel compilation fails
+    mode: "reduce-overhead"           # "default", "reduce-overhead", "max-autotune"
+  matmul_precision: "medium"          # "highest", "high", "medium" - medium enables TF32
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+# Architecture params are saved in checkpoints for portable loading.
+# Changing these starts a NEW model (incompatible with existing checkpoints).
+# For 8GB VRAM laptop inference, keep total params under ~500M (<2GB FP32).
+# -----------------------------------------------------------------------------
+model:
+  channels: 128                       # CNN channels in ResidualBlocks
+  num_blocks: 8                       # Number of residual blocks
+  embedding_size: 256                 # Board embedding vector size
+  hidden_size: 128                    # MoveScorer MLP hidden layer size
+
+# -----------------------------------------------------------------------------
+# Self-Play Settings
+# -----------------------------------------------------------------------------
+selfplay:
+  cpu_workers: 10                     # 10 of 12 cores — leave 2 for dataloader + system
+  games_per_epoch: 100                # Smaller batches for faster iteration on local
+  difficulties:                       # List of difficulties to cycle through
+    - "easy"
+    - "medium"
+    - "hard"
+  focus_side: "both"                  # "white", "black", or "both"
+  opponent_focus: "both"              # "ml", "algorithm", or "both"
+  noise_prob: 0.20                    # Probability of random move for exploration
+  max_moves_per_game: 100             # Maximum moves per game
+
+# -----------------------------------------------------------------------------
+# Training Hyperparameters
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 512                     # Smaller batch — fits 8.5GB VRAM with AMP headroom
+  learning_rate: 4.0e-4               # Higher LR for smaller batch
+  weight_decay: 1.0e-5                # Weight decay for regularization
+  grad_clip_norm: 1.0                 # Gradient clipping norm (null to disable)
+  train_steps: 100000000000           # Total training steps
+  checkpoint_every: 2000              # Save checkpoint every N steps
+
+  # Reward scoring mode for training loss weighting:
+  #   "scoring" - always use the scoring system reward weights
+  #   "none"    - never use scoring (uniform weights, classic behavior)
+  #   "cycle"   - alternate epochs: odd=scoring, even=uniform (default)
+  reward_mode: "cycle"
+
+# -----------------------------------------------------------------------------
+# DataLoader Settings
+# -----------------------------------------------------------------------------
+dataloader:
+  num_workers: 2                      # With RAM caching, 2 workers suffice (just memory copies)
+  pin_memory: true                    # Pin memory for faster GPU transfer
+  prefetch_factor: 4                  # Higher prefetch to keep GPU fed
+  
+  # RAM Caching (see IMPROVEMENTS.md)
+  ram_cache:
+    enabled: true                     # Enable RAM caching for pre-tensorized data
+    threshold_gb: 16.0                # Minimum available RAM (GB) to enable caching
+    cache_file: null                  # Optional: path to save/load cached tensors (.pt)
+
+# -----------------------------------------------------------------------------
+# Model Testing Settings (ML vs Algorithm)
+# -----------------------------------------------------------------------------
+testing:
+  enabled: false                      # Enable periodic testing against algorithm
+  every_n_steps: 5000                 # Test every N training steps
+  num_games: 50                       # Number of test games per evaluation
+  difficulty: "medium"                # Algorithm difficulty for testing
+
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
+paths:
+  checkpoint_dir: "models/checkpoints"
+  latest_model: "models/latest.pt"
+  replay_dir: "data/replay"
+  log_dir: "logs"
+  stats_file: "models/training_stats.json"
+
+# -----------------------------------------------------------------------------
+# Statistics Collection (for optimization analysis)
+# -----------------------------------------------------------------------------
+statistics:
+  enabled: true                       # Enhanced stats collection (JSON + CSV exports)
+  record_every: 10                    # Record loss/gradients every N steps
+  system_every: 500                   # Record GPU/CPU/RAM metrics every N steps
+  model_health_every: 2000            # Record parameter norms every N steps
+  score_dist_every: 50                # Record score distribution every N steps
+  buffer_size: 50000                  # Ring buffer size
+  flush_every: 5000                   # Flush incremental stats every N steps
+  output_dir: "logs/stats"            # Export directory
+
+# -----------------------------------------------------------------------------
+# Resume Settings  
+# -----------------------------------------------------------------------------
+resume:
+  enabled: true                       # Enable auto-resume from latest checkpoint
+  checkpoint_path: null               # Specific checkpoint path (null = auto-detect)
+  skip_corrupted: true                # Skip checkpoints with NaN/Inf values
+
+# -----------------------------------------------------------------------------
+# Time-based Stopping
+# -----------------------------------------------------------------------------
+time_limit:
+  enabled: true
+  duration: "2h"                      # Training duration (e.g., "2h", "1d12h", "30m")
+
+# =============================================================================
+# Hardware-Specific Profiles
+# =============================================================================
+# These are example profiles for different hardware configurations.
+# Use the --profile flag to select a profile:
+#   python -m dama.ai.ml.trainer --config config/training_config.yaml --profile server
+# =============================================================================
+
+profiles:
+  # AMD MI210 Server (64GB VRAM, 128 CPU threads, 1TB RAM)
+  server:
+    device:
+      type: "cuda"
+      amp:
+        enabled: true
+        dtype: "bfloat16"
+    selfplay:
+      cpu_workers: 48
+      games_per_epoch: 2048
+    training:
+      batch_size: 1024
+      learning_rate: 1.0e-4
+    dataloader:
+      num_workers: 16
+      ram_cache:
+        enabled: true
+        threshold_gb: 64.0
+
+  # Local development (NVIDIA RTX, 8GB+ VRAM)
+  local:
+    device:
+      type: "cuda"
+      amp:
+        enabled: true
+        dtype: "float16"
+    selfplay:
+      cpu_workers: 8
+      games_per_epoch: 100
+    training:
+      batch_size: 512
+      learning_rate: 4.0e-4
+    dataloader:
+      num_workers: 4
+      ram_cache:
+        enabled: false
+
+  # CPU-only training
+  cpu:
+    device:
+      type: "cpu"
+      amp:
+        enabled: false
+    selfplay:
+      cpu_workers: 4
+      games_per_epoch: 50
+    training:
+      batch_size: 64
+      learning_rate: 1.0e-4
+    dataloader:
+      num_workers: 2
+      ram_cache:
+        enabled: true
+        threshold_gb: 8.0
