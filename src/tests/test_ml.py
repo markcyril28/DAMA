@@ -109,55 +109,59 @@ class TestDataset:
     def test_dama_dataset_getitem(self, sample_entries):
         """Test DamaDataset item retrieval."""
         dataset = DamaDataset(sample_entries)
-        board, move_features, target, reward_weight = dataset[0]
-        
+        board, move_features, target, reward_weight, value_target = dataset[0]
+
         assert isinstance(board, torch.Tensor)
         assert board.shape == (BOARD_PLANES, 8, 8)
         assert isinstance(move_features, torch.Tensor)
         assert isinstance(target, int)
         assert isinstance(reward_weight, float)
         assert reward_weight > 0
-    
+        assert isinstance(value_target, float)
+
     def test_preprocess_entries_to_tensors(self, sample_entries):
         """Test tensor preprocessing."""
-        boards, move_features, move_counts, targets, reward_weights = preprocess_entries_to_tensors(
+        boards, move_features, move_counts, targets, reward_weights, value_targets = preprocess_entries_to_tensors(
             sample_entries, max_moves_per_sample=64, show_progress=False
         )
-        
+
         assert boards.shape == (len(sample_entries), BOARD_PLANES, 8, 8)
         assert move_features.shape == (len(sample_entries), 64, MOVE_FEATURE_SIZE)
         assert move_counts.shape == (len(sample_entries),)
         assert targets.shape == (len(sample_entries),)
         assert reward_weights.shape == (len(sample_entries),)
         assert (reward_weights > 0).all()
-    
+        assert value_targets.shape == (len(sample_entries),)
+
     def test_cached_tensor_dataset(self, sample_entries):
         """Test CachedTensorDataset creation."""
         cached_dataset = CachedTensorDataset.from_entries(
             sample_entries, max_moves_per_sample=64, show_progress=False
         )
-        
+
         assert len(cached_dataset) == len(sample_entries)
-        
+
         # Test item retrieval
-        board, move_features, move_count, target, reward_weight = cached_dataset[0]
+        board, move_features, move_count, target, reward_weight, value_target = cached_dataset[0]
         assert board.shape == (BOARD_PLANES, 8, 8)
         assert move_features.shape == (64, MOVE_FEATURE_SIZE)
         assert isinstance(reward_weight, float)
         assert reward_weight > 0
-    
+        assert isinstance(value_target, float)
+
     def test_collate_batch(self, sample_entries):
         """Test batch collation."""
         dataset = DamaDataset(sample_entries)
         batch = [dataset[i] for i in range(3)]
-        
-        boards, all_moves, move_counts, targets, reward_weights = collate_batch(batch)
-        
+
+        boards, all_moves, move_counts, targets, reward_weights, value_targets = collate_batch(batch)
+
         assert boards.shape[0] == 3
         assert len(move_counts) == 3
         assert len(targets) == 3
         assert len(reward_weights) == 3
         assert (reward_weights > 0).all()
+        assert len(value_targets) == 3
     
     def test_ram_detection(self):
         """Test RAM detection functions."""
