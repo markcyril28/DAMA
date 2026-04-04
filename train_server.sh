@@ -23,8 +23,8 @@ set -euo pipefail
 
 # Config file to use (comment/uncomment to switch)
 # Note: These are relative to PROJECT_DIR, resolved after SCRIPT_DIR is set
-_CONFIG_FILE="config/training_config_server.yaml"
-# _CONFIG_FILE="config/training_config_local.yaml"
+_CONFIG_FILE="config/training_config_server_retrain.yaml"
+# _CONFIG_FILE="config/training_config_server.yaml"
 # _CONFIG_FILE="config/training_config.yaml"
 
 # Optional: Profile to apply from the config file
@@ -37,7 +37,9 @@ CONFIG_PROFILE=""
 # Resume Settings (can override config file)
 # -----------------------------------------------------------------------------
 RESUME=""                        # Path to checkpoint to resume from
-RESUME_LATEST=true               # Resume from latest checkpoint in models/checkpoints/
+RESUME_LATEST=false              # Set true to resume from latest checkpoint in models/checkpoints/
+                                 # NOTE: Set to false for fresh retrain — old checkpoints are
+                                 # degenerate. See config/training_config_server_retrain.yaml.
 
 # -----------------------------------------------------------------------------
 # Time-based Stopping (can override config file)
@@ -49,9 +51,9 @@ TRAIN_DURATION=""                # Override config duration (e.g., "2h", "1d", "
 # END OF PARAMETERS - Do not edit below this line
 # =============================================================================
 
-# Get the directory where this script is located
+# Get the directory where this script is located (project root)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
 
 # Resolve config file path (relative paths are relative to PROJECT_DIR)
 CONFIG_FILE="${PROJECT_DIR}/${_CONFIG_FILE}"
