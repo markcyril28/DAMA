@@ -221,13 +221,23 @@ profiles:
         dtype: "float16"
       compile:
         enabled: true
-        mode: "reduce-overhead"
+        mode: "reduce-overhead"        # SM-count guard auto-downgrades to 'default' on small GPUs
     selfplay:
       cpu_workers: 10
       games_per_epoch: 200
+      difficulties:                       # Exclude super_hard — 5s/move is too slow for 12 cores
+        - "easy"
+        - "medium"
+        - "hard"
       pipeline_mode: "simultaneous"
+      algo_vs_algo:
+        games_per_epoch: 200
+        difficulties:                     # Exclude super_hard for local hardware
+          - "easy"
+          - "medium"
+          - "hard"
     training:
-      batch_size: 1024
+      batch_size: 8192                  # 8GB VRAM — ~5.5GB peak with 128ch/8blocks model
       learning_rate: 1.5e-4
       gradient_accumulation_steps: 1
       lr_scheduler:
@@ -235,7 +245,7 @@ profiles:
         warmup_steps: 100
     dataloader:
       num_workers: 0
-      replay_max_entries: 200000
+      replay_max_entries: 600000        # 32GB RAM — ~2.1GB cached, ~1.8GB on GPU
       ram_cache:
         enabled: true
         threshold_gb: 16.0
