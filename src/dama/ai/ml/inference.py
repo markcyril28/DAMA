@@ -120,14 +120,16 @@ def get_ml_move(
     board_tensor = torch.from_numpy(encode_board(state)).unsqueeze(0)
     move_tensor = torch.from_numpy(encode_moves(state, moves))
 
-    # Move to device
+    # Move to device (skip no-op .to() when already on CPU)
     if device is None:
         device = next(model.parameters()).device
-    board_tensor = board_tensor.to(device)
-    move_tensor = move_tensor.to(device)
+    if device.type != 'cpu':
+        board_tensor = board_tensor.to(device)
+        move_tensor = move_tensor.to(device)
 
-    # Run inference
-    with torch.no_grad():
+    # inference_mode is faster than no_grad: also disables version counting
+    # and autograd dispatch overhead (~5-10% faster for small forward passes)
+    with torch.inference_mode():
         scores = model.score_single(board_tensor, move_tensor)
 
     # Select best move
@@ -164,14 +166,15 @@ def get_move_scores(
     board_tensor = torch.from_numpy(encode_board(state)).unsqueeze(0)
     move_tensor = torch.from_numpy(encode_moves(state, moves))
 
-    # Move to device
+    # Move to device (skip no-op .to() when already on CPU)
     if device is None:
         device = next(model.parameters()).device
-    board_tensor = board_tensor.to(device)
-    move_tensor = move_tensor.to(device)
+    if device.type != 'cpu':
+        board_tensor = board_tensor.to(device)
+        move_tensor = move_tensor.to(device)
 
-    # Run inference
-    with torch.no_grad():
+    # inference_mode is faster than no_grad
+    with torch.inference_mode():
         scores = model.score_single(board_tensor, move_tensor)
 
     # Convert to list
