@@ -1,0 +1,1942 @@
+"""Training loop for the move scorer model."""
+
+import os
+import sys
+import json
+import time
+import argparse
+import tempfile
+import warnings
+import platform
+import threading
+import multiprocessing as mp
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+
+# Set multiprocessing start method before any other multiprocessing imports
+# 'fork' is faster on Linux but can cause issues with CUDA
+# 'spawn' is safer but slower
+if platform.system() != 'Windows':
+    try:
+        mp.set_start_method('fork', force=False)
+    except RuntimeError:
+        pass  # Already set
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+
+# Enable TF32/medium precision for better performance on Ampere+ GPUs
+# 'medium' allows more aggressive use of TF32 tensor cores
+# Note: Check ROCm support for TF32 equivalent on AMD GPUs
+torch.set_float32_matmul_precision('medium')
+
+# Configure torch.compile CUDAGraph settings to avoid overhead from dynamic shapes
+# This prevents recording too many graphs for varying input sizes
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+    inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
+    # Silence the "skipping cudagraphs" info messages
+    import logging
+    logging.getLogger("torch._inductor.compile_fx").setLevel(logging.WARNING)
+    logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
+except (ImportError, AttributeError):
+    pass  # Older PyTorch versions may not have this config
+
+# Suppress torch.compile inductor warnings
+warnings.filterwarnings('ignore', message='.*TensorFloat32.*')
+warnings.filterwarnings('ignore', message='.*max_autotune_gemm.*')
+warnings.filterwarnings('ignore', message='.*CUDAGraph.*dynamic shapes.*')
+warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
+
+from .model import MoveScorerNet, create_model, save_model, load_model
+from .replay import ReplayBuffer
+from .selfplay import SelfPlayRunner
+from .dataset import create_dataloader, prepare_training_data
+from .stats_collector import StatsCollector
+
+
+def parse_duration(duration_str: Optional[str]) -> Optional[datetime]:
+    """Parse duration string and return the stop time.
+    
+    Supported formats:
+    - Nd or Ndays (e.g., 2d, 2days) - N days
+    - Nh or Nhours (e.g., 4h, 4hours) - N hours  
+    - Nm or Nmin (e.g., 30m, 30min) - N minutes
+    - Combined (e.g., 1d12h, 2d6h30m) - multiple units
+    """
+    if not duration_str:
+        return None
+    
+    duration_str = duration_str.strip().lower()
+    
+    import re
+    from datetime import timedelta
+    
+    total_seconds = 0
+    
+    # Match patterns like 2d, 4h, 30m
+    patterns = [
+        (r'(\d+)\s*d(?:ays?)?', 86400),   # days
+        (r'(\d+)\s*h(?:ours?)?', 3600),    # hours
+        (r'(\d+)\s*m(?:in(?:utes?)?)?', 60),  # minutes
+        (r'(\d+)\s*s(?:ec(?:onds?)?)?', 1),   # seconds
+    ]
+    
+    matched_any = False
+    for pattern, multiplier in patterns:
+        for match in re.finditer(pattern, duration_str):
+            total_seconds += int(match.group(1)) * multiplier
+            matched_any = True
+    
+    if not matched_any:
+        # Try parsing as plain number (assume hours)
+        try:
+            hours = float(duration_str)
+            total_seconds = int(hours * 3600)
+            matched_any = True
+        except ValueError:
+            pass
+    
+    if not matched_any or total_seconds <= 0:
+        raise ValueError(f"Could not parse duration '{duration_str}'. Use format like: 2d, 4h, 30m, 1d12h, 2days, etc.")
+    
+    stop_time = datetime.now() + timedelta(seconds=total_seconds)
+    return stop_time
+
+
+@dataclass
+class TrainingStats:
+    """Training statistics tracking."""
+    start_time: str = ""
+    end_time: str = ""
+    total_steps: int = 0
+    epochs_completed: int = 0
+    best_loss: float = float('inf')
+    best_val_loss: float = float('inf')
+    
+    # History lists (stored as lists for JSON serialization)
+    loss_history: list = None
+    val_loss_history: list = None
+    lr_history: list = None
+    gpu_mem_history: list = None
+    step_times: list = None
+    test_history: list = None  # Model vs algorithm test results
+    
+    def __post_init__(self):
+        if self.loss_history is None:
+            self.loss_history = []
+        if self.val_loss_history is None:
+            self.val_loss_history = []
+        if self.lr_history is None:
+            self.lr_history = []
+        if self.gpu_mem_history is None:
+            self.gpu_mem_history = []
+        if self.step_times is None:
+            self.step_times = []
+        if self.test_history is None:
+            self.test_history = []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'total_steps': self.total_steps,
+            'epochs_completed': self.epochs_completed,
+            'best_loss': self.best_loss,
+            'best_val_loss': self.best_val_loss,
+            'loss_history': self.loss_history,
+            'val_loss_history': self.val_loss_history,
+            'lr_history': self.lr_history,
+            'gpu_mem_history': self.gpu_mem_history,
+            'step_times': self.step_times,
+            'test_history': self.test_history,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TrainingStats':
+        """Create from dictionary."""
+        return cls(
+            start_time=data.get('start_time', ''),
+            end_time=data.get('end_time', ''),
+            total_steps=data.get('total_steps', 0),
+            epochs_completed=data.get('epochs_completed', 0),
+            best_loss=data.get('best_loss', float('inf')),
+            best_val_loss=data.get('best_val_loss', float('inf')),
+            loss_history=data.get('loss_history', []),
+            val_loss_history=data.get('val_loss_history', []),
+            lr_history=data.get('lr_history', []),
+            gpu_mem_history=data.get('gpu_mem_history', []),
+            step_times=data.get('step_times', []),
+            test_history=data.get('test_history', []),
+        )
+
+
+@dataclass
+class TrainingConfig:
+    """Training configuration."""
+    # Device settings
+    device: str = 'cuda'
+    amp: bool = True
+    amp_dtype: str = 'float16'  # 'float16' or 'bfloat16' (bfloat16 recommended for AMD MI210)
+    compile_model: bool = True
+    compile_mode: str = 'reduce-overhead'
+
+    # Model architecture settings
+    model_channels: int = 64       # CNN channels in ResidualBlocks
+    model_blocks: int = 4          # Number of residual blocks
+    model_embedding: int = 128     # Board embedding size
+    model_hidden: int = 64         # MoveScorer MLP hidden size
+
+    # Self-play settings
+    cpu_workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 2)))
+    selfplay_games: int = 500
+    selfplay_difficulties: list = field(default_factory=lambda: ['medium'])  # List of difficulties to cycle
+    selfplay_focus_side: str = 'both'  # white, black, both
+    selfplay_opponent_focus: str = 'both'  # ml, algorithm, both
+    selfplay_noise_prob: float = 0.1  # Probability of random move for exploration
+    selfplay_max_moves: int = 200  # Maximum moves per game
+    selfplay_every: int = 5000  # Run self-play data refresh every N steps
+
+    # Training settings
+    batch_size: int = 256
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-5  # Weight decay for regularization
+    train_steps: int = 999999999  # Default to essentially indefinite
+    checkpoint_every: int = 1000
+
+    # Reward scoring mode:
+    #   'scoring'  - always use the scoring system reward weights
+    #   'none'     - never use scoring (uniform weights, classic behavior)
+    #   'cycle'    - alternate epochs: odd epochs use scoring, even epochs don't
+    reward_mode: str = 'cycle'
+
+    # Learning rate scheduler
+    lr_scheduler_enabled: bool = False
+    lr_scheduler_type: str = 'cosine_warm_restarts'  # CosineAnnealingWarmRestarts
+    lr_scheduler_T0: int = 500       # Steps for first cosine cycle
+    lr_scheduler_T_mult: int = 2     # Cycle length multiplier after each restart
+    lr_scheduler_eta_min: float = 1e-5  # Minimum LR
+
+    # Value head / TD learning
+    value_head_enabled: bool = False
+    value_head_hidden: int = 128
+    value_weight: float = 0.5  # Weight of value loss relative to policy loss
+
+    # DataLoader settings
+    dataloader_workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 2)))
+    pin_memory: bool = True
+
+    # Stability
+    grad_clip_norm: Optional[float] = 1.0
+
+    # Model testing settings
+    test_vs_algo: bool = True
+    test_every: int = 5000  # Run tests every N steps
+    test_games: int = 50  # Number of test games per evaluation
+    test_difficulty: str = 'medium'
+
+    # Statistics collection settings
+    stats_enabled: bool = True
+    stats_record_every: int = 10        # Record loss/grad every N steps
+    stats_system_every: int = 500       # Record GPU/CPU metrics every N steps
+    stats_model_health_every: int = 2000  # Record param norms every N steps
+    stats_score_dist_every: int = 50    # Record score distribution every N steps
+    stats_buffer_size: int = 50000      # Ring buffer size for high-frequency metrics
+    stats_flush_every: int = 5000       # Flush incremental stats to disk
+    stats_output_dir: str = 'logs/stats'
+
+    # Paths
+    checkpoint_dir: str = 'models/checkpoints'
+    latest_path: str = 'models/latest.pt'
+    replay_dir: str = 'data/replay'
+    log_dir: str = 'logs'
+    stats_file: str = 'models/training_stats.json'
+
+    # Resume
+    resume: Optional[str] = None
+
+    # Time-based stopping
+    stop_time: Optional[datetime] = None  # Calculated from train_duration
+
+
+class Trainer:
+    """
+    Trainer for the move scorer model.
+
+    Supports:
+    - Self-play data generation
+    - Imitation learning from algorithmic AI
+    - Checkpoint saving and resume
+    - Mixed precision training
+    - IPC control for GUI integration
+    """
+
+    def __init__(self, config: TrainingConfig):
+        self.config = config
+
+        # Set up device
+        if config.device == 'cuda' and not torch.cuda.is_available():
+            print("ERROR: CUDA requested but not available.")
+            print("\nTroubleshooting:")
+            print("  1. Ensure NVIDIA GPU driver is installed on Windows")
+            print("  2. Run 'nvidia-smi' to verify GPU access in WSL")
+            print("  3. Reinstall PyTorch with CUDA support")
+            sys.exit(1)
+
+        self.device = torch.device(config.device)
+        print(f"Using device: {self.device}")
+
+        if self.device.type == 'cuda':
+            print(f"GPU: {torch.cuda.get_device_name()}")
+            print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+        # Set thread count for CPU operations - optimize for available cores
+        cpu_threads = min(16, max(1, (os.cpu_count() or 1)))  # Cap at 16 for efficiency
+        torch.set_num_threads(cpu_threads)
+        try:
+            torch.set_num_interop_threads(min(4, cpu_threads))
+        except Exception:
+            pass
+
+        # Create directories
+        Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+
+        # Initialize components
+        self.model = create_model(
+            embedding_size=config.model_embedding,
+            num_blocks=config.model_blocks,
+            hidden_size=config.model_hidden,
+            channels=config.model_channels,
+            value_head_enabled=config.value_head_enabled,
+            value_head_hidden=config.value_head_hidden,
+        )
+        self.model.to(self.device)
+
+        # Use fused AdamW for faster training on CUDA (PyTorch 2.0+)
+        use_fused = config.device == 'cuda' and hasattr(optim.AdamW, 'fused')
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            fused=use_fused if use_fused else False,
+        )
+        if use_fused:
+            print("Using fused AdamW optimizer for faster training")
+        
+        # Determine AMP dtype
+        self.amp_dtype = torch.float16
+        if config.amp:
+            if config.amp_dtype == 'bfloat16':
+                if torch.cuda.is_bf16_supported():
+                    self.amp_dtype = torch.bfloat16
+                    print("Using BFloat16 mixed precision (no GradScaler needed)")
+                else:
+                    print("BFloat16 not supported, falling back to Float16")
+                    self.amp_dtype = torch.float16
+            else:
+                print("Using Float16 mixed precision with GradScaler")
+        
+        # GradScaler only needed for float16, not bfloat16
+        self.scaler = GradScaler() if (config.amp and self.amp_dtype == torch.float16) else None
+
+        # Learning rate scheduler
+        self.scheduler = None
+        if config.lr_scheduler_enabled:
+            if config.lr_scheduler_type == 'cosine_warm_restarts':
+                self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self.optimizer,
+                    T_0=config.lr_scheduler_T0,
+                    T_mult=config.lr_scheduler_T_mult,
+                    eta_min=config.lr_scheduler_eta_min,
+                )
+                print(f"LR Scheduler: CosineAnnealingWarmRestarts "
+                      f"(T_0={config.lr_scheduler_T0}, T_mult={config.lr_scheduler_T_mult}, "
+                      f"eta_min={config.lr_scheduler_eta_min})")
+            else:
+                print(f"Warning: Unknown LR scheduler type '{config.lr_scheduler_type}'")
+
+        self.replay_buffer = ReplayBuffer(config.replay_dir)
+
+        # Training state
+        self.step = 0
+        self.best_loss = float('inf')
+        self.epoch = 0
+
+        # Control flags for IPC
+        self._paused = False
+        self._stopped = False
+
+        # Background self-play state
+        self._bg_selfplay_thread: Optional[threading.Thread] = None
+        self._bg_selfplay_entries: Optional[list] = None
+        self._bg_selfplay_lock = threading.Lock()
+
+        # Training statistics
+        self.stats = TrainingStats()
+        self._load_stats()
+        
+        # Timing for step tracking
+        self._last_step_time = None
+
+        # Enhanced statistics collector
+        self.stats_collector: Optional[StatsCollector] = None
+        if config.stats_enabled:
+            self.stats_collector = StatsCollector(
+                output_dir=config.stats_output_dir,
+                buffer_size=config.stats_buffer_size,
+                flush_every=config.stats_flush_every,
+            )
+            # Snapshot the config for the session report
+            self.stats_collector.set_config_snapshot({
+                'device': config.device,
+                'amp': config.amp,
+                'amp_dtype': config.amp_dtype,
+                'compile_model': config.compile_model,
+                'compile_mode': config.compile_mode,
+                'model_channels': config.model_channels,
+                'model_blocks': config.model_blocks,
+                'model_embedding': config.model_embedding,
+                'model_hidden': config.model_hidden,
+                'batch_size': config.batch_size,
+                'learning_rate': config.learning_rate,
+                'weight_decay': config.weight_decay,
+                'grad_clip_norm': config.grad_clip_norm,
+                'train_steps': config.train_steps,
+                'checkpoint_every': config.checkpoint_every,
+                'cpu_workers': config.cpu_workers,
+                'selfplay_games': config.selfplay_games,
+                'selfplay_difficulties': config.selfplay_difficulties,
+                'selfplay_noise_prob': config.selfplay_noise_prob,
+                'selfplay_max_moves': config.selfplay_max_moves,
+                'selfplay_every': config.selfplay_every,
+                'dataloader_workers': config.dataloader_workers,
+                'test_every': config.test_every,
+                'test_games': config.test_games,
+                'test_difficulty': config.test_difficulty,
+                'lr_scheduler_enabled': config.lr_scheduler_enabled,
+                'lr_scheduler_type': config.lr_scheduler_type,
+                'lr_scheduler_T0': config.lr_scheduler_T0,
+                'lr_scheduler_T_mult': config.lr_scheduler_T_mult,
+                'lr_scheduler_eta_min': config.lr_scheduler_eta_min,
+                'value_head_enabled': config.value_head_enabled,
+                'value_head_hidden': config.value_head_hidden,
+                'value_weight': config.value_weight,
+            })
+
+        # Logging
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = Path(config.log_dir) / f"train_{timestamp}.jsonl"
+
+        # Resume if specified
+        if config.resume:
+            self._load_checkpoint(config.resume)
+
+        # Compile after loading checkpoint to avoid state_dict key mismatch
+        if self.config.compile_model and hasattr(torch, "compile"):
+            try:
+                print(f"Enabling torch.compile (mode={self.config.compile_mode})...")
+                sys.stdout.flush()
+                # mode="reduce-overhead" compiles faster than default while still being fast
+                # Other options: "default" (balanced), "max-autotune" (slowest compile, fastest run)
+                self.model = torch.compile(self.model, mode=self.config.compile_mode)
+                print("torch.compile enabled - model will be compiled on first forward pass")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"torch.compile unavailable: {e}")
+
+    def _has_non_finite_tensors(self) -> bool:
+        """Check if model parameters or buffers contain NaN/Inf."""
+        for name, param in self.model.named_parameters():
+            if not torch.isfinite(param).all():
+                print(f"  Non-finite parameter detected: {name}")
+                return True
+        for name, buf in self.model.named_buffers():
+            if not torch.isfinite(buf).all():
+                print(f"  Non-finite buffer detected: {name}")
+                return True
+        return False
+
+    def _reset_model_state(self, reason: str) -> None:
+        """Reset model/optimizer if checkpoint is corrupt."""
+        print(f"WARNING: {reason}. Resetting model and optimizer state.")
+        self.model = create_model(
+            embedding_size=self.config.model_embedding,
+            num_blocks=self.config.model_blocks,
+            hidden_size=self.config.model_hidden,
+            channels=self.config.model_channels,
+            value_head_enabled=self.config.value_head_enabled,
+            value_head_hidden=self.config.value_head_hidden,
+        )
+        self.model.to(self.device)
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
+        self.scaler = GradScaler() if self.config.amp else None
+        self.step = 0
+        self.epoch = 0
+        self.best_loss = float('inf')
+
+    def _load_checkpoint(self, path: str) -> None:
+        """Load training state from checkpoint."""
+        print(f"Resuming from {path}")
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+
+        # Handle state_dict from compiled models (torch.compile adds "_orig_mod." prefix)
+        state_dict = checkpoint['model_state_dict']
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+        # Load with strict=False to handle old checkpoints that lack value_head keys.
+        # New value_head parameters will keep their random initialization.
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  New parameters (randomly initialized): {missing}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {unexpected}")
+
+        # Try to restore optimizer state; skip if model architecture changed
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except (ValueError, KeyError) as e:
+            print(f"  Warning: Could not restore optimizer state ({e}). "
+                  f"Using fresh optimizer — momentum/variance buffers will be re-estimated.")
+
+        # Reset LR to the config value after loading optimizer state.
+        # load_state_dict() overwrites param_groups['lr'] with the checkpoint's saved LR,
+        # which ignores any change made in the config file (e.g. batch-size scaling).
+        # We always want the config's learning_rate to win on resume.
+        old_lr = self.optimizer.param_groups[0]['lr']
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.config.learning_rate
+        print(f"  LR reset: {old_lr:.2e} (checkpoint) → {self.config.learning_rate:.2e} (config)")
+
+        self.step = checkpoint.get('step', 0)
+        self.best_loss = checkpoint.get('loss', float('inf'))
+
+        # Restore scheduler state if available
+        if (self.scheduler is not None and
+                'scheduler_state_dict' in checkpoint):
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print(f"Restored LR scheduler state")
+            except Exception as e:
+                print(f"Warning: Could not restore scheduler state: {e}")
+
+        # Restore RNG state if available
+        if 'rng_state' in checkpoint:
+            rng = checkpoint['rng_state']
+            if 'torch' in rng:
+                # Ensure RNG state is a ByteTensor
+                rng_state = rng['torch']
+                if not isinstance(rng_state, torch.ByteTensor):
+                    rng_state = rng_state.to(torch.uint8)
+                torch.set_rng_state(rng_state.cpu())
+            if 'cuda' in rng and torch.cuda.is_available():
+                cuda_rng = rng['cuda']
+                if not isinstance(cuda_rng, torch.ByteTensor):
+                    cuda_rng = cuda_rng.to(torch.uint8)
+                torch.cuda.set_rng_state(cuda_rng.cpu())
+
+        print(f"Resumed at step {self.step}")
+
+        if self._has_non_finite_tensors():
+            self._reset_model_state("Loaded checkpoint contains NaN/Inf")
+
+    def _load_stats(self) -> None:
+        """Load training stats from file if exists, and merge in any missing test history from log files."""
+        stats_path = Path(self.config.stats_file)
+        if stats_path.exists():
+            try:
+                with open(stats_path, 'r') as f:
+                    data = json.load(f)
+                self.stats = TrainingStats.from_dict(data)
+                print(f"Loaded training stats: {self.stats.total_steps} previous steps")
+            except Exception as e:
+                print(f"Could not load stats: {e}")
+                self.stats = TrainingStats()
+        
+        # Merge any missing test results from JSONL log files
+        self._merge_test_history_from_logs()
+
+    def _merge_test_history_from_logs(self) -> None:
+        """Merge test_vs_algo entries from JSONL log files into stats.test_history."""
+        log_dir = Path(self.config.log_dir)
+        if not log_dir.exists():
+            return
+        
+        # Build a set of existing steps to avoid duplicates
+        existing_steps = {entry.get('step') for entry in self.stats.test_history}
+        
+        # Find all training log files
+        log_files = sorted(log_dir.glob("train_*.jsonl"))
+        merged_count = 0
+        
+        for log_file in log_files:
+            try:
+                with open(log_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            if entry.get('type') == 'test_vs_algo':
+                                step = entry.get('step')
+                                if step is not None and step not in existing_steps:
+                                    # Remove the 'type' field before adding to test_history
+                                    entry_copy = {k: v for k, v in entry.items() if k != 'type'}
+                                    self.stats.test_history.append(entry_copy)
+                                    existing_steps.add(step)
+                                    merged_count += 1
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                continue
+        
+        if merged_count > 0:
+            # Sort by step
+            self.stats.test_history.sort(key=lambda x: x.get('step', 0))
+            print(f"Merged {merged_count} test entries from log files into stats")
+
+    def _save_stats(self) -> None:
+        """Save training stats to file."""
+        stats_path = Path(self.config.stats_file)
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        self.stats.total_steps = self.step
+        self.stats.end_time = datetime.now().isoformat()
+        
+        with open(stats_path, 'w') as f:
+            json.dump(self.stats.to_dict(), f, indent=2)
+
+    def _record_step_stats(self, loss: float, lr: float) -> None:
+        """Record statistics for a training step."""
+        current_time = time.time()
+        
+        # Record loss
+        self.stats.loss_history.append({
+            'step': self.step,
+            'loss': loss,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Record learning rate
+        self.stats.lr_history.append({
+            'step': self.step,
+            'lr': lr
+        })
+        
+        # Record GPU memory
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.memory_allocated() / 1e6
+            self.stats.gpu_mem_history.append({
+                'step': self.step,
+                'gpu_mem_mb': gpu_mem
+            })
+        
+        # Record step time
+        if self._last_step_time is not None:
+            step_time = current_time - self._last_step_time
+            self.stats.step_times.append({
+                'step': self.step,
+                'time_sec': step_time
+            })
+        self._last_step_time = current_time
+        
+        # Update best loss
+        if loss < self.stats.best_loss:
+            self.stats.best_loss = loss
+
+    def _record_validation_stats(self, val_loss: float) -> None:
+        """Record validation statistics."""
+        self.stats.val_loss_history.append({
+            'step': self.step,
+            'val_loss': val_loss,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        if val_loss < self.stats.best_val_loss:
+            self.stats.best_val_loss = val_loss
+
+    def _save_checkpoint(self, loss: float) -> str:
+        """Save a checkpoint atomically."""
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'step': self.step,
+            'loss': loss,
+            'epoch': self.epoch,
+            'arch_params': getattr(self.model, 'arch_params', {
+                'embedding_size': self.config.model_embedding,
+                'num_blocks': self.config.model_blocks,
+                'hidden_size': self.config.model_hidden,
+                'channels': self.config.model_channels,
+                'value_head_enabled': self.config.value_head_enabled,
+                'value_head_hidden': self.config.value_head_hidden,
+            }),
+            'rng_state': {
+                'torch': torch.get_rng_state(),
+            }
+        }
+
+        # Save scheduler state for proper resume
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+
+        if torch.cuda.is_available():
+            checkpoint['rng_state']['cuda'] = torch.cuda.get_rng_state()
+
+        # Save to temp file then rename (atomic)
+        checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
+
+        with tempfile.NamedTemporaryFile(delete=False, dir=self.config.checkpoint_dir) as tmp:
+            torch.save(checkpoint, tmp.name)
+            tmp_path = tmp.name
+
+        os.replace(tmp_path, checkpoint_path)
+
+        # Update latest.pt
+        latest_path = Path(self.config.latest_path)
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(delete=False, dir=latest_path.parent) as tmp:
+            torch.save(checkpoint, tmp.name)
+            tmp_path = tmp.name
+
+        os.replace(tmp_path, latest_path)
+
+        # Save stats alongside checkpoint
+        self._save_stats()
+
+        # Record checkpoint in stats collector
+        if self.stats_collector:
+            ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
+            save_elapsed = time.time() - _ckpt_save_start if '_ckpt_save_start' in dir() else 0
+            self.stats_collector.record_checkpoint(
+                step=self.step, loss=loss, path=str(checkpoint_path),
+                file_size_mb=ckpt_size,
+            )
+
+        print(f"Checkpoint saved: {checkpoint_path}")
+        return str(checkpoint_path)
+
+    def _log(self, data: Dict[str, Any]) -> None:
+        """Log training metrics."""
+        data['timestamp'] = datetime.now().isoformat()
+        with open(self.log_file, 'a') as f:
+            f.write(json.dumps(data) + '\n')
+
+    def run_selfplay(self, num_games: int, callback=None) -> int:
+        """Run self-play to generate training data."""
+        _selfplay_start = time.time()
+        total_games = max(0, num_games)
+        opponent_focus = self.config.selfplay_opponent_focus
+        side_focus = self.config.selfplay_focus_side
+
+        if opponent_focus == 'ml':
+            ml_self_games = total_games
+            vs_algo_games = 0
+        elif opponent_focus == 'algorithm':
+            ml_self_games = 0
+            vs_algo_games = total_games
+        else:
+            ml_self_games = total_games // 2
+            vs_algo_games = total_games - ml_self_games
+
+        if opponent_focus == 'ml':
+            focus_desc = "ML self-play"
+        elif opponent_focus == 'algorithm':
+            focus_desc = "ML vs algorithm"
+        else:
+            focus_desc = "half ML self-play, half vs algorithm"
+
+        print(
+            f"\nGenerating {num_games} self-play games "
+            f"({focus_desc}; focus side: {side_focus})..."
+        )
+
+        # Save current model for self-play inference
+        temp_model_path = Path(self.config.checkpoint_dir) / "temp_selfplay_model.pt"
+        temp_model_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'step': self.step,
+        }, temp_model_path)
+
+        completed_total = 0
+
+        def make_progress(base: int):
+            def _progress(completed, _total):
+                overall = base + completed
+                if callback:
+                    callback(overall, total_games)
+                if overall % 50 == 0:
+                    print(f"  Games: {overall}/{total_games}")
+            return _progress
+
+        entries = 0
+        difficulties = self.config.selfplay_difficulties
+        num_difficulties = len(difficulties)
+
+        def get_difficulty_for_batch(batch_idx: int) -> str:
+            """Cycle through difficulties for each batch of games."""
+            diff = difficulties[batch_idx % num_difficulties]
+            # 'self' means ML self-play, use 'medium' as base difficulty
+            return 'medium' if diff == 'self' else diff
+
+        def is_self_play_batch(batch_idx: int) -> bool:
+            """Check if this batch should be ML self-play."""
+            return difficulties[batch_idx % num_difficulties] == 'self'
+
+        # Log difficulties being used
+        print(f"  Cycling through difficulties: {difficulties}")
+
+        if ml_self_games > 0:
+            # For ML self-play, use medium difficulty as base
+            runner = SelfPlayRunner(
+                replay_buffer=self.replay_buffer,
+                num_workers=self.config.cpu_workers,
+                difficulty='medium',
+                max_moves=self.config.selfplay_max_moves,
+                noise_prob=self.config.selfplay_noise_prob,
+                p1_policy='ml',
+                p2_policy='ml',
+                model_path=str(temp_model_path),
+                device=self.device,
+            )
+            entries += runner.run_games(ml_self_games, callback=make_progress(completed_total))
+            completed_total += ml_self_games
+
+        if vs_algo_games > 0:
+            if side_focus == 'white':
+                ml_as_p1 = vs_algo_games
+                ml_as_p2 = 0
+            elif side_focus == 'black':
+                ml_as_p1 = 0
+                ml_as_p2 = vs_algo_games
+            else:
+                ml_as_p1 = vs_algo_games // 2
+                ml_as_p2 = vs_algo_games - ml_as_p1
+
+            # Split games across difficulties (excluding 'self' which is handled separately)
+            algo_difficulties = [d for d in difficulties if d != 'self']
+            if not algo_difficulties:
+                algo_difficulties = ['medium']
+
+            if ml_as_p1 > 0:
+                games_per_diff = ml_as_p1 // len(algo_difficulties)
+                remainder = ml_as_p1 % len(algo_difficulties)
+                
+                for i, diff in enumerate(algo_difficulties):
+                    games_this_diff = games_per_diff + (1 if i < remainder else 0)
+                    if games_this_diff > 0:
+                        runner = SelfPlayRunner(
+                            replay_buffer=self.replay_buffer,
+                            num_workers=self.config.cpu_workers,
+                            difficulty=diff,
+                            max_moves=self.config.selfplay_max_moves,
+                            noise_prob=self.config.selfplay_noise_prob,
+                            p1_policy='ml',
+                            p2_policy='algorithmic',
+                            model_path=str(temp_model_path),
+                            device=self.device,
+                        )
+                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total))
+                        completed_total += games_this_diff
+
+            if ml_as_p2 > 0:
+                games_per_diff = ml_as_p2 // len(algo_difficulties)
+                remainder = ml_as_p2 % len(algo_difficulties)
+                
+                for i, diff in enumerate(algo_difficulties):
+                    games_this_diff = games_per_diff + (1 if i < remainder else 0)
+                    if games_this_diff > 0:
+                        runner = SelfPlayRunner(
+                            replay_buffer=self.replay_buffer,
+                            num_workers=self.config.cpu_workers,
+                            difficulty=diff,
+                            max_moves=self.config.selfplay_max_moves,
+                            noise_prob=self.config.selfplay_noise_prob,
+                            p1_policy='algorithmic',
+                            p2_policy='ml',
+                            model_path=str(temp_model_path),
+                            device=self.device,
+                        )
+                        entries += runner.run_games(games_this_diff, callback=make_progress(completed_total))
+                        completed_total += games_this_diff
+
+        print(f"Generated {entries} training entries")
+
+        # Record self-play stats
+        if self.stats_collector:
+            _selfplay_elapsed = time.time() - _selfplay_start
+            self.stats_collector.record_selfplay_epoch(
+                step=self.step,
+                epoch=self.epoch,
+                num_games=total_games,
+                num_entries=entries,
+                elapsed_sec=_selfplay_elapsed,
+            )
+
+            # Record replay buffer state
+            try:
+                buf_entries = self.replay_buffer.count_entries()
+                replay_dir = Path(self.config.replay_dir)
+                num_files = len(list(replay_dir.glob("*.jsonl"))) if replay_dir.exists() else 0
+                total_bytes = sum(
+                    f.stat().st_size for f in replay_dir.glob("*.jsonl")
+                ) if replay_dir.exists() else 0
+                self.stats_collector.record_replay_buffer_state(
+                    step=self.step,
+                    total_entries=buf_entries,
+                    num_files=num_files,
+                    total_size_bytes=total_bytes,
+                )
+            except Exception:
+                pass  # Non-critical
+
+        return entries
+
+    # ------------------------------------------------------------------
+    # Background self-play: overlap CPU game generation with GPU training
+    # ------------------------------------------------------------------
+
+    def _start_background_selfplay(self, num_games: int) -> None:
+        """Launch self-play + data preparation in a background thread.
+
+        The thread orchestrates ProcessPoolExecutor workers (true parallelism)
+        so the GIL is not an issue. GPU training continues on the main thread.
+        """
+        if self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
+            return  # already running
+
+        def _worker():
+            try:
+                self.run_selfplay(num_games)
+                train_entries, _ = prepare_training_data(self.replay_buffer)
+                with self._bg_selfplay_lock:
+                    self._bg_selfplay_entries = train_entries
+            except Exception as e:
+                print(f"Background self-play error: {e}")
+
+        self._bg_selfplay_thread = threading.Thread(target=_worker, daemon=True)
+        self._bg_selfplay_thread.start()
+
+    def _collect_background_selfplay(self) -> Optional[list]:
+        """Check if background self-play finished. Return entries or None."""
+        if self._bg_selfplay_thread is None:
+            return None
+        if self._bg_selfplay_thread.is_alive():
+            return None
+        self._bg_selfplay_thread.join()
+        self._bg_selfplay_thread = None
+        with self._bg_selfplay_lock:
+            entries = self._bg_selfplay_entries
+            self._bg_selfplay_entries = None
+        return entries
+
+    def run_test_vs_algo(self, num_games: int = None) -> Dict[str, Any]:
+        """
+        Run test games between current model and algorithmic AI.
+        
+        Args:
+            num_games: Number of test games (defaults to config)
+        
+        Returns:
+            Test statistics dictionary
+        """
+        if num_games is None:
+            num_games = self.config.test_games
+        
+        print(f"\nRunning {num_games} test games vs algorithm ({self.config.test_difficulty})...")
+        
+        from .model_vs_algo import ModelVsAlgoTester
+        
+        # Save current model temporarily for testing
+        temp_path = Path(self.config.checkpoint_dir) / "temp_test_model.pt"
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'step': self.step,
+        }, temp_path)
+        
+        try:
+            tester = ModelVsAlgoTester(
+                model_path=str(temp_path),
+                algo_difficulty=self.config.test_difficulty,
+                num_workers=min(self.config.cpu_workers, 4),
+                max_moves=self.config.selfplay_max_moves,
+            )
+            
+            def progress(completed, total, stats):
+                if completed % 10 == 0:
+                    print(f"  Test games: {completed}/{total} (ML: {stats.ml_win_rate*100:.1f}%)")
+            
+            stats = tester.run_tests(num_games=num_games, callback=progress)
+            
+            # Record in training stats
+            test_record = {
+                'step': self.step,
+                'epoch': self.epoch,
+                'total_games': stats.total_games,
+                'ml_wins': stats.ml_wins,
+                'algo_wins': stats.algo_wins,
+                'draws': stats.draws,
+                'ml_win_rate': stats.ml_win_rate,
+                'ml_as_p1_win_rate': stats.ml_as_p1_win_rate,
+                'ml_as_p2_win_rate': stats.ml_as_p2_win_rate,
+                'avg_game_length': stats.avg_game_length,
+                'timestamp': datetime.now().isoformat(),
+            }
+            self.stats.test_history.append(test_record)
+            
+            # Record in enhanced stats collector
+            if self.stats_collector:
+                self.stats_collector.record_evaluation(
+                    step=self.step, epoch=self.epoch, test_record=test_record,
+                )
+            
+            print(f"  ML Win Rate: {stats.ml_win_rate*100:.1f}%")
+            print(f"    As P1 (White): {stats.ml_as_p1_win_rate*100:.1f}%")
+            print(f"    As P2 (Black): {stats.ml_as_p2_win_rate*100:.1f}%")
+            if self.stats_collector and self.stats_collector.eval_records:
+                latest = self.stats_collector.eval_records[-1]
+                elo = latest.get('estimated_elo_diff', 0)
+                print(f"    Est. ELO diff:  {elo:+.0f}")
+            
+            # Log to JSONL
+            self._log({
+                'type': 'test_vs_algo',
+                **test_record
+            })
+            
+            # Save stats to JSON file immediately so plot_training.py can read them
+            self._save_stats()
+            
+            return test_record
+        
+        finally:
+            # Clean up temp file
+            if temp_path.exists():
+                temp_path.unlink()
+
+    def _should_use_scoring_for_epoch(self, epoch: int) -> bool:
+        """Determine whether to use the scoring system for a given epoch number."""
+        mode = self.config.reward_mode.lower()
+        if mode == 'scoring':
+            return True
+        elif mode == 'none':
+            return False
+        else:  # 'cycle'
+            # Odd epochs (1, 3, 5...) use scoring; even epochs (2, 4, 6...) don't
+            return (epoch % 2) == 1
+
+    def _should_use_scoring(self) -> bool:
+        """Determine whether to use the scoring system for the upcoming epoch."""
+        return self._should_use_scoring_for_epoch(self.epoch + 1)
+
+    def train_epoch(self, dataloader, use_scoring: bool = True) -> float:
+        """Train for one epoch, returns average loss.
+        
+        Args:
+            dataloader: Training data loader
+            use_scoring: If True, apply reward weights from the scoring system.
+                         If False, use uniform weights (classic behavior).
+        """
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+        total_batches = len(dataloader)
+        first_batch = True
+        epoch_start_time = time.time()
+        _step_start = time.time()
+
+        for boards, move_features, move_counts, targets, reward_weights, value_targets in dataloader:
+            if first_batch:
+                print(f"  First batch loaded. Processing {total_batches} batches...")
+                sys.stdout.flush()
+                first_batch = False
+            
+            if self._stopped:
+                break
+
+            while self._paused:
+                time.sleep(0.1)
+                if self._stopped:
+                    break
+
+            _step_start = time.time()
+
+            # Move to device (non_blocking allows async transfer when pin_memory=True)
+            boards = boards.to(self.device, non_blocking=True)
+            move_features = move_features.to(self.device, non_blocking=True)
+            move_counts = move_counts.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            # Only send reward weights to device when scoring is active
+            if use_scoring:
+                reward_weights = reward_weights.to(self.device, non_blocking=True)
+            else:
+                reward_weights = None
+            # Value targets for TD/value learning
+            if self.config.value_head_enabled:
+                value_targets = value_targets.to(self.device, non_blocking=True)
+            else:
+                value_targets = None
+
+            if not torch.isfinite(boards).all() or not torch.isfinite(move_features).all():
+                print("  Warning: non-finite inputs detected; skipping batch")
+                if self.stats_collector:
+                    self.stats_collector.record_non_finite_event(
+                        self.step, 'input_data', 'Non-finite board or move features')
+                continue
+
+            self.optimizer.zero_grad()
+
+            # --- Forward + backward ---
+            _grad_norm = None
+            _grad_norms_per_layer = None
+            _current_scores = None
+
+            if self.config.amp:
+                with autocast(device_type='cuda', dtype=self.amp_dtype):
+                    if self.config.value_head_enabled:
+                        scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                    else:
+                        scores = self.model(boards, move_features, move_counts)
+                        value_preds = None
+                    if not torch.isfinite(scores).all():
+                        print("  Warning: non-finite scores detected; skipping batch")
+                        if self.stats_collector:
+                            self.stats_collector.record_non_finite_event(
+                                self.step, 'model_scores', 'Non-finite output scores')
+                        continue
+                    _current_scores = scores.detach()
+                    policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
+                    
+                    # Value head loss (MSE between predicted value and game result)
+                    if value_preds is not None and value_targets is not None:
+                        value_loss = nn.functional.mse_loss(value_preds, value_targets)
+                        loss = policy_loss + self.config.value_weight * value_loss
+                    else:
+                        loss = policy_loss
+
+                if not torch.isfinite(loss):
+                    print("  Warning: non-finite loss detected; skipping batch")
+                    if self.stats_collector:
+                        self.stats_collector.record_non_finite_event(
+                            self.step, 'loss', 'Non-finite loss value')
+                    continue
+
+                if self.scaler is not None:
+                    # Float16 path with GradScaler
+                    self.scaler.scale(loss).backward()
+                    if self.config.grad_clip_norm is not None:
+                        self.scaler.unscale_(self.optimizer)
+                        # Capture gradient norms before clipping
+                        if (self.stats_collector and
+                                self.step % self.config.stats_record_every == 0):
+                            _grad_norm, _grad_norms_per_layer = (
+                                StatsCollector.compute_gradient_stats(self.model))
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # BFloat16 path without GradScaler
+                    loss.backward()
+                    # Capture gradient norms before clipping
+                    if (self.stats_collector and
+                            self.step % self.config.stats_record_every == 0):
+                        _grad_norm, _grad_norms_per_layer = (
+                            StatsCollector.compute_gradient_stats(self.model))
+                    if self.config.grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                    self.optimizer.step()
+            else:
+                if self.config.value_head_enabled:
+                    scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                else:
+                    scores = self.model(boards, move_features, move_counts)
+                    value_preds = None
+                if not torch.isfinite(scores).all():
+                    print("  Warning: non-finite scores detected; skipping batch")
+                    if self.stats_collector:
+                        self.stats_collector.record_non_finite_event(
+                            self.step, 'model_scores', 'Non-finite output scores (FP32)')
+                    continue
+                _current_scores = scores.detach()
+                policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
+                if value_preds is not None and value_targets is not None:
+                    value_loss = nn.functional.mse_loss(value_preds, value_targets)
+                    loss = policy_loss + self.config.value_weight * value_loss
+                else:
+                    loss = policy_loss
+                if not torch.isfinite(loss):
+                    print("  Warning: non-finite loss detected; skipping batch")
+                    if self.stats_collector:
+                        self.stats_collector.record_non_finite_event(
+                            self.step, 'loss', 'Non-finite loss value (FP32)')
+                    continue
+                loss.backward()
+                # Capture gradient norms before clipping
+                if (self.stats_collector and
+                        self.step % self.config.stats_record_every == 0):
+                    _grad_norm, _grad_norms_per_layer = (
+                        StatsCollector.compute_gradient_stats(self.model))
+                if self.config.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                self.optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+            self.step += 1
+            _step_elapsed = time.time() - _step_start
+
+            # Step the LR scheduler (per-step, not per-epoch)
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            # Get current LR (from scheduler if active, else from config)
+            current_lr = (self.scheduler.get_last_lr()[0]
+                          if self.scheduler is not None
+                          else self.config.learning_rate)
+
+            # Record step stats every N steps (to avoid excessive memory usage)
+            if self.step % self.config.stats_record_every == 0:
+                self._record_step_stats(loss.item(), current_lr)
+
+                # Enhanced stats collection
+                if self.stats_collector:
+                    # Score distribution stats
+                    _score_stats = None
+                    if (_current_scores is not None and
+                            self.step % self.config.stats_score_dist_every == 0):
+                        _score_stats = StatsCollector.compute_score_stats(
+                            _current_scores, move_counts)
+
+                    self.stats_collector.record_training_step(
+                        step=self.step,
+                        loss=loss.item(),
+                        lr=current_lr,
+                        batch_size=boards.shape[0],
+                        step_time=_step_elapsed,
+                        grad_norm=_grad_norm,
+                        grad_norms_per_layer=_grad_norms_per_layer,
+                        score_stats=_score_stats,
+                    )
+
+            # System metrics (lower frequency)
+            if (self.stats_collector and
+                    self.step % self.config.stats_system_every == 0):
+                self.stats_collector.record_system_metrics(self.step)
+
+            # Model health (even lower frequency)
+            if (self.stats_collector and
+                    self.step % self.config.stats_model_health_every == 0):
+                self.stats_collector.record_model_health(self.model, self.step)
+
+            # Checkpoint
+            if self.step % self.config.checkpoint_every == 0:
+                avg_loss = total_loss / num_batches
+                self._save_checkpoint(avg_loss)
+
+                # Log metrics
+                gpu_mem = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                self._log({
+                    'step': self.step,
+                    'loss': avg_loss,
+                    'lr': self.config.learning_rate,
+                    'gpu_mem_mb': gpu_mem,
+                })
+
+            # Progress
+            if self.step % 100 == 0:
+                print(f"  Step {self.step}, Loss: {loss.item():.4f}")
+
+            if self.step >= self.config.train_steps:
+                break
+
+        epoch_time = time.time() - epoch_start_time
+
+        # Record epoch in stats collector
+        if self.stats_collector:
+            avg = total_loss / max(num_batches, 1)
+            self.stats_collector.record_epoch(
+                epoch=self.epoch + 1,  # will be incremented by caller
+                step=self.step,
+                avg_loss=avg,
+                num_batches=num_batches,
+                epoch_time_sec=epoch_time,
+            )
+
+        return total_loss / max(num_batches, 1)
+
+    def _compute_loss(
+        self,
+        scores: torch.Tensor,
+        move_counts: torch.Tensor,
+        targets: torch.Tensor,
+        reward_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute reward-weighted cross-entropy loss for move selection.
+
+        The model outputs one score per move. For each position,
+        we want to maximize the score of the chosen move.
+
+        Fully vectorized — no Python loop over batch positions.
+        Uses scatter to build a padded (batch_size, max_moves) matrix,
+        then applies log_softmax in one GPU call.
+        """
+        batch_size = move_counts.shape[0]
+        counts = move_counts.long()
+        max_moves = int(counts.max().item())
+        if max_moves == 0:
+            return scores.sum() * 0
+
+        # Build scatter indices without a Python loop.
+        # exclusive_cumsum[i] = start offset of position i inside the flat scores tensor.
+        exclusive_cumsum = counts.cumsum(0) - counts          # (batch_size,)
+        row_idx = torch.repeat_interleave(
+            torch.arange(batch_size, device=scores.device), counts
+        )                                                      # (total_moves,)
+        col_idx = (
+            torch.arange(scores.shape[0], device=scores.device, dtype=torch.long)
+            - exclusive_cumsum[row_idx]
+        )                                                      # (total_moves,)
+
+        # Scatter scores into a padded matrix; -inf for unused (padding) slots.
+        # float32 for numerical stability regardless of AMP dtype.
+        padded = torch.full(
+            (batch_size, max_moves), float('-inf'),
+            device=scores.device, dtype=torch.float32,
+        )
+        padded[row_idx, col_idx] = scores.float()
+
+        # Positions with zero moves have an all-inf row: log_softmax(-inf,...) = nan.
+        # Set those rows to 0 so softmax gives uniform output — their weight (w=0)
+        # ensures they never contribute to the loss regardless.
+        no_moves = counts == 0
+        if no_moves.any():
+            padded[no_moves] = 0.0
+
+        # log_softmax handles numerical stability internally; -inf pads → 0 prob.
+        log_probs = torch.nn.functional.log_softmax(padded, dim=1)  # (batch_size, max_moves)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+
+        # Gather the log prob of the chosen move for each position.
+        safe_targets = targets.long().clamp(0, max_moves - 1).unsqueeze(1)  # (batch_size, 1)
+        chosen_log_probs = log_probs.gather(1, safe_targets).squeeze(1)     # (batch_size,)
+
+        # Mask entries with zero moves or out-of-range target index.
+        valid = (counts > 0) & (targets.long() >= 0) & (targets.long() < counts)
+
+        # Build per-sample weights (zero for invalid entries).
+        if reward_weights is not None:
+            w = reward_weights.float().squeeze(-1) * valid.float()
+        else:
+            w = valid.float()
+
+        total_weight = w.sum()
+        if total_weight == 0:
+            return scores.sum() * 0
+
+        return -(chosen_log_probs * w).sum() / total_weight
+
+    def train(self) -> None:
+        """Run the full training loop."""
+        print("\n" + "=" * 50)
+        print("Filipino Dama - ML Training")
+        print("=" * 50)
+        # Print model architecture
+        total_params = sum(p.numel() for p in self.model.parameters())
+        model_mb = total_params * 4 / 1e6  # FP32 size
+        value_str = f", value_head={self.config.value_head_hidden}h" if self.config.value_head_enabled else ""
+        print(f"Model: {self.config.model_channels}ch, {self.config.model_blocks} blocks, "
+              f"{self.config.model_embedding} emb, {self.config.model_hidden} hidden{value_str} "
+              f"({total_params:,} params, ~{model_mb:.1f}MB FP32)")
+        print(f"Reward mode: {self.config.reward_mode}")
+        if self.config.reward_mode == 'cycle':
+            print("  (Odd epochs use scoring, even epochs use uniform weights)")
+
+        # Set start time for stats
+        if not self.stats.start_time:
+            self.stats.start_time = datetime.now().isoformat()
+
+        # Generate initial self-play data if needed
+        entry_count = self.replay_buffer.count_entries()
+        if entry_count < self.config.batch_size * 10:
+            print(f"\nInsufficient training data ({entry_count} entries)")
+            self.run_selfplay(self.config.selfplay_games)
+
+        # Prepare data
+        print("\nPreparing training data...")
+        train_entries, val_entries = prepare_training_data(self.replay_buffer)
+        print(f"Training: {len(train_entries)}, Validation: {len(val_entries)}")
+
+        if not train_entries:
+            print("ERROR: No training data available")
+            return
+
+        # Create dataloader
+        effective_workers = self.config.dataloader_workers
+        
+        print(f"Creating DataLoader with {effective_workers} workers...")
+        sys.stdout.flush()
+        dataloader = create_dataloader(
+            train_entries,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=effective_workers,
+            pin_memory=self.config.pin_memory,
+        )
+        print(f"DataLoader ready with {len(dataloader)} batches.")
+        sys.stdout.flush()
+
+        # Training loop
+        print(f"\nStarting training from step {self.step}...")
+        print("(First batch may take a moment to load...)")
+        sys.stdout.flush()
+        start_time = time.time()
+
+        # Track last test step
+        last_test_step = 0
+        loss = 0.0  # Initialize loss in case loop doesn't run
+
+        # Start continuous background self-play immediately so CPU is never idle
+        self._start_background_selfplay(self.config.selfplay_games // 2)
+
+        while self.step < self.config.train_steps:
+            if self._stopped:
+                break
+
+            # Check if stop time has been reached
+            if self.config.stop_time and datetime.now() >= self.config.stop_time:
+                print(f"\nStop time reached ({self.config.stop_time.strftime('%Y-%m-%d %H:%M')}). Saving and exiting...")
+                break
+
+            loss = self.train_epoch(dataloader, use_scoring=self._should_use_scoring())
+            self.epoch += 1
+            self.stats.epochs_completed = self.epoch
+            scoring_label = "scoring" if self._should_use_scoring_for_epoch(self.epoch - 1) else "no-scoring"
+            current_lr = (self.scheduler.get_last_lr()[0]
+                          if self.scheduler is not None
+                          else self.config.learning_rate)
+            print(f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
+                  f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
+
+            # Continuous background self-play: swap data when ready, restart immediately
+            bg_entries = self._collect_background_selfplay()
+            if bg_entries is not None and len(bg_entries) > 0:
+                print("Background self-play complete — refreshing DataLoader...")
+                dataloader = create_dataloader(
+                    bg_entries,
+                    batch_size=self.config.batch_size,
+                    shuffle=True,
+                    num_workers=effective_workers,
+                    pin_memory=self.config.pin_memory,
+                )
+                # Immediately start the next batch — keeps CPU busy at all times
+                self._start_background_selfplay(self.config.selfplay_games // 2)
+            
+            # Periodic model testing vs algorithm
+            if (self.config.test_vs_algo and 
+                self.step > 0 and 
+                self.step - last_test_step >= self.config.test_every):
+                try:
+                    self.run_test_vs_algo()
+                    last_test_step = self.step
+                except Exception as e:
+                    print(f"Test vs algorithm failed: {e}")
+
+        # Wait for any background self-play to finish before exit
+        if self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
+            print("Waiting for background self-play to finish...")
+            self._bg_selfplay_thread.join(timeout=60)
+
+        # Final checkpoint
+        self._save_checkpoint(loss)
+        
+        # Final test vs algorithm
+        if self.config.test_vs_algo:
+            try:
+                print("\nRunning final model evaluation...")
+                self.run_test_vs_algo(num_games=self.config.test_games * 2)
+            except Exception as e:
+                print(f"Final test failed: {e}")
+
+        elapsed = time.time() - start_time
+        print(f"\nTraining complete!")
+        print(f"  Total steps: {self.step}")
+        print(f"  Epochs: {self.epoch}")
+        print(f"  Time: {elapsed:.1f}s")
+        print(f"  Final model: {self.config.latest_path}")
+        
+        # Print test summary
+        if self.stats.test_history:
+            latest_test = self.stats.test_history[-1]
+            print(f"  Final ML Win Rate: {latest_test.get('ml_win_rate', 0)*100:.1f}%")
+
+        # Export comprehensive statistics
+        if self.stats_collector:
+            try:
+                self.stats_collector.print_session_summary()
+                exports = self.stats_collector.export_all()
+                print(f"\n  Statistics exported to: {self.config.stats_output_dir}/")
+                for name, path in exports.items():
+                    print(f"    {name}: {path}")
+            except Exception as e:
+                print(f"  Warning: Failed to export statistics: {e}")
+
+    def pause(self) -> None:
+        """Pause training."""
+        self._paused = True
+
+    def resume(self) -> None:
+        """Resume training."""
+        self._paused = False
+
+    def stop(self) -> None:
+        """Stop training."""
+        self._stopped = True
+        self._paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current training status."""
+        gpu_mem = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+        
+        # Get recent loss from history
+        recent_loss = None
+        if self.stats.loss_history:
+            recent_loss = self.stats.loss_history[-1].get('loss')
+        
+        return {
+            'step': self.step,
+            'epoch': self.epoch,
+            'paused': self._paused,
+            'device': str(self.device),
+            'gpu_mem_mb': gpu_mem,
+            'recent_loss': recent_loss,
+            'best_loss': self.stats.best_loss if self.stats.best_loss != float('inf') else None,
+        }
+
+    def get_stats(self) -> TrainingStats:
+        """Get the full training statistics."""
+        return self.stats
+
+
+def list_checkpoints(checkpoint_dir: str = 'models/checkpoints') -> list:
+    """List available checkpoints sorted by step."""
+    checkpoint_path = Path(checkpoint_dir)
+    if not checkpoint_path.exists():
+        return []
+    
+    checkpoints = []
+    for f in checkpoint_path.glob('model_step_*.pt'):
+        try:
+            step = int(f.stem.split('_')[-1])
+            checkpoints.append({
+                'path': str(f),
+                'step': step,
+                'name': f.name,
+            })
+        except ValueError:
+            continue
+    
+    # Sort by step
+    checkpoints.sort(key=lambda x: x['step'])
+    return checkpoints
+
+
+def load_training_stats(stats_file: str = 'models/training_stats.json') -> Optional[TrainingStats]:
+    """Load training statistics from file."""
+    stats_path = Path(stats_file)
+    if not stats_path.exists():
+        return None
+    
+    try:
+        with open(stats_path, 'r') as f:
+            data = json.load(f)
+        return TrainingStats.from_dict(data)
+    except Exception:
+        return None
+
+
+def load_config_from_yaml(config_path: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load training configuration from a YAML file.
+    
+    Args:
+        config_path: Path to the YAML config file
+        profile: Optional profile name to apply (e.g., 'server', 'local', 'cpu')
+    
+    Returns:
+        Dictionary of configuration values
+    """
+    import yaml
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Apply profile if specified
+    if profile and 'profiles' in config:
+        if profile in config['profiles']:
+            profile_config = config['profiles'][profile]
+            # Deep merge profile into config
+            def deep_merge(base: dict, override: dict) -> dict:
+                result = base.copy()
+                for key, value in override.items():
+                    if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                        result[key] = deep_merge(result[key], value)
+                    else:
+                        result[key] = value
+                return result
+            config = deep_merge(config, profile_config)
+            print(f"Applied profile: {profile}")
+        else:
+            print(f"Warning: Profile '{profile}' not found. Available: {list(config['profiles'].keys())}")
+    
+    return config
+
+
+def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
+    """
+    Convert YAML config dictionary to TrainingConfig dataclass.
+    
+    Args:
+        yaml_config: Dictionary loaded from YAML file
+    
+    Returns:
+        TrainingConfig instance
+    """
+    device_cfg = yaml_config.get('device', {})
+    selfplay_cfg = yaml_config.get('selfplay', {})
+    training_cfg = yaml_config.get('training', {})
+    dataloader_cfg = yaml_config.get('dataloader', {})
+    testing_cfg = yaml_config.get('testing', {})
+    paths_cfg = yaml_config.get('paths', {})
+    resume_cfg = yaml_config.get('resume', {})
+    time_cfg = yaml_config.get('time_limit', {})
+    stats_cfg = yaml_config.get('statistics', {})
+    model_cfg = yaml_config.get('model', {})
+    lr_sched_cfg = training_cfg.get('lr_scheduler', {})
+    value_head_cfg = yaml_config.get('value_head', {})
+    
+    # Parse stop time if duration is set
+    stop_time = None
+    if time_cfg.get('enabled') and time_cfg.get('duration'):
+        stop_time = parse_duration(time_cfg['duration'])
+    
+    return TrainingConfig(
+        # Device settings
+        device=device_cfg.get('type', 'cuda'),
+        amp=device_cfg.get('amp', {}).get('enabled', True),
+        amp_dtype=device_cfg.get('amp', {}).get('dtype', 'float16'),
+        compile_model=device_cfg.get('compile', {}).get('enabled', True),
+        compile_mode=device_cfg.get('compile', {}).get('mode', 'reduce-overhead'),
+        # Model architecture
+        model_channels=model_cfg.get('channels', 64),
+        model_blocks=model_cfg.get('num_blocks', 4),
+        model_embedding=model_cfg.get('embedding_size', 128),
+        model_hidden=model_cfg.get('hidden_size', 64),
+        # Self-play settings
+        cpu_workers=selfplay_cfg.get('cpu_workers', 10),
+        selfplay_games=selfplay_cfg.get('games_per_epoch', 500),
+        selfplay_focus_side=selfplay_cfg.get('focus_side', 'both'),
+        selfplay_opponent_focus=selfplay_cfg.get('opponent_focus', 'both'),
+        selfplay_difficulties=selfplay_cfg.get('difficulties', ['medium']),
+        selfplay_noise_prob=selfplay_cfg.get('noise_prob', 0.1),
+        selfplay_max_moves=selfplay_cfg.get('max_moves_per_game', 200),
+        selfplay_every=selfplay_cfg.get('selfplay_every', 5000),
+        # Training settings
+        batch_size=training_cfg.get('batch_size', 256),
+        learning_rate=training_cfg.get('learning_rate', 3e-4),
+        weight_decay=training_cfg.get('weight_decay', 1e-5),
+        grad_clip_norm=training_cfg.get('grad_clip_norm'),
+        train_steps=training_cfg.get('train_steps', 10000),
+        checkpoint_every=training_cfg.get('checkpoint_every', 1000),
+        reward_mode=training_cfg.get('reward_mode', 'cycle'),
+        # LR scheduler settings
+        lr_scheduler_enabled=lr_sched_cfg.get('enabled', False),
+        lr_scheduler_type=lr_sched_cfg.get('type', 'cosine_warm_restarts'),
+        lr_scheduler_T0=lr_sched_cfg.get('T_0', 500),
+        lr_scheduler_T_mult=lr_sched_cfg.get('T_mult', 2),
+        lr_scheduler_eta_min=lr_sched_cfg.get('eta_min', 1e-5),
+        # Value head / TD learning
+        value_head_enabled=value_head_cfg.get('enabled', False),
+        value_head_hidden=value_head_cfg.get('hidden_size', 128),
+        value_weight=value_head_cfg.get('value_weight', 0.5),
+        # DataLoader settings
+        dataloader_workers=dataloader_cfg.get('num_workers', 4),
+        pin_memory=dataloader_cfg.get('pin_memory', True),
+        # Testing settings
+        test_vs_algo=testing_cfg.get('enabled', True),
+        test_every=testing_cfg.get('every_n_steps', 5000),
+        test_games=testing_cfg.get('num_games', 50),
+        test_difficulty=testing_cfg.get('difficulty', 'medium'),
+        # Statistics collection settings
+        stats_enabled=stats_cfg.get('enabled', True),
+        stats_record_every=stats_cfg.get('record_every', 10),
+        stats_system_every=stats_cfg.get('system_every', 500),
+        stats_model_health_every=stats_cfg.get('model_health_every', 2000),
+        stats_score_dist_every=stats_cfg.get('score_dist_every', 50),
+        stats_buffer_size=stats_cfg.get('buffer_size', 50000),
+        stats_flush_every=stats_cfg.get('flush_every', 5000),
+        stats_output_dir=stats_cfg.get('output_dir', paths_cfg.get('log_dir', 'logs') + '/stats'),
+        # Paths
+        checkpoint_dir=paths_cfg.get('checkpoint_dir', 'models/checkpoints'),
+        latest_path=paths_cfg.get('latest_model', 'models/latest.pt'),
+        replay_dir=paths_cfg.get('replay_dir', 'data/replay'),
+        log_dir=paths_cfg.get('log_dir', 'logs'),
+        stats_file=paths_cfg.get('stats_file', 'models/training_stats.json'),
+        # Resume
+        resume=resume_cfg.get('checkpoint_path'),
+        stop_time=stop_time,
+    )
+
+
+def main():
+    """Main entry point for command-line training."""
+    parser = argparse.ArgumentParser(description='Train Filipino Dama ML model')
+
+    # Config file support
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to YAML config file (e.g., config/training_config.yaml)')
+    parser.add_argument('--profile', type=str, default=None,
+                       help='Config profile to use (e.g., server, local, cpu)')
+
+    # Device settings
+    parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'],
+                       help='Device to train on')
+    parser.add_argument('--no-amp', action='store_true',
+                       help='Disable mixed precision training')
+    parser.add_argument('--amp-dtype', type=str, default='float16',
+                       choices=['float16', 'bfloat16'],
+                       help='AMP dtype: float16 (default) or bfloat16 (recommended for AMD MI210)')
+    parser.add_argument('--compile-model', action='store_true',
+                       help='Use torch.compile for faster training')
+    parser.add_argument('--compile-mode', type=str, default='reduce-overhead', 
+                       choices=['default', 'reduce-overhead', 'max-autotune'],
+                       help='Compilation mode: default (fast compile), reduce-overhead (fast run)')
+
+    # Self-play settings
+    parser.add_argument('--cpu-workers', type=int, default=10,
+                       help='Number of parallel self-play workers')
+    parser.add_argument('--selfplay-games', type=int, default=500,
+                       help='Number of self-play games per iteration')
+    parser.add_argument('--focus-side', type=str, default='both',
+                       choices=['white', 'black', 'both'],
+                       help='Which side to focus on during self-play vs algorithm')
+    parser.add_argument('--opponent-focus', type=str, default='both',
+                       choices=['ml', 'algorithm', 'both'],
+                       help='Opponent type to focus on during self-play')
+    parser.add_argument('--selfplay-difficulties', type=str, default='medium',
+                       help='Comma-separated difficulties to cycle: easy,medium,hard,self')
+    parser.add_argument('--noise-prob', type=float, default=0.1,
+                       help='Probability of random move for exploration (0.0 to 1.0)')
+    parser.add_argument('--max-moves', type=int, default=200,
+                       help='Maximum moves per game before declaring draw')
+
+    # Training settings
+    parser.add_argument('--batch-size', type=int, default=256,
+                       help='Training batch size')
+    parser.add_argument('--learning-rate', type=float, default=3e-4,
+                       help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-5,
+                       help='Weight decay for regularization (0 to disable)')
+    parser.add_argument('--grad-clip-norm', type=float, default=1.0,
+                       help='Gradient clipping norm (0 to disable)')
+    parser.add_argument('--train-steps', type=int, default=10000,
+                       help='Total training steps')
+    parser.add_argument('--checkpoint-every', type=int, default=1000,
+                       help='Steps between checkpoints')
+    parser.add_argument('--reward-mode', type=str, default='cycle',
+                       choices=['scoring', 'none', 'cycle'],
+                       help='Reward scoring mode: scoring (always use), none (never use), cycle (alternate epochs)')
+
+    # DataLoader settings
+    parser.add_argument('--dataloader-workers', type=int, default=4,
+                       help='Number of dataloader workers')
+    parser.add_argument('--pin-memory', action='store_true',
+                       help='Pin memory for faster GPU transfer')
+
+    # Model testing settings
+    parser.add_argument('--test-vs-algo', action='store_true',
+                       help='Enable periodic testing against algorithm')
+    parser.add_argument('--test-every', type=int, default=5000,
+                       help='Steps between model tests')
+    parser.add_argument('--test-games', type=int, default=50,
+                       help='Number of test games per evaluation')
+    parser.add_argument('--test-difficulty', type=str, default='medium',
+                       choices=['easy', 'medium', 'hard'],
+                       help='Algorithm difficulty for testing')
+
+    # Resume settings
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from')
+    parser.add_argument('--resume-latest', action='store_true',
+                       help='Resume from the latest checkpoint in models/checkpoints/')
+    parser.add_argument('--train-duration', type=str, default=None,
+                       help='Train for this duration (e.g., 2d, 4h, 30m, 1d12h)')
+
+    args = parser.parse_args()
+
+    # If config file provided, load it and use as base
+    if args.config:
+        print(f"Loading config from: {args.config}")
+        yaml_config = load_config_from_yaml(args.config, args.profile)
+        config = config_from_yaml(yaml_config)
+        
+        # Override with any CLI arguments that were explicitly provided
+        # (detect via comparison with parser defaults)
+        defaults = parser.parse_args([])
+        explicit = {k for k, v in vars(args).items()
+                     if v != getattr(defaults, k, None)}
+
+        cli_map = {
+            'device': 'device',
+            'batch_size': 'batch_size',
+            'learning_rate': 'learning_rate',
+            'weight_decay': 'weight_decay',
+            'grad_clip_norm': 'grad_clip_norm',
+            'train_steps': 'train_steps',
+            'checkpoint_every': 'checkpoint_every',
+            'reward_mode': 'reward_mode',
+            'cpu_workers': 'cpu_workers',
+            'selfplay_games': 'selfplay_games',
+            'focus_side': 'selfplay_focus_side',
+            'opponent_focus': 'selfplay_opponent_focus',
+            'noise_prob': 'selfplay_noise_prob',
+            'max_moves': 'selfplay_max_moves',
+            'dataloader_workers': 'dataloader_workers',
+            'test_every': 'test_every',
+            'test_games': 'test_games',
+            'test_difficulty': 'test_difficulty',
+            'amp_dtype': 'amp_dtype',
+            'compile_mode': 'compile_mode',
+        }
+        for arg_name, config_attr in cli_map.items():
+            if arg_name in explicit:
+                setattr(config, config_attr, getattr(args, arg_name))
+        # Handle special cases
+        if 'no_amp' in explicit:
+            config.amp = not args.no_amp
+        if 'compile_model' in explicit:
+            config.compile_model = args.compile_model
+        if 'pin_memory' in explicit:
+            config.pin_memory = args.pin_memory
+        if 'test_vs_algo' in explicit:
+            config.test_vs_algo = args.test_vs_algo
+        if 'selfplay_difficulties' in explicit:
+            config.selfplay_difficulties = [d.strip() for d in args.selfplay_difficulties.split(',')]
+        if 'grad_clip_norm' in explicit:
+            config.grad_clip_norm = args.grad_clip_norm if args.grad_clip_norm > 0 else None
+
+        # Resume handling
+        if args.resume:
+            config.resume = args.resume
+        elif args.resume_latest:
+            import glob
+            import re
+            pattern = os.path.join(config.checkpoint_dir, 'model_step_*.pt')
+            checkpoints = glob.glob(pattern)
+            if checkpoints:
+                def get_step(path):
+                    match = re.search(r'model_step_(\d+)\.pt$', path)
+                    return int(match.group(1)) if match else 0
+                checkpoints.sort(key=get_step)
+                config.resume = checkpoints[-1]
+                print(f'Resuming from latest checkpoint: {config.resume}')
+
+        if args.train_duration:
+            config.stop_time = parse_duration(args.train_duration)
+
+        if explicit:
+            print(f"CLI overrides: {', '.join(sorted(explicit - {'config', 'profile', 'resume', 'resume_latest', 'train_duration'}))}")
+
+        # Print loaded config summary
+        print(f"Config loaded: batch_size={config.batch_size}, lr={config.learning_rate}, "
+              f"workers={config.dataloader_workers}, amp={config.amp}")
+    else:
+        # Use command line arguments only
+        # Handle --resume-latest
+        resume_path = args.resume
+        if args.resume_latest:
+            import glob
+            import re
+            checkpoint_dir = 'models/checkpoints'
+            pattern = os.path.join(checkpoint_dir, 'model_step_*.pt')
+            checkpoints = glob.glob(pattern)
+            if checkpoints:
+                # Sort by step number to find the latest
+                def get_step(path):
+                    match = re.search(r'model_step_(\d+)\.pt$', path)
+                    return int(match.group(1)) if match else 0
+                checkpoints.sort(key=get_step)
+                resume_path = checkpoints[-1]
+                print(f'Resuming from latest checkpoint: {resume_path}')
+            else:
+                print('No checkpoints found in models/checkpoints/, starting fresh.')
+                resume_path = None
+
+        # Parse train duration
+        stop_time = parse_duration(args.train_duration) if args.train_duration else None
+        if stop_time:
+            print(f'Training duration: {args.train_duration}')
+            print(f'Training will stop at: {stop_time.strftime("%Y-%m-%d %H:%M:%S")}')
+
+        config = TrainingConfig(
+            # Device settings
+            compile_mode=args.compile_mode,
+            device=args.device,
+            amp=not args.no_amp,
+            amp_dtype=args.amp_dtype,
+            compile_model=args.compile_model,
+            # Self-play settings
+            cpu_workers=args.cpu_workers,
+            selfplay_games=args.selfplay_games,
+            selfplay_focus_side=args.focus_side,
+            selfplay_opponent_focus=args.opponent_focus,
+            selfplay_difficulties=[d.strip() for d in args.selfplay_difficulties.split(',')],
+            selfplay_noise_prob=args.noise_prob,
+            selfplay_max_moves=args.max_moves,
+            # Training settings
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
+            train_steps=args.train_steps,
+            checkpoint_every=args.checkpoint_every,
+            reward_mode=args.reward_mode,
+            # DataLoader settings
+            dataloader_workers=args.dataloader_workers,
+            pin_memory=args.pin_memory,
+            # Model testing settings
+            test_vs_algo=args.test_vs_algo,
+            test_every=args.test_every,
+            test_games=args.test_games,
+            test_difficulty=args.test_difficulty,
+            # Resume settings
+            resume=resume_path,
+            stop_time=stop_time,
+        )
+
+    trainer = Trainer(config)
+    trainer.train()
+
+
+if __name__ == '__main__':
+    main()
