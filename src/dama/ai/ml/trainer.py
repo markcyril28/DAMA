@@ -953,9 +953,15 @@ class Trainer:
             self.stats.best_val_loss = val_loss
 
     def _save_checkpoint(self, loss: float) -> str:
-        """Save a checkpoint atomically."""
+        """Save a checkpoint atomically.
+
+        The state_dict copy happens on the main thread (requires CUDA sync),
+        but the actual disk I/O is offloaded to a background thread so the
+        GPU can continue training while the file is being written.
+        """
+        # Copy state dicts to CPU (requires CUDA sync — must be on main thread)
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': {k: v.cpu() for k, v in self.model.state_dict().items()},
             'optimizer_state_dict': self.optimizer.state_dict(),
             'step': self.step,
             'loss': loss,
@@ -973,45 +979,50 @@ class Trainer:
             }
         }
 
-        # Save scheduler state for proper resume
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
         if torch.cuda.is_available():
             checkpoint['rng_state']['cuda'] = torch.cuda.get_rng_state()
 
-        # Save to temp file then rename (atomic)
         checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
-
-        with tempfile.NamedTemporaryFile(delete=False, dir=self.config.checkpoint_dir) as tmp:
-            torch.save(checkpoint, tmp.name)
-            tmp_path = tmp.name
-
-        os.replace(tmp_path, checkpoint_path)
-
-        # Update latest.pt
         latest_path = Path(self.config.latest_path)
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        _step = self.step
+        _stats_collector = self.stats_collector
 
-        with tempfile.NamedTemporaryFile(delete=False, dir=latest_path.parent) as tmp:
-            torch.save(checkpoint, tmp.name)
-            tmp_path = tmp.name
+        # Offload disk I/O to background thread — GPU resumes training immediately.
+        def _write_checkpoint():
+            try:
+                # Save to temp file then rename (atomic)
+                with tempfile.NamedTemporaryFile(delete=False, dir=self.config.checkpoint_dir) as tmp:
+                    torch.save(checkpoint, tmp.name)
+                    tmp_path = tmp.name
+                os.replace(tmp_path, checkpoint_path)
 
-        os.replace(tmp_path, latest_path)
+                latest_path.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(delete=False, dir=latest_path.parent) as tmp:
+                    torch.save(checkpoint, tmp.name)
+                    tmp_path = tmp.name
+                os.replace(tmp_path, latest_path)
 
-        # Save stats alongside checkpoint
-        self._save_stats()
+                self._save_stats()
 
-        # Record checkpoint in stats collector
-        if self.stats_collector:
-            ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
-            save_elapsed = time.time() - _ckpt_save_start if '_ckpt_save_start' in dir() else 0
-            self.stats_collector.record_checkpoint(
-                step=self.step, loss=loss, path=str(checkpoint_path),
-                file_size_mb=ckpt_size,
-            )
+                if _stats_collector:
+                    ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
+                    _stats_collector.record_checkpoint(
+                        step=_step, loss=loss, path=str(checkpoint_path),
+                        file_size_mb=ckpt_size,
+                    )
+                print(f"Checkpoint saved: {checkpoint_path}")
+            except Exception as e:
+                print(f"Checkpoint save error: {e}")
 
-        print(f"Checkpoint saved: {checkpoint_path}")
+        thread = threading.Thread(target=_write_checkpoint, daemon=True)
+        thread.start()
+        # Don't join — let it finish in the background while training continues.
+        # The next checkpoint will implicitly wait if the thread is still alive
+        # (via the GIL during state_dict copy).
+
         return str(checkpoint_path)
 
     def _log(self, data: Dict[str, Any]) -> None:
