@@ -1444,47 +1444,47 @@ class Trainer:
             # Move to device — skip when CUDAPrefetcher already transferred
             # or when data is GPU-resident (already on device)
             if not _use_prefetcher and not _data_on_gpu:
-                boards = boards.to(self.device, non_blocking=True)
-                move_features = move_features.to(self.device, non_blocking=True)
-                move_counts = move_counts.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
+                boards = boards.to(_device, non_blocking=True)
+                move_features = move_features.to(_device, non_blocking=True)
+                move_counts = move_counts.to(_device, non_blocking=True)
+                targets = targets.to(_device, non_blocking=True)
             # Conditionally load reward weights / value targets
             if not use_scoring:
                 reward_weights = None
             elif not _use_prefetcher and not _data_on_gpu:
-                reward_weights = reward_weights.to(self.device, non_blocking=True)
-            if not self.config.value_head_enabled:
+                reward_weights = reward_weights.to(_device, non_blocking=True)
+            if not _value_head_enabled:
                 value_targets = None
             elif not _use_prefetcher and not _data_on_gpu:
-                value_targets = value_targets.to(self.device, non_blocking=True)
+                value_targets = value_targets.to(_device, non_blocking=True)
 
             # Periodic sanity check — avoids CUDA sync on every step
-            _do_sanity = (self.step % self._SANITY_CHECK_INTERVAL == 0)
+            _do_sanity = (self.step % _sanity_interval == 0)
             if _do_sanity:
                 if not torch.isfinite(boards).all() or not torch.isfinite(move_features).all():
                     print("  Warning: non-finite inputs detected; skipping batch")
-                    if self.stats_collector:
-                        self.stats_collector.record_non_finite_event(
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
                             self.step, 'input_data', 'Non-finite board or move features')
                     continue
 
             # Only zero gradients at the start of an accumulation window
             if _micro_step == 0:
                 # set_to_none=True avoids a memset, letting PyTorch deallocate instead
-                self.optimizer.zero_grad(set_to_none=True)
+                _optimizer.zero_grad(set_to_none=True)
 
             # --- Forward + backward ---
             _grad_norm = None
             _grad_norms_per_layer = None
             _current_scores = None
 
-            if self.config.amp:
-                with autocast(device_type='cuda', dtype=self.amp_dtype):
-                    if self._use_padded:
-                        if self.config.value_head_enabled:
-                            scores, value_preds = self.model.forward_padded_with_value(boards, move_features, move_counts)
+            if _use_amp:
+                with autocast(device_type='cuda', dtype=_amp_dtype):
+                    if _use_padded:
+                        if _value_head_enabled:
+                            scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
                         else:
-                            scores = self.model.forward_padded(boards, move_features, move_counts)
+                            scores = _model.forward_padded(boards, move_features, move_counts)
                             value_preds = None
                     else:
                         if self.config.value_head_enabled:
