@@ -241,6 +241,74 @@ class MoveScorerNet(nn.Module):
 
         return scores, values
 
+    def forward_padded(
+        self,
+        board: torch.Tensor,
+        move_features: torch.Tensor,
+        move_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Score moves using padded move features (training-optimized path).
+
+        Uses batched expand instead of repeat_interleave for regular memory
+        access and better torch.compile compatibility with fixed shapes.
+
+        Args:
+            board: (batch_size, BOARD_PLANES, 8, 8)
+            move_features: (batch_size, max_moves, MOVE_FEATURE_SIZE) padded
+            move_counts: (batch_size,) valid moves per position
+
+        Returns:
+            (batch_size, max_moves) scores, -inf for padding slots
+        """
+        batch_size = board.shape[0]
+        max_moves = move_features.shape[1]
+
+        board_embeddings = self.board_encoder(board)
+
+        # Expand embeddings to match padded move slots (no gather/scatter needed)
+        expanded = board_embeddings.unsqueeze(1).expand(-1, max_moves, -1)
+        expanded_flat = expanded.reshape(-1, expanded.shape[-1])
+        moves_flat = move_features.reshape(-1, move_features.shape[-1])
+
+        scores = self.move_scorer(expanded_flat, moves_flat).reshape(batch_size, max_moves)
+
+        # Mask invalid positions with -inf for correct softmax behavior
+        arange = torch.arange(max_moves, device=board.device)
+        valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
+        scores = scores.masked_fill(~valid_mask, float('-inf'))
+
+        return scores
+
+    def forward_padded_with_value(
+        self,
+        board: torch.Tensor,
+        move_features: torch.Tensor,
+        move_counts: torch.Tensor,
+    ) -> tuple:
+        """Padded forward with value head (training-optimized path)."""
+        batch_size = board.shape[0]
+        max_moves = move_features.shape[1]
+
+        board_embeddings = self.board_encoder(board)
+
+        expanded = board_embeddings.unsqueeze(1).expand(-1, max_moves, -1)
+        expanded_flat = expanded.reshape(-1, expanded.shape[-1])
+        moves_flat = move_features.reshape(-1, move_features.shape[-1])
+
+        scores = self.move_scorer(expanded_flat, moves_flat).reshape(batch_size, max_moves)
+
+        arange = torch.arange(max_moves, device=board.device)
+        valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
+        scores = scores.masked_fill(~valid_mask, float('-inf'))
+
+        if self.value_head is not None:
+            values = self.value_head(board_embeddings)
+        else:
+            values = torch.zeros(batch_size, device=board.device)
+
+        return scores, values
+
     def score_single(self, board: torch.Tensor, move_features: torch.Tensor) -> torch.Tensor:
         """
         Score moves for a single position (convenience method).
