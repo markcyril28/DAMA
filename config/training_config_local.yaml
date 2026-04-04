@@ -1,68 +1,61 @@
 # =============================================================================
-# Micro Training Configuration
+# Local Training Configuration (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
 # =============================================================================
-# This is the centralized configuration file for training hyperparameters.
-# It consolidates settings from train_server.sh, local_train.sh, and trainer.py.
+# Updated 2026-04-04 based on training analysis (Parts 1-3).
+# Key fixes: data starvation, P1/P2 asymmetry, testing enabled.
 #
 # Usage:
-#   python -m dama.ai.ml.trainer --config config/training_config.yaml
-#
-# Override any setting via command line:
-#   python -m dama.ai.ml.trainer --config config/training_config.yaml --batch-size 512
+#   python -m dama.ai.ml.trainer --config config/training_config_local.yaml
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Device Settings
 # -----------------------------------------------------------------------------
 device:
-  type: "cuda"                        # "cuda" (ROCm/HIP or CUDA) or "cpu"
+  type: "cuda"
   amp:
-    enabled: true                     # Enable automatic mixed precision
-    dtype: "float16"                  # float16 with GradScaler for RTX 5050 (bfloat16 is for MI210)
+    enabled: true
+    dtype: "float16"                    # float16 + GradScaler for RTX 5050 (no native bfloat16)
   compile:
-    enabled: true                     # Warmup tests compilation; auto-falls back to eager on failure
-    mode: "reduce-overhead"           # CUDAGraph capture — avoid "max-autotune" (Triton may fail on RTX 5050)
-  matmul_precision: "medium"          # "highest", "high", "medium" - medium enables TF32
+    enabled: true                       # Auto-falls back to eager on failure
+    mode: "reduce-overhead"             # CUDAGraphs — avoid "max-autotune" (Triton fails on RTX 5050)
+  matmul_precision: "medium"            # TF32 enabled
 
 # -----------------------------------------------------------------------------
 # Model Architecture
 # -----------------------------------------------------------------------------
-# Architecture params are saved in checkpoints for portable loading.
-# Changing these starts a NEW model (incompatible with existing checkpoints).
-# For 8GB VRAM laptop inference, keep total params under ~500M (<2GB FP32).
+# Must match existing checkpoints (128/8/256/128). DO NOT change without
+# retraining from scratch or the checkpoint will fail to load.
 # -----------------------------------------------------------------------------
 model:
-  channels: 128                       # CNN channels in ResidualBlocks
-  num_blocks: 8                       # Number of residual blocks
-  embedding_size: 256                 # Board embedding vector size
-  hidden_size: 128                    # MoveScorer MLP hidden layer size
+  channels: 128                         # CNN channels in ResidualBlocks
+  num_blocks: 8                         # Number of residual blocks
+  embedding_size: 256                   # Board embedding vector size
+  hidden_size: 128                      # MoveScorer MLP hidden layer size
 
 # -----------------------------------------------------------------------------
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                     # 8 of 12 cores — 4 reserved for GPU driver + training I/O.
-                                      # FastBatchIterator needs no DataLoader workers, so all cores go to self-play.
-  games_per_epoch: 20                # 2x previous — GPU finishes epochs in ~15s while self-play
-                                      # takes 60-120s. More games = fresher data per cycle.
-  difficulties:                       # List of difficulties to cycle through
+  cpu_workers: 11                       # 11 of 12 cores = 92%. GPU training barely uses CPU
+                                        # (compiled fwd+loss, GPU-resident data). 1 core suffices
+                                        # for GPU driver + training thread.
+  games_per_epoch: 200                  # Was 20. Generates ~10,800 entries/epoch at avg 54 moves/game.
+  difficulties:
     - "easy"
     - "medium"
-    #- "hard"
-  focus_side: "black"                  # "white", "black", or "both"
-  opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
-  noise_prob: 0.20                    # Slightly lower noise for faster convergence
-  max_moves_per_game: 100             # Maximum moves per game
-  pipeline_mode: "simultaneous"       # "simultaneous" = generate data on CPU while training on GPU (overlapped)
-                                      # "alternate"     = generate all data first, then train (sequential)
+    # - "hard"                          # Re-enable when model beats medium at >40% WR consistently
+  focus_side: "both"                    # Was "black" (overcorrection). Balanced P1/P2 exposure.
+  opponent_focus: "both"                # Was "algorithm". Now 50% ML-vs-ML + 50% ML-vs-algo.
+  noise_prob: 0.15                      # Was 0.20. Slightly less noise for better convergence.
+  max_moves_per_game: 150               # Was 100. Allow endgame play.
+  pipeline_mode: "simultaneous"
 
-  # Algo-vs-algo: pure algorithmic games as additional training data.
-  # Generates games between all difficulty matchup pairs (e.g., easy-vs-easy,
-  # easy-vs-medium, medium-vs-medium).
   algo_vs_algo:
-    enabled: true                     # Include algo-vs-algo games in training data
-    games_per_epoch: 300               # Additional games per self-play epoch
-    difficulties:                     # Difficulties to combine into matchup pairs
+    enabled: true
+    games_per_epoch: 400                # Cython fast path makes these cheap. Fills buffer quickly
+                                        # so GPU has diverse batches from the start.
+    difficulties:
       - "easy"
       - "medium"
       - "hard"
@@ -71,57 +64,52 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 4096                    # Must be smaller than available training entries;
-                                      # 4096 batch activations ~570MB, well within 8GB.
-                                      # Doubles samples/sec by amortizing per-step overhead.
-  learning_rate: 4.0e-4               # Base LR for batch_size 2048
-  weight_decay: 1.0e-5                # Weight decay for regularization
-  grad_clip_norm: 1.0                 # Gradient clipping norm (null to disable)
-  train_steps: 100000000000           # Total training steps
-  checkpoint_every: 2000              # Save checkpoint every N steps
-  gradient_accumulation_steps: 1      # No accumulation — batch fits in VRAM
+  batch_size: 8192                      # Saturate RTX 5050 compute units. Model is tiny (~500K params),
+                                        # small batches leave GPU idle between kernel launches.
+                                        # 8192 activations ~1.1GB, well within 8GB VRAM.
+  learning_rate: 4.0e-4                 # Sqrt-scaled for batch 8192: base * sqrt(8192/2048) = 2× base.
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  train_steps: 100000000000
+  checkpoint_every: 2000
+  gradient_accumulation_steps: 1
 
-  # Learning rate schedule
   lr_scheduler:
     enabled: true
     type: "cosine_warm_restarts"
-    T_0: 500
-    T_mult: 2
+    T_0: 2000                           # Was 500. Longer cycles at step 56K for plateau escape.
+    T_mult: 2                           # Doubling: 2000, 4000, 8000, 16000, ...
     eta_min: 1.0e-5
-    warmup_steps: 150                 # Longer warmup for larger batch
+    warmup_steps: 100                   # Was 150. Shorter warmup since base LR is lower.
 
-  # Reward scoring mode for training loss weighting:
-  #   "scoring" - always use the scoring system reward weights
-  #   "none"    - never use scoring (uniform weights, classic behavior)
-  #   "cycle"   - alternate epochs: odd=scoring, even=uniform (default)
-  reward_mode: "scoring"
+  reward_mode: "cycle"                  # Was "scoring". Alternate scoring/uniform for diversity.
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
 dataloader:
-  num_workers: 0                      # FastBatchIterator bypasses DataLoader — workers unused
-  pin_memory: true                    # Pin memory for faster GPU transfer
-  prefetch_factor: 4                  # Higher prefetch to keep GPU fed
-  replay_max_entries: 400000          # Use more of the replay buffer — more batches per epoch, less overfitting between self-play
-  clear_replay_after_load: true      # Delete replay JSONL files after loading into memory
-                                      # Frees disk space and prevents re-training on stale data.
-                                      # New self-play data is generated fresh each epoch regardless.
+  num_workers: 0                        # FastBatchIterator bypasses DataLoader
+  pin_memory: true
+  prefetch_factor: 4
+  replay_max_entries: 400000            # Large buffer → more batches per epoch → GPU stays busy.
+                                        # 400K entries × ~3.5KB = ~1.4GB RAM (fine for 32GB).
+  clear_replay_after_load: false        # Accumulate data across self-play cycles. With batch 8192
+                                        # and ~10K entries per cycle, clearing gives only 1 batch/epoch.
+                                        # Accumulating → ~48 batches/epoch when buffer fills (400K).
 
-  # RAM Caching (see IMPROVEMENTS.md)
   ram_cache:
-    enabled: true                     # Enable RAM caching for pre-tensorized data
-    threshold_gb: 24.0                 # Minimum available RAM (GB) to enable caching
-    cache_file: null                  # Optional: path to save/load cached tensors (.pt)
+    enabled: true
+    threshold_gb: 16.0                  # Was 24. Safer headroom on 32GB system.
+    cache_file: null
 
 # -----------------------------------------------------------------------------
 # Model Testing Settings (ML vs Algorithm)
 # -----------------------------------------------------------------------------
 testing:
-  enabled: false                      # Enable periodic testing against algorithm
-  every_n_steps: 5000                 # Test every N training steps
-  num_games: 50                       # Number of test games per evaluation
-  difficulty: "medium"                # Algorithm difficulty for testing
+  enabled: true                         # Was false. MUST track training quality.
+  every_n_steps: 2000                   # Was 5000. More frequent with smaller game count.
+  num_games: 30                         # Was 50. 30 games = fast eval with directional signal.
+  difficulty: "medium"
 
 # -----------------------------------------------------------------------------
 # Paths
@@ -134,91 +122,85 @@ paths:
   stats_file: "models/training_stats.json"
 
 # -----------------------------------------------------------------------------
-# Statistics Collection (for optimization analysis)
+# Statistics Collection
 # -----------------------------------------------------------------------------
 statistics:
-  enabled: true                       # Enhanced stats collection (JSON + CSV exports)
-  record_every: 500                   # Record loss/gradients every N steps (each triggers .item() CUDA sync)
-  system_every: 2000                  # Record GPU/CPU/RAM metrics every N steps
-  model_health_every: 5000            # Record parameter norms every N steps
-  score_dist_every: 500               # Record score distribution every N steps
-  buffer_size: 50000                  # Ring buffer size
-  flush_every: 5000                   # Flush incremental stats every N steps
-  output_dir: "logs/stats"            # Export directory
+  enabled: true
+  record_every: 2000                    # Each .item() forces CUDA sync (~20-100μs pipeline stall).
+                                        # 2000 interval = 4× fewer GPU stalls vs 500.
+  system_every: 5000
+  model_health_every: 10000
+  score_dist_every: 2000
+  buffer_size: 50000
+  flush_every: 5000
+  output_dir: "logs/stats"
 
 # -----------------------------------------------------------------------------
 # Thermal Protection
 # -----------------------------------------------------------------------------
-# Pauses training when GPU or CPU temperature exceeds the threshold.
-# After resting for the configured duration, training resumes automatically.
 thermal_protection:
-  enabled: true                        # RTX 5050 laptop — protect from throttling
-  temp_limit_c: 90                     # Temperature threshold in Celsius
-  rest_duration: "5m"                  # Rest duration when limit is hit (e.g., "5m", "10m", "1m30s")
-  check_every: 30                      # Check temperature every N seconds
+  enabled: true
+  temp_limit_c: 90
+  rest_duration: "5m"
+  check_every: 30
 
 # -----------------------------------------------------------------------------
 # Resume Settings
 # -----------------------------------------------------------------------------
 resume:
-  enabled: true                       # Enable auto-resume from latest checkpoint
-  checkpoint_path: null               # Specific checkpoint path (null = auto-detect)
-  skip_corrupted: true                # Skip checkpoints with NaN/Inf values
+  enabled: true
+  checkpoint_path: null
+  skip_corrupted: true
 
 # -----------------------------------------------------------------------------
 # Time-based Stopping
 # -----------------------------------------------------------------------------
 time_limit:
   enabled: true
-  duration: "2h"                      # Training duration (e.g., "2h", "1d12h", "30m")
+  duration: "4h"                        # Was 2h. Longer sessions for more progress.
 
 # =============================================================================
 # Hardware-Specific Profiles
 # =============================================================================
-# These are example profiles for different hardware configurations.
-# Use the --profile flag to select a profile:
-#   python -m dama.ai.ml.trainer --config config/training_config.yaml --profile server
+# WARNING: Profiles do NOT override model architecture. Server uses 64/4/128/64
+# which is INCOMPATIBLE with local checkpoints (128/8/256/128).
 # =============================================================================
 
 profiles:
-  # AMD MI210 Server (64GB VRAM, 128 CPU threads, 1TB RAM)
   server:
     device:
-      type: "cuda"
       amp:
-        enabled: true
         dtype: "bfloat16"
+      compile:
+        mode: "max-autotune"
     selfplay:
       cpu_workers: 48
       games_per_epoch: 2048
     training:
-      batch_size: 1024
-      learning_rate: 1.0e-4
+      batch_size: 4096
+      learning_rate: 3.0e-4
+      lr_scheduler:
+        warmup_steps: 400
     dataloader:
-      num_workers: 16
+      replay_max_entries: 1000000
       ram_cache:
-        enabled: true
         threshold_gb: 64.0
+    thermal_protection:
+      enabled: false
 
-  # Local development (NVIDIA RTX, 8GB+ VRAM)
   local:
     device:
-      type: "cuda"
       amp:
-        enabled: true
         dtype: "float16"
+      compile:
+        mode: "reduce-overhead"
     selfplay:
-      cpu_workers: 8
-      games_per_epoch: 100
+      cpu_workers: 11
+      games_per_epoch: 200
     training:
-      batch_size: 512
+      batch_size: 8192
       learning_rate: 4.0e-4
-    dataloader:
-      num_workers: 4
-      ram_cache:
-        enabled: false
 
-  # CPU-only training
   cpu:
     device:
       type: "cpu"
