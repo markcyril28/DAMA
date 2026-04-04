@@ -608,16 +608,19 @@ class Trainer:
                         self.model, mode=self.config.compile_mode, fullgraph=True)
                     print("  Running compile warmup (model forward only)...")
                     sys.stdout.flush()
+                    # Non-padded forward() expects 2D move_features (total_moves, feat_size),
+                    # not the 3D padded tensor. Flatten to match the expected shape.
+                    _total_moves = int(_wc.sum().item())
+                    _wm_flat = torch.randn(_total_moves, _wm.shape[-1], device=self.device)
                     with torch.no_grad():
                         if self.config.amp:
                             with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                                 compiled_model.forward_padded(_wb, _wm, _wc)
-                                # Also warm up __call__ path — it triggers
-                                # different Triton kernels than forward_padded
-                                compiled_model(_wb, _wm, _wc)
+                                compiled_model(_wb, _wm_flat, _wc)
                         else:
                             compiled_model.forward_padded(_wb, _wm, _wc)
-                            compiled_model(_wb, _wm, _wc)
+                            compiled_model(_wb, _wm_flat, _wc)
+                    del _wm_flat
                     self.model = compiled_model
                     print("torch.compile warmup OK — compiled model active (loss uncompiled)")
                     sys.stdout.flush()
@@ -1612,8 +1615,9 @@ class Trainer:
                         boards, move_features, move_counts, targets, reward_weights)
 
                 if _do_sanity:
+                    # Compiled path is always padded — scores have -inf padding,
+                    # so only NaN indicates a real problem
                     if (torch.isnan(_current_scores).any()
-                            or torch.isinf(_current_scores).any()
                             or not torch.isfinite(loss)):
                         print("  Warning: non-finite values detected; skipping batch")
                         if _stats_collector:
@@ -1674,7 +1678,8 @@ class Trainer:
                         raise
                 if _do_sanity:
                     if _use_padded:
-                        _bad = torch.isnan(scores).any() or torch.isinf(scores).any()
+                        # Padded path uses -inf for padding slots — only NaN is a real problem
+                        _bad = torch.isnan(scores).any()
                     else:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
@@ -1726,7 +1731,8 @@ class Trainer:
                         value_preds = None
                 if _do_sanity:
                     if _use_padded:
-                        _bad = torch.isnan(scores).any() or torch.isinf(scores).any()
+                        # Padded path uses -inf for padding slots — only NaN is a real problem
+                        _bad = torch.isnan(scores).any()
                     else:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
@@ -1879,6 +1885,9 @@ class Trainer:
                 break
 
         epoch_time = time.time() - epoch_start_time
+
+        # Expose to caller for dead-epoch detection
+        self._last_epoch_batches = num_batches
 
         # Record epoch in stats collector — single sync for the whole epoch
         if _stats_collector:
@@ -2105,6 +2114,8 @@ class Trainer:
         # Track last test step
         last_test_step = 0
         loss = 0.0  # Initialize loss in case loop doesn't run
+        _consecutive_dead_epochs = 0  # epochs where all batches were skipped (non-finite)
+        _DEAD_EPOCH_RECOVERY_THRESHOLD = 3  # trigger checkpoint rollback after this many
 
         # Start continuous background self-play immediately so CPU is never idle.
         # Full game count (not half) — GPU epochs are ~100x faster than self-play,
@@ -2130,6 +2141,39 @@ class Trainer:
                           else self.config.learning_rate)
             print(f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
                   f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
+
+            # --- Dead-epoch recovery: detect & recover from stuck non-finite state ---
+            if getattr(self, '_last_epoch_batches', -1) == 0:
+                _consecutive_dead_epochs += 1
+                if _consecutive_dead_epochs >= _DEAD_EPOCH_RECOVERY_THRESHOLD:
+                    print(f"\n{'='*60}")
+                    print(f"WARNING: {_consecutive_dead_epochs} consecutive epochs with "
+                          f"all batches skipped (non-finite scores).")
+                    weights_corrupted = self._has_non_finite_tensors()
+                    if weights_corrupted:
+                        print("  Cause: model weights contain NaN/Inf")
+                    else:
+                        print("  Cause: FP16 overflow (weights finite in FP32, "
+                              "but intermediate values overflow float16)")
+                    # Find and load the most recent checkpoint
+                    ckpt_dir = Path(self.config.checkpoint_dir)
+                    ckpts = sorted(ckpt_dir.glob("model_step_*.pt"))
+                    if ckpts:
+                        last_ckpt = str(ckpts[-1])
+                        print(f"  Rolling back to checkpoint: {last_ckpt}")
+                        self._load_checkpoint(last_ckpt)
+                        # Reset GradScaler to prevent the same overflow pattern
+                        if self.scaler is not None:
+                            self.scaler = GradScaler()
+                            print("  GradScaler reset to default scale")
+                    else:
+                        print("  No checkpoints found — resetting model from scratch")
+                        self._reset_model_state("No checkpoint for recovery")
+                    print(f"{'='*60}\n")
+                    sys.stdout.flush()
+                    _consecutive_dead_epochs = 0
+            else:
+                _consecutive_dead_epochs = 0
 
             if _simultaneous:
                 # Continuous background self-play: swap data when ready, restart immediately
