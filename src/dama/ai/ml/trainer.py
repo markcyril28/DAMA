@@ -1600,25 +1600,25 @@ class Trainer:
             # parameters a second time in compute_gradient_stats.  Per-layer
             # norms are only collected at model_health frequency (much lower)
             # to avoid ~40 .item() CUDA syncs per stats step.
-            _want_grad_stats = (self.stats_collector and
-                                self.step % self.config.stats_record_every == 0)
+            _want_grad_stats = (_stats_collector and
+                                self.step % _stats_record_every == 0)
 
-            if self.config.amp and self.scaler is not None:
-                if self.config.grad_clip_norm is not None:
-                    self.scaler.unscale_(self.optimizer)
+            if _use_amp and _scaler is not None:
+                if _grad_clip_norm is not None:
+                    _scaler.unscale_(_optimizer)
                     _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip_norm)
+                        _model.parameters(), _grad_clip_norm)
                     if _want_grad_stats:
                         _grad_norm = _clip_norm.item()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                _scaler.step(_optimizer)
+                _scaler.update()
             else:
-                if self.config.grad_clip_norm is not None:
+                if _grad_clip_norm is not None:
                     _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip_norm)
+                        _model.parameters(), _grad_clip_norm)
                     if _want_grad_stats:
                         _grad_norm = _clip_norm.item()
-                self.optimizer.step()
+                _optimizer.step()
 
             # Accumulate on GPU — no sync. Only .item() when needed for logging.
             # Undo the /accum_steps scaling so total_loss_acc reflects true loss.
@@ -1628,34 +1628,35 @@ class Trainer:
             _step_elapsed = (time.time() - _step_start) if _will_record else 0.0
 
             # Step the LR scheduler (per-step, not per-epoch)
-            if self.scheduler is not None:
-                self.scheduler.step()
+            if _scheduler is not None:
+                _scheduler.step()
 
             # Get current LR (from scheduler if active, else from config)
-            current_lr = (self.scheduler.get_last_lr()[0]
-                          if self.scheduler is not None
-                          else self.config.learning_rate)
+            current_lr = (_scheduler.get_last_lr()[0]
+                          if _scheduler is not None
+                          else _cfg.learning_rate)
 
             # Only call loss.item() (CUDA sync) when we actually need the scalar.
             # Avoid hardcoded intervals — piggyback on stats_record_every to
             # eliminate extra CUDA sync points on the critical path.
+            _step = self.step  # cache for repeated modulo checks below
             _need_loss_val = (
-                self.step % self.config.stats_record_every == 0
-                or self.step % self.config.checkpoint_every == 0
+                _step % _stats_record_every == 0
+                or _step % _checkpoint_every == 0
             )
             _loss_val = loss.item() if _need_loss_val else None
 
             # Record step stats every N steps (to avoid excessive memory usage)
-            if _loss_val is not None and self.step % self.config.stats_record_every == 0:
+            if _loss_val is not None and _step % _stats_record_every == 0:
                 self._record_step_stats(_loss_val, current_lr)
 
                 # Enhanced stats collection
-                if self.stats_collector:
+                if _stats_collector:
                     # Score distribution stats
                     _score_stats = None
                     if (_current_scores is not None and
-                            self.step % self.config.stats_score_dist_every == 0):
-                        if self._use_padded:
+                            _step % _stats_score_dist_every == 0):
+                        if _use_padded:
                             # Extract valid scores from padded (batch, max_moves) matrix
                             _max_m = _current_scores.shape[1]
                             _arange = torch.arange(_max_m, device=_current_scores.device)
@@ -1666,8 +1667,8 @@ class Trainer:
                             _score_stats = StatsCollector.compute_score_stats(
                                 _current_scores, move_counts)
 
-                    self.stats_collector.record_training_step(
-                        step=self.step,
+                    _stats_collector.record_training_step(
+                        step=_step,
                         loss=_loss_val,
                         lr=current_lr,
                         batch_size=boards.shape[0],
@@ -1678,43 +1679,41 @@ class Trainer:
                     )
 
             # System metrics (lower frequency)
-            if (self.stats_collector and
-                    self.step % self.config.stats_system_every == 0):
-                self.stats_collector.record_system_metrics(self.step)
+            if _stats_collector and _step % _stats_system_every == 0:
+                _stats_collector.record_system_metrics(_step)
 
             # Model health (even lower frequency)
-            if (self.stats_collector and
-                    self.step % self.config.stats_model_health_every == 0):
-                self.stats_collector.record_model_health(self.model, self.step)
+            if _stats_collector and _step % _stats_model_health_every == 0:
+                _stats_collector.record_model_health(_model, _step)
 
             # Checkpoint
-            if self.step % self.config.checkpoint_every == 0:
+            if _step % _checkpoint_every == 0:
                 avg_loss = (total_loss_acc / num_batches).item()
                 self._save_checkpoint(avg_loss)
 
                 # Log metrics
                 gpu_mem = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
                 self._log({
-                    'step': self.step,
+                    'step': _step,
                     'loss': avg_loss,
-                    'lr': self.config.learning_rate,
+                    'lr': _cfg.learning_rate,
                     'gpu_mem_mb': gpu_mem,
                 })
 
             # Progress — print at the stats interval (which already computed .item()).
             # Avoids extra CUDA syncs from a separate hardcoded interval.
-            if _loss_val is not None and self.step % self.config.stats_record_every == 0:
-                print(f"  Step {self.step}, Loss: {_loss_val:.4f}")
+            if _loss_val is not None and _step % _stats_record_every == 0:
+                print(f"  Step {_step}, Loss: {_loss_val:.4f}")
 
-            if self.step >= self.config.train_steps:
+            if _step >= _train_steps:
                 break
 
         epoch_time = time.time() - epoch_start_time
 
         # Record epoch in stats collector — single sync for the whole epoch
-        if self.stats_collector:
+        if _stats_collector:
             avg = (total_loss_acc / max(num_batches, 1)).item()
-            self.stats_collector.record_epoch(
+            _stats_collector.record_epoch(
                 epoch=self.epoch + 1,  # will be incremented by caller
                 step=self.step,
                 avg_loss=avg,
