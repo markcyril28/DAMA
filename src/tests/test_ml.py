@@ -32,7 +32,6 @@ from dama.ai.ml.dataset import (
     CachedTensorDataset,
     preprocess_entries_to_tensors,
     collate_batch,
-    collate_cached_batch,
     get_available_ram_gb,
     get_total_ram_gb,
 )
