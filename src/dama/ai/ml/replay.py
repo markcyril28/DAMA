@@ -319,7 +319,8 @@ class ReplayBuffer:
                 path = futures[future]
                 try:
                     count = future.result()
-                except Exception:
+                except Exception as e:
+                    print(f"  Warning: failed to count entries in {path}: {e}")
                     count = 0
                 file_counts.append((path, count))
 

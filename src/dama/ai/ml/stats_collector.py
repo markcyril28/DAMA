@@ -376,11 +376,39 @@ class StatsCollector:
 
         return metrics
 
-    @staticmethod
-    def _get_gpu_utilization() -> Optional[float]:
-        """Try to read GPU utilization percentage."""
+    # Lazily-initialised NVML handle shared across instances
+    _nvml_handle = None
+    _nvml_failed = False
+
+    @classmethod
+    def _ensure_nvml(cls) -> bool:
+        if cls._nvml_handle is not None:
+            return True
+        if cls._nvml_failed:
+            return False
         try:
-            # NVIDIA
+            import pynvml
+            pynvml.nvmlInit()
+            cls._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return True
+        except Exception:
+            cls._nvml_failed = True
+            return False
+
+    @classmethod
+    def _get_gpu_utilization(cls) -> Optional[float]:
+        """Read GPU utilization %. Prefers NVML (~0.1 ms) over subprocess."""
+        # Fast path: NVML
+        if cls._ensure_nvml():
+            try:
+                import pynvml
+                rates = pynvml.nvmlDeviceGetUtilizationRates(cls._nvml_handle)
+                return float(rates.gpu)
+            except Exception:
+                pass
+
+        # Fallback: subprocess
+        try:
             import subprocess
             result = subprocess.run(
                 ['nvidia-smi', '--query-gpu=utilization.gpu',
@@ -393,7 +421,6 @@ class StatsCollector:
             pass
 
         try:
-            # AMD ROCm
             import subprocess
             result = subprocess.run(
                 ['rocm-smi', '--showuse', '--json'],
@@ -401,7 +428,6 @@ class StatsCollector:
             )
             if result.returncode == 0:
                 data = json.loads(result.stdout)
-                # rocm-smi JSON format varies; try common keys
                 for card in data.values():
                     if isinstance(card, dict):
                         for key in ('GPU use (%)', 'GPU Usage (%)', 'gpu_use_percent'):
@@ -418,24 +444,66 @@ class StatsCollector:
 
     def record_model_health(self, model: torch.nn.Module, step: int) -> Dict[str, Any]:
         """Snapshot parameter norms, means, stds, and BatchNorm stats.
-        
+
+        Batches GPU→CPU transfers: collects all per-param tensors on device,
+        then does a single .cpu() transfer for norms/means/stds and deltas.
+
         Also computes weight update ratios if a previous snapshot exists.
         Returns a summary dict.
         """
         summary: Dict[str, Any] = {}
         layer_summaries: Dict[str, Dict[str, float]] = {}
 
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
+        # --- Phase 1: compute all stats on GPU without .item() ---
+        names: List[str] = []
+        gpu_norms: List[torch.Tensor] = []
+        gpu_means: List[torch.Tensor] = []
+        gpu_stds: List[torch.Tensor] = []
+        gpu_deltas: List[torch.Tensor] = []
+        has_prev: List[bool] = []
 
-            with torch.no_grad():
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                names.append(name)
                 p = param.float()
-                norm = p.norm().item()
-                mean = p.mean().item()
-                std = p.std().item() if p.numel() > 1 else 0.0
+                gpu_norms.append(p.norm())
+                gpu_means.append(p.mean())
+                gpu_stds.append(p.std() if p.numel() > 1
+                                else torch.tensor(0.0, device=param.device))
 
-            # Ensure per-layer buffers exist
+                if name in self._prev_param_snapshot:
+                    gpu_deltas.append(
+                        (param - self._prev_param_snapshot[name]).float().norm())
+                    has_prev.append(True)
+                else:
+                    has_prev.append(False)
+
+                self._prev_param_snapshot[name] = param.detach().clone()
+
+        if not names:
+            summary['layer_count'] = 0
+            summary['total_params'] = sum(p.numel() for p in model.parameters())
+            summary['trainable_params'] = 0
+            summary['layers'] = {}
+            return summary
+
+        # --- Phase 2: single CPU transfer ---
+        all_tensors = gpu_norms + gpu_means + gpu_stds + gpu_deltas
+        all_cpu = torch.stack(all_tensors).cpu().tolist()
+
+        n = len(names)
+        norms_cpu = all_cpu[:n]
+        means_cpu = all_cpu[n:2 * n]
+        stds_cpu = all_cpu[2 * n:3 * n]
+        deltas_cpu = all_cpu[3 * n:]
+
+        # --- Phase 3: populate buffers (pure Python, no GPU) ---
+        delta_idx = 0
+        for i, name in enumerate(names):
+            norm, mean, std = norms_cpu[i], means_cpu[i], stds_cpu[i]
+
             if name not in self.param_norms:
                 self.param_norms[name] = MetricBuffer(5000)
                 self.param_means[name] = MetricBuffer(5000)
@@ -446,37 +514,39 @@ class StatsCollector:
             self.param_means[name].append(mean, step)
             self.param_stds[name].append(std, step)
 
-            # Weight update ratio: |Δw| / |w|
-            if name in self._prev_param_snapshot:
-                with torch.no_grad():
-                    delta = (param - self._prev_param_snapshot[name]).float().norm().item()
-                    ratio = delta / max(norm, 1e-8)
-                    self.weight_update_ratios[name].append(ratio, step)
-                    layer_summaries[name] = {
-                        'norm': norm, 'mean': mean, 'std': std,
-                        'update_ratio': ratio,
-                    }
+            if has_prev[i]:
+                delta = deltas_cpu[delta_idx]
+                delta_idx += 1
+                ratio = delta / max(norm, 1e-8)
+                self.weight_update_ratios[name].append(ratio, step)
+                layer_summaries[name] = {
+                    'norm': norm, 'mean': mean, 'std': std,
+                    'update_ratio': ratio,
+                }
             else:
                 layer_summaries[name] = {
                     'norm': norm, 'mean': mean, 'std': std,
                 }
 
-            self._prev_param_snapshot[name] = param.detach().clone()
+        # BatchNorm running statistics — batch transfer
+        bn_names: List[str] = []
+        bn_tensors: List[torch.Tensor] = []
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+                    if module.running_mean is not None:
+                        bn_names.append(f"bn_{name}")
+                        bn_tensors.append(module.running_mean.norm())
+                        bn_tensors.append(module.running_var.mean())
 
-        # BatchNorm running statistics
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
-                if module.running_mean is not None:
-                    bn_key = f"bn_{name}"
-                    if bn_key not in self.bn_running_mean_norms:
-                        self.bn_running_mean_norms[bn_key] = MetricBuffer(5000)
-                        self.bn_running_var_means[bn_key] = MetricBuffer(5000)
-                    self.bn_running_mean_norms[bn_key].append(
-                        module.running_mean.norm().item(), step
-                    )
-                    self.bn_running_var_means[bn_key].append(
-                        module.running_var.mean().item(), step
-                    )
+        if bn_tensors:
+            bn_cpu = torch.stack(bn_tensors).cpu().tolist()
+            for i, bn_key in enumerate(bn_names):
+                if bn_key not in self.bn_running_mean_norms:
+                    self.bn_running_mean_norms[bn_key] = MetricBuffer(5000)
+                    self.bn_running_var_means[bn_key] = MetricBuffer(5000)
+                self.bn_running_mean_norms[bn_key].append(bn_cpu[2 * i], step)
+                self.bn_running_var_means[bn_key].append(bn_cpu[2 * i + 1], step)
 
         summary['layer_count'] = len(layer_summaries)
         summary['total_params'] = sum(p.numel() for p in model.parameters())
@@ -491,15 +561,69 @@ class StatsCollector:
     # ===================================================================
 
     @staticmethod
+    def compute_score_stats_padded(
+        scores: torch.Tensor, move_counts: torch.Tensor
+    ) -> Dict[str, float]:
+        """Vectorized score stats from padded (batch, max_moves) scores.
+
+        Padded positions must be -inf.  Only 4 CUDA syncs total
+        (mean, std, entropy, margin) vs O(batch_size) syncs in the
+        per-position loop.
+
+        Args:
+            scores: (batch, max_moves) padded output scores (-inf for padding).
+            move_counts: (batch,) number of valid moves per position.
+        """
+        result: Dict[str, float] = {}
+        with torch.no_grad():
+            max_moves = scores.shape[1]
+            arange = torch.arange(max_moves, device=scores.device)
+            valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
+
+            valid_scores = scores[valid_mask]
+            finite_mask = torch.isfinite(valid_scores)
+            finite_scores = valid_scores[finite_mask]
+            if finite_scores.numel() == 0:
+                return result
+
+            result['mean'] = finite_scores.mean().item()
+            result['std'] = (finite_scores.std().item()
+                             if finite_scores.numel() > 1 else 0.0)
+
+            # Filter to positions with >1 move for entropy / margin
+            multi = move_counts > 1
+            if not multi.any():
+                return result
+
+            ms = scores[multi].float()          # (N, max_moves)
+            mc = move_counts[multi]              # (N,)
+            mm = arange.unsqueeze(0) < mc.unsqueeze(1)  # (N, max_moves)
+
+            # softmax: -inf slots → prob 0 naturally
+            probs = torch.softmax(ms, dim=1)
+            log_probs = torch.log_softmax(ms, dim=1)
+            ent = -(probs * log_probs)
+            ent[~mm] = 0.0
+            result['entropy'] = ent.sum(dim=1).mean().item()
+
+            # top-1 margin
+            ss = ms.clone()
+            ss[~mm] = -1e9
+            sorted_s, _ = ss.sort(dim=1, descending=True)
+            result['top1_margin'] = (sorted_s[:, 0] - sorted_s[:, 1]).mean().item()
+
+        return result
+
+    @staticmethod
     def compute_score_stats(
         scores: torch.Tensor, move_counts: torch.Tensor
     ) -> Dict[str, float]:
         """Compute distribution statistics over model output scores.
-        
+
         Args:
-            scores: (total_moves,) raw output scores.
+            scores: (total_moves,) flat raw output scores.
             move_counts: (batch_size,) number of moves per position.
-        
+
         Returns:
             Dict with mean, std, entropy, top1_margin.
         """
@@ -510,31 +634,42 @@ class StatsCollector:
                 return result
 
             result['mean'] = finite_scores.mean().item()
-            result['std'] = finite_scores.std().item() if finite_scores.numel() > 1 else 0.0
+            result['std'] = (finite_scores.std().item()
+                             if finite_scores.numel() > 1 else 0.0)
 
-            # Per-position entropy and top-1 margin
-            entropies = []
-            margins = []
-            offset = 0
-            for i in range(move_counts.shape[0]):
-                n = move_counts[i].item()
-                if n <= 1:
-                    offset += n
-                    continue
-                pos_scores = scores[offset:offset + n].float()
-                probs = torch.softmax(pos_scores, dim=0)
-                log_probs = torch.log_softmax(pos_scores, dim=0)
-                entropy = -(probs * log_probs).sum().item()
-                entropies.append(entropy)
+            batch_size = move_counts.shape[0]
+            max_moves = move_counts.max().item()
 
-                sorted_scores, _ = pos_scores.sort(descending=True)
-                margins.append((sorted_scores[0] - sorted_scores[1]).item())
-                offset += n
+            multi = move_counts > 1
+            if not multi.any():
+                return result
 
-            if entropies:
-                result['entropy'] = _safe_mean(entropies)
-            if margins:
-                result['top1_margin'] = _safe_mean(margins)
+            # Pad flat scores into (batch, max_moves) matrix
+            padded = scores.new_full((batch_size, max_moves), float('-inf'))
+            arange = torch.arange(max_moves, device=scores.device)
+            mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
+
+            offsets = torch.zeros(batch_size, dtype=torch.long,
+                                 device=scores.device)
+            offsets[1:] = move_counts[:-1].cumsum(0)
+            flat_idx = (offsets.unsqueeze(1) + arange.unsqueeze(0)).clamp(
+                max=scores.shape[0] - 1)
+            padded[mask] = scores[flat_idx[mask]]
+
+            ms = padded[multi].float()
+            mc = move_counts[multi]
+            mm = arange.unsqueeze(0) < mc.unsqueeze(1)
+
+            probs = torch.softmax(ms, dim=1)
+            log_probs = torch.log_softmax(ms, dim=1)
+            ent = -(probs * log_probs)
+            ent[~mm] = 0.0
+            result['entropy'] = ent.sum(dim=1).mean().item()
+
+            ss = ms.clone()
+            ss[~mm] = -1e9
+            sorted_s, _ = ss.sort(dim=1, descending=True)
+            result['top1_margin'] = (sorted_s[:, 0] - sorted_s[:, 1]).mean().item()
 
         return result
 
@@ -547,23 +682,29 @@ class StatsCollector:
         model: torch.nn.Module,
     ) -> Tuple[float, Dict[str, float]]:
         """Compute global and per-layer gradient norms.
-        
+
         Should be called AFTER loss.backward() but BEFORE optimizer.step()
-        or grad clipping.
-        
+        or grad clipping.  Uses a single CPU transfer for all parameter
+        norms instead of per-parameter .item() syncs.
+
         Returns:
             (global_grad_norm, per_layer_norms)
         """
-        total_norm_sq = 0.0
-        per_layer: Dict[str, float] = {}
+        names: List[str] = []
+        norms: List[torch.Tensor] = []
 
         for name, param in model.named_parameters():
             if param.grad is not None:
-                grad_norm = param.grad.float().norm().item()
-                per_layer[name] = grad_norm
-                total_norm_sq += grad_norm ** 2
+                names.append(name)
+                norms.append(param.grad.float().norm())
 
-        global_norm = math.sqrt(total_norm_sq)
+        if not norms:
+            return 0.0, {}
+
+        # Single CUDA→CPU sync for all norms
+        norms_cpu = torch.stack(norms).cpu().tolist()
+        per_layer = dict(zip(names, norms_cpu))
+        global_norm = math.sqrt(sum(n * n for n in norms_cpu))
         return global_norm, per_layer
 
     # ===================================================================

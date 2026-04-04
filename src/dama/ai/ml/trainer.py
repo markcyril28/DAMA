@@ -633,11 +633,41 @@ class Trainer:
     # Thermal protection
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _get_gpu_temperature() -> Optional[float]:
-        """Read GPU temperature in Celsius via nvidia-smi or rocm-smi."""
+    # Lazily-initialised NVML handle — avoids subprocess per temp check
+    _nvml_handle = None
+    _nvml_failed = False
+
+    @classmethod
+    def _ensure_nvml(cls) -> bool:
+        """One-time NVML init; returns True if handle is available."""
+        if cls._nvml_handle is not None:
+            return True
+        if cls._nvml_failed:
+            return False
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            cls._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return True
+        except Exception:
+            cls._nvml_failed = True
+            return False
+
+    @classmethod
+    def _get_gpu_temperature(cls) -> Optional[float]:
+        """Read GPU temperature in Celsius. Prefers NVML (~0.1 ms) over
+        subprocess nvidia-smi (~50 ms)."""
+        # Fast path: NVML
+        if cls._ensure_nvml():
+            try:
+                import pynvml
+                return float(pynvml.nvmlDeviceGetTemperature(
+                    cls._nvml_handle, pynvml.NVML_TEMPERATURE_GPU))
+            except Exception:
+                pass
+
+        # Fallback: subprocess
         import subprocess
-        # NVIDIA
         try:
             result = subprocess.run(
                 ['nvidia-smi', '--query-gpu=temperature.gpu',
@@ -1094,7 +1124,7 @@ class Trainer:
             return _progress
 
         entries = 0
-        difficulties = self.config.selfplay_difficulties
+        difficulties = self.config.selfplay_difficulties or ['medium']
         num_difficulties = len(difficulties)
 
         def get_difficulty_for_batch(batch_idx: int) -> str:
@@ -1189,7 +1219,7 @@ class Trainer:
             from itertools import combinations_with_replacement
             from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed
 
-            ava_diffs = self.config.algo_vs_algo_difficulties
+            ava_diffs = self.config.algo_vs_algo_difficulties or ['medium']
             # Generate all matchup pairs (including same-difficulty mirrors)
             matchups = list(combinations_with_replacement(ava_diffs, 2))
             games_per_matchup = algo_vs_algo_games // len(matchups)
@@ -1801,12 +1831,8 @@ class Trainer:
                     if (_current_scores is not None and
                             _step % _stats_score_dist_every == 0):
                         if _use_padded:
-                            # Extract valid scores from padded (batch, max_moves) matrix
-                            _max_m = _current_scores.shape[1]
-                            _arange = torch.arange(_max_m, device=_current_scores.device)
-                            _vmask = _arange.unsqueeze(0) < move_counts.unsqueeze(1)
-                            _score_stats = StatsCollector.compute_score_stats(
-                                _current_scores[_vmask], move_counts)
+                            _score_stats = StatsCollector.compute_score_stats_padded(
+                                _current_scores, move_counts)
                         else:
                             _score_stats = StatsCollector.compute_score_stats(
                                 _current_scores, move_counts)
