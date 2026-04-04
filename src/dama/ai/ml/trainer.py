@@ -1377,7 +1377,7 @@ class Trainer:
         total_batches = len(dataloader)
         first_batch = True
         epoch_start_time = time.time()
-        _step_start = time.time()
+        _step_start = 0.0  # lazily set only when stats recording needs it
         accum_steps = self.config.gradient_accumulation_steps
         _micro_step = 0  # counts mini-batches within an accumulation window
 
@@ -1408,7 +1408,11 @@ class Trainer:
             # Thermal protection: pause if GPU/CPU is too hot
             self._check_thermal_and_rest()
 
-            _step_start = time.time()
+            # Only time steps when stats recording needs it (avoids 2× time.time() per step)
+            _will_record = (self.stats_collector and
+                            (self.step + 1) % self.config.stats_record_every == 0)
+            if _will_record:
+                _step_start = time.time()
 
             # Move to device — skip when CUDAPrefetcher already transferred
             # or when data is GPU-resident (already on device)
@@ -1594,7 +1598,7 @@ class Trainer:
             total_loss_acc += loss.detach() * accum_steps
             num_batches += 1
             self.step += 1
-            _step_elapsed = time.time() - _step_start
+            _step_elapsed = (time.time() - _step_start) if _will_record else 0.0
 
             # Step the LR scheduler (per-step, not per-epoch)
             if self.scheduler is not None:
