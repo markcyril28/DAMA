@@ -20,9 +20,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dama.types import Player, Move, Position
 from dama.game_state import GameState
 from dama.ai.ml.move_encoder import (
-    encode_board, 
-    encode_moves, 
-    BOARD_PLANES, 
+    encode_board,
+    encode_move,
+    encode_moves,
+    decode_board,
+    BOARD_PLANES,
     MOVE_FEATURE_SIZE
 )
 from dama.ai.ml.dataset import (
@@ -72,11 +74,72 @@ class TestMoveEncoder:
         """Test that move encoding has correct shape."""
         state = GameState.initial()
         moves = state.legal_moves()
-        
+
         encoded = encode_moves(state, moves)
-        
+
         assert encoded.shape == (len(moves), MOVE_FEATURE_SIZE)
         assert encoded.dtype == np.float32
+
+    def test_encode_board_p2_flip(self):
+        """Test that P2 board encoding flips rows so pieces appear at top."""
+        state = GameState.initial()
+
+        # P1 encoding: P1 men should be in rows 0-2 (top)
+        p1_enc = encode_board(state)
+        # P1 men (plane 0) should have pieces in rows 0-2
+        assert p1_enc[0, :3, :].sum() > 0
+        assert p1_enc[0, 5:, :].sum() == 0
+
+        # Switch to P2's turn by making a move
+        moves = state.legal_moves()
+        state_p2 = state.apply_move(moves[0])
+        assert state_p2.current_player == Player.TWO
+
+        # P2 encoding: P2's own men (plane 0) should appear in rows 0-2
+        # because rows are flipped — P2's actual rows 5-7 map to 0-2
+        p2_enc = encode_board(state_p2)
+        # Current player's men (P2) should be at top after flip
+        assert p2_enc[0, :3, :].sum() > 0
+        # Opponent's men (P1) should be at bottom after flip
+        assert p2_enc[2, 5:, :].sum() > 0
+
+    def test_encode_move_p2_flip(self):
+        """Test that P2 move encoding flips rows."""
+        from dama.types import Piece, PieceType
+        # A P2 move from (5,0) to (4,1) should flip to (2,0) -> (3,1)
+        move = Move(path=((5, 0), (4, 1)), captures=())
+        piece = Piece(Player.TWO, PieceType.MAN)
+
+        enc_p1 = encode_move(move, piece, Player.ONE)
+        enc_p2 = encode_move(move, piece, Player.TWO)
+
+        # P1: from_row=5/7, to_row=4/7
+        assert abs(enc_p1[0] - 5 / 7.0) < 1e-6
+        assert abs(enc_p1[2] - 4 / 7.0) < 1e-6
+
+        # P2: from_row=(7-5)/7=2/7, to_row=(7-4)/7=3/7
+        assert abs(enc_p2[0] - 2 / 7.0) < 1e-6
+        assert abs(enc_p2[2] - 3 / 7.0) < 1e-6
+
+        # Columns should be unchanged
+        assert enc_p1[1] == enc_p2[1]
+        assert enc_p1[3] == enc_p2[3]
+
+    def test_decode_board_p2_roundtrip(self):
+        """Test that encode -> decode round-trips correctly for P2."""
+        state = GameState.initial()
+        moves = state.legal_moves()
+        state_p2 = state.apply_move(moves[0])
+
+        encoded = encode_board(state_p2)
+        decoded = decode_board(encoded, state_p2.current_player)
+
+        # All pieces should be in the same positions after round-trip
+        for pos, piece in state_p2.board.get_pieces():
+            decoded_piece = decoded.board.get_piece(pos)
+            assert decoded_piece is not None, f"Missing piece at {pos}"
+            assert decoded_piece.player == piece.player
+            assert decoded_piece.is_king == piece.is_king
 
 
 class TestDataset:

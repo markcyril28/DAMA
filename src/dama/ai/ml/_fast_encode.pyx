@@ -19,6 +19,7 @@ def encode_board_fast_cy(dict state_dict, np.ndarray[DTYPE_f, ndim=3] planes):
     """Encode board state directly from compact dict into pre-allocated planes.
 
     Cython version: ~3-5x faster than pure Python for large batches.
+    Flips rows for P2 so both sides see canonical orientation.
     """
     cdef int turn = state_dict['turn']
     cdef list mapping
@@ -26,6 +27,7 @@ def encode_board_fast_cy(dict state_dict, np.ndarray[DTYPE_f, ndim=3] planes):
     cdef int plane_idx
     cdef list positions
     cdef int row, col
+    cdef bint flip = (turn == 2)
 
     if turn == 1:
         mapping = [('p1_men', 0), ('p1_kings', 1), ('p2_men', 2), ('p2_kings', 3)]
@@ -39,6 +41,8 @@ def encode_board_fast_cy(dict state_dict, np.ndarray[DTYPE_f, ndim=3] planes):
         positions = state_dict.get(key, ())
         for pos in positions:
             row = pos[0]
+            if flip:
+                row = 7 - row
             col = pos[1]
             planes[plane_idx, row, col] = 1.0
 
@@ -62,13 +66,14 @@ def encode_moves_fast_cy(
     cdef int n, i
     cdef dict m
     cdef list path, captures
-    cdef bint promotion, is_king
+    cdef bint promotion, is_king, flip
     cdef int start_r, start_c, end_r, end_c
     cdef int num_captures
     cdef float cap_ratio
 
     king_key = 'p1_kings' if turn == 1 else 'p2_kings'
     king_set = {(pos[0], pos[1]) for pos in state_dict.get(king_key, ())}
+    flip = (turn == 2)
 
     n = len(legal_moves)
     if n > out.shape[0]:
@@ -84,6 +89,10 @@ def encode_moves_fast_cy(
         end_r = path[len(path) - 1][0]
         end_c = path[len(path) - 1][1]
         is_king = (start_r, start_c) in king_set
+
+        if flip:
+            start_r = 7 - start_r
+            end_r = 7 - end_r
 
         out[i, 0] = start_r / 7.0
         out[i, 1] = start_c / 7.0
@@ -123,7 +132,7 @@ def preprocess_chunk_cy(
     cdef dict state_dict, m_dict
     cdef list positions, path, captures, legal_moves_list, mapping
     cdef str key, king_key
-    cdef bint promotion, is_king
+    cdef bint promotion, is_king, flip
     cdef set king_set
     cdef float cap_ratio
 
@@ -131,6 +140,7 @@ def preprocess_chunk_cy(
         entry = entries[start_idx + i]
         state_dict = entry.state
         turn = state_dict['turn']
+        flip = (turn == 2)
 
         # ── Encode board ──
         if turn == 1:
@@ -145,6 +155,8 @@ def preprocess_chunk_cy(
             positions = state_dict.get(key, ())
             for pos in positions:
                 row = pos[0]
+                if flip:
+                    row = 7 - row
                 col = pos[1]
                 boards[i, plane_idx, row, col] = 1.0
         boards[i, 4, :, :] = 1.0
@@ -169,6 +181,10 @@ def preprocess_chunk_cy(
             end_r = path[path_len - 1][0]
             end_c = path[path_len - 1][1]
             is_king = (start_r, start_c) in king_set
+
+            if flip:
+                start_r = 7 - start_r
+                end_r = 7 - end_r
 
             all_move_features[i, j, 0] = start_r / 7.0
             all_move_features[i, j, 1] = start_c / 7.0
