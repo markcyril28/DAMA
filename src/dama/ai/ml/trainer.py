@@ -645,9 +645,10 @@ class Trainer:
                         print(f"torch.compile failed ({e2}), falling back to eager mode")
                         sys.stdout.flush()
 
-            del _wb, _wm, _wc
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
+            if not _skip_compile:
+                del _wb, _wm, _wc
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Thermal protection
