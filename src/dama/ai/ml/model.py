@@ -94,8 +94,6 @@ class MoveScorer(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
-        # Clamp scores to prevent overflow in float16 (AMP) - range [-50, 50] is safe for softmax
-        x = torch.clamp(x, min=-50.0, max=50.0)
         return x
 
 
@@ -284,7 +282,7 @@ class MoveScorerNet(nn.Module):
         x = F.relu(self.move_scorer.fc1(combined))
         x = F.relu(self.move_scorer.fc2(x))
         x = self.move_scorer.fc3(x)
-        scores = torch.clamp(x.squeeze(-1), min=-50.0, max=50.0)  # (batch, max_moves)
+        scores = x.squeeze(-1)  # (batch, max_moves)
 
         # Mask invalid (padding) slots to -inf
         arange = torch.arange(max_moves, device=board.device)
@@ -316,7 +314,7 @@ class MoveScorerNet(nn.Module):
         x = F.relu(self.move_scorer.fc1(combined))
         x = F.relu(self.move_scorer.fc2(x))
         x = self.move_scorer.fc3(x)
-        scores = torch.clamp(x.squeeze(-1), min=-50.0, max=50.0)
+        scores = x.squeeze(-1)
 
         arange = torch.arange(max_moves, device=board.device)
         valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
