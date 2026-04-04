@@ -4,15 +4,18 @@
 # Hardware: AMD Instinct MI210 (64GB HBM2e) + 64 CPU threads + 1TB DDR4 RAM
 # Platform: ROCm 6.x, gfx90a (CDNA2)
 #
-# Thread Allocation (64 total):
+# Thread Allocation (64 total — auto-configured by trainer):
 #   - Self-play workers:   52 (~81%)  ← game generation (NOTE: GIL limits true
 #                                        parallelism; actual ~5x speedup observed)
-#   - DataLoader workers:   8 (~13%)  ← data loading
-#   - PyTorch threads:      4 ( ~6%)  ← CPU tensor ops (GPU-bound for inference)
+#   - PyTorch intra-op:    32 (50%)   ← tensor ops, preprocessing (auto: cores//2, cap 64)
+#   - PyTorch inter-op:     8 (12.5%) ← parallel independent ops (auto: cores//8, cap 8)
+#   - DataLoader workers:   0         ← FastBatchIterator bypasses DataLoader
 #
 # GPU VRAM: batch_size=32768 BF16 uses ~9.7 GB of 64 GB (model+activations+optimizer).
-# _compute_loss() is fully vectorized — 3 GPU kernels for the entire batch regardless
-# of size. Step time expected well below the old ~20s (which was Python-loop-bound).
+# _compute_loss() is fully vectorized — 3 GPU kernels for the entire batch.
+# Masked MoveScorer only computes valid move slots (~84% less MLP compute vs
+# full-padded — avg ~10 legal moves vs 64 padded slots).
+# Dataset preprocessing parallelized across CPU cores (ProcessPoolExecutor).
 #
 # Usage:
 #   python -m dama.ai.ml.trainer --config config/training_config_server.yaml
@@ -160,9 +163,9 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 # Model: 4.5M params, ~9MB BF16.
-# _compute_loss() is fully vectorized — batch size no longer bottlenecks through Python.
-# batch_size=32768 uses ~9.7 GB VRAM BF16 (of 64 GB). Step time expected to drop
-# significantly vs the old ~20s/step (which was Python-loop-bound, not GPU-bound).
+# _compute_loss() is fully vectorized + masked MoveScorer eliminates ~84% of
+# MLP compute (only valid move slots, not all 64 padded). batch_size=32768
+# uses ~9.7 GB VRAM BF16 (of 64 GB). Step time is now GPU-bound, not Python-bound.
 # -----------------------------------------------------------------------------
 training:
   batch_size: 32768                   # *** Increased from 4096 ***
@@ -232,12 +235,15 @@ value_head:
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-# With RAM caching, I/O is trivial. Keep conservative worker count.
-# The real bottleneck is the Python per-position loop in _compute_loss().
+# FastBatchIterator bypasses DataLoader entirely — zero workers needed.
+# pin_memory=true enables async HBM2e transfers via CUDAPrefetcher
+# (avoids synchronous pageable→staging copy for unpinned tensors).
+# Dataset preprocessing is parallelized via ProcessPoolExecutor (auto-scaled
+# to min(cores/2, 16) workers for datasets >5K entries).
 # -----------------------------------------------------------------------------
 dataloader:
-  num_workers: 8                      # 8 of 64 threads for data loading.
-  pin_memory: true                    # Pinned memory for faster HBM2e transfers
+  num_workers: 0                      # FastBatchIterator bypasses DataLoader — workers unused.
+  pin_memory: true                    # Pinned memory for async HBM2e transfers via CUDAPrefetcher
   prefetch_factor: 2                  # 2 is plenty with RAM cache
 
   # RAM Caching (1TB DDR4 available)
@@ -282,6 +288,17 @@ statistics:
   buffer_size: 100000                 # Large ring buffer — 1TB RAM is abundant
   flush_every: 1000                   # Flush to disk every 1000 steps
   output_dir: "logs/stats"
+
+# -----------------------------------------------------------------------------
+# Thermal Protection
+# -----------------------------------------------------------------------------
+# Pauses training when GPU or CPU temperature exceeds the threshold.
+# After resting for the configured duration, training resumes automatically.
+thermal_protection:
+  enabled: false                       # Disabled: MI210 has enterprise active cooling
+  temp_limit_c: 90                     # Temperature threshold in Celsius
+  rest_duration: "5m"                  # Rest duration when limit is hit
+  check_every: 30                      # Check temperature every N seconds
 
 # -----------------------------------------------------------------------------
 # Resume Settings
