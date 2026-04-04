@@ -1392,76 +1392,82 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _start_background_selfplay(self, num_games: int) -> None:
-        """Launch self-play + data preparation in a background thread.
+        """Launch continuous self-play + data preparation in a background thread.
 
-        The thread orchestrates ProcessPoolExecutor workers (true parallelism)
-        so the GIL is not an issue. GPU training continues on the main thread.
+        The thread runs a continuous loop: generate games → preprocess →
+        store dataset → immediately start next cycle.  This eliminates the
+        CPU idle gap between self-play cycles that existed when the thread
+        was one-shot and the main thread had to restart it.
+
+        The main thread picks up completed datasets via _collect_background_selfplay()
+        at epoch boundaries.  If multiple cycles complete between collections,
+        only the latest dataset is kept.
 
         Uses incremental preprocessing when possible: only preprocesses the
         new self-play entries to tensors, then concatenates with the existing
         dataset.  Falls back to full rebuild when no existing dataset exists.
-        This avoids re-preprocessing hundreds of thousands of entries that
-        haven't changed.
         """
         if self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
             return  # already running
 
-        # Capture reference to existing dataset for incremental update
-        _existing_dataset = getattr(self, '_current_dataset', None)
-        _max_entries = self.config.replay_max_entries
-
         def _worker():
-            try:
-                self.run_selfplay(num_games, collect_dicts=True)
+            _existing = getattr(self, '_current_dataset', None)
+            _max_entries = self.config.replay_max_entries
 
-                new_dicts = getattr(self, '_last_selfplay_dicts', None)
+            while not self._stopped:
+                try:
+                    self.run_selfplay(num_games, collect_dicts=True)
 
-                if new_dicts and _existing_dataset is not None and len(_existing_dataset) > 0:
-                    # Incremental: preprocess only new entries, concatenate with existing.
-                    # from_dicts() skips ReplayEntry.from_dict() round-trip — processes
-                    # raw dicts directly via _preprocess_chunk.
-                    print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
-                          f"(existing: {len(_existing_dataset)})")
-                    new_dataset = CachedTensorDataset.from_dicts(
-                        new_dicts, max_moves_per_sample=64, show_progress=True)
-                    dataset = _existing_dataset.concat(new_dataset, max_entries=_max_entries)
-                    print(f"  Merged dataset: {len(dataset)} entries")
-                else:
-                    # Full rebuild (first cycle or no existing dataset)
-                    train_entries, _ = prepare_training_data(
-                        self.replay_buffer, max_entries=_max_entries, val_split=0.0)
-                    if self.config.clear_replay_after_load:
-                        deleted = self.replay_buffer.clear_files()
-                        if deleted:
-                            print(f"Cleared {deleted} replay files after loading")
-                    dataset = CachedTensorDataset.from_entries(
-                        train_entries, max_moves_per_sample=64, show_progress=True)
+                    new_dicts = getattr(self, '_last_selfplay_dicts', None)
 
-                with self._bg_selfplay_lock:
-                    self._bg_selfplay_entries = None
-                    self._bg_selfplay_dataset = dataset
-            except Exception as e:
-                import traceback
-                print(f"Background self-play error: {e}")
-                traceback.print_exc()
+                    if new_dicts and _existing is not None and len(_existing) > 0:
+                        print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
+                              f"(existing: {len(_existing)})")
+                        new_dataset = CachedTensorDataset.from_dicts(
+                            new_dicts, max_moves_per_sample=64, show_progress=True)
+                        dataset = _existing.concat(new_dataset, max_entries=_max_entries)
+                        print(f"  Merged dataset: {len(dataset)} entries")
+                    else:
+                        train_entries, _ = prepare_training_data(
+                            self.replay_buffer, max_entries=_max_entries, val_split=0.0)
+                        if self.config.clear_replay_after_load:
+                            deleted = self.replay_buffer.clear_files()
+                            if deleted:
+                                print(f"Cleared {deleted} replay files after loading")
+                        dataset = CachedTensorDataset.from_entries(
+                            train_entries, max_moves_per_sample=64, show_progress=True)
+
+                    with self._bg_selfplay_lock:
+                        self._bg_selfplay_entries = None
+                        self._bg_selfplay_dataset = dataset
+
+                    # Use the just-produced dataset as base for next incremental cycle
+                    _existing = dataset
+
+                except Exception as e:
+                    import traceback
+                    print(f"Background self-play error: {e}")
+                    traceback.print_exc()
+                    # Don't crash the loop — sleep briefly and retry
+                    if not self._stopped:
+                        time.sleep(2.0)
 
         self._bg_selfplay_thread = threading.Thread(target=_worker, daemon=True)
         self._bg_selfplay_thread.start()
 
     def _collect_background_selfplay(self):
-        """Check if background self-play finished. Return (entries, dataset) or (None, None)."""
-        if self._bg_selfplay_thread is None:
-            return None, None
-        if self._bg_selfplay_thread.is_alive():
-            return None, None
-        self._bg_selfplay_thread.join()
-        self._bg_selfplay_thread = None
+        """Check if background self-play produced a dataset. Non-blocking.
+
+        Returns (None, dataset) if a new dataset is available, (None, None)
+        otherwise.  The background thread keeps running — no need to restart.
+        """
         with self._bg_selfplay_lock:
-            entries = self._bg_selfplay_entries
             dataset = self._bg_selfplay_dataset
-            self._bg_selfplay_entries = None
+            if dataset is None:
+                return None, None
             self._bg_selfplay_dataset = None
-        return entries, dataset
+            self._bg_selfplay_entries = None
+        return None, dataset
 
     def run_test_vs_algo(self, num_games: int = None) -> Dict[str, Any]:
         """
@@ -2280,7 +2286,7 @@ class Trainer:
                 _consecutive_dead_epochs = 0
 
             if _simultaneous:
-                # Continuous background self-play: swap data when ready, restart immediately
+                # Continuous background self-play: check if new data is ready
                 bg_entries, bg_dataset = self._collect_background_selfplay()
                 if bg_dataset is not None:
                     print(f"Background self-play complete — refreshing DataLoader "
@@ -2310,8 +2316,7 @@ class Trainer:
                         )
                     self._use_padded = True
                     _gpu_resident = getattr(dataloader, 'on_gpu', False)
-                    # Immediately start the next batch — keeps CPU busy at all times
-                    self._start_background_selfplay(self.config.selfplay_games)
+                    # Background thread is continuous — no need to restart
             else:
                 # Alternate mode: generate data synchronously, then rebuild dataloader
                 print("Running self-play (alternate mode)...")
