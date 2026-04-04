@@ -128,6 +128,7 @@ def _encode_moves_fast(
     turn = state_dict['turn']
     king_key = 'p1_kings' if turn == 1 else 'p2_kings'
     king_set = {(pos[0], pos[1]) for pos in state_dict.get(king_key, ())}
+    flip = turn == 2
 
     n = min(len(legal_moves), out.shape[0])
     for i in range(n):
@@ -139,9 +140,12 @@ def _encode_moves_fast(
         end = path[-1]
         is_king = (start[0], start[1]) in king_set
 
-        out[i, 0] = start[0] / 7.0
+        start_r = 7 - start[0] if flip else start[0]
+        end_r = 7 - end[0] if flip else end[0]
+
+        out[i, 0] = start_r / 7.0
         out[i, 1] = start[1] / 7.0
-        out[i, 2] = end[0] / 7.0
+        out[i, 2] = end_r / 7.0
         out[i, 3] = end[1] / 7.0
         out[i, 4] = 1.0 if captures else 0.0
         num_captures = len(captures)
