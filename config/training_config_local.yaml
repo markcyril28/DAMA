@@ -41,8 +41,10 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 12                     # All 12 cores — FastBatchIterator needs no DataLoader workers
-  games_per_epoch: 100                # Smaller batches for faster iteration on local
+  cpu_workers: 10                     # 10 of 12 cores — 2 reserved for GPU driver + training I/O.
+                                      # FastBatchIterator needs no DataLoader workers, so all cores go to self-play.
+  games_per_epoch: 200                # 2x previous — GPU finishes epochs in ~15s while self-play
+                                      # takes 60-120s. More games = fresher data per cycle.
   difficulties:                       # List of difficulties to cycle through
     #- "easy"
     - "medium"
@@ -51,8 +53,8 @@ selfplay:
   opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
   noise_prob: 0.15                    # Slightly lower noise for faster convergence
   max_moves_per_game: 100             # Maximum moves per game
-  pipeline_mode: "alternate"          # "simultaneous"  = overlap CPU self-play with GPU training
-                                      # "alternate"     = generate all data first, then train
+  pipeline_mode: "alternate"       # CPU self-play overlaps with GPU training — GPU never idles.
+                                      # "alternate" left the GPU idle for 60-120s per self-play cycle.
 
   # Algo-vs-algo: pure algorithmic games as additional training data.
   # Generates games between all difficulty matchup pairs (e.g., easy-vs-easy,
@@ -69,13 +71,15 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 2048                    # GPU-resident dataset + AMP: fits in 8.5GB VRAM
-  learning_rate: 4.0e-4               # Higher LR for larger effective batch
+  batch_size: 4096                    # 2x previous — model ~4.5M params uses <1GB VRAM at AMP fp16;
+                                      # 4096 batch activations ~570MB, well within 8GB.
+                                      # Doubles samples/sec by amortizing per-step overhead.
+  learning_rate: 5.6e-4               # Sqrt-scaled from 4e-4 at 2048: 4e-4 * sqrt(2) ≈ 5.66e-4
   weight_decay: 1.0e-5                # Weight decay for regularization
   grad_clip_norm: 1.0                 # Gradient clipping norm (null to disable)
   train_steps: 100000000000           # Total training steps
   checkpoint_every: 2000              # Save checkpoint every N steps
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 1      # No accumulation — batch fits in VRAM
 
   # Learning rate schedule
   lr_scheduler:
@@ -84,7 +88,7 @@ training:
     T_0: 500
     T_mult: 2
     eta_min: 1.0e-5
-    warmup_steps: 100
+    warmup_steps: 150                 # Longer warmup for larger batch
 
   # Reward scoring mode for training loss weighting:
   #   "scoring" - always use the scoring system reward weights
