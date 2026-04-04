@@ -891,6 +891,13 @@ def fast_search(
 
     _order_moves(&moves)
 
+    # Allocate TT on first use; clear before each search to avoid stale entries
+    # from prior positions. The table persists within the process to amortize
+    # allocation cost across the ~50 searches in a typical self-play game.
+    _ensure_tt()
+    if _tt_table != NULL:
+        memset(_tt_table, 0, TT_SIZE * sizeof(TTEntry))
+
     deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
     ss.deadline = deadline
     ss.nodes = 0
