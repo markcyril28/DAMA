@@ -9,7 +9,7 @@ set -euo pipefail
 #   RAM: 32 GB
 #   CPU Cores: 12
 #
-# All training parameters are in config/training_config_local.yaml.
+# All training parameters are in config/training_config_local_retrain.yaml.
 # This script only handles session-level overrides (resume, duration, etc.).
 # =============================================================================
 
