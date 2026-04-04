@@ -152,9 +152,12 @@ def preprocess_entries_to_tensors(
         )
 
     # Parallelize for large datasets (>5K entries) where IPC cost is amortized.
-    # Use min(cores/2, 16) workers — more than 16 hits diminishing returns
-    # from pickle serialization overhead.
-    num_workers = max(1, min(16, (os.cpu_count() or 1) // 2))
+    # Scale workers with core count: cap at 48 on high-core servers (128+ cores),
+    # 16 on typical desktops. Beyond ~48 workers, pickle serialization of numpy
+    # arrays and process startup overhead dominate over compute gains.
+    _cores = os.cpu_count() or 1
+    _worker_cap = 48 if _cores >= 64 else 16
+    num_workers = max(1, min(_worker_cap, _cores // 2))
     use_parallel = n >= 5000 and num_workers > 1
 
     if use_parallel:
@@ -510,9 +513,11 @@ class FastBatchIterator:
             total_vram = torch.cuda.get_device_properties(device).total_memory
             allocated = torch.cuda.memory_allocated(device)
             available = total_vram - allocated
-            # Use GPU cache if dataset fits in <40% of remaining VRAM
-            # (leave headroom for activations, gradients, optimizer state)
-            if dataset_bytes < available * 0.4:
+            # Use GPU cache if dataset fits in <55% of remaining VRAM.
+            # The model is small (~1MB params + ~2MB optimizer), so most VRAM
+            # headroom is for activations + gradients which scale with batch_size.
+            # 55% leaves ample room for batch_size up to 32K on 64GB GPUs.
+            if dataset_bytes < available * 0.55:
                 self._boards = dataset.boards.to(device)
                 self._move_features = dataset.move_features.to(device)
                 self._move_counts = dataset.move_counts.to(device)
