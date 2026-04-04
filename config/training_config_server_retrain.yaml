@@ -82,8 +82,9 @@ selfplay:
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 3600*4               # Cython fast path: ~3ms/easy, ~378ms/hard.
-                                          # Server has 4x the cores of local — scale up.
+    games_per_epoch: 14400                # Cython fast path: ~3ms/easy, ~378ms/hard.
+                                          # Same count as local — 52 workers process
+                                          # these much faster than local's 8 workers.
                                           # Fills replay buffer quickly with high-quality
                                           # data.
     difficulties:                         # Exclude super_hard — per pass 8 analysis,
