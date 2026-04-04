@@ -2671,7 +2671,7 @@ def main():
     parser.add_argument('--test-games', type=int, default=50,
                        help='Number of test games per evaluation')
     parser.add_argument('--test-difficulty', type=str, default='medium',
-                       choices=['easy', 'medium', 'hard'],
+                       choices=['easy', 'medium', 'hard', 'super_hard'],
                        help='Algorithm difficulty for testing')
 
     # Resume settings

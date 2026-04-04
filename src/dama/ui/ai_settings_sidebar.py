@@ -32,7 +32,7 @@ class AISettingsSidebar(QWidget):
         top_layout.setContentsMargins(0, 0, 0, 0)
 
         self.difficulty_combo = QComboBox()
-        self.difficulty_combo.addItems(["easy", "medium", "hard", "custom"])
+        self.difficulty_combo.addItems(["easy", "medium", "hard", "super_hard", "custom"])
         self.difficulty_combo.setCurrentText(config.ai.algorithmic.difficulty)
         self.difficulty_combo.currentTextChanged.connect(self._on_difficulty_changed)
         self.difficulty_combo.currentTextChanged.connect(self._save)

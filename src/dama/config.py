@@ -66,7 +66,7 @@ class GameSettings:
 @dataclass
 class AlgorithmicAISettings:
     """Algorithmic AI settings."""
-    difficulty: str = "medium"  # easy, medium, hard, custom
+    difficulty: str = "medium"  # easy, medium, hard, super_hard, custom
     # Custom parameters (used when difficulty is "custom")
     time_budget: float = 1.0  # seconds
     max_depth: int = 6

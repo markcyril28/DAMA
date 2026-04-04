@@ -243,7 +243,7 @@ class SettingsDialog(QDialog):
         algo_layout = QFormLayout(algo_group)
 
         self.difficulty_combo = QComboBox()
-        self.difficulty_combo.addItems(["easy", "medium", "hard", "custom"])
+        self.difficulty_combo.addItems(["easy", "medium", "hard", "super_hard", "custom"])
         self.difficulty_combo.setCurrentText(self.config.ai.algorithmic.difficulty)
         self.difficulty_combo.currentTextChanged.connect(self._on_difficulty_changed)
         algo_layout.addRow("Difficulty:", self.difficulty_combo)

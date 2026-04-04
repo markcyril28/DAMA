@@ -873,6 +873,8 @@ def fast_search(
         time_budget = 0.2
     elif difficulty == 'hard':
         time_budget = 2.5
+    elif difficulty == 'super_hard':
+        time_budget = 5.0
     else:
         time_budget = 0.8
 
@@ -882,6 +884,8 @@ def fast_search(
         max_depth = 3
     elif difficulty == 'hard':
         max_depth = 8
+    elif difficulty == 'super_hard':
+        max_depth = 12
     else:
         max_depth = 5
 
@@ -1080,6 +1084,8 @@ def play_full_game_cy(
                 time_budget = 0.2; max_depth = 3
             elif cur_diff == 'hard':
                 time_budget = 2.5; max_depth = 8
+            elif cur_diff == 'super_hard':
+                time_budget = 5.0; max_depth = 12
             else:
                 time_budget = 0.8; max_depth = 5
 

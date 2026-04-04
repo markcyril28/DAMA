@@ -26,6 +26,7 @@ TIME_BUDGETS = {
     'easy': 0.2,
     'medium': 0.8,
     'hard': 2.5,
+    'super_hard': 5.0,
 }
 
 # Max depth limits as fallback
@@ -33,6 +34,7 @@ MAX_DEPTHS = {
     'easy': 3,
     'medium': 5,
     'hard': 8,
+    'super_hard': 12,
 }
 
 # Number of worker threads (default to CPU count)

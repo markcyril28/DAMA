@@ -758,7 +758,7 @@ class TestPanel(QWidget):
         config_layout.addRow("Number of Games:", self.num_games_spin)
         
         self.difficulty_combo = QComboBox()
-        self.difficulty_combo.addItems(['easy', 'medium', 'hard'])
+        self.difficulty_combo.addItems(['easy', 'medium', 'hard', 'super_hard'])
         self.difficulty_combo.setCurrentText('medium')
         config_layout.addRow("Algorithm Difficulty:", self.difficulty_combo)
         
@@ -1221,7 +1221,7 @@ class TrainingPanel(QWidget):
         test_config_layout.addRow("Test Games:", self.test_games_spin)
         
         self.test_difficulty_combo = QComboBox()
-        self.test_difficulty_combo.addItems(['easy', 'medium', 'hard'])
+        self.test_difficulty_combo.addItems(['easy', 'medium', 'hard', 'super_hard'])
         self.test_difficulty_combo.setCurrentText('medium')
         self.test_difficulty_combo.setToolTip("Algorithm difficulty for testing")
         test_config_layout.addRow("Test Difficulty:", self.test_difficulty_combo)
