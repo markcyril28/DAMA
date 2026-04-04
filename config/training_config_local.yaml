@@ -46,9 +46,9 @@ selfplay:
   games_per_epoch: 20                # 2x previous — GPU finishes epochs in ~15s while self-play
                                       # takes 60-120s. More games = fresher data per cycle.
   difficulties:                       # List of difficulties to cycle through
-    #- "easy"
+    - "easy"
     - "medium"
-    - "hard"
+    #- "hard"
   focus_side: "black"                  # "white", "black", or "both"
   opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
   noise_prob: 0.20                    # Slightly lower noise for faster convergence
