@@ -60,9 +60,10 @@ model:
 # via Cython fast path.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 52                         # 52 of 128 threads for self-play workers.
-                                          # GIL limits true parallelism to ~5 effective
-                                          # workers, but more workers keep the queue full.
+  cpu_workers: 52                         # 52 of 128 cores for self-play processes.
+                                          # ProcessPoolExecutor uses separate processes
+                                          # (not threads), so GIL is not a factor.
+                                          # 52 leaves ~76 cores for training + OS.
   games_per_epoch: 200                    # ML-vs-algo games per cycle.
                                           # 200 games x ~40 moves = ~8K entries/cycle.
   difficulties:
