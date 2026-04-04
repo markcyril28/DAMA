@@ -104,6 +104,7 @@ class ReplayBuffer:
 
         line = _json_dumps(entry.to_dict())
         self._current_writer.write(line + '\n')
+        self._session_entries.setdefault(self._current_file, []).append(entry)
 
     def add_entries(self, entries: List[ReplayEntry]) -> None:
         """Add multiple entries and flush once."""
@@ -113,6 +114,8 @@ class ReplayBuffer:
         lines = [_json_dumps(entry.to_dict()) for entry in entries]
         self._current_writer.write('\n'.join(lines) + '\n')
         self._current_writer.flush()
+        # Keep in memory so close() can promote to file cache without re-parsing.
+        self._session_entries.setdefault(self._current_file, []).extend(entries)
 
     def _close_current(self) -> None:
         """Close the current file."""

@@ -61,7 +61,10 @@ warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
 
 from .model import MoveScorerNet, create_model, save_model, load_model
 from .replay import ReplayBuffer
-from .selfplay import SelfPlayRunner, _play_game_worker_algo_vs_algo
+from .selfplay import (
+    SelfPlayRunner, _play_game_worker_algo_vs_algo,
+    _play_games_batch_worker_algo,
+)
 from .dataset import (
     create_dataloader, create_dataloader_from_dataset, prepare_training_data,
     CachedTensorDataset, CUDAPrefetcher, FastBatchIterator,
@@ -1209,21 +1212,28 @@ class Trainer:
             random.shuffle(ava_task_args)
 
             effective_workers = min(self.config.cpu_workers, 8) if platform.system() == 'Windows' else self.config.cpu_workers
+
+            # Batch games per worker to reduce IPC overhead
+            ava_batch_size = max(1, (len(ava_task_args) + effective_workers - 1) // effective_workers)
+            ava_batches = [
+                ava_task_args[i:i + ava_batch_size]
+                for i in range(0, len(ava_task_args), ava_batch_size)
+            ]
             try:
                 with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                    futures = [executor.submit(_play_game_worker_algo_vs_algo, a) for a in ava_task_args]
+                    futures = [executor.submit(_play_games_batch_worker_algo, b) for b in ava_batches]
                     for future in _as_completed(futures):
                         try:
-                            entries_data = future.result(timeout=300)
+                            entries_data = future.result(timeout=300 * ava_batch_size)
                             from .replay import ReplayEntry
                             ava_entries = [ReplayEntry.from_dict(d) for d in entries_data]
                             self.replay_buffer.add_entries(ava_entries)
                             entries += len(ava_entries)
-                            completed_total += 1
+                            batch_idx = futures.index(future)
+                            completed_total += len(ava_batches[batch_idx])
                             if callback:
                                 callback(completed_total, grand_total)
-                            if completed_total % 50 == 0:
-                                print(f"  Games: {completed_total}/{grand_total}")
+                            print(f"  Games: {completed_total}/{grand_total}")
                         except Exception as e:
                             print(f"Algo-vs-algo error: {e}")
             except Exception as e:

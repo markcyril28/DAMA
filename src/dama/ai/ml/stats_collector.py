@@ -433,7 +433,7 @@ class StatsCollector:
                 p = param.float()
                 norm = p.norm().item()
                 mean = p.mean().item()
-                std = p.std().item()
+                std = p.std().item() if p.numel() > 1 else 0.0
 
             # Ensure per-layer buffers exist
             if name not in self.param_norms:
