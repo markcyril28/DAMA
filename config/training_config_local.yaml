@@ -41,7 +41,7 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 8                     # 10 of 12 cores — 2 reserved for GPU driver + training I/O.
+  cpu_workers: 8                     # 8 of 12 cores — 4 reserved for GPU driver + training I/O.
                                       # FastBatchIterator needs no DataLoader workers, so all cores go to self-play.
   games_per_epoch: 20                # 2x previous — GPU finishes epochs in ~15s while self-play
                                       # takes 60-120s. More games = fresher data per cycle.
