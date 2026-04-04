@@ -681,3 +681,15 @@ def get_scoring_config() -> Dict[str, Any]:
         'reward_weight_max': REWARD_WEIGHT_MAX,
         'reward_weight_draw': REWARD_WEIGHT_DRAW,
     }
+
+
+# ────────────────────────────────────────────────────────────────
+# Cython acceleration: override score_game_dicts with compiled version
+# when available.  All callers that import score_game_dicts from this
+# module automatically get the fast path — no changes needed at call sites.
+# ────────────────────────────────────────────────────────────────
+try:
+    from ._fast_score import score_game_dicts_cy as _cy_score_game_dicts
+    score_game_dicts = _cy_score_game_dicts
+except ImportError:
+    pass  # Keep the Python version defined above

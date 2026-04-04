@@ -12,6 +12,10 @@ extensions = [
         define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
     ),
     Extension(
+        "dama.ai.ml._fast_score",
+        sources=["dama/ai/ml/_fast_score.pyx"],
+    ),
+    Extension(
         "dama.ai.algorithmic._fast_search",
         sources=["dama/ai/algorithmic/_fast_search.pyx"],
     ),

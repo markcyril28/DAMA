@@ -530,6 +530,7 @@ class Trainer:
         self._bg_selfplay_thread: Optional[threading.Thread] = None
         self._bg_selfplay_entries: Optional[list] = None
         self._bg_selfplay_dataset: Optional[CachedTensorDataset] = None
+        self._bg_selfplay_incremental: Optional[CachedTensorDataset] = None
         self._bg_selfplay_lock = threading.Lock()
 
         # Padded training path flag (set when CachedTensorDataset is used)
@@ -1423,11 +1424,12 @@ class Trainer:
                     if new_dicts and _existing is not None and len(_existing) > 0:
                         print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
                               f"(existing: {len(_existing)})")
-                        new_dataset = CachedTensorDataset.from_dicts(
+                        incremental = CachedTensorDataset.from_dicts(
                             new_dicts, max_moves_per_sample=64, show_progress=True)
-                        dataset = _existing.concat(new_dataset, max_entries=_max_entries)
+                        dataset = _existing.concat(incremental, max_entries=_max_entries)
                         print(f"  Merged dataset: {len(dataset)} entries")
                     else:
+                        incremental = None
                         train_entries, _ = prepare_training_data(
                             self.replay_buffer, max_entries=_max_entries, val_split=0.0)
                         if self.config.clear_replay_after_load:
@@ -1440,6 +1442,7 @@ class Trainer:
                     with self._bg_selfplay_lock:
                         self._bg_selfplay_entries = None
                         self._bg_selfplay_dataset = dataset
+                        self._bg_selfplay_incremental = incremental
 
                     # Use the just-produced dataset as base for next incremental cycle
                     _existing = dataset
@@ -1458,16 +1461,22 @@ class Trainer:
     def _collect_background_selfplay(self):
         """Check if background self-play produced a dataset. Non-blocking.
 
-        Returns (None, dataset) if a new dataset is available, (None, None)
-        otherwise.  The background thread keeps running — no need to restart.
+        Returns (dataset, incremental) where:
+        - dataset: Full merged dataset (old + new), used for _current_dataset tracking
+        - incremental: Only the new entries from this cycle, used for GPU update_data
+          to avoid re-uploading the entire dataset via PCIe.  None on first cycle
+          (full rebuild).
+        The background thread keeps running — no need to restart.
         """
         with self._bg_selfplay_lock:
             dataset = self._bg_selfplay_dataset
             if dataset is None:
                 return None, None
+            incremental = self._bg_selfplay_incremental
             self._bg_selfplay_dataset = None
+            self._bg_selfplay_incremental = None
             self._bg_selfplay_entries = None
-        return None, dataset
+        return dataset, incremental
 
     def run_test_vs_algo(self, num_games: int = None) -> Dict[str, Any]:
         """
@@ -2287,19 +2296,20 @@ class Trainer:
 
             if _simultaneous:
                 # Continuous background self-play: check if new data is ready
-                bg_entries, bg_dataset = self._collect_background_selfplay()
+                bg_dataset, bg_incremental = self._collect_background_selfplay()
                 if bg_dataset is not None:
                     print(f"Background self-play complete — refreshing DataLoader "
                           f"({len(bg_dataset)} entries)...")
                     # Track current dataset for incremental updates in next cycle
                     self._current_dataset = bg_dataset
-                    # In-place GPU buffer update: only upload new entries via PCIe.
-                    # Avoids full GPU re-upload of 600K+ entries (~2GB) and
-                    # eliminates torch.cuda.empty_cache() stall.
+                    # In-place GPU buffer update: when incremental data is available,
+                    # only upload the new entries via PCIe (~60MB) instead of the
+                    # full merged dataset (~2GB).  GPU-side shift handles old entries.
                     _is_fast = isinstance(dataloader, FastBatchIterator)
                     if _is_fast:
+                        _update_src = bg_incremental if bg_incremental is not None else bg_dataset
                         dataloader.update_data(
-                            bg_dataset, max_entries=self.config.replay_max_entries)
+                            _update_src, max_entries=self.config.replay_max_entries)
                         dataloader.dataset = bg_dataset
                     else:
                         # Fallback: recreate dataloader (non-FastBatchIterator path)
