@@ -1487,25 +1487,25 @@ class Trainer:
                             scores = _model.forward_padded(boards, move_features, move_counts)
                             value_preds = None
                     else:
-                        if self.config.value_head_enabled:
-                            scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                        if _value_head_enabled:
+                            scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
                         else:
-                            scores = self.model(boards, move_features, move_counts)
+                            scores = _model(boards, move_features, move_counts)
                             value_preds = None
                     if _do_sanity:
                         # Padded scores have intentional -inf; only flag NaN or +inf
-                        if self._use_padded:
+                        if _use_padded:
                             _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
                         else:
                             _bad = not torch.isfinite(scores).all()
                         if _bad:
                             print("  Warning: non-finite scores detected; skipping batch")
-                            if self.stats_collector:
-                                self.stats_collector.record_non_finite_event(
+                            if _stats_collector:
+                                _stats_collector.record_non_finite_event(
                                     self.step, 'model_scores', 'Non-finite output scores')
                             continue
                     _current_scores = scores.detach()
-                    if self._use_padded:
+                    if _use_padded:
                         policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
                     else:
                         policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
@@ -1513,7 +1513,7 @@ class Trainer:
                     # Value head loss (MSE between predicted value and game result)
                     if value_preds is not None and value_targets is not None:
                         value_loss = nn.functional.mse_loss(value_preds, value_targets)
-                        loss = policy_loss + self.config.value_weight * value_loss
+                        loss = policy_loss + _value_weight * value_loss
                     else:
                         loss = policy_loss
 
@@ -1528,47 +1528,47 @@ class Trainer:
                 # every step eliminates a major pipeline stall.
                 if _do_sanity and not torch.isfinite(loss):
                     print("  Warning: non-finite loss detected; skipping batch")
-                    if self.stats_collector:
-                        self.stats_collector.record_non_finite_event(
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
                             self.step, 'loss', 'Non-finite loss value')
                     continue
 
-                if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
+                if _scaler is not None:
+                    _scaler.scale(loss).backward()
                 else:
                     loss.backward()
             else:
-                if self._use_padded:
-                    if self.config.value_head_enabled:
-                        scores, value_preds = self.model.forward_padded_with_value(boards, move_features, move_counts)
+                if _use_padded:
+                    if _value_head_enabled:
+                        scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
                     else:
-                        scores = self.model.forward_padded(boards, move_features, move_counts)
+                        scores = _model.forward_padded(boards, move_features, move_counts)
                         value_preds = None
                 else:
-                    if self.config.value_head_enabled:
-                        scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                    if _value_head_enabled:
+                        scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
                     else:
-                        scores = self.model(boards, move_features, move_counts)
+                        scores = _model(boards, move_features, move_counts)
                         value_preds = None
                 if _do_sanity:
-                    if self._use_padded:
+                    if _use_padded:
                         _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
                     else:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
                         print("  Warning: non-finite scores detected; skipping batch")
-                        if self.stats_collector:
-                            self.stats_collector.record_non_finite_event(
+                        if _stats_collector:
+                            _stats_collector.record_non_finite_event(
                                 self.step, 'model_scores', 'Non-finite output scores (FP32)')
                         continue
                 _current_scores = scores.detach()
-                if self._use_padded:
+                if _use_padded:
                     policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
                 else:
                     policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
                 if value_preds is not None and value_targets is not None:
                     value_loss = nn.functional.mse_loss(value_preds, value_targets)
-                    loss = policy_loss + self.config.value_weight * value_loss
+                    loss = policy_loss + _value_weight * value_loss
                 else:
                     loss = policy_loss
 
@@ -1577,8 +1577,8 @@ class Trainer:
 
                 if _do_sanity and not torch.isfinite(loss):
                     print("  Warning: non-finite loss detected; skipping batch")
-                    if self.stats_collector:
-                        self.stats_collector.record_non_finite_event(
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
                             self.step, 'loss', 'Non-finite loss value (FP32)')
                     continue
                 loss.backward()
