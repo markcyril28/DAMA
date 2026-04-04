@@ -34,6 +34,11 @@ from torch.amp import GradScaler, autocast
 # Note: Check ROCm support for TF32 equivalent on AMD GPUs
 torch.set_float32_matmul_precision('medium')
 
+# Enable cuDNN autotuning — finds the fastest convolution algorithm for
+# the fixed input shapes (8x8 board, constant batch size with drop_last=True).
+# One-time benchmark cost on first forward pass, then faster for all subsequent.
+torch.backends.cudnn.benchmark = True
+
 # Configure torch.compile CUDAGraph settings to avoid overhead from dynamic shapes
 # This prevents recording too many graphs for varying input sizes
 try:
@@ -56,7 +61,10 @@ warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
 from .model import MoveScorerNet, create_model, save_model, load_model
 from .replay import ReplayBuffer
 from .selfplay import SelfPlayRunner
-from .dataset import create_dataloader, prepare_training_data
+from .dataset import (
+    create_dataloader, create_dataloader_from_dataset, prepare_training_data,
+    CachedTensorDataset, CUDAPrefetcher, FastBatchIterator,
+)
 from .stats_collector import StatsCollector
 
 
@@ -107,6 +115,28 @@ def parse_duration(duration_str: Optional[str]) -> Optional[datetime]:
     
     stop_time = datetime.now() + timedelta(seconds=total_seconds)
     return stop_time
+
+
+def _parse_rest_duration(duration_str: str) -> int:
+    """Parse a duration string like '5m', '1m30s', '10m' into total seconds."""
+    import re
+    duration_str = duration_str.strip().lower()
+    total = 0
+    for match in re.finditer(r'(\d+)\s*([hms])', duration_str):
+        value, unit = int(match.group(1)), match.group(2)
+        if unit == 'h':
+            total += value * 3600
+        elif unit == 'm':
+            total += value * 60
+        elif unit == 's':
+            total += value
+    if total == 0:
+        # Fallback: try as plain integer (assume minutes)
+        try:
+            total = int(float(duration_str)) * 60
+        except ValueError:
+            total = 300  # default 5 minutes
+    return total
 
 
 @dataclass
@@ -264,6 +294,12 @@ class TrainingConfig:
     log_dir: str = 'logs'
     stats_file: str = 'models/training_stats.json'
 
+    # Thermal protection
+    thermal_enabled: bool = False
+    thermal_temp_limit_c: int = 90        # Temperature threshold in Celsius
+    thermal_rest_seconds: int = 300       # Rest duration in seconds (parsed from duration string)
+    thermal_check_every: int = 30         # Check temperature every N seconds
+
     # Resume
     resume: Optional[str] = None
 
@@ -401,7 +437,14 @@ class Trainer:
         # Background self-play state
         self._bg_selfplay_thread: Optional[threading.Thread] = None
         self._bg_selfplay_entries: Optional[list] = None
+        self._bg_selfplay_dataset: Optional[CachedTensorDataset] = None
         self._bg_selfplay_lock = threading.Lock()
+
+        # Padded training path flag (set when CachedTensorDataset is used)
+        self._use_padded = False
+
+        # Thermal protection state
+        self._last_thermal_check: float = 0.0  # time.time() of last check
 
         # Training statistics
         self.stats = TrainingStats()
@@ -475,6 +518,117 @@ class Trainer:
                 sys.stdout.flush()
             except Exception as e:
                 print(f"torch.compile unavailable: {e}")
+
+    # ------------------------------------------------------------------
+    # Thermal protection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_gpu_temperature() -> Optional[float]:
+        """Read GPU temperature in Celsius via nvidia-smi or rocm-smi."""
+        import subprocess
+        # NVIDIA
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=temperature.gpu',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                return float(result.stdout.strip().split('\n')[0])
+        except Exception:
+            pass
+        # AMD ROCm
+        try:
+            result = subprocess.run(
+                ['rocm-smi', '--showtemp', '--json'],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                import json as _json
+                data = _json.loads(result.stdout)
+                for card in data.values():
+                    if isinstance(card, dict):
+                        for key in ('Temperature (Sensor edge) (C)',
+                                    'edge temperature', 'temperature'):
+                            if key in card:
+                                return float(str(card[key]).rstrip('Cc °'))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _get_cpu_temperature() -> Optional[float]:
+        """Read highest CPU core temperature via psutil (Linux)."""
+        try:
+            import psutil
+            temps = psutil.sensors_temperatures()
+            if not temps:
+                return None
+            # Check common sensor groups: coretemp (Intel), k10temp (AMD), etc.
+            for group_name in ('coretemp', 'k10temp', 'zenpower', 'cpu_thermal',
+                               'acpitz', 'thinkpad'):
+                if group_name in temps:
+                    return max(s.current for s in temps[group_name])
+            # Fallback: return max across all sensors
+            all_temps = [s.current for entries in temps.values() for s in entries
+                         if s.current > 0]
+            return max(all_temps) if all_temps else None
+        except Exception:
+            return None
+
+    def _check_thermal_and_rest(self) -> None:
+        """If thermal protection is enabled, check temps and sleep if too hot.
+
+        Called periodically from the training loop. Uses wall-clock gating
+        so we don't shell out to nvidia-smi on every batch.
+        """
+        if not self.config.thermal_enabled:
+            return
+
+        now = time.time()
+        if now - self._last_thermal_check < self.config.thermal_check_every:
+            return
+        self._last_thermal_check = now
+
+        limit = self.config.thermal_temp_limit_c
+        gpu_temp = self._get_gpu_temperature()
+        cpu_temp = self._get_cpu_temperature()
+
+        hot_source = None
+        hot_temp = None
+        if gpu_temp is not None and gpu_temp >= limit:
+            hot_source, hot_temp = 'GPU', gpu_temp
+        elif cpu_temp is not None and cpu_temp >= limit:
+            hot_source, hot_temp = 'CPU', cpu_temp
+
+        if hot_source is None:
+            return
+
+        rest_secs = self.config.thermal_rest_seconds
+        rest_min = rest_secs / 60
+        print(f"\n{'=' * 50}")
+        print(f"THERMAL PROTECTION: {hot_source} temperature is {hot_temp:.0f}°C "
+              f"(limit: {limit}°C)")
+        print(f"Pausing training for {rest_min:.1f} minutes to cool down...")
+        print(f"{'=' * 50}")
+        sys.stdout.flush()
+
+        # Sleep in small increments so we can still respond to stop signals
+        end_time = time.time() + rest_secs
+        while time.time() < end_time:
+            if self._stopped:
+                break
+            time.sleep(min(5.0, end_time - time.time()))
+
+        # Log temps after resting
+        gpu_after = self._get_gpu_temperature()
+        cpu_after = self._get_cpu_temperature()
+        print(f"Thermal rest complete. Temps now — "
+              f"GPU: {gpu_after or 'N/A'}°C, CPU: {cpu_after or 'N/A'}°C")
+        print("Resuming training...")
+        sys.stdout.flush()
+        self._last_thermal_check = time.time()
 
     def _has_non_finite_tensors(self) -> bool:
         """Check if model parameters or buffers contain NaN/Inf."""
@@ -940,6 +1094,8 @@ class Trainer:
 
         The thread orchestrates ProcessPoolExecutor workers (true parallelism)
         so the GIL is not an issue. GPU training continues on the main thread.
+        Pre-processes data to tensors in the background so the GPU doesn't
+        stall waiting for dataset creation between epochs.
         """
         if self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
             return  # already running
@@ -948,26 +1104,33 @@ class Trainer:
             try:
                 self.run_selfplay(num_games)
                 train_entries, _ = prepare_training_data(self.replay_buffer)
+                # Pre-process to tensors in background to avoid GPU idle time
+                dataset = CachedTensorDataset.from_entries(
+                    train_entries, max_moves_per_sample=64, show_progress=True,
+                )
                 with self._bg_selfplay_lock:
                     self._bg_selfplay_entries = train_entries
+                    self._bg_selfplay_dataset = dataset
             except Exception as e:
                 print(f"Background self-play error: {e}")
 
         self._bg_selfplay_thread = threading.Thread(target=_worker, daemon=True)
         self._bg_selfplay_thread.start()
 
-    def _collect_background_selfplay(self) -> Optional[list]:
-        """Check if background self-play finished. Return entries or None."""
+    def _collect_background_selfplay(self):
+        """Check if background self-play finished. Return (entries, dataset) or (None, None)."""
         if self._bg_selfplay_thread is None:
-            return None
+            return None, None
         if self._bg_selfplay_thread.is_alive():
-            return None
+            return None, None
         self._bg_selfplay_thread.join()
         self._bg_selfplay_thread = None
         with self._bg_selfplay_lock:
             entries = self._bg_selfplay_entries
+            dataset = self._bg_selfplay_dataset
             self._bg_selfplay_entries = None
-        return entries
+            self._bg_selfplay_dataset = None
+        return entries, dataset
 
     def run_test_vs_algo(self, num_games: int = None) -> Dict[str, Any]:
         """
@@ -1094,7 +1257,14 @@ class Trainer:
         accum_steps = self.config.gradient_accumulation_steps
         _micro_step = 0  # counts mini-batches within an accumulation window
 
-        for boards, move_features, move_counts, targets, reward_weights, value_targets in dataloader:
+        # Use CUDA prefetcher for overlapped H2D transfer
+        _use_prefetcher = self.device.type == 'cuda'
+        if _use_prefetcher:
+            iter_loader = CUDAPrefetcher(dataloader, self.device)
+        else:
+            iter_loader = dataloader
+
+        for boards, move_features, move_counts, targets, reward_weights, value_targets in iter_loader:
             if first_batch:
                 print(f"  First batch loaded. Processing {total_batches} batches...")
                 sys.stdout.flush()
@@ -1108,23 +1278,26 @@ class Trainer:
                 if self._stopped:
                     break
 
+            # Thermal protection: pause if GPU/CPU is too hot
+            self._check_thermal_and_rest()
+
             _step_start = time.time()
 
-            # Move to device (non_blocking allows async transfer when pin_memory=True)
-            boards = boards.to(self.device, non_blocking=True)
-            move_features = move_features.to(self.device, non_blocking=True)
-            move_counts = move_counts.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
-            # Only send reward weights to device when scoring is active
-            if use_scoring:
-                reward_weights = reward_weights.to(self.device, non_blocking=True)
-            else:
+            # Move to device — skip when CUDAPrefetcher already transferred
+            if not _use_prefetcher:
+                boards = boards.to(self.device, non_blocking=True)
+                move_features = move_features.to(self.device, non_blocking=True)
+                move_counts = move_counts.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+            # Conditionally load reward weights / value targets
+            if not use_scoring:
                 reward_weights = None
-            # Value targets for TD/value learning
-            if self.config.value_head_enabled:
-                value_targets = value_targets.to(self.device, non_blocking=True)
-            else:
+            elif not _use_prefetcher:
+                reward_weights = reward_weights.to(self.device, non_blocking=True)
+            if not self.config.value_head_enabled:
                 value_targets = None
+            elif not _use_prefetcher:
+                value_targets = value_targets.to(self.device, non_blocking=True)
 
             # Periodic sanity check — avoids CUDA sync on every step
             _do_sanity = (self.step % self._SANITY_CHECK_INTERVAL == 0)
@@ -1148,19 +1321,35 @@ class Trainer:
 
             if self.config.amp:
                 with autocast(device_type='cuda', dtype=self.amp_dtype):
-                    if self.config.value_head_enabled:
-                        scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                    if self._use_padded:
+                        if self.config.value_head_enabled:
+                            scores, value_preds = self.model.forward_padded_with_value(boards, move_features, move_counts)
+                        else:
+                            scores = self.model.forward_padded(boards, move_features, move_counts)
+                            value_preds = None
                     else:
-                        scores = self.model(boards, move_features, move_counts)
-                        value_preds = None
-                    if _do_sanity and not torch.isfinite(scores).all():
-                        print("  Warning: non-finite scores detected; skipping batch")
-                        if self.stats_collector:
-                            self.stats_collector.record_non_finite_event(
-                                self.step, 'model_scores', 'Non-finite output scores')
-                        continue
+                        if self.config.value_head_enabled:
+                            scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                        else:
+                            scores = self.model(boards, move_features, move_counts)
+                            value_preds = None
+                    if _do_sanity:
+                        # Padded scores have intentional -inf; only flag NaN or +inf
+                        if self._use_padded:
+                            _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
+                        else:
+                            _bad = not torch.isfinite(scores).all()
+                        if _bad:
+                            print("  Warning: non-finite scores detected; skipping batch")
+                            if self.stats_collector:
+                                self.stats_collector.record_non_finite_event(
+                                    self.step, 'model_scores', 'Non-finite output scores')
+                            continue
                     _current_scores = scores.detach()
-                    policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
+                    if self._use_padded:
+                        policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
+                    else:
+                        policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
 
                     # Value head loss (MSE between predicted value and game result)
                     if value_preds is not None and value_targets is not None:
@@ -1173,8 +1362,12 @@ class Trainer:
                 if accum_steps > 1:
                     loss = loss / accum_steps
 
-                # Loss is a scalar — isfinite check is cheap (no large-tensor sync)
-                if not torch.isfinite(loss):
+                # Periodic loss sanity check — `not tensor` calls .item() which
+                # forces a CUDA sync (~20-100μs).  GradScaler already handles
+                # NaN/Inf by skipping the optimizer step, so this is informational
+                # only.  Checking every _SANITY_CHECK_INTERVAL steps instead of
+                # every step eliminates a major pipeline stall.
+                if _do_sanity and not torch.isfinite(loss):
                     print("  Warning: non-finite loss detected; skipping batch")
                     if self.stats_collector:
                         self.stats_collector.record_non_finite_event(
@@ -1186,19 +1379,34 @@ class Trainer:
                 else:
                     loss.backward()
             else:
-                if self.config.value_head_enabled:
-                    scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                if self._use_padded:
+                    if self.config.value_head_enabled:
+                        scores, value_preds = self.model.forward_padded_with_value(boards, move_features, move_counts)
+                    else:
+                        scores = self.model.forward_padded(boards, move_features, move_counts)
+                        value_preds = None
                 else:
-                    scores = self.model(boards, move_features, move_counts)
-                    value_preds = None
-                if _do_sanity and not torch.isfinite(scores).all():
-                    print("  Warning: non-finite scores detected; skipping batch")
-                    if self.stats_collector:
-                        self.stats_collector.record_non_finite_event(
-                            self.step, 'model_scores', 'Non-finite output scores (FP32)')
-                    continue
+                    if self.config.value_head_enabled:
+                        scores, value_preds = self.model.forward_with_value(boards, move_features, move_counts)
+                    else:
+                        scores = self.model(boards, move_features, move_counts)
+                        value_preds = None
+                if _do_sanity:
+                    if self._use_padded:
+                        _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
+                    else:
+                        _bad = not torch.isfinite(scores).all()
+                    if _bad:
+                        print("  Warning: non-finite scores detected; skipping batch")
+                        if self.stats_collector:
+                            self.stats_collector.record_non_finite_event(
+                                self.step, 'model_scores', 'Non-finite output scores (FP32)')
+                        continue
                 _current_scores = scores.detach()
-                policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
+                if self._use_padded:
+                    policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
+                else:
+                    policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
                 if value_preds is not None and value_targets is not None:
                     value_loss = nn.functional.mse_loss(value_preds, value_targets)
                     loss = policy_loss + self.config.value_weight * value_loss
@@ -1208,7 +1416,7 @@ class Trainer:
                 if accum_steps > 1:
                     loss = loss / accum_steps
 
-                if not torch.isfinite(loss):
+                if _do_sanity and not torch.isfinite(loss):
                     print("  Warning: non-finite loss detected; skipping batch")
                     if self.stats_collector:
                         self.stats_collector.record_non_finite_event(
@@ -1281,8 +1489,16 @@ class Trainer:
                     _score_stats = None
                     if (_current_scores is not None and
                             self.step % self.config.stats_score_dist_every == 0):
-                        _score_stats = StatsCollector.compute_score_stats(
-                            _current_scores, move_counts)
+                        if self._use_padded:
+                            # Extract valid scores from padded (batch, max_moves) matrix
+                            _max_m = _current_scores.shape[1]
+                            _arange = torch.arange(_max_m, device=_current_scores.device)
+                            _vmask = _arange.unsqueeze(0) < move_counts.unsqueeze(1)
+                            _score_stats = StatsCollector.compute_score_stats(
+                                _current_scores[_vmask], move_counts)
+                        else:
+                            _score_stats = StatsCollector.compute_score_stats(
+                                _current_scores, move_counts)
 
                     self.stats_collector.record_training_step(
                         step=self.step,
@@ -1319,9 +1535,13 @@ class Trainer:
                     'gpu_mem_mb': gpu_mem,
                 })
 
-            # Progress
+            # Progress — avoid .item() fallback that would force a CUDA sync.
+            # Use the GPU accumulator when _loss_val wasn't already computed.
             if self.step % 100 == 0:
-                _print_loss = _loss_val if _loss_val is not None else loss.item()
+                if _loss_val is not None:
+                    _print_loss = _loss_val
+                else:
+                    _print_loss = (total_loss_acc / max(num_batches, 1)).item()
                 print(f"  Step {self.step}, Loss: {_print_loss:.4f}")
 
             if self.step >= self.config.train_steps:
@@ -1431,6 +1651,46 @@ class Trainer:
 
         return -(chosen_log_probs * w).sum() / total_weight
 
+    def _compute_loss_padded(
+        self,
+        scores: torch.Tensor,
+        move_counts: torch.Tensor,
+        targets: torch.Tensor,
+        reward_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute loss from padded score matrix (training-optimized path).
+
+        Scores arrive as (batch, max_moves) with -inf for invalid positions
+        from forward_padded — no scatter/gather needed.
+        """
+        batch_size = scores.shape[0]
+        if batch_size == 0:
+            return scores.sum() * 0
+
+        counts = move_counts.long()
+
+        # Zero-move rows are all-inf → replace with 0 for stable softmax
+        no_moves = counts == 0
+        scores = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
+
+        log_probs = torch.nn.functional.log_softmax(scores.float(), dim=1)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+
+        max_moves = scores.shape[1]
+        safe_targets = targets.long().clamp(0, max_moves - 1).unsqueeze(1)
+        chosen_log_probs = log_probs.gather(1, safe_targets).squeeze(1)
+
+        valid = (counts > 0) & (targets.long() >= 0) & (targets.long() < counts)
+
+        if reward_weights is not None:
+            w = reward_weights.float().squeeze(-1) * valid.float()
+        else:
+            w = valid.float()
+
+        total_weight = w.sum().clamp(min=1.0)
+        return -(chosen_log_probs * w).sum() / total_weight
+
     def train(self) -> None:
         """Run the full training loop."""
         print("\n" + "=" * 50)
@@ -1450,6 +1710,10 @@ class Trainer:
         if accum > 1:
             effective_bs = self.config.batch_size * accum
             print(f"Gradient accumulation: {accum} steps (effective batch size: {effective_bs})")
+        if self.config.thermal_enabled:
+            rest_min = self.config.thermal_rest_seconds / 60
+            print(f"Thermal protection: ON (limit={self.config.thermal_temp_limit_c}°C, "
+                  f"rest={rest_min:.0f}m, check every {self.config.thermal_check_every}s)")
 
         # Set start time for stats
         if not self.stats.start_time:
@@ -1482,7 +1746,10 @@ class Trainer:
             num_workers=effective_workers,
             pin_memory=self.config.pin_memory,
         )
-        print(f"DataLoader ready with {len(dataloader)} batches.")
+        _is_fast = isinstance(dataloader, FastBatchIterator)
+        self._use_padded = _is_fast or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
+        _path_label = " (fast tensor indexing)" if _is_fast else (" (padded training path)" if self._use_padded else "")
+        print(f"DataLoader ready with {len(dataloader)} batches{_path_label}.")
         sys.stdout.flush()
 
         # Training loop
@@ -1518,16 +1785,27 @@ class Trainer:
                   f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
 
             # Continuous background self-play: swap data when ready, restart immediately
-            bg_entries = self._collect_background_selfplay()
-            if bg_entries is not None and len(bg_entries) > 0:
+            bg_entries, bg_dataset = self._collect_background_selfplay()
+            if bg_entries is not None:
                 print("Background self-play complete — refreshing DataLoader...")
-                dataloader = create_dataloader(
-                    bg_entries,
-                    batch_size=self.config.batch_size,
-                    shuffle=True,
-                    num_workers=effective_workers,
-                    pin_memory=self.config.pin_memory,
-                )
+                if bg_dataset is not None:
+                    # Dataset pre-built in background — instant DataLoader creation
+                    dataloader = create_dataloader_from_dataset(
+                        bg_dataset,
+                        batch_size=self.config.batch_size,
+                        num_workers=effective_workers,
+                        pin_memory=self.config.pin_memory,
+                    )
+                    self._use_padded = True
+                else:
+                    dataloader = create_dataloader(
+                        bg_entries,
+                        batch_size=self.config.batch_size,
+                        shuffle=True,
+                        num_workers=effective_workers,
+                        pin_memory=self.config.pin_memory,
+                    )
+                    self._use_padded = isinstance(dataloader, FastBatchIterator) or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
                 # Immediately start the next batch — keeps CPU busy at all times
                 self._start_background_selfplay(self.config.selfplay_games // 2)
             
@@ -1717,6 +1995,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     model_cfg = yaml_config.get('model', {})
     lr_sched_cfg = training_cfg.get('lr_scheduler', {})
     value_head_cfg = yaml_config.get('value_head', {})
+    thermal_cfg = yaml_config.get('thermal_protection', {})
     
     # Parse stop time if duration is set
     stop_time = None
@@ -1787,6 +2066,11 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         replay_dir=paths_cfg.get('replay_dir', 'data/replay'),
         log_dir=paths_cfg.get('log_dir', 'logs'),
         stats_file=paths_cfg.get('stats_file', 'models/training_stats.json'),
+        # Thermal protection
+        thermal_enabled=thermal_cfg.get('enabled', False),
+        thermal_temp_limit_c=thermal_cfg.get('temp_limit_c', 90),
+        thermal_rest_seconds=_parse_rest_duration(thermal_cfg.get('rest_duration', '5m')),
+        thermal_check_every=thermal_cfg.get('check_every', 30),
         # Resume
         resume=resume_cfg.get('checkpoint_path'),
         stop_time=stop_time,
