@@ -189,6 +189,7 @@ profiles:
     selfplay:
       cpu_workers: 112                # 128 cores − 16 reserved for training I/O + preprocessing
       games_per_epoch: 32768          # Proportional to batch size — keeps GPU fed
+      pipeline_mode: "simultaneous"   # Overlap CPU self-play with GPU training
     training:
       batch_size: 32768               # 64GB VRAM — ~6.4GB activations, still <10% VRAM
       learning_rate: 5.6e-4           # Sqrt-scaled from 4e-4 at 16384 (x1.41)
@@ -214,15 +215,16 @@ profiles:
         enabled: true                 # Warmup auto-falls back to eager on failure
         mode: "reduce-overhead"       # CUDAGraphs — avoid max-autotune (Triton may fail on RTX 5050)
     selfplay:
-      cpu_workers: 12                 # FastBatchIterator needs no DataLoader workers — reclaim for self-play
+      cpu_workers: 14                 # 14 of 16 cores — 2 for GPU driver + training I/O
       games_per_epoch: 512            # Proportional to batch size — keeps GPU fed
+      pipeline_mode: "simultaneous"   # Overlap CPU self-play with GPU training
     training:
-      batch_size: 4096                # ~800MB activations — fits comfortably in 8GB with AMP
-      learning_rate: 1.1e-3           # Sqrt-scaled for effective batch 8192 (4096 x 2 accum)
-      gradient_accumulation_steps: 2  # Effective batch 8192 — better gradients, no extra VRAM
+      batch_size: 4096                # ~570MB activations at AMP fp16 — fits in 8GB with headroom
+      learning_rate: 5.6e-4           # Sqrt-scaled from 4e-4 at 2048 (x1.41)
+      gradient_accumulation_steps: 1  # No accumulation — batch fits, saves the extra fwd/bwd pass
       lr_scheduler:
         enabled: true
-        warmup_steps: 150             # Longer warmup for larger effective batch
+        warmup_steps: 150             # Longer warmup for larger batch
     dataloader:
       num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
       replay_max_entries: 400000      # 32GB RAM — ~1.4GB, better data diversity
