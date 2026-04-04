@@ -41,7 +41,7 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 6                     # 8 of 12 cores — 4 reserved for GPU driver + training I/O.
+  cpu_workers: 10                     # 8 of 12 cores — 4 reserved for GPU driver + training I/O.
                                       # FastBatchIterator needs no DataLoader workers, so all cores go to self-play.
   games_per_epoch: 20                # 2x previous — GPU finishes epochs in ~15s while self-play
                                       # takes 60-120s. More games = fresher data per cycle.
@@ -51,7 +51,7 @@ selfplay:
     - "hard"
   focus_side: "black"                  # "white", "black", or "both"
   opponent_focus: "algorithm"              # "ml", "algorithm", or "both"
-  noise_prob: 0.15                    # Slightly lower noise for faster convergence
+  noise_prob: 0.20                    # Slightly lower noise for faster convergence
   max_moves_per_game: 100             # Maximum moves per game
   pipeline_mode: "simultaneous"       # "simultaneous" = generate data on CPU while training on GPU (overlapped)
                                       # "alternate"     = generate all data first, then train (sequential)
@@ -71,10 +71,10 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 4096                    # 2x previous — model ~4.5M params uses <1GB VRAM at AMP fp16;
+  batch_size: 4096                    # Must be smaller than available training entries;
                                       # 4096 batch activations ~570MB, well within 8GB.
                                       # Doubles samples/sec by amortizing per-step overhead.
-  learning_rate: 5.6e-4               # Sqrt-scaled from 4e-4 at 2048: 4e-4 * sqrt(2) ≈ 5.66e-4
+  learning_rate: 4.0e-4               # Base LR for batch_size 2048
   weight_decay: 1.0e-5                # Weight decay for regularization
   grad_clip_norm: 1.0                 # Gradient clipping norm (null to disable)
   train_steps: 100000000000           # Total training steps
@@ -111,7 +111,7 @@ dataloader:
   # RAM Caching (see IMPROVEMENTS.md)
   ram_cache:
     enabled: true                     # Enable RAM caching for pre-tensorized data
-    threshold_gb: 16.0                 # Minimum available RAM (GB) to enable caching
+    threshold_gb: 24.0                 # Minimum available RAM (GB) to enable caching
     cache_file: null                  # Optional: path to save/load cached tensors (.pt)
 
 # -----------------------------------------------------------------------------
