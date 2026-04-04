@@ -379,10 +379,10 @@ class SelfPlayRunner:
 
         # Always use ProcessPoolExecutor for true parallelism (avoids GIL).
         # ML inference uses CPU in worker processes to avoid CUDA multi-process issues.
+        # Batch multiple games per worker to reduce IPC overhead (pickle + scheduling).
         if can_parallel:
             uses_ml = self.p1_policy == 'ml' or self.p2_policy == 'ml'
             if uses_ml:
-                worker_fn = _play_game_worker_full
                 task_args = [
                     (
                         self.difficulty,
@@ -396,16 +396,25 @@ class SelfPlayRunner:
                     )
                     for start in start_players
                 ]
+                batch_worker_fn = _play_games_batch_worker_full
             else:
-                worker_fn = _play_game_worker
                 task_args = args
+                batch_worker_fn = _play_games_batch_worker
 
-            print(f"  Starting parallel self-play with {effective_workers} workers...")
+            # Split games into batches — one batch per worker
+            batch_size = max(1, (num_games + effective_workers - 1) // effective_workers)
+            batches = [
+                task_args[i:i + batch_size]
+                for i in range(0, len(task_args), batch_size)
+            ]
+
+            print(f"  Starting parallel self-play with {effective_workers} workers, "
+                  f"{len(batches)} batches of ~{batch_size} games...")
             sys.stdout.flush()
             try:
                 with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                    futures = [executor.submit(worker_fn, a) for a in task_args]
-                    print(f"  Submitted {len(futures)} game tasks...")
+                    futures = [executor.submit(batch_worker_fn, b) for b in batches]
+                    print(f"  Submitted {len(futures)} batch tasks...")
                     sys.stdout.flush()
 
                     for future in as_completed(futures):
@@ -413,12 +422,16 @@ class SelfPlayRunner:
                             break
 
                         try:
-                            entries_data = future.result(timeout=300)  # 5 minute timeout per game
+                            # Each future returns entries from multiple games
+                            entries_data = future.result(timeout=300 * batch_size)
                             entries = [ReplayEntry.from_dict(d) for d in entries_data]
                             self.replay_buffer.add_entries(entries)
                             total_entries += len(entries)
 
-                            self._games_completed += 1
+                            # Count completed games from this batch by batch index
+                            batch_idx = futures.index(future)
+                            games_in_batch = len(batches[batch_idx])
+                            self._games_completed += games_in_batch
                             if callback:
                                 callback(self._games_completed, num_games)
 
