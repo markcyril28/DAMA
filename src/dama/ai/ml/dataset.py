@@ -5,10 +5,10 @@ import random
 import psutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Tuple, Iterator, Optional
+from typing import List, Tuple, Optional
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 
 from ...types import Move, Player
 from ...game_state import GameState
@@ -227,7 +227,6 @@ _fork_max_moves: int = 64
 
 # Shared-memory output globals (set by parent before forking)
 _fork_shm_names: Optional[dict] = None  # {'boards': name, 'move_features': name, ...}
-_fork_shm_shapes: Optional[dict] = None  # shapes for each array
 _fork_total_n: int = 0  # total dataset size
 
 
@@ -880,6 +879,7 @@ class FastBatchIterator:
         drop_last: bool = True,
         pin_memory: bool = False,
         device: Optional[torch.device] = None,
+        capacity: int = 0,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -891,12 +891,17 @@ class FastBatchIterator:
         # Eliminates all pin_memory + CUDAPrefetcher + H2D transfer overhead.
         self.on_gpu = False
         if device is not None and device.type == 'cuda':
-            dataset_bytes = sum(
-                t.nelement() * t.element_size() for t in [
+            # Use capacity for VRAM budget check (pre-allocate for future updates)
+            _budget_n = max(self.n, capacity) if capacity > 0 else self.n
+            _per_entry = sum(
+                t.element_size() * (t.nelement() // max(1, len(dataset)))
+                for t in [
                     dataset.boards, dataset.move_features, dataset.move_counts,
                     dataset.targets, dataset.reward_weights, dataset.value_targets,
                 ]
-            )
+            ) if self.n > 0 else 3584  # fallback estimate ~3.5KB/entry
+            budget_bytes = _budget_n * _per_entry
+
             total_vram = torch.cuda.get_device_properties(device).total_memory
             allocated = torch.cuda.memory_allocated(device)
             available = total_vram - allocated
@@ -904,22 +909,54 @@ class FastBatchIterator:
             # The model is small (~1MB params + ~2MB optimizer), so most VRAM
             # headroom is for activations + gradients which scale with batch_size.
             # 55% leaves ample room for batch_size up to 32K on 64GB GPUs.
-            if dataset_bytes < available * 0.55:
-                # Store boards in channels_last (NHWC) format — cuDNN selects
-                # faster convolution kernels and BoardEncoder.forward() skips
-                # its per-batch is_contiguous check + conversion.
-                self._boards = dataset.boards.to(device, memory_format=torch.channels_last)
-                self._move_features = dataset.move_features.to(device)
-                self._move_counts = dataset.move_counts.to(device)
-                self._targets = dataset.targets.to(device)
-                self._reward_weights = dataset.reward_weights.to(device)
-                self._value_targets = dataset.value_targets.to(device)
+            if budget_bytes < available * 0.55:
+                alloc_n = _budget_n if capacity > 0 else self.n
+                b_shape = dataset.boards.shape[1:]
+                mf_shape = dataset.move_features.shape[1:]
+
+                if alloc_n > self.n:
+                    # Pre-allocate to capacity and fill the first n entries
+                    self._boards = torch.empty(alloc_n, *b_shape, device=device,
+                                               dtype=dataset.boards.dtype).contiguous(
+                                                   memory_format=torch.channels_last)
+                    self._boards[:self.n] = dataset.boards.to(
+                        device, memory_format=torch.channels_last)
+                    self._move_features = torch.empty(alloc_n, *mf_shape, device=device,
+                                                      dtype=dataset.move_features.dtype)
+                    self._move_features[:self.n] = dataset.move_features.to(device)
+                    self._move_counts = torch.empty(alloc_n, device=device,
+                                                    dtype=dataset.move_counts.dtype)
+                    self._move_counts[:self.n] = dataset.move_counts.to(device)
+                    self._targets = torch.empty(alloc_n, device=device,
+                                                dtype=dataset.targets.dtype)
+                    self._targets[:self.n] = dataset.targets.to(device)
+                    self._reward_weights = torch.empty(alloc_n, device=device,
+                                                       dtype=dataset.reward_weights.dtype)
+                    self._reward_weights[:self.n] = dataset.reward_weights.to(device)
+                    self._value_targets = torch.empty(alloc_n, device=device,
+                                                      dtype=dataset.value_targets.dtype)
+                    self._value_targets[:self.n] = dataset.value_targets.to(device)
+                    print(f"  GPU-resident dataset: {self.n} entries in "
+                          f"{alloc_n}-capacity buffer "
+                          f"({budget_bytes / 1e6:.0f}MB reserved, "
+                          f"{available / 1e6:.0f}MB available, boards=channels_last)")
+                else:
+                    # Store boards in channels_last (NHWC) format — cuDNN selects
+                    # faster convolution kernels and BoardEncoder.forward() skips
+                    # its per-batch is_contiguous check + conversion.
+                    self._boards = dataset.boards.to(device, memory_format=torch.channels_last)
+                    self._move_features = dataset.move_features.to(device)
+                    self._move_counts = dataset.move_counts.to(device)
+                    self._targets = dataset.targets.to(device)
+                    self._reward_weights = dataset.reward_weights.to(device)
+                    self._value_targets = dataset.value_targets.to(device)
+                    dataset_bytes = self.n * _per_entry
+                    print(f"  GPU-resident dataset: {dataset_bytes / 1e6:.0f}MB on GPU "
+                          f"({available / 1e6:.0f}MB available, boards=channels_last)")
                 self.on_gpu = True
                 self._device = device
-                print(f"  GPU-resident dataset: {dataset_bytes / 1e6:.0f}MB on GPU "
-                      f"({available / 1e6:.0f}MB available, boards=channels_last)")
             else:
-                print(f"  Dataset too large for GPU cache ({dataset_bytes / 1e6:.0f}MB, "
+                print(f"  Dataset too large for GPU cache ({budget_bytes / 1e6:.0f}MB, "
                       f"{available / 1e6:.0f}MB available) — using CPU+pin")
 
         if not self.on_gpu:
@@ -973,40 +1010,140 @@ class FastBatchIterator:
                 self._value_targets[idx],
             )
 
+    def update_data(
+        self,
+        new_dataset: CachedTensorDataset,
+        max_entries: int = 0,
+    ) -> None:
+        """Update buffers in-place with new data, avoiding full GPU re-upload.
 
-class StreamingDamaDataset(IterableDataset):
-    """
-    Streaming dataset that reads from replay files on-the-fly.
+        Keeps the most recent ``max_entries`` entries by trimming the oldest
+        from the existing buffer and appending all entries from *new_dataset*.
+        When GPU-resident, only the new entries are transferred via PCIe —
+        existing GPU data is shifted in-place (GPU→GPU memcpy, ~10× faster
+        than CPU→GPU upload for the same size).
 
-    More memory efficient for large datasets.
-    """
+        Falls back to full replacement when:
+        - Not GPU-resident (CPU pinned path — rebuild is cheap anyway)
+        - Buffer capacity is insufficient and reallocation is needed
+        """
+        new_n = len(new_dataset)
+        if new_n == 0:
+            return
 
-    def __init__(self, replay_buffer: ReplayBuffer, shuffle: bool = True):
-        self.replay_buffer = replay_buffer
-        self.shuffle = shuffle
+        if max_entries > 0 and self.n + new_n > max_entries:
+            keep_old = max(0, max_entries - new_n)
+        else:
+            keep_old = self.n
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, int, float, float]]:
-        for entry in self.replay_buffer.iterate_entries(shuffle_files=self.shuffle):
-            # Reconstruct game state
-            state = GameState.from_compact(entry.state)
+        total = keep_old + new_n
+        offset = self.n - keep_old  # how many old entries to trim from head
 
-            # Encode board
-            board = encode_board(state)
+        if self.on_gpu:
+            dev = self._device
+            buf_cap = self._boards.shape[0]
 
-            # Reconstruct moves and encode them
-            moves = [Move.from_dict(m) for m in entry.legal_moves]
-            move_features = encode_moves(state, moves)
+            if total <= buf_cap:
+                # Buffer is large enough — shift old data left, append new.
+                # GPU→GPU copy: ~10× faster than equivalent CPU→GPU transfer.
+                if offset > 0 and keep_old > 0:
+                    # Non-overlapping when offset > 0 (destination starts before source)
+                    self._boards[:keep_old] = self._boards[offset:offset + keep_old]
+                    self._move_features[:keep_old] = self._move_features[offset:offset + keep_old]
+                    self._move_counts[:keep_old] = self._move_counts[offset:offset + keep_old]
+                    self._targets[:keep_old] = self._targets[offset:offset + keep_old]
+                    self._reward_weights[:keep_old] = self._reward_weights[offset:offset + keep_old]
+                    self._value_targets[:keep_old] = self._value_targets[offset:offset + keep_old]
 
-            # Compute reward weight
-            reward_weight = compute_reward_weight(entry.score)
+                # Upload only new entries (small PCIe transfer)
+                self._boards[keep_old:total] = new_dataset.boards.to(
+                    dev, memory_format=torch.channels_last, non_blocking=True)
+                self._move_features[keep_old:total] = new_dataset.move_features.to(
+                    dev, non_blocking=True)
+                self._move_counts[keep_old:total] = new_dataset.move_counts.to(
+                    dev, non_blocking=True)
+                self._targets[keep_old:total] = new_dataset.targets.to(
+                    dev, non_blocking=True)
+                self._reward_weights[keep_old:total] = new_dataset.reward_weights.to(
+                    dev, non_blocking=True)
+                self._value_targets[keep_old:total] = new_dataset.value_targets.to(
+                    dev, non_blocking=True)
+                # Sync to ensure all non_blocking transfers complete
+                torch.cuda.current_stream(dev).synchronize()
+                self.n = total
+                self.drop_last = total > self.batch_size
+                print(f"  GPU buffer updated in-place: kept {keep_old} old + "
+                      f"{new_n} new = {total} entries "
+                      f"(uploaded {new_n * 3.5 / 1024:.1f}MB, "
+                      f"avoided {keep_old * 3.5 / 1024:.1f}MB re-upload)")
+                return
 
-            yield (
-                torch.from_numpy(board),
-                torch.from_numpy(move_features),
-                entry.chosen_index,
-                reward_weight,
-                float(entry.result),  # value target
-            )
+            # Buffer too small — must reallocate.  Allocate with slack to
+            # reduce future reallocations.
+            new_cap = max(total, int(max_entries * 1.1)) if max_entries > 0 else total
+            print(f"  GPU buffer realloc: {buf_cap} → {new_cap} capacity")
+            b_shape = self._boards.shape[1:]
+            mf_shape = self._move_features.shape[1:]
+            new_boards = torch.empty(new_cap, *b_shape, device=dev,
+                                     dtype=self._boards.dtype).contiguous(
+                                         memory_format=torch.channels_last)
+            new_mf = torch.empty(new_cap, *mf_shape, device=dev,
+                                 dtype=self._move_features.dtype)
+            new_mc = torch.empty(new_cap, device=dev, dtype=self._move_counts.dtype)
+            new_tgt = torch.empty(new_cap, device=dev, dtype=self._targets.dtype)
+            new_rw = torch.empty(new_cap, device=dev, dtype=self._reward_weights.dtype)
+            new_vt = torch.empty(new_cap, device=dev, dtype=self._value_targets.dtype)
+
+            # Copy old data (GPU→GPU, fast)
+            if keep_old > 0:
+                new_boards[:keep_old] = self._boards[offset:offset + keep_old]
+                new_mf[:keep_old] = self._move_features[offset:offset + keep_old]
+                new_mc[:keep_old] = self._move_counts[offset:offset + keep_old]
+                new_tgt[:keep_old] = self._targets[offset:offset + keep_old]
+                new_rw[:keep_old] = self._reward_weights[offset:offset + keep_old]
+                new_vt[:keep_old] = self._value_targets[offset:offset + keep_old]
+
+            # Upload new entries (small PCIe transfer)
+            new_boards[keep_old:total] = new_dataset.boards.to(
+                dev, memory_format=torch.channels_last, non_blocking=True)
+            new_mf[keep_old:total] = new_dataset.move_features.to(dev, non_blocking=True)
+            new_mc[keep_old:total] = new_dataset.move_counts.to(dev, non_blocking=True)
+            new_tgt[keep_old:total] = new_dataset.targets.to(dev, non_blocking=True)
+            new_rw[keep_old:total] = new_dataset.reward_weights.to(dev, non_blocking=True)
+            new_vt[keep_old:total] = new_dataset.value_targets.to(dev, non_blocking=True)
+            torch.cuda.current_stream(dev).synchronize()
+
+            # Swap buffers — old ones freed by refcount
+            self._boards = new_boards
+            self._move_features = new_mf
+            self._move_counts = new_mc
+            self._targets = new_tgt
+            self._reward_weights = new_rw
+            self._value_targets = new_vt
+            self.n = total
+            self.drop_last = total > self.batch_size
+            return
+
+        # CPU path: rebuild from scratch (pinning is fast, no PCIe bottleneck)
+        merged = self.dataset.concat(new_dataset, max_entries=max_entries)
+        self.dataset = merged
+        self.n = len(merged)
+        _should_pin = torch.cuda.is_available()
+        if _should_pin:
+            self._boards = merged.boards.pin_memory()
+            self._move_features = merged.move_features.pin_memory()
+            self._move_counts = merged.move_counts.pin_memory()
+            self._targets = merged.targets.pin_memory()
+            self._reward_weights = merged.reward_weights.pin_memory()
+            self._value_targets = merged.value_targets.pin_memory()
+        else:
+            self._boards = merged.boards
+            self._move_features = merged.move_features
+            self._move_counts = merged.move_counts
+            self._targets = merged.targets
+            self._reward_weights = merged.reward_weights
+            self._value_targets = merged.value_targets
+        self.drop_last = self.n > self.batch_size
 
 
 def collate_batch(
@@ -1057,6 +1194,7 @@ def create_dataloader(
     use_ram_cache: bool = True,
     ram_threshold_gb: float = 16.0,
     device: Optional[torch.device] = None,
+    capacity: int = 0,
 ) -> DataLoader:
     """
     Create a DataLoader from replay entries.
@@ -1115,6 +1253,7 @@ def create_dataloader(
             drop_last=_drop,
             pin_memory=pin_memory,
             device=device,
+            capacity=capacity,
         )
 
     # Fall back to standard dataset
@@ -1157,6 +1296,7 @@ def create_dataloader_from_dataset(
     num_workers: int = 4,
     pin_memory: bool = True,
     device: Optional[torch.device] = None,
+    capacity: int = 0,
 ) -> FastBatchIterator:
     """Create a fast batch iterator from a pre-built CachedTensorDataset.
 
@@ -1165,6 +1305,8 @@ def create_dataloader_from_dataset(
     to avoid blocking the training loop.
 
     When device is CUDA, tries GPU-resident caching for zero H2D overhead.
+    When capacity > 0, pre-allocates GPU buffers to that size so future
+    update_data() calls avoid reallocation.
     """
     return FastBatchIterator(
         dataset,
@@ -1173,24 +1315,7 @@ def create_dataloader_from_dataset(
         drop_last=len(dataset) > batch_size,
         pin_memory=pin_memory,
         device=device,
-    )
-
-
-def create_streaming_dataloader(
-    replay_buffer: ReplayBuffer,
-    batch_size: int = 64,
-    num_workers: int = 0,
-    pin_memory: bool = True,
-) -> DataLoader:
-    """Create a streaming DataLoader from a replay buffer."""
-    dataset = StreamingDamaDataset(replay_buffer)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=collate_batch,
-        pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
+        capacity=capacity,
     )
 
 
