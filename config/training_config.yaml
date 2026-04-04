@@ -45,8 +45,9 @@ selfplay:
   games_per_epoch: 2048               # Number of games to generate per epoch
   difficulties:                       # List of difficulties to cycle through
     - "easy"
-    - "medium" 
+    - "medium"
     - "hard"
+    - "super_hard"
   focus_side: "both"                  # "white", "black", or "both"
   opponent_focus: "both"              # "ml", "algorithm", or "both"
   noise_prob: 0.20                    # Probability of random move for exploration
@@ -64,6 +65,7 @@ selfplay:
       - "easy"
       - "medium"
       - "hard"
+      - "super_hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters

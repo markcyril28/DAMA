@@ -142,6 +142,7 @@ selfplay:
                                       # 6h session → ~1.7 complete cycles → ~945 training steps.
   difficulties:                       # Train against medium difficulty only.
     - "medium"                        #   Medium: 0.8s/move, depth 5 — optimal learning signal.
+    # - "super_hard"                  #   5.0s/move, depth 12 — enable when model beats hard
                                       #   v3 tried hard (depth 8) but model copied moves without
                                       #   understanding. Medium provides consistent, learnable
                                       #   patterns. The goal is to beat medium, not match hard.
@@ -172,6 +173,7 @@ selfplay:
       - "easy"
       - "medium"
       - "hard"
+      - "super_hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters

@@ -33,7 +33,7 @@ device:
   compile:
     enabled: true                       # SM-count guard in trainer.py auto-downgrades
                                         # to mode='default' on small GPUs (RTX 5050).
-                                        # Shapes are fixed (batch=4096, board=5x8x8,
+                                        # Shapes are fixed (batch=8192, board=5x8x8,
                                         # moves=64x8) so no recompilation churn.
   matmul_precision: "medium"            # TF32 enabled
 
@@ -63,6 +63,7 @@ selfplay:
   difficulties:
     - "easy"                            # Start with easy — learnable signal for
     - "medium"                          # a random model. Medium adds challenge.
+    # - "super_hard"                    # Enable once model is competitive at hard
   focus_side: "both"                    # Equal P1/P2 exposure from the start
   opponent_focus: "algorithm"           # 100% algorithmic teachers. A random model
                                         # playing itself generates pure noise.
@@ -82,13 +83,16 @@ selfplay:
       - "easy"
       - "medium"
       - "hard"
+      - "super_hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 4096                      # Good balance for RTX 5050 — ~98 batches
-                                        # per epoch at 400K buffer. ~0.6GB VRAM.
+  batch_size: 8192                      # VRAM budget: 8GB total, ~1.8GB dataset (600K),
+                                        # ~3.2GB activations (128ch/8blocks), ~0.5GB other
+                                        # = ~5.5GB peak. 2x GPU kernel utilization vs 4096.
+                                        # ~73 batches/epoch at 600K buffer.
   learning_rate: 3.0e-4                 # Standard rate for fresh training with
                                         # Adam. Not too aggressive, not too slow.
   weight_decay: 1.0e-4                  # 10x higher than before — helps prevent
@@ -121,7 +125,9 @@ dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
   prefetch_factor: 4
-  replay_max_entries: 400000            # 400K entries x ~3.5KB = ~1.4GB RAM
+  replay_max_entries: 600000            # 600K entries x ~3.5KB = ~2.1GB RAM.
+                                        # GPU-resident: ~1.8GB VRAM (fits in 55% threshold).
+                                        # More data diversity = less overfitting on stale data.
   clear_replay_after_load: false        # Accumulate data across cycles
 
   ram_cache:

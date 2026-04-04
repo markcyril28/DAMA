@@ -2271,6 +2271,13 @@ class Trainer:
                           f"({len(bg_dataset)} entries)...")
                     # Track current dataset for incremental updates in next cycle
                     self._current_dataset = bg_dataset
+                    # Free old GPU-resident tensors BEFORE allocating new ones.
+                    # With large datasets (600K+ entries, ~2GB each), both old and
+                    # new datasets on GPU simultaneously can OOM on 8GB cards.
+                    _was_gpu = getattr(dataloader, 'on_gpu', False)
+                    if _was_gpu:
+                        dataloader = None
+                        torch.cuda.empty_cache()
                     # Dataset pre-built in background — instant DataLoader creation
                     dataloader = create_dataloader_from_dataset(
                         bg_dataset,
@@ -2297,6 +2304,11 @@ class Trainer:
                     dataset = CachedTensorDataset.from_entries(
                         train_entries, max_moves_per_sample=64, show_progress=True,
                     )
+                    # Free old GPU tensors before allocating new ones
+                    _was_gpu = getattr(dataloader, 'on_gpu', False)
+                    if _was_gpu:
+                        dataloader = None
+                        torch.cuda.empty_cache()
                     dataloader = create_dataloader_from_dataset(
                         dataset,
                         batch_size=self.config.batch_size,

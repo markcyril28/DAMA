@@ -68,6 +68,7 @@ selfplay:
     - "easy"
     - "medium"
     # - "hard"                          # Re-enable when model beats medium at >40% WR consistently
+    # - "super_hard"                    # Re-enable when model beats hard consistently
   focus_side: "both"                    # [Part 2] Balanced P1/P2 exposure. 100 games as P1, 100 as P2.
                                         # P1/P2 asymmetry root cause is board encoding (no position
                                         # flip), not data imbalance. Both sides need equal training.
@@ -93,6 +94,7 @@ selfplay:
       - "easy"
       - "medium"
       - "hard"
+      - "super_hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
