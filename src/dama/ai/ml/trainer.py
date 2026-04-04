@@ -181,6 +181,33 @@ def _parse_rest_duration(duration_str: str) -> int:
     return total
 
 
+def _eval_expr(value):
+    """Evaluate simple arithmetic expressions from YAML config values.
+
+    YAML doesn't support math, so ``8192*2`` is parsed as the string
+    ``"8192*2"`` instead of ``16384``.  This helper safely evaluates
+    expressions that contain only integers, floats, and the operators
+    ``+ - * / // **`` (plus parentheses and whitespace).
+
+    Non-string values and strings that aren't arithmetic expressions are
+    returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    import re
+    # Only allow digits, decimal points, operators, parens, whitespace
+    if not re.fullmatch(r'[\d\s\+\-\*\/\.\(\)]+', value):
+        return value
+    try:
+        result = eval(value, {"__builtins__": {}})  # noqa: S307
+        # Preserve int when possible (e.g. 8192*2 -> 16384, not 16384.0)
+        if isinstance(result, float) and result == int(result):
+            result = int(result)
+        return result
+    except Exception:
+        return value
+
+
 @dataclass
 class TrainingStats:
     """Training statistics tracking."""
@@ -2167,6 +2194,7 @@ class Trainer:
             use_ram_cache=self.config.ram_cache_enabled,
             ram_threshold_gb=self.config.ram_cache_threshold_gb,
             device=self.device,
+            capacity=self.config.replay_max_entries if _simultaneous else 0,
         )
         _is_fast = isinstance(dataloader, FastBatchIterator)
         self._use_padded = _is_fast or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
@@ -2259,21 +2287,27 @@ class Trainer:
                           f"({len(bg_dataset)} entries)...")
                     # Track current dataset for incremental updates in next cycle
                     self._current_dataset = bg_dataset
-                    # Free old GPU-resident tensors BEFORE allocating new ones.
-                    # With large datasets (600K+ entries, ~2GB each), both old and
-                    # new datasets on GPU simultaneously can OOM on 8GB cards.
-                    _was_gpu = getattr(dataloader, 'on_gpu', False)
-                    if _was_gpu:
-                        dataloader = None
-                        torch.cuda.empty_cache()
-                    # Dataset pre-built in background — instant DataLoader creation
-                    dataloader = create_dataloader_from_dataset(
-                        bg_dataset,
-                        batch_size=self.config.batch_size,
-                        num_workers=effective_workers,
-                        pin_memory=self.config.pin_memory,
-                        device=self.device,
-                    )
+                    # In-place GPU buffer update: only upload new entries via PCIe.
+                    # Avoids full GPU re-upload of 600K+ entries (~2GB) and
+                    # eliminates torch.cuda.empty_cache() stall.
+                    _is_fast = isinstance(dataloader, FastBatchIterator)
+                    if _is_fast:
+                        dataloader.update_data(
+                            bg_dataset, max_entries=self.config.replay_max_entries)
+                        dataloader.dataset = bg_dataset
+                    else:
+                        # Fallback: recreate dataloader (non-FastBatchIterator path)
+                        _was_gpu = getattr(dataloader, 'on_gpu', False)
+                        if _was_gpu:
+                            dataloader = None
+                            torch.cuda.empty_cache()
+                        dataloader = create_dataloader_from_dataset(
+                            bg_dataset,
+                            batch_size=self.config.batch_size,
+                            num_workers=effective_workers,
+                            pin_memory=self.config.pin_memory,
+                            device=self.device,
+                        )
                     self._use_padded = True
                     _gpu_resident = getattr(dataloader, 'on_gpu', False)
                     # Immediately start the next batch — keeps CPU busy at all times
@@ -2481,6 +2515,14 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     Returns:
         TrainingConfig instance
     """
+    # Evaluate arithmetic expressions in all scalar values (e.g. 8192*2 → 16384).
+    def _resolve(d: dict) -> dict:
+        return {k: (_resolve(v) if isinstance(v, dict) else
+                    [_eval_expr(i) for i in v] if isinstance(v, list) else
+                    _eval_expr(v))
+                for k, v in d.items()}
+    yaml_config = _resolve(yaml_config)
+
     device_cfg = yaml_config.get('device', {})
     selfplay_cfg = yaml_config.get('selfplay', {})
     algo_vs_algo_cfg = selfplay_cfg.get('algo_vs_algo', {})
@@ -2554,7 +2596,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
         clear_replay_after_load=dataloader_cfg.get('clear_replay_after_load', False),
         # Testing settings
-        test_vs_algo=testing_cfg.get('enabled', True),
+        test_vs_algo=testing_cfg.get('enabled', False),
         test_every=testing_cfg.get('every_n_steps', 5000),
         test_games=testing_cfg.get('num_games', 50),
         test_difficulty=testing_cfg.get('difficulty', 'medium'),
