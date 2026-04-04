@@ -1,11 +1,27 @@
 # =============================================================================
 # Local Training Configuration (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
 # =============================================================================
-# Updated 2026-04-04 based on training analysis (Parts 1-3).
-# Key fixes: data starvation, P1/P2 asymmetry, testing enabled.
+# Updated 2026-04-05 based on training analysis v6.
+#
+# CRITICAL: Resume from models/checkpoints/model_step_050000.pt (not latest.pt).
+# Steps 50K-56K suffered catastrophic LR-scheduler-induced forgetting.
+# The step 50K checkpoint had 43% WR vs medium — the best ever recorded.
+#
+# Key changes from previous config:
+#   1. LR scheduler DISABLED — caused 43%->0% WR crash via 31x LR oscillations
+#   2. LR reduced to 1.5e-4 — conservative fine-tuning rate for pre-trained model
+#   3. opponent_focus changed to "algorithm" — at <50% WR, ML self-play teaches
+#      losing patterns. 100% algorithmic teachers provide consistent signal.
+#   4. games_per_epoch increased to 200 — more ML-vs-algo data per cycle
+#   5. algo_vs_algo reduced to 900 — rebalances ratio (was 94.7% algo data)
+#   6. focus_side "both" kept — P1/P2 asymmetry root cause is board encoding
+#      (no position flip for P2), not data imbalance. Balanced exposure is correct.
+#   7. testing every 1000 steps with 50 games — faster feedback loop
+#   8. batch_size reduced to 4096 — more gradient updates per epoch
 #
 # Usage:
-#   python -m dama.ai.ml.trainer --config config/training_config_local.yaml
+#   python -m dama.ai.ml.trainer --config config/training_config_local.yaml \
+#       --resume models/checkpoints/model_step_050000.pt
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -36,25 +52,43 @@ model:
 # -----------------------------------------------------------------------------
 # Self-Play Settings
 # -----------------------------------------------------------------------------
+# At 43% WR (step 50K peak), the model is strong enough for medium-only training.
+# 100% algorithmic opponents: at <50% WR, ML self-play still produces more
+# losing games than winning ones, teaching losing patterns. Pure algorithmic
+# teachers provide consistent, learnable move selection signal.
+# -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                       # 10 of 12 cores. GPU training barely uses CPU
-                                        # (compiled fwd+loss, GPU-resident data). 2 core suffices
-                                        # for GPU driver + training thread.
-  games_per_epoch: 100                  # 
+  cpu_workers: 10                       # 10 of 12 cores — 2 for GPU driver + training thread
+  games_per_epoch: 200                  # [Part 2] Doubled from 100. More ML-vs-algo data per cycle.
+                                        # 200 games x ~42 moves = ~8.4K entries/cycle from ML games.
+                                        # With algo-vs-algo, total ~57K entries/cycle.
+  selfplay_every: 5000                  # Explicit — matches trainer default. In alternate mode,
+                                        # self-play runs every epoch regardless, but set for clarity.
   difficulties:
     - "easy"
     - "medium"
     # - "hard"                          # Re-enable when model beats medium at >40% WR consistently
-  focus_side: "both"                    # Was "black" (overcorrection). Balanced P1/P2 exposure.
-  opponent_focus: "both"                # Was "algorithm". Now 50% ML-vs-ML + 50% ML-vs-algo.
-  noise_prob: 0.15                      # Was 0.20. Slightly less noise for better convergence.
-  max_moves_per_game: 150               # Was 100. Allow endgame play.
-  pipeline_mode: "alternate"
+  focus_side: "both"                    # [Part 2] Balanced P1/P2 exposure. 100 games as P1, 100 as P2.
+                                        # P1/P2 asymmetry root cause is board encoding (no position
+                                        # flip), not data imbalance. Both sides need equal training.
+  opponent_focus: "algorithm"           # [Part 1] 100% algorithmic opponents. Was "both" (50% ML
+                                        # self-play). At <50% WR, ML-vs-ML generates mostly losing
+                                        # games. Pure algo teachers give consistent learning signal.
+  noise_prob: 0.15                      # Sweet spot — 85% teacher moves, 15% exploration
+  max_moves_per_game: 150               # Allow endgame play (avg game length is ~42 moves,
+                                        # so this rarely constrains games)
+  pipeline_mode: "simultaneous"         # Was "alternate" — GPU sat idle during entire self-play
+                                        # cycle (~60s+). Simultaneous trains on GPU while CPU
+                                        # generates data in background. With batch_size=8192 and
+                                        # ~57K entries, epochs are <1s, so GPU processes hundreds
+                                        # of epochs while waiting for next self-play batch.
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 3600                # Cython fast path: ~3ms/easy, ~378ms/hard game.
-                                        # 1800 games → ~97K entries/epoch, fills 400K buffer in ~4 cycles.
+    games_per_epoch: 900                # [Part 2] Reduced from 3600. Was 94.7% of training data.
+                                        # 900 algo + 200 ML = ~82% algo. Better balance.
+                                        # ~48K algo entries + ~8.4K ML entries = ~57K per cycle.
+                                        # Cython fast path: ~3ms/easy, ~378ms/hard. Total ~60s.
     difficulties:
       - "easy"
       - "medium"
@@ -64,25 +98,36 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 8192                      # Saturate RTX 5050 compute units. Model is tiny (~500K params),
-                                        # small batches leave GPU idle between kernel launches.
-                                        # 8192 activations ~1.1GB, well within 8GB VRAM.
-  learning_rate: 4.0e-4                 # Sqrt-scaled for batch 8192: base * sqrt(8192/2048) = 2× base.
-  weight_decay: 1.0e-5
-  grad_clip_norm: 1.0
-  train_steps: 100000000000
-  checkpoint_every: 2000
+  batch_size: 4096                      # [Part 1] Reduced from 8192. Halving batch size gives 2x
+                                        # more gradient updates per epoch with smaller step magnitude.
+                                        # At 400K entries, ~98 batches/epoch vs ~49 with 8192.
+                                        # ~0.6GB activations — easily fits 8GB VRAM.
+  learning_rate: 1.5e-4                 # [Part 1] Reduced from 4.0e-4. Conservative fine-tuning rate
+                                        # for a model already at 43% WR. The crash was caused by
+                                        # LR swings up to 3.9e-4 — staying well below that.
+  weight_decay: 1.0e-5                  # Model is underfitting — keep regularization minimal
+  grad_clip_norm: 1.0                   # Standard clipping — stable with algo-only data
+  train_steps: 100000000000             # Unlimited — time_limit controls stopping
+  checkpoint_every: 2000                # Save every 2000 steps for safety
   gradient_accumulation_steps: 1
 
+  # LR SCHEDULER: DISABLED
+  # [Part 1] Root cause of catastrophic regression. Cosine warm restarts with
+  # T_0=2000 created 31x LR swings (1.24e-5 -> 3.90e-4) that destroyed the
+  # model's learned policy over steps 50K-56K. Fixed LR is stable and proven
+  # (server v5 post-mortem reached the same conclusion independently).
+  # Re-enable only after the model reaches a clear plateau (loss stable for
+  # >5000 steps AND WR stable for >3 test cycles).
   lr_scheduler:
-    enabled: true
-    type: "cosine_warm_restarts"
-    T_0: 2000                           # Was 500. Longer cycles at step 56K for plateau escape.
-    T_mult: 2                           # Doubling: 2000, 4000, 8000, 16000, ...
-    eta_min: 1.0e-5
-    warmup_steps: 100                   # Was 150. Shorter warmup since base LR is lower.
+    enabled: false
+    type: "cosine_warm_restarts"        # (Inactive — kept for reference)
+    T_0: 5000                           # If re-enabled: much longer cycles to prevent instability
+    T_mult: 2
+    eta_min: 5.0e-5                     # Higher floor — don't let LR drop below useful range
+    warmup_steps: 200
 
-  reward_mode: "cycle"                  # Was "scoring". Alternate scoring/uniform for diversity.
+  reward_mode: "cycle"                  # Alternate scoring/uniform epochs — adds regularization
+                                        # diversity without the instability of a LR scheduler
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
@@ -91,25 +136,27 @@ dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
   prefetch_factor: 4
-  replay_max_entries: 400000            # Large buffer → more batches per epoch → GPU stays busy.
-                                        # 400K entries × ~3.5KB = ~1.4GB RAM (fine for 32GB).
-  clear_replay_after_load: false        # Accumulate data across self-play cycles. With batch 8192
-                                        # and ~10K entries per cycle, clearing gives only 1 batch/epoch.
-                                        # Accumulating → ~48 batches/epoch when buffer fills (400K).
+  replay_max_entries: 400000            # Large buffer. 400K entries x ~3.5KB = ~1.4GB RAM.
+                                        # At batch_size=4096, gives ~98 batches/epoch.
+  clear_replay_after_load: false        # Accumulate data across self-play cycles for diversity
 
   ram_cache:
     enabled: true
-    threshold_gb: 16.0                  # Was 24. Safer headroom on 32GB system.
+    threshold_gb: 16.0                  # Safe headroom on 32GB system
     cache_file: null
 
 # -----------------------------------------------------------------------------
 # Model Testing Settings (ML vs Algorithm)
 # -----------------------------------------------------------------------------
+# [Part 1] More frequent testing to catch regressions early.
+# 50 games gives +/-14% CI (95% confidence) — enough for directional signal.
+# At ~98 steps/epoch with alternate mode, test every ~10 epochs.
+# -----------------------------------------------------------------------------
 testing:
-  enabled: true                         # Was false. MUST track training quality.
-  every_n_steps: 2000                   # Was 5000. More frequent with smaller game count.
-  num_games: 30                         # Was 50. 30 games = fast eval with directional signal.
-  difficulty: "medium"
+  enabled: true
+  every_n_steps: 1000                   # [Part 1] Was 2000. Faster feedback to catch regressions.
+  num_games: 50                         # [Part 1] Was 30. Slightly more reliable signal.
+  difficulty: "medium"                  # Benchmark target
 
 # -----------------------------------------------------------------------------
 # Paths
@@ -126,11 +173,10 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 2000                    # Each .item() forces CUDA sync (~20-100μs pipeline stall).
-                                        # 2000 interval = 4× fewer GPU stalls vs 500.
+  record_every: 1000                    # Balance between GPU sync stalls and monitoring granularity
   system_every: 5000
-  model_health_every: 10000
-  score_dist_every: 2000
+  model_health_every: 5000
+  score_dist_every: 1000
   buffer_size: 50000
   flush_every: 5000
   output_dir: "logs/stats"
@@ -149,7 +195,7 @@ thermal_protection:
 # -----------------------------------------------------------------------------
 resume:
   enabled: true
-  checkpoint_path: null
+  checkpoint_path: "models/checkpoints/model_step_050000.pt"  # Roll back to 43% WR peak
   skip_corrupted: true
 
 # -----------------------------------------------------------------------------
@@ -157,13 +203,14 @@ resume:
 # -----------------------------------------------------------------------------
 time_limit:
   enabled: true
-  duration: "4h"                        # Was 2h. Longer sessions for more progress.
+  duration: "4h"
 
 # =============================================================================
-# Hardware-Specific Profiles
+# Hardware-Specific Profiles (reference only — use top-level values directly)
 # =============================================================================
-# WARNING: Profiles do NOT override model architecture. Server uses 64/4/128/64
-# which is INCOMPATIBLE with local checkpoints (128/8/256/128).
+# WARNING: Profiles do NOT override model architecture. The base config in
+# training_config.yaml uses 64/4/128/64 which is INCOMPATIBLE with local
+# checkpoints (128/8/256/128). Always use this file for local training.
 # =============================================================================
 
 profiles:
@@ -177,12 +224,12 @@ profiles:
       cpu_workers: 48
       games_per_epoch: 2048
     training:
-      batch_size: 4096
-      learning_rate: 3.0e-4
+      batch_size: 32768
+      learning_rate: 2.0e-4
       lr_scheduler:
-        warmup_steps: 400
+        enabled: false                  # Match server config v5 decision
     dataloader:
-      replay_max_entries: 1000000
+      replay_max_entries: 500000
       ram_cache:
         threshold_gb: 64.0
     thermal_protection:
@@ -195,11 +242,11 @@ profiles:
       compile:
         mode: "reduce-overhead"
     selfplay:
-      cpu_workers: 11
-      games_per_epoch: 200
+      cpu_workers: 10                   # [Part 3] Fixed: now matches top-level
+      games_per_epoch: 200              # [Part 3] Fixed: now matches top-level
     training:
-      batch_size: 8192
-      learning_rate: 4.0e-4
+      batch_size: 4096                  # [Part 3] Fixed: now matches top-level
+      learning_rate: 1.5e-4             # [Part 3] Fixed: now matches top-level
 
   cpu:
     device:
