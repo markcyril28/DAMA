@@ -139,6 +139,24 @@ class ReplayBuffer:
 
         return len(to_delete)
 
+    def clear_files(self) -> int:
+        """Delete all replay files and clear the file cache. Returns number deleted.
+
+        Call this after loading entries into memory to free disk space and
+        prevent re-training on the same data.
+        """
+        self._close_current()
+        files = self.get_replay_files()
+        deleted = 0
+        for f in files:
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError:
+                pass
+        self._file_cache.clear()
+        return deleted
+
     def count_entries(self) -> int:
         """Count total entries across all files."""
         files = self.get_replay_files()

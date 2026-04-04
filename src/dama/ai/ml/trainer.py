@@ -306,6 +306,7 @@ class TrainingConfig:
     ram_cache_enabled: bool = True
     ram_cache_threshold_gb: float = 8.0
     replay_max_entries: int = 100000  # Max entries to sample from replay buffer per epoch
+    clear_replay_after_load: bool = False  # Delete replay files after loading into memory
 
     # Stability
     grad_clip_norm: Optional[float] = 1.0
@@ -1291,6 +1292,10 @@ class Trainer:
                 self.run_selfplay(num_games)
                 train_entries, _ = prepare_training_data(
                     self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
+                if self.config.clear_replay_after_load:
+                    deleted = self.replay_buffer.clear_files()
+                    if deleted:
+                        print(f"Cleared {deleted} replay files after loading")
                 # Pre-process to tensors in background to avoid GPU idle time
                 dataset = CachedTensorDataset.from_entries(
                     train_entries, max_moves_per_sample=64, show_progress=True,
@@ -2022,6 +2027,11 @@ class Trainer:
             self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
         print(f"Training entries: {len(train_entries)}")
 
+        if self.config.clear_replay_after_load:
+            deleted = self.replay_buffer.clear_files()
+            if deleted:
+                print(f"Cleared {deleted} replay files after loading")
+
         if not train_entries:
             print("ERROR: No training data available")
             return
@@ -2117,6 +2127,10 @@ class Trainer:
                 self.run_selfplay(self.config.selfplay_games)
                 train_entries, _ = prepare_training_data(
                     self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
+                if self.config.clear_replay_after_load:
+                    deleted = self.replay_buffer.clear_files()
+                    if deleted:
+                        print(f"Cleared {deleted} replay files after loading")
                 if train_entries:
                     dataset = CachedTensorDataset.from_entries(
                         train_entries, max_moves_per_sample=64, show_progress=True,
@@ -2377,6 +2391,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         ram_cache_enabled=dataloader_cfg.get('ram_cache', {}).get('enabled', True),
         ram_cache_threshold_gb=dataloader_cfg.get('ram_cache', {}).get('threshold_gb', 8.0),
         replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
+        clear_replay_after_load=dataloader_cfg.get('clear_replay_after_load', False),
         # Testing settings
         test_vs_algo=testing_cfg.get('enabled', True),
         test_every=testing_cfg.get('every_n_steps', 5000),
