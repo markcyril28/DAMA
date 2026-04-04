@@ -1130,7 +1130,8 @@ class Trainer:
             f.write(json.dumps(data) + '\n')
 
     def run_selfplay(self, num_games: int, callback=None,
-                     collect_dicts: bool = False) -> int:
+                     collect_dicts: bool = False,
+                     skip_replay: bool = False) -> int:
         """Run self-play to generate training data.
 
         Args:
@@ -1138,10 +1139,20 @@ class Trainer:
             callback: Progress callback.
             collect_dicts: If True, store all raw dicts in self._last_selfplay_dicts
                 for incremental dataset updates (avoids re-loading from replay).
+            skip_replay: If True, skip JSONL replay I/O entirely. The dicts are
+                kept in memory via collect_dicts. Avoids json.dumps + disk writes
+                when the data won't be re-read from replay (background self-play
+                after the first cycle).
 
         Returns:
             Total number of training entries generated.
         """
+        if skip_replay and not collect_dicts:
+            raise ValueError(
+                "skip_replay=True requires collect_dicts=True, otherwise "
+                "generated data is silently discarded (not saved to disk or memory)."
+            )
+
         _selfplay_start = time.time()
         total_games = max(0, num_games)
         opponent_focus = self.config.selfplay_opponent_focus
@@ -1306,7 +1317,8 @@ class Trainer:
         sys.stdout.flush()
 
         # --- Open one replay file for the entire self-play cycle ---
-        self.replay_buffer.start_new_file()
+        if not skip_replay:
+            self.replay_buffer.start_new_file()
 
         # --- Submit ALL to one ProcessPoolExecutor ---
         try:
@@ -1324,7 +1336,8 @@ class Trainer:
                     task_type, batch_game_count = future_meta[future]
                     try:
                         entries_data = future.result(timeout=600)
-                        self.replay_buffer.add_entry_dicts(entries_data)
+                        if not skip_replay:
+                            self.replay_buffer.add_entry_dicts(entries_data)
                         entries += len(entries_data)
                         if _collected is not None:
                             _collected.extend(entries_data)
@@ -1341,7 +1354,8 @@ class Trainer:
             for task_a in all_algo_tasks:
                 try:
                     entries_data = _play_game_worker_algo_vs_algo(task_a)
-                    self.replay_buffer.add_entry_dicts(entries_data)
+                    if not skip_replay:
+                        self.replay_buffer.add_entry_dicts(entries_data)
                     entries += len(entries_data)
                     if _collected is not None:
                         _collected.extend(entries_data)
@@ -1351,7 +1365,8 @@ class Trainer:
                 except Exception as e:
                     print(f"Sequential fallback error: {e}")
 
-        self.replay_buffer.close()
+        if not skip_replay:
+            self.replay_buffer.close()
         print(f"Generated {entries} training entries")
 
         # Store collected dicts for incremental preprocessing
@@ -1369,22 +1384,24 @@ class Trainer:
                 elapsed_sec=_selfplay_elapsed,
             )
 
-            # Record replay buffer state
-            try:
-                buf_entries = self.replay_buffer.count_entries()
-                replay_dir = Path(self.config.replay_dir)
-                num_files = len(list(replay_dir.glob("*.jsonl"))) if replay_dir.exists() else 0
-                total_bytes = sum(
-                    f.stat().st_size for f in replay_dir.glob("*.jsonl")
-                ) if replay_dir.exists() else 0
-                self.stats_collector.record_replay_buffer_state(
-                    step=self.step,
-                    total_entries=buf_entries,
-                    num_files=num_files,
-                    total_size_bytes=total_bytes,
-                )
-            except Exception:
-                pass  # Non-critical
+            # Record replay buffer state (skip when replay I/O was bypassed —
+            # file counts would be stale and count_entries() does unnecessary I/O)
+            if not skip_replay:
+                try:
+                    buf_entries = self.replay_buffer.count_entries()
+                    replay_dir = Path(self.config.replay_dir)
+                    num_files = len(list(replay_dir.glob("*.jsonl"))) if replay_dir.exists() else 0
+                    total_bytes = sum(
+                        f.stat().st_size for f in replay_dir.glob("*.jsonl")
+                    ) if replay_dir.exists() else 0
+                    self.stats_collector.record_replay_buffer_state(
+                        step=self.step,
+                        total_entries=buf_entries,
+                        num_files=num_files,
+                        total_size_bytes=total_bytes,
+                    )
+                except Exception:
+                    pass  # Non-critical
 
         return entries
 
@@ -1417,7 +1434,13 @@ class Trainer:
 
             while not self._stopped:
                 try:
-                    self.run_selfplay(num_games, collect_dicts=True)
+                    # Skip JSONL replay I/O when we have an existing dataset to
+                    # build on incrementally.  Data flows directly from self-play
+                    # workers → memory dicts → CachedTensorDataset → GPU, avoiding
+                    # json serialization + disk writes + ReplayEntry conversion.
+                    _skip = _existing is not None and len(_existing) > 0
+                    self.run_selfplay(
+                        num_games, collect_dicts=True, skip_replay=_skip)
 
                     new_dicts = getattr(self, '_last_selfplay_dicts', None)
 
