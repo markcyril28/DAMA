@@ -117,6 +117,23 @@ class ReplayBuffer:
         # Keep in memory so close() can promote to file cache without re-parsing.
         self._session_entries.setdefault(self._current_file, []).extend(entries)
 
+    def add_entry_dicts(self, dicts: List[dict]) -> None:
+        """Add entries from raw dicts — avoids dict→ReplayEntry→dict round-trip.
+
+        Self-play workers already return dicts (serialized for IPC). Writing
+        them directly to JSONL skips one to_dict() call per entry. ReplayEntry
+        objects are created once for the session cache (needed by load_all_entries).
+        """
+        if not dicts:
+            return
+        if self._current_writer is None:
+            self.start_new_file()
+        lines = [_json_dumps(d) for d in dicts]
+        self._current_writer.write('\n'.join(lines) + '\n')
+        self._current_writer.flush()
+        entries = [ReplayEntry.from_dict(d) for d in dicts]
+        self._session_entries.setdefault(self._current_file, []).extend(entries)
+
     def _close_current(self) -> None:
         """Close the current file and promote session entries to file cache."""
         if self._current_writer is not None:
@@ -175,23 +192,46 @@ class ReplayBuffer:
         return deleted
 
     def count_entries(self) -> int:
-        """Count total entries across all files."""
+        """Count total entries across all files.
+
+        Uses cached entry counts where available (file cache + session cache)
+        and only reads uncached files from disk. ~500 bytes/entry estimate for
+        files not yet loaded.
+        """
         files = self.get_replay_files()
         if not files:
             return 0
 
-        def _count_file(path: Path) -> int:
-            with open(path, 'r') as f:
-                return sum(1 for _ in f)
-
         total = 0
-        with ThreadPoolExecutor(max_workers=min(8, len(files))) as executor:
-            futures = {executor.submit(_count_file, p): p for p in files}
-            for future in as_completed(futures):
+        uncached_files = []
+        for f in files:
+            # Check session entries first (not yet promoted to file cache)
+            if f in self._session_entries:
+                total += len(self._session_entries[f])
+                continue
+            # Check file cache (promoted after close)
+            cached = self._file_cache.get(f)
+            if cached is not None:
                 try:
-                    total += future.result()
-                except Exception as e:
-                    print(f"  Warning: failed to count replay file {futures[future]}: {e}")
+                    if f.stat().st_mtime == cached[0]:
+                        total += len(cached[1])
+                        continue
+                except OSError:
+                    pass
+            uncached_files.append(f)
+
+        if uncached_files:
+            def _count_file(path: Path) -> int:
+                with open(path, 'r') as fh:
+                    return sum(1 for _ in fh)
+
+            with ThreadPoolExecutor(max_workers=min(8, len(uncached_files))) as executor:
+                futures = {executor.submit(_count_file, p): p for p in uncached_files}
+                for future in as_completed(futures):
+                    try:
+                        total += future.result()
+                    except Exception as e:
+                        print(f"  Warning: failed to count replay file {futures[future]}: {e}")
         return total
 
     def iterate_entries(self, shuffle_files: bool = True) -> Iterator[ReplayEntry]:
