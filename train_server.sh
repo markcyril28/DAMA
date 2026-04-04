@@ -92,13 +92,14 @@ export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 export TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE=1
 
 # =============================================================================
-# CPU/Memory Optimizations - scale to available cores
+# CPU/Memory Optimizations
 # =============================================================================
-OMP_THREADS=$(( CPU_COUNT > 8 ? CPU_COUNT / 4 : CPU_COUNT / 2 ))
-OMP_THREADS=$(( OMP_THREADS > 0 ? OMP_THREADS : 1 ))
-export OMP_NUM_THREADS=$OMP_THREADS
-export MKL_NUM_THREADS=$OMP_THREADS
-export NUMEXPR_MAX_THREADS=$OMP_THREADS
+# Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
+# The training thread uses GPU for all compute; these libraries would otherwise
+# spawn threads that compete with the 52 self-play worker processes.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_MAX_THREADS=1
 
 # Increase file descriptor limit (best-effort, may fail on some systems)
 ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
@@ -224,4 +225,4 @@ echo ""
 echo "  See ${CONFIG_FILE} for all training parameters."
 echo ""
 
-exec -a "python3" python3 -m dama.ai.ml.trainer ${ARGS}
+exec -a "python3" python3 -W ignore::FutureWarning -m dama.ai.ml.trainer ${ARGS}
