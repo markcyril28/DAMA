@@ -49,12 +49,12 @@ selfplay:
   opponent_focus: "both"                # Was "algorithm". Now 50% ML-vs-ML + 50% ML-vs-algo.
   noise_prob: 0.15                      # Was 0.20. Slightly less noise for better convergence.
   max_moves_per_game: 150               # Was 100. Allow endgame play.
-  pipeline_mode: "simultaneous"
+  pipeline_mode: "alternate"
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 800                # Cython fast path: ~3ms/easy, ~378ms/hard game.
-                                        # 800 games → ~43K entries/epoch, fills 400K buffer in ~9 cycles.
+    games_per_epoch: 3600                # Cython fast path: ~3ms/easy, ~378ms/hard game.
+                                        # 1800 games → ~97K entries/epoch, fills 400K buffer in ~4 cycles.
     difficulties:
       - "easy"
       - "medium"
