@@ -1029,6 +1029,9 @@ def play_full_game_cy(
     init_standard_board(board)
     player = start_player
 
+    # Allocate TT once; clear before each per-move search inside the loop.
+    _ensure_tt()
+
     cdef list entries = []
     cdef list moves_list
     cdef dict state_dict
@@ -1067,6 +1070,10 @@ def play_full_game_cy(
                 time_budget = 2.5; max_depth = 8
             else:
                 time_budget = 0.8; max_depth = 5
+
+            # Clear TT before each move's search (different root position)
+            if _tt_table != NULL:
+                memset(_tt_table, 0, TT_SIZE * sizeof(TTEntry))
 
             ss.deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
             ss.nodes = 0
