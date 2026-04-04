@@ -16,7 +16,9 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # SESSION SETTINGS — Edit these per-run
 # -----------------------------------------------------------------------------
-RESUME_LATEST=true               # Resume from latest checkpoint in models/checkpoints/
+RESUME_LATEST=false              # Set true to resume from latest checkpoint in models/checkpoints/
+                                 # NOTE: Set to false for fresh retrain — old checkpoints may be
+                                 # degenerate. See config/training_config_local_retrain.yaml.
 RESUME=""                        # Or set a specific checkpoint path
 TRAIN_DURATION=""                # Train for this duration (empty = use config's time_limit)
                                  # Examples: "2d", "4h", "30m", "1d12h"
@@ -63,11 +65,11 @@ python -W ignore::FutureWarning -c "import torch; assert torch.cuda.is_available
 }
 
 echo "CUDA verified. Starting training..."
-echo "Config: config/training_config_local.yaml"
+echo "Config: config/training_config_local_retrain.yaml"
 echo ""
 
 # Build command arguments — only session-level overrides
-ARGS="--config ${PROJECT_DIR}/config/training_config_local.yaml"
+ARGS="--config ${PROJECT_DIR}/config/training_config_local_retrain.yaml"
 
 # Resume settings
 if [ -n "$RESUME" ]; then
