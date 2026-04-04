@@ -335,6 +335,120 @@ def compute_reward_weights_batch(scores: np.ndarray) -> np.ndarray:
     return np.clip(normalized, REWARD_WEIGHT_MIN, REWARD_WEIGHT_MAX).astype(np.float32)
 
 
+# ────────────────────────────────────────────────────────────────
+# Fast-path scoring: works directly on compact dicts
+# ────────────────────────────────────────────────────────────────
+# Avoids GameState/Board/Piece object creation and eliminates
+# the expensive legal_moves() call by using pre-stored move counts.
+
+def _material_from_compact(state_dict: dict, player_int: int) -> float:
+    """Compute material score directly from compact dict."""
+    if player_int == 1:
+        men = len(state_dict.get('p1_men', ()))
+        kings = len(state_dict.get('p1_kings', ()))
+    else:
+        men = len(state_dict.get('p2_men', ()))
+        kings = len(state_dict.get('p2_kings', ()))
+    return men * MAN_VALUE + kings * KING_VALUE
+
+
+def _material_advantage_from_compact(state_dict: dict, player_int: int) -> float:
+    """Compute material advantage directly from compact dict."""
+    opp = 2 if player_int == 1 else 1
+    return _material_from_compact(state_dict, player_int) - _material_from_compact(state_dict, opp)
+
+
+def _positional_score_from_compact(state_dict: dict, player_int: int) -> float:
+    """Compute positional score directly from compact dict (no object creation)."""
+    score = 0.0
+    start_row = 0 if player_int == 1 else 7
+
+    # Men
+    men_key = 'p1_men' if player_int == 1 else 'p2_men'
+    for pos in state_dict.get(men_key, ()):
+        row, col = pos[0], pos[1]
+        if 2 <= row <= 5 and 2 <= col <= 5:
+            score += CENTER_BONUS
+        if player_int == 1:
+            advancement = row
+        else:
+            advancement = 7 - row
+        score += advancement * ADVANCE_BONUS_PER_ROW
+        if row == start_row:
+            score += BACK_ROW_BONUS
+        if col == 0 or col == 7:
+            score += EDGE_PENALTY
+
+    # Kings
+    king_key = 'p1_kings' if player_int == 1 else 'p2_kings'
+    for pos in state_dict.get(king_key, ()):
+        row, col = pos[0], pos[1]
+        if 2 <= row <= 5 and 2 <= col <= 5:
+            score += CENTER_BONUS
+        if row == start_row:
+            score += BACK_ROW_BONUS
+        if col == 0 or col == 7:
+            score += EDGE_PENALTY
+
+    return score
+
+
+def _mobility_score_from_moves(legal_moves: list, state_dict: dict, player_int: int) -> float:
+    """Approximate mobility score from pre-stored legal moves (no move generation).
+
+    Uses the move dicts already stored in the replay entry instead of
+    re-running the expensive legal_moves() computation.
+    """
+    king_key = 'p1_kings' if player_int == 1 else 'p2_kings'
+    king_set = {(p[0], p[1]) for p in state_dict.get(king_key, ())}
+
+    score = 0.0
+    for m in legal_moves:
+        captures = m.get('captures', ())
+        if captures:
+            n_cap = len(captures)
+            score += CAPTURE_MOVE_BONUS
+            score += (n_cap - 1) * CAPTURE_MOVE_BONUS * 0.5
+        else:
+            score += MOBILITY_WEIGHT
+        start = m['path'][0]
+        if (start[0], start[1]) in king_set:
+            score += KING_MOBILITY_WEIGHT
+
+    return score
+
+
+def _position_total_fast(state_dict: dict, legal_moves: list, player_int: int) -> float:
+    """Fast compute_position_total using compact dicts (no GameState/Board objects)."""
+    material = _material_from_compact(state_dict, player_int)
+    material_adv = _material_advantage_from_compact(state_dict, player_int)
+    positional = _positional_score_from_compact(state_dict, player_int)
+    mobility = _mobility_score_from_moves(legal_moves, state_dict, player_int)
+    return material + material_adv * 0.5 + positional + mobility
+
+
+def _per_move_score_fast(
+    state_dict: dict,
+    legal_moves: list,
+    player_int: int,
+    game_score: float,
+    move_index: int,
+    total_moves: int,
+) -> float:
+    """Fast per-move score using compact dicts (no GameState reconstruction)."""
+    pos_score = _position_total_fast(state_dict, legal_moves, player_int)
+
+    if total_moves > 0:
+        progress = move_index / total_moves
+    else:
+        progress = 0.5
+
+    outcome_weight = 0.3 + 0.7 * progress
+    position_weight = 1.0 - outcome_weight
+
+    return position_weight * pos_score + outcome_weight * game_score
+
+
 def score_game_entries(
     entries: list,
     winner: Optional[Player],
@@ -346,8 +460,9 @@ def score_game_entries(
     """
     Compute and assign scores to all replay entries from a completed game.
 
-    This should be called after a game finishes to populate the 'score'
-    field in each ReplayEntry.
+    Uses fast-path scoring that works directly on compact dicts and
+    pre-stored legal moves, avoiding expensive GameState reconstruction
+    and redundant move generation.
 
     Args:
         entries: List of ReplayEntry objects from the game
@@ -375,17 +490,15 @@ def score_game_entries(
             captures_made=player_captures.get(player, 0),
         )
 
-    # Assign per-move scores
+    # Assign per-move scores using fast path (no GameState reconstruction)
+    game_scores_by_int = {int(p): s for p, s in game_scores.items()}
     for i, entry in enumerate(entries):
-        player = Player(entry.state['turn'])
-
-        # Reconstruct state for positional evaluation
-        entry_state = GameState.from_compact(entry.state)
-
-        entry.score = compute_per_move_score(
-            state=entry_state,
-            player=player,
-            game_score=game_scores[player],
+        player_int = entry.state['turn']
+        entry.score = _per_move_score_fast(
+            state_dict=entry.state,
+            legal_moves=entry.legal_moves,
+            player_int=player_int,
+            game_score=game_scores_by_int[player_int],
             move_index=i,
             total_moves=total_moves,
         )

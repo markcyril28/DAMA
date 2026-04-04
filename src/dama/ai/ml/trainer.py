@@ -608,8 +608,12 @@ class Trainer:
                         if self.config.amp:
                             with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                                 compiled_model.forward_padded(_wb, _wm, _wc)
+                                # Also warm up __call__ path — it triggers
+                                # different Triton kernels than forward_padded
+                                compiled_model(_wb, _wm, _wc)
                         else:
                             compiled_model.forward_padded(_wb, _wm, _wc)
+                            compiled_model(_wb, _wm, _wc)
                     self.model = compiled_model
                     print("torch.compile warmup OK — compiled model active (loss uncompiled)")
                     sys.stdout.flush()
@@ -1569,41 +1573,69 @@ class Trainer:
 
             elif _use_amp:
                 # ── AMP path (fallback: value head or non-padded) ──
-                with autocast(device_type='cuda', dtype=_amp_dtype):
-                    if _use_padded:
-                        if _value_head_enabled:
-                            scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
-                        else:
-                            scores = _model.forward_padded(boards, move_features, move_counts)
-                            value_preds = None
-                    else:
-                        if _value_head_enabled:
-                            scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
-                        else:
-                            scores = _model(boards, move_features, move_counts)
-                            value_preds = None
-                    if _do_sanity:
+                try:
+                    with autocast(device_type='cuda', dtype=_amp_dtype):
                         if _use_padded:
-                            _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
+                            if _value_head_enabled:
+                                scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
+                            else:
+                                scores = _model.forward_padded(boards, move_features, move_counts)
+                                value_preds = None
                         else:
-                            _bad = not torch.isfinite(scores).all()
-                        if _bad:
-                            print("  Warning: non-finite scores detected; skipping batch")
-                            if _stats_collector:
-                                _stats_collector.record_non_finite_event(
-                                    self.step, 'model_scores', 'Non-finite output scores')
-                            continue
-                    _current_scores = scores.detach()
+                            if _value_head_enabled:
+                                scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
+                            else:
+                                scores = _model(boards, move_features, move_counts)
+                                value_preds = None
+                except RuntimeError as _compile_err:
+                    if "device kernel image is invalid" in str(_compile_err) and first_batch:
+                        # torch.compile generated incompatible CUDA kernels —
+                        # unwrap to eager model and retry this batch
+                        print(f"torch.compile runtime failure: {_compile_err}")
+                        print("Falling back to eager mode for remaining training...")
+                        sys.stdout.flush()
+                        _orig = getattr(_model, '_orig_mod', None)
+                        if _orig is not None:
+                            self.model = _orig
+                            _model = _orig
+                        torch._dynamo.reset()
+                        with autocast(device_type='cuda', dtype=_amp_dtype):
+                            if _use_padded:
+                                if _value_head_enabled:
+                                    scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
+                                else:
+                                    scores = _model.forward_padded(boards, move_features, move_counts)
+                                    value_preds = None
+                            else:
+                                if _value_head_enabled:
+                                    scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
+                                else:
+                                    scores = _model(boards, move_features, move_counts)
+                                    value_preds = None
+                    else:
+                        raise
+                if _do_sanity:
                     if _use_padded:
-                        policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
+                        _bad = torch.isnan(scores).any() or (scores == float('inf')).any()
                     else:
-                        policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
+                        _bad = not torch.isfinite(scores).all()
+                    if _bad:
+                        print("  Warning: non-finite scores detected; skipping batch")
+                        if _stats_collector:
+                            _stats_collector.record_non_finite_event(
+                                self.step, 'model_scores', 'Non-finite output scores')
+                        continue
+                _current_scores = scores.detach()
+                if _use_padded:
+                    policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
+                else:
+                    policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
 
-                    if value_preds is not None and value_targets is not None:
-                        value_loss = nn.functional.mse_loss(value_preds, value_targets)
-                        loss = policy_loss + _value_weight * value_loss
-                    else:
-                        loss = policy_loss
+                if value_preds is not None and value_targets is not None:
+                    value_loss = nn.functional.mse_loss(value_preds, value_targets)
+                    loss = policy_loss + _value_weight * value_loss
+                else:
+                    loss = policy_loss
 
                 if accum_steps > 1:
                     loss = loss / accum_steps
