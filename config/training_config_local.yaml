@@ -53,8 +53,8 @@ selfplay:
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 400                # Cython fast path makes these cheap. Fills buffer quickly
-                                        # so GPU has diverse batches from the start.
+    games_per_epoch: 800                # Cython fast path: ~3ms/easy, ~378ms/hard game.
+                                        # 800 games → ~43K entries/epoch, fills 400K buffer in ~9 cycles.
     difficulties:
       - "easy"
       - "medium"
