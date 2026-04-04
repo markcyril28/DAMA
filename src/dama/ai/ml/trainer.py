@@ -1383,13 +1383,37 @@ class Trainer:
         accum_steps = self.config.gradient_accumulation_steps
         _micro_step = 0  # counts mini-batches within an accumulation window
 
+        # Cache frequently accessed config/state as locals to eliminate
+        # attribute lookup overhead on every step (~50ns each, adds up at 10+ steps/sec).
+        _cfg = self.config
+        _device = self.device
+        _stats_collector = self.stats_collector
+        _stats_record_every = _cfg.stats_record_every
+        _stats_score_dist_every = _cfg.stats_score_dist_every
+        _stats_system_every = _cfg.stats_system_every
+        _stats_model_health_every = _cfg.stats_model_health_every
+        _checkpoint_every = _cfg.checkpoint_every
+        _train_steps = _cfg.train_steps
+        _grad_clip_norm = _cfg.grad_clip_norm
+        _use_amp = _cfg.amp
+        _amp_dtype = self.amp_dtype
+        _value_head_enabled = _cfg.value_head_enabled
+        _value_weight = _cfg.value_weight
+        _scaler = self.scaler
+        _optimizer = self.optimizer
+        _scheduler = self.scheduler
+        _model = self.model
+        _use_padded = self._use_padded
+        _sanity_interval = self._SANITY_CHECK_INTERVAL
+        _thermal_enabled = _cfg.thermal_enabled
+
         # Use CUDA prefetcher for overlapped H2D transfer — but skip when data
         # is already GPU-resident (no transfer to overlap, prefetcher just adds
         # stream-sync overhead).
         _data_on_gpu = getattr(dataloader, 'on_gpu', False)
-        _use_prefetcher = self.device.type == 'cuda' and not _data_on_gpu
+        _use_prefetcher = _device.type == 'cuda' and not _data_on_gpu
         if _use_prefetcher:
-            iter_loader = CUDAPrefetcher(dataloader, self.device)
+            iter_loader = CUDAPrefetcher(dataloader, _device)
         else:
             iter_loader = dataloader
 
@@ -1407,12 +1431,13 @@ class Trainer:
                 if self._stopped:
                     break
 
-            # Thermal protection: pause if GPU/CPU is too hot
-            self._check_thermal_and_rest()
+            # Thermal protection: only check when enabled (avoid method call overhead)
+            if _thermal_enabled:
+                self._check_thermal_and_rest()
 
             # Only time steps when stats recording needs it (avoids 2× time.time() per step)
-            _will_record = (self.stats_collector and
-                            (self.step + 1) % self.config.stats_record_every == 0)
+            _will_record = (_stats_collector and
+                            (self.step + 1) % _stats_record_every == 0)
             if _will_record:
                 _step_start = time.time()
 
