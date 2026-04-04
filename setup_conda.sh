@@ -101,6 +101,10 @@ echo ""
 echo "Installing Cython for accelerated preprocessing..."
 pip install cython
 
+echo ""
+echo "Installing pynvml for fast GPU monitoring (thermal/utilization)..."
+pip install pynvml
+
 # Build Cython extensions (encoding: ~7x speedup, search: ~130x speedup)
 echo "Building Cython extensions..."
 if [[ -f "$PROJECT_DIR/src/setup_cython.py" ]]; then
