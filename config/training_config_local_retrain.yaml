@@ -76,7 +76,7 @@ selfplay:
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 3600               # Cython fast path: ~3ms/easy, ~378ms/hard.
+    games_per_epoch: 3600*2               # Cython fast path: ~3ms/easy, ~378ms/hard.
                                         # Fills replay buffer quickly with high-quality
                                         # data. ~97K entries/epoch from algo games.
     difficulties:                       # Exclude super_hard — per pass 8 analysis,
