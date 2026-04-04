@@ -15,6 +15,7 @@ passed as ints through the C call tree — zero per-node Python overhead.
 from libc.string cimport memcpy, memset
 from libc.math cimport fabs
 from libc.time cimport clock, CLOCKS_PER_SEC
+from libc.stdlib cimport malloc, free, calloc
 
 # ── Board cell values ──
 DEF EMPTY = 0
@@ -87,6 +88,116 @@ cdef void _init_center():
     CENTER_SQ[4*8+1] = 1; CENTER_SQ[4*8+3] = 1; CENTER_SQ[4*8+5] = 1; CENTER_SQ[4*8+7] = 1
 
 _init_center()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Zobrist hashing + Transposition table
+# ═══════════════════════════════════════════════════════════════════════
+# Zobrist hashing maps board positions to 64-bit pseudo-random keys.
+# The transposition table caches search results so that positions reached
+# via different move orders (transpositions) reuse prior work.
+# Typical hit rates are 30-60%, giving ~2-4x speedup at deeper depths.
+
+DEF TT_SIZE_BITS = 20
+DEF TT_SIZE = 1048576          # 1 << 20 = 1M entries (~16MB)
+DEF TT_MASK = 1048575          # TT_SIZE - 1
+
+# TT entry flags
+DEF TT_EXACT = 0
+DEF TT_LOWERBOUND = 1
+DEF TT_UPPERBOUND = 2
+
+cdef struct TTEntry:
+    unsigned long long hash_key  # Full hash for collision verification
+    float score
+    short depth
+    unsigned char flag           # TT_EXACT / TT_LOWERBOUND / TT_UPPERBOUND
+    unsigned char padding
+
+# Zobrist keys: 5 piece types × 64 squares, plus side-to-move toggle.
+# Piece indices: 0=EMPTY (unused), 1=P1_MAN, 2=P1_KING, 3=P2_MAN, 4=P2_KING
+cdef unsigned long long ZOBRIST_PIECES[5][64]
+cdef unsigned long long ZOBRIST_SIDE
+
+# Module-level TT allocated on first use (persists across searches within a process).
+cdef TTEntry *_tt_table = NULL
+
+cdef void _init_zobrist():
+    """Initialize Zobrist hash keys with a deterministic PRNG."""
+    # LCG with constants from Knuth's MMIX
+    cdef unsigned long long state = 0x12345678DEADBEEF
+    cdef int piece, sq
+    for piece in range(5):
+        for sq in range(64):
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL
+            ZOBRIST_PIECES[piece][sq] = state
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL
+    ZOBRIST_SIDE = state
+
+_init_zobrist()
+
+cdef void _ensure_tt():
+    """Allocate TT on first use (zero-initialized = all entries empty)."""
+    global _tt_table
+    if _tt_table == NULL:
+        _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))
+
+cdef inline unsigned long long compute_hash(
+    signed char *board, int player
+) noexcept nogil:
+    """Compute full Zobrist hash for a board position."""
+    cdef unsigned long long h = 0
+    cdef int sq, piece
+    for sq in range(64):
+        piece = board[sq]
+        if piece != EMPTY:
+            h = h ^ ZOBRIST_PIECES[piece][sq]
+    if player == PLAYER_TWO:
+        h = h ^ ZOBRIST_SIDE
+    return h
+
+cdef inline void tt_store(
+    unsigned long long hash_key, float score, int depth, int flag
+) noexcept nogil:
+    """Store a search result in the transposition table (always-replace)."""
+    cdef unsigned long long idx = hash_key & TT_MASK
+    cdef TTEntry *entry = &_tt_table[idx]
+    # Always-replace: simpler than depth-preferred and works well with
+    # iterative deepening (newer results from deeper searches overwrite).
+    entry.hash_key = hash_key
+    entry.score = score
+    entry.depth = <short>depth
+    entry.flag = <unsigned char>flag
+    entry.padding = 0
+
+cdef inline bint tt_probe(
+    unsigned long long hash_key, int depth,
+    float *score, float *alpha, float *beta
+) noexcept nogil:
+    """Probe the transposition table. Returns True if a cutoff occurred.
+
+    On a hit with sufficient depth, adjusts alpha/beta or returns exact score.
+    The caller should check if alpha >= beta after this returns True.
+    """
+    cdef unsigned long long idx = hash_key & TT_MASK
+    cdef TTEntry *entry = &_tt_table[idx]
+    if entry.hash_key != hash_key:
+        return False
+    if entry.depth < depth:
+        return False
+    if entry.flag == TT_EXACT:
+        score[0] = entry.score
+        return True
+    elif entry.flag == TT_LOWERBOUND:
+        if entry.score > alpha[0]:
+            alpha[0] = entry.score
+    elif entry.flag == TT_UPPERBOUND:
+        if entry.score < beta[0]:
+            beta[0] = entry.score
+    if alpha[0] >= beta[0]:
+        score[0] = entry.score
+        return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -552,11 +663,12 @@ cdef float alphabeta(
     signed char *board, int player, int depth, float alpha, float beta,
     Rules *rules, SearchState *ss
 ) noexcept nogil:
-    """Negamax alpha-beta search."""
+    """Negamax alpha-beta search with transposition table."""
     cdef CMoveList moves
     cdef signed char new_board[64]
-    cdef float score, best
-    cdef int i, opp
+    cdef float score, best, orig_alpha
+    cdef int i, opp, tt_flag
+    cdef unsigned long long h
 
     ss.nodes += 1
 
@@ -566,6 +678,13 @@ cdef float alphabeta(
 
     if depth == 0:
         return evaluate_with_mobility(board, player, rules)
+
+    # ── TT probe ──
+    h = compute_hash(board, player)
+    orig_alpha = alpha
+    if _tt_table != NULL:
+        if tt_probe(h, depth, &score, &alpha, &beta):
+            return score
 
     moves.count = 0
     generate_all_moves_c(board, player, rules, &moves)
@@ -591,6 +710,16 @@ cdef float alphabeta(
             alpha = score
         if alpha >= beta:
             break
+
+    # ── TT store ──
+    if _tt_table != NULL and not ss.timeout:
+        if best <= orig_alpha:
+            tt_flag = TT_UPPERBOUND
+        elif best >= beta:
+            tt_flag = TT_LOWERBOUND
+        else:
+            tt_flag = TT_EXACT
+        tt_store(h, best, depth, tt_flag)
 
     return best
 
