@@ -1,0 +1,192 @@
+# =============================================================================
+# Retrain from Scratch — Local (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
+# =============================================================================
+# Created 2026-04-05 after discovering all prior checkpoints were degenerate.
+#
+# Root cause: torch.clamp(-50, 50) in MoveScorer killed gradients once raw
+# scores exceeded the clamp range (~step 0). Every checkpoint from step 0
+# onward output identical scores (50.0) for all moves. Fix: clamp removed
+# from model.py. This config starts training from a fresh random model.
+#
+# Strategy for fresh training:
+#   Phase 1 (steps 0-5K): Pure imitation learning from algorithmic teacher.
+#     100% algo opponents, higher noise for exploration, easy+medium difficulty.
+#   Phase 2 (steps 5K+): Same config continues — algo teachers remain until
+#     the model demonstrates competence (>20% WR vs medium in test games).
+#     Manually switch opponent_focus to "both" once that threshold is reached.
+#
+# Usage:
+#   bash local_train.sh  (after updating it to point here)
+#   — or —
+#   PYTHONPATH=src python -m dama.ai.ml.trainer \
+#       --config config/training_config_local_retrain.yaml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Device Settings
+# -----------------------------------------------------------------------------
+device:
+  type: "cuda"
+  amp:
+    enabled: true
+    dtype: "float16"                    # float16 + GradScaler for RTX 5050
+  compile:
+    enabled: true                       # SM-count guard in trainer.py auto-downgrades
+                                        # to mode='default' on small GPUs (RTX 5050).
+                                        # Shapes are fixed (batch=4096, board=5x8x8,
+                                        # moves=64x8) so no recompilation churn.
+  matmul_precision: "medium"            # TF32 enabled
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+# Same architecture as before. Fresh weights — no checkpoint compatibility
+# concern, but keeping the architecture allows reuse of eval_checkpoints.sh
+# and model_vs_algo infrastructure without changes.
+# -----------------------------------------------------------------------------
+model:
+  channels: 128                         # CNN channels in ResidualBlocks
+  num_blocks: 8                         # Number of residual blocks
+  embedding_size: 256                   # Board embedding vector size
+  hidden_size: 128                      # MoveScorer MLP hidden layer size
+
+# -----------------------------------------------------------------------------
+# Self-Play Settings
+# -----------------------------------------------------------------------------
+# Fresh model knows nothing — 100% algorithmic teachers, generous exploration.
+# algo_vs_algo provides high-quality baseline data from day one.
+# -----------------------------------------------------------------------------
+selfplay:
+  cpu_workers: 10                      # 10 of 12 cores for self-play workers
+  games_per_epoch: 100                  # ML-vs-algo games per cycle.
+                                        # 100 games x ~40 moves = ~4K entries/cycle.
+  difficulties:
+    - "easy"                            # Start with easy — learnable signal for
+    - "medium"                          # a random model. Medium adds challenge.
+  focus_side: "both"                    # Equal P1/P2 exposure from the start
+  opponent_focus: "algorithm"           # 100% algorithmic teachers. A random model
+                                        # playing itself generates pure noise.
+  noise_prob: 0.20                      # Higher noise for fresh model — more
+                                        # exploration of the move space early on.
+  max_moves_per_game: 150               # Allow endgame play
+  pipeline_mode: "simultaneous"         # Overlaps CPU self-play with GPU training.
+                                        # Trainer auto-generates initial data if
+                                        # replay buffer has < batch_size*10 entries.
+
+  algo_vs_algo:
+    enabled: true
+    games_per_epoch: 1800               # Cython fast path: ~3ms/easy, ~378ms/hard.
+                                        # Fills replay buffer quickly with high-quality
+                                        # data. ~97K entries/epoch from algo games.
+    difficulties:
+      - "easy"
+      - "medium"
+      - "hard"
+
+# -----------------------------------------------------------------------------
+# Training Hyperparameters
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 4096                      # Good balance for RTX 5050 — ~98 batches
+                                        # per epoch at 400K buffer. ~0.6GB VRAM.
+  learning_rate: 3.0e-4                 # Standard rate for fresh training with
+                                        # Adam. Not too aggressive, not too slow.
+  weight_decay: 1.0e-4                  # 10x higher than before — helps prevent
+                                        # embedding magnitude explosion that caused
+                                        # the original degeneration.
+  grad_clip_norm: 1.0                   # Standard gradient clipping
+  train_steps: 100000000000             # Unlimited — time_limit controls stopping
+  checkpoint_every: 1000                # More frequent saves for fresh training —
+                                        # lets eval_checkpoints.sh track progress
+                                        # at fine granularity.
+  gradient_accumulation_steps: 1
+
+  lr_scheduler:
+    enabled: true
+    type: "cosine_warm_restarts"
+    T_0: 5000                           # Long first cycle — let the model learn
+                                        # before any LR disruption.
+    T_mult: 2                           # Doubling: 5000, 10000, 20000, ...
+    eta_min: 3.0e-5                     # Floor at 10% of base LR
+    warmup_steps: 500                   # Gentle warmup from near-zero to base LR.
+                                        # Critical for fresh model — prevents
+                                        # large early gradients from destabilizing.
+
+  reward_mode: "cycle"                  # Alternate scoring/uniform epochs
+
+# -----------------------------------------------------------------------------
+# DataLoader Settings
+# -----------------------------------------------------------------------------
+dataloader:
+  num_workers: 0                        # FastBatchIterator bypasses DataLoader
+  pin_memory: true
+  prefetch_factor: 4
+  replay_max_entries: 400000            # 400K entries x ~3.5KB = ~1.4GB RAM
+  clear_replay_after_load: false        # Accumulate data across cycles
+
+  ram_cache:
+    enabled: true
+    threshold_gb: 16.0
+    cache_file: null
+
+# -----------------------------------------------------------------------------
+# Model Testing Settings (ML vs Algorithm)
+# -----------------------------------------------------------------------------
+# Frequent testing for fresh training — want to see the learning curve.
+# -----------------------------------------------------------------------------
+testing:
+  enabled: true
+  every_n_steps: 1000                   # Test every 1000 steps
+  num_games: 30                         # 30 games — fast eval, directional signal
+  difficulty: "medium"                  # Benchmark target
+
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
+paths:
+  checkpoint_dir: "models/checkpoints"
+  latest_model: "models/latest.pt"
+  replay_dir: "data/replay"
+  log_dir: "logs"
+  stats_file: "models/training_stats.json"
+
+# -----------------------------------------------------------------------------
+# Statistics Collection
+# -----------------------------------------------------------------------------
+statistics:
+  enabled: true
+  record_every: 500                     # More frequent for fresh training —
+                                        # want to catch problems early.
+  system_every: 5000
+  model_health_every: 2000              # Monitor embedding magnitudes closely
+  score_dist_every: 500                 # Track score distributions to verify
+                                        # the model is actually differentiating moves.
+  buffer_size: 50000
+  flush_every: 5000
+  output_dir: "logs/stats"
+
+# -----------------------------------------------------------------------------
+# Thermal Protection
+# -----------------------------------------------------------------------------
+thermal_protection:
+  enabled: true
+  temp_limit_c: 90
+  rest_duration: "5m"
+  check_every: 30
+
+# -----------------------------------------------------------------------------
+# Resume Settings
+# -----------------------------------------------------------------------------
+# DISABLED — fresh training from random initialization.
+# -----------------------------------------------------------------------------
+resume:
+  enabled: false
+  checkpoint_path: null
+  skip_corrupted: true
+
+# -----------------------------------------------------------------------------
+# Time-based Stopping
+# -----------------------------------------------------------------------------
+time_limit:
+  enabled: true
+  duration: "4h"
