@@ -207,7 +207,10 @@ profiles:
         enabled: true
         threshold_gb: 64.0
 
-  # Local development (NVIDIA RTX 5050, 8GB VRAM, 16 CPU threads, 32GB RAM)
+  # Local development (NVIDIA RTX 5050, 8GB VRAM, 12 CPU cores, 32GB RAM)
+  # WARNING: This profile does NOT override model architecture. The main config
+  # uses 64/4/128/64 which is INCOMPATIBLE with local checkpoints (128/8/256/128).
+  # Use training_config_local.yaml directly for local training.
   local:
     device:
       type: "cuda"
@@ -215,27 +218,27 @@ profiles:
         enabled: true
         dtype: "float16"
       compile:
-        enabled: true                 # Warmup auto-falls back to eager on failure
-        mode: "reduce-overhead"       # CUDAGraphs — avoid max-autotune (Triton may fail on RTX 5050)
+        enabled: true
+        mode: "reduce-overhead"
     selfplay:
-      cpu_workers: 14                 # 14 of 16 cores — 2 for GPU driver + training I/O
-      games_per_epoch: 512            # Proportional to batch size — keeps GPU fed
-      pipeline_mode: "simultaneous"   # Overlap CPU self-play with GPU training
+      cpu_workers: 10
+      games_per_epoch: 200
+      pipeline_mode: "simultaneous"
     training:
-      batch_size: 8192                # ~1.1GB activations at AMP fp16 — model is tiny, GPU has 6GB headroom
-      learning_rate: 7.9e-4           # Sqrt-scaled from 5.6e-4 at 4096 (x1.41)
-      gradient_accumulation_steps: 1  # No accumulation — batch fits, saves the extra fwd/bwd pass
+      batch_size: 1024
+      learning_rate: 1.5e-4
+      gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: true
-        warmup_steps: 200             # Longer warmup for larger batch
+        warmup_steps: 100
     dataloader:
-      num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
-      replay_max_entries: 500000      # 32GB RAM — ~1.75GB, better data diversity at larger batch
+      num_workers: 0
+      replay_max_entries: 200000
       ram_cache:
-        enabled: true                 # 32GB RAM is plenty for caching
-        threshold_gb: 8.0
+        enabled: true
+        threshold_gb: 16.0
     thermal_protection:
-      enabled: true                    # RTX 5050 laptop — protect from throttling
+      enabled: true
       temp_limit_c: 90
       rest_duration: "5m"
       check_every: 30
