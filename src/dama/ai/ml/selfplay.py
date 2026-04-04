@@ -204,17 +204,33 @@ def _play_game_worker(args: Tuple[str, int, float, int]) -> List[dict]:
 def _play_games_batch_worker(batch_args: list) -> List[dict]:
     """Run multiple algo-only games in one worker call to reduce IPC overhead.
 
-    Instead of 1 game per task (high per-task pickle + scheduling overhead),
-    each worker processes a batch of games and returns all entries at once.
-    Reduces IPC from N_games submissions to N_workers submissions.
+    Uses the Cython full game loop when available (2-7x faster than Python path
+    due to no Python object creation during gameplay + TT persistence across moves).
+    Falls back to play_single_game if the extension isn't built.
     """
     all_entries = []
-    for difficulty, max_moves, noise_prob, start_player in batch_args:
-        record = play_single_game(
-            difficulty, max_moves, noise_prob, start_player,
-            p1_policy='algorithmic', p2_policy='algorithmic',
-        )
-        all_entries.extend(e.to_dict() for e in record.entries)
+    if _HAS_FAST_GAME:
+        from .scoring import score_game_dicts as _score
+        for difficulty, max_moves, noise_prob, start_player in batch_args:
+            result = play_full_game_cy(
+                p1_difficulty=difficulty, p2_difficulty=difficulty,
+                max_moves=max_moves, noise_prob=noise_prob,
+                start_player=start_player,
+            )
+            _score(
+                entry_dicts=result['entries'], winner_int=result['winner'],
+                total_moves=result['num_moves'], max_moves=max_moves,
+                final_state_dict=result['final_state'],
+                p1_captures=result['p1_captures'], p2_captures=result['p2_captures'],
+            )
+            all_entries.extend(result['entries'])
+    else:
+        for difficulty, max_moves, noise_prob, start_player in batch_args:
+            record = play_single_game(
+                difficulty, max_moves, noise_prob, start_player,
+                p1_policy='algorithmic', p2_policy='algorithmic',
+            )
+            all_entries.extend(e.to_dict() for e in record.entries)
     return all_entries
 
 
@@ -299,17 +315,36 @@ def _play_game_worker_algo_vs_algo(
 
 
 def _play_games_batch_worker_algo(batch_args: list) -> List[dict]:
-    """Batched worker for algo-vs-algo games with per-player difficulties."""
+    """Batched worker for algo-vs-algo games with per-player difficulties.
+
+    Uses Cython full game loop when available (per-player difficulties + TT).
+    """
     all_entries = []
-    for p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player in batch_args:
-        record = play_single_game(
-            difficulty=p1_difficulty,
-            max_moves=max_moves, noise_prob=noise_prob,
-            start_player=start_player,
-            p1_policy='algorithmic', p2_policy='algorithmic',
-            p1_difficulty=p1_difficulty, p2_difficulty=p2_difficulty,
-        )
-        all_entries.extend(e.to_dict() for e in record.entries)
+    if _HAS_FAST_GAME:
+        from .scoring import score_game_dicts as _score
+        for p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player in batch_args:
+            result = play_full_game_cy(
+                p1_difficulty=p1_difficulty, p2_difficulty=p2_difficulty,
+                max_moves=max_moves, noise_prob=noise_prob,
+                start_player=start_player,
+            )
+            _score(
+                entry_dicts=result['entries'], winner_int=result['winner'],
+                total_moves=result['num_moves'], max_moves=max_moves,
+                final_state_dict=result['final_state'],
+                p1_captures=result['p1_captures'], p2_captures=result['p2_captures'],
+            )
+            all_entries.extend(result['entries'])
+    else:
+        for p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player in batch_args:
+            record = play_single_game(
+                difficulty=p1_difficulty,
+                max_moves=max_moves, noise_prob=noise_prob,
+                start_player=start_player,
+                p1_policy='algorithmic', p2_policy='algorithmic',
+                p1_difficulty=p1_difficulty, p2_difficulty=p2_difficulty,
+            )
+            all_entries.extend(e.to_dict() for e in record.entries)
     return all_entries
 
 
