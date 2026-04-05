@@ -1299,11 +1299,18 @@ class Trainer:
                     tmp_path = tmp.name
                 os.replace(tmp_path, checkpoint_path)
 
+                # latest.pt = hardlink to checkpoint (instant, avoids second
+                # torch.save serialization + disk write of ~55MB).  Falls back
+                # to shutil.copy2 if hardlink fails (cross-device, permissions).
                 latest_path.parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(delete=False, dir=latest_path.parent) as tmp:
-                    torch.save(checkpoint, tmp.name)
-                    tmp_path = tmp.name
-                os.replace(tmp_path, latest_path)
+                try:
+                    _lp = str(latest_path)
+                    if os.path.exists(_lp):
+                        os.unlink(_lp)
+                    os.link(str(checkpoint_path), _lp)
+                except OSError:
+                    import shutil
+                    shutil.copy2(str(checkpoint_path), _lp)
 
                 self._save_stats(_snapshot=_stats_snapshot)
 
@@ -1501,12 +1508,57 @@ class Trainer:
 
             random.shuffle(all_algo_tasks)
 
-        # Save model to disk only when ML games need it (avoids ~2ms CUDA sync
-        # for state_dict copy on algo-only cycles where no worker loads the model).
+        # [Pass 70] Build a CPU model copy for fork-inherited self-play.
+        # On Linux (fork start method), workers inherit this global via
+        # copy-on-write — zero torch.save/load disk I/O per cycle.
+        # Falls back to disk path on Windows (spawn mode) or if anything fails.
+        # Still save to disk as fallback for get_model() cache miss.
+        import dama.ai.ml.selfplay as _sp_mod
         if all_ml_tasks:
             temp_model_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.device.type == 'cuda':
+                _sd = {k: v.to('cpu', non_blocking=True)
+                       for k, v in self.model.state_dict().items()}
+                torch.cuda.current_stream().synchronize()
+            else:
+                _sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            # Build CPU model for fork inheritance (avoids N × torch.load)
+            try:
+                _fork_model = create_model(
+                    **getattr(self.model, 'arch_params', {
+                        'embedding_size': self.config.model_embedding,
+                        'num_blocks': self.config.model_blocks,
+                        'hidden_size': self.config.model_hidden,
+                        'channels': self.config.model_channels,
+                    }))
+                _fork_model.load_state_dict(_sd)
+                _fork_model.eval()
+                # [Pass 68] JIT-trace the fork model for faster CPU inference.
+                # TorchScript eliminates Python interpreter overhead between ops,
+                # giving 10-30% speedup on CPU forward passes.  Trace with
+                # max_moves=32 (config default) so traced shapes cover all games.
+                # Falls back to eager model if tracing fails.
+                try:
+                    _max_m = self.config.max_moves_per_sample
+                    _sample = (
+                        torch.zeros(1, 5, 8, 8),
+                        torch.zeros(1, _max_m, 8),
+                        torch.tensor([1], dtype=torch.int32),
+                    )
+                    # Warm up to allocate internal buffers (_mask_arange)
+                    with torch.inference_mode():
+                        _fork_model.forward_padded(*_sample)
+                    # Trace forward_padded via a thin wrapper so callers use __call__
+                    _fork_model.forward = _fork_model.forward_padded
+                    _fork_model = torch.jit.trace(_fork_model, _sample)
+                except Exception:
+                    pass  # Keep eager model
+                _sp_mod._FORK_MODEL = _fork_model
+            except Exception:
+                _sp_mod._FORK_MODEL = None
+            # Save to disk as fallback (Windows spawn, or cache miss)
             torch.save({
-                'model_state_dict': self.model.state_dict(),
+                'model_state_dict': _sd,
                 'arch_params': getattr(self.model, 'arch_params', {}),
                 'step': self.step,
             }, temp_model_path)
@@ -1526,7 +1578,10 @@ class Trainer:
         # hard-hard batches to take ~19s each, creating straggler workers while
         # others sat idle.  25 halves max straggler time to ~9.5s.
         _ALGO_BATCH_CAP = 25
-        _ML_BATCH_CAP = 10  # ML games are slower — smaller batches for balance
+        _ML_BATCH_CAP = 20  # [Pass 67] Increased from 10. Interleaved play batches
+                            # all active ML positions per step — more games per batch
+                            # = more positions per forward_padded() call = better CPU
+                            # BLAS amortization. batch=10 gave 3-5x; 20 should be better.
 
         def _make_batches(tasks, cap):
             # Target ~1 batch per worker, but cap per batch for load balancing
@@ -1604,6 +1659,9 @@ class Trainer:
                         callback(completed_total, grand_total)
                 except Exception as e:
                     print(f"Sequential fallback error: {e}")
+
+        # [Pass 70] Clean up fork-inherited model to free CPU memory.
+        _sp_mod._FORK_MODEL = None
 
         if not skip_replay:
             self.replay_buffer.close()
@@ -1852,12 +1910,19 @@ class Trainer:
 
         from .model_vs_algo import ModelVsAlgoTester
 
-        # Save current model temporarily for testing
+        # Save current model temporarily for testing.
+        # Non_blocking D2H copies + single sync (same as _save_checkpoint).
         temp_path = Path(self.config.checkpoint_dir) / "temp_test_model.pt"
         temp_path.parent.mkdir(parents=True, exist_ok=True)
 
+        if self.device.type == 'cuda':
+            _sd = {k: v.to('cpu', non_blocking=True)
+                   for k, v in self.model.state_dict().items()}
+            torch.cuda.current_stream().synchronize()
+        else:
+            _sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
         torch.save({
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': _sd,
             'arch_params': getattr(self.model, 'arch_params', {}),
             'step': self.step,
         }, temp_path)
@@ -2695,11 +2760,18 @@ class Trainer:
 
         def _start_async_test():
             nonlocal _async_test_thread
-            # Save model in main thread (brief CUDA sync for state_dict copy)
+            # Save model with non_blocking D2H copies (same pattern as
+            # _save_checkpoint) — avoids per-tensor CUDA sync overhead.
             _test_path = Path(self.config.checkpoint_dir) / "temp_async_test.pt"
             _test_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.device.type == 'cuda':
+                _sd = {k: v.to('cpu', non_blocking=True)
+                       for k, v in self.model.state_dict().items()}
+                torch.cuda.current_stream().synchronize()
+            else:
+                _sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
             torch.save({
-                'model_state_dict': self.model.state_dict(),
+                'model_state_dict': _sd,
                 'arch_params': getattr(self.model, 'arch_params', {}),
                 'step': self.step,
             }, _test_path)
@@ -2711,7 +2783,12 @@ class Trainer:
             _n_games = self.config.test_games
             _diff = self.config.test_difficulty
             _max_mv = self.config.selfplay_max_moves
-            _n_wk = min(self.config.cpu_workers, 4)
+            # [Pass 67] Reduced from 4 to 2 for async tests during simultaneous
+            # mode.  Background self-play uses cpu_workers (11) processes; adding
+            # 4 more test workers = 15 processes on 12 cores = oversubscription.
+            # 2 test workers keeps total at 13, near core count. Sync tests
+            # (run_test_vs_algo) keep 4 workers since self-play isn't running.
+            _n_wk = min(self.config.cpu_workers, 2)
 
             def _worker():
                 try:
@@ -3167,7 +3244,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         model_embedding=model_cfg.get('embedding_size', 128),
         model_hidden=model_cfg.get('hidden_size', 64),
         # Self-play settings
-        cpu_workers=selfplay_cfg.get('cpu_workers', 10),
+        cpu_workers=selfplay_cfg.get('cpu_workers', max(2, os.cpu_count() or 2)),
         selfplay_games=selfplay_cfg.get('games_per_epoch', 500),
         selfplay_focus_side=selfplay_cfg.get('focus_side', 'both'),
         selfplay_opponent_focus=selfplay_cfg.get('opponent_focus', 'both'),
@@ -3186,7 +3263,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         weight_decay=training_cfg.get('weight_decay', 1e-5),
         grad_clip_norm=training_cfg.get('grad_clip_norm'),
         gradient_accumulation_steps=training_cfg.get('gradient_accumulation_steps', 1),
-        train_steps=training_cfg.get('train_steps', 10000),
+        train_steps=training_cfg.get('train_steps', 999999999),
         checkpoint_every=training_cfg.get('checkpoint_every', 1000),
         reward_mode=training_cfg.get('reward_mode', 'cycle'),
         # LR scheduler settings
@@ -3201,7 +3278,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         value_head_hidden=value_head_cfg.get('hidden_size', 128),
         value_weight=value_head_cfg.get('value_weight', 0.5),
         # DataLoader settings
-        dataloader_workers=dataloader_cfg.get('num_workers', 4),
+        dataloader_workers=dataloader_cfg.get('num_workers', 0),
         pin_memory=dataloader_cfg.get('pin_memory', True),
         ram_cache_enabled=dataloader_cfg.get('ram_cache', {}).get('enabled', True),
         ram_cache_threshold_gb=dataloader_cfg.get('ram_cache', {}).get('threshold_gb', 8.0),
