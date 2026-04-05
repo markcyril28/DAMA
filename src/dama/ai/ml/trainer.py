@@ -1552,12 +1552,12 @@ class Trainer:
 
         # Cap per-batch game count for finer-grained load balancing.
         # Without a cap, 3600 algo games / 10 workers = 360 per batch — one slow
-        # batch (e.g., heavy on hard matchups) starves other workers.  Cap at 25
-        # games gives 144 batches; workers pick up the next batch as each finishes,
-        # naturally balancing fast and slow matchups.  Previous cap of 50 caused
-        # hard-hard batches to take ~19s each, creating straggler workers while
-        # others sat idle.  25 halves max straggler time to ~9.5s.
-        _ALGO_BATCH_CAP = 25
+        # batch (e.g., heavy on hard matchups) starves other workers.
+        # [Pass 72] Raised from 25→40: with mixed difficulties (easy/medium/hard),
+        # average game time drops ~40%. Larger batches amortize IPC overhead while
+        # shuffle distributes difficulties evenly across batches, preventing
+        # straggler-heavy batches.  40 × 0.67s avg = ~27s worst-case batch.
+        _ALGO_BATCH_CAP = 40
         _ML_BATCH_CAP = 20  # [Pass 67] Increased from 10. Interleaved play batches
                             # all active ML positions per step — more games per batch
                             # = more positions per forward_padded() call = better CPU
