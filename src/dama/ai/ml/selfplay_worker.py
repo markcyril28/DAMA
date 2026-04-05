@@ -4,7 +4,7 @@ Standalone self-play worker for use with GNU Parallel.
 
 Usage:
     python -m dama.ai.ml.selfplay_worker --games 10 --output games_001.jsonl
-    
+
 Or with GNU Parallel:
     seq 1 32 | parallel -j 32 python -m dama.ai.ml.selfplay_worker --games 16 --output games_{}.jsonl
 """
@@ -19,6 +19,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from dama.types import Player
+from dama.ai.ml.scoring import score_game_dicts
+
+# Try Cython full game loop first (2-7x faster than Python game loop).
+try:
+    from dama.ai.algorithmic._fast_search import play_full_game_cy
+    _HAS_FAST_GAME = True
+except ImportError:
+    _HAS_FAST_GAME = False
+
 from dama.game_state import GameState
 from dama.board import Board
 from dama.ai.algorithmic.search import get_best_move
@@ -34,15 +43,36 @@ def play_single_game(
 ) -> list:
     """Play a single game and return entries as dicts.
 
+    Uses Cython full game loop when available (2-7x faster).
+    Falls back to Python game loop otherwise.
+
     Args:
         difficulty: Default difficulty (used when p1/p2_difficulty not set)
         p1_difficulty: Difficulty for Player 1 (overrides difficulty if set)
         p2_difficulty: Difficulty for Player 2 (overrides difficulty if set)
     """
-    start_player = Player(start_player)
     _p1_diff = p1_difficulty or difficulty
     _p2_diff = p2_difficulty or difficulty
 
+    # Fast path: Cython full game loop runs entirely in C.
+    # Avoids all GameState/Board/Move/Piece Python object creation.
+    if _HAS_FAST_GAME:
+        result = play_full_game_cy(
+            p1_difficulty=_p1_diff, p2_difficulty=_p2_diff,
+            max_moves=max_moves, noise_prob=noise_prob,
+            start_player=start_player,
+        )
+        entries = result['entries']
+        score_game_dicts(
+            entry_dicts=entries, winner_int=result['winner'],
+            total_moves=result['num_moves'], max_moves=max_moves,
+            final_state_dict=result['final_state'],
+            p1_captures=result['p1_captures'], p2_captures=result['p2_captures'],
+        )
+        return entries
+
+    # Python fallback
+    start_player = Player(start_player)
     state = GameState(
         board=Board.initial(),
         current_player=start_player,
@@ -50,8 +80,9 @@ def play_single_game(
     )
     entries = []
     move_count = 0
+    player_captures = {Player.ONE: 0, Player.TWO: 0}
 
-    while not state.is_terminal() and move_count < max_moves:
+    while move_count < max_moves:
         legal_moves = state.legal_moves()
         if not legal_moves:
             break
@@ -62,7 +93,7 @@ def play_single_game(
         if random.random() < noise_prob and len(legal_moves) > 1:
             chosen_move = random.choice(legal_moves)
         else:
-            chosen_move = get_best_move(state, cur_diff)
+            chosen_move = get_best_move(state, cur_diff, use_parallel=False)
             if chosen_move is None:
                 chosen_move = random.choice(legal_moves)
 
@@ -78,12 +109,17 @@ def play_single_game(
                 chosen_index = 0
                 chosen_move = legal_moves[0]
 
+        # Track captures
+        if chosen_move.is_capture:
+            player_captures[state.current_player] += chosen_move.num_captures
+
         # Record the position
         entry = {
             'state': state.to_compact(),
             'legal_moves': [m.to_dict() for m in legal_moves],
             'chosen_index': chosen_index,
-            'result': 0,  # Will be filled after game ends
+            'result': 0,
+            'score': 0.0,
         }
         entries.append(entry)
 
@@ -91,20 +127,28 @@ def play_single_game(
         state = state.apply_move(chosen_move)
         move_count += 1
 
-    # Determine winner
+    # Determine winner and score entries
     winner = state.winner()
+    winner_int = int(winner) if winner is not None else None
 
-    # Update results from each player's perspective
     for entry in entries:
         turn = entry['state']['turn']
-        player = Player(turn)
-
         if winner is None:
-            entry['result'] = 0  # Draw
-        elif winner == player:
-            entry['result'] = 1  # Win
+            entry['result'] = 0
+        elif turn == winner_int:
+            entry['result'] = 1
         else:
-            entry['result'] = -1  # Loss
+            entry['result'] = -1
+
+    score_game_dicts(
+        entry_dicts=entries,
+        winner_int=winner_int,
+        total_moves=move_count,
+        max_moves=max_moves,
+        final_state_dict=state.to_compact(),
+        p1_captures=player_captures[Player.ONE],
+        p2_captures=player_captures[Player.TWO],
+    )
 
     return entries
 
@@ -154,7 +198,8 @@ def main():
             total_entries += len(entries)
 
     mode = "algo-vs-algo" if args.p1_difficulty or args.p2_difficulty else args.difficulty
-    print(f"Generated {total_entries} entries from {args.games} games ({mode}) -> {output_path}")
+    cy_label = " (Cython)" if _HAS_FAST_GAME else ""
+    print(f"Generated {total_entries} entries from {args.games} games ({mode}{cy_label}) -> {output_path}")
 
 
 if __name__ == '__main__':
