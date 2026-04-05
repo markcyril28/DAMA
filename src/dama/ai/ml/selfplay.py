@@ -407,14 +407,11 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                     counts[j] = _encode_moves_fast(sd, md, all_mf[j])
 
             with torch.inference_mode():
-                _bt = torch.from_numpy(boards)
-                _mft = torch.from_numpy(all_mf)
-                _mct = torch.from_numpy(counts)
-                # [Pass 68] JIT-traced models use __call__; eager uses forward_padded.
-                if isinstance(model, torch.jit.ScriptModule):
-                    scores = model(_bt, _mft, _mct)
-                else:
-                    scores = model.forward_padded(_bt, _mft, _mct)
+                scores = model.forward_padded(
+                    torch.from_numpy(boards),
+                    torch.from_numpy(all_mf),
+                    torch.from_numpy(counts),
+                )
 
             # [Pass 71] Batch argmax: single torch op for all positions instead
             # of per-game Python slicing + argmax.  forward_padded already masks
