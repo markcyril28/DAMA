@@ -153,9 +153,9 @@ _init_lmr_table()
 # via different move orders (transpositions) reuse prior work.
 # Typical hit rates are 30-60%, giving ~2-4x speedup at deeper depths.
 
-DEF TT_SIZE_BITS = 22
-DEF TT_SIZE = 4194304          # 1 << 22 = 4M entries (~64MB)
-DEF TT_MASK = 4194303          # TT_SIZE - 1
+DEF TT_SIZE_BITS = 23
+DEF TT_SIZE = 8388608          # 1 << 23 = 8M entries (~128MB)
+DEF TT_MASK = 8388607          # TT_SIZE - 1
 
 # TT entry flags
 DEF TT_EXACT = 0
@@ -614,34 +614,53 @@ cdef void generate_captures(
 cdef void generate_all_moves_c(
     signed char *board, int player, Rules *rules, CMoveList *out
 ) noexcept nogil:
-    """Generate all legal moves for a player. Forced capture applied if rules say so."""
+    """Generate all legal moves for a player. Forced capture applied if rules say so.
+
+    Two-pass strategy when forced_capture is enabled (default in Dama):
+    1. Generate captures for all pieces
+    2. If any captures found: return immediately (skip simple move generation)
+    3. Otherwise: generate simple moves in a second pass
+
+    This avoids calling generate_simple_moves() for every piece (~40-60% of
+    positions have forced captures). Simple move generation for flying kings
+    involves diagonal sliding — more expensive than the extra dark-square scan.
+    At 10M+ nodes per hard game, this saves significant move-gen time.
+    """
     cdef CMoveList simple_moves
     cdef CMoveList capture_moves
     cdef int r, c, piece, i, sq
 
-    simple_moves.count = 0
     capture_moves.count = 0
 
+    # Pass 1: generate captures for all pieces
     for i in range(NUM_DARK_SQ):
         sq = DARK_SQ[i]
         piece = board[sq]
         if piece == EMPTY or not is_player(piece, player):
             continue
-        r = DARK_SQ_R[i]
-        c = DARK_SQ_C[i]
-        generate_captures(board, r, c, piece, player, rules, &capture_moves)
-        generate_simple_moves(board, r, c, piece, player, rules, &simple_moves)
+        generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, &capture_moves)
 
+    # Early exit: forced capture with captures found — skip simple moves entirely
     if rules.forced_capture and capture_moves.count > 0:
         out.count = capture_moves.count
         for i in range(capture_moves.count):
             out.moves[i] = capture_moves.moves[i]
-    else:
-        out.count = simple_moves.count + capture_moves.count
-        for i in range(capture_moves.count):
-            out.moves[i] = capture_moves.moves[i]
-        for i in range(simple_moves.count):
-            out.moves[capture_moves.count + i] = simple_moves.moves[i]
+        return
+
+    # Pass 2: generate simple moves (no forced captures, or no captures found)
+    simple_moves.count = 0
+    for i in range(NUM_DARK_SQ):
+        sq = DARK_SQ[i]
+        piece = board[sq]
+        if piece == EMPTY or not is_player(piece, player):
+            continue
+        generate_simple_moves(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, &simple_moves)
+
+    out.count = simple_moves.count + capture_moves.count
+    for i in range(capture_moves.count):
+        out.moves[i] = capture_moves.moves[i]
+    for i in range(simple_moves.count):
+        out.moves[capture_moves.count + i] = simple_moves.moves[i]
 
 
 cdef int generate_captures_only_c(
@@ -1520,6 +1539,90 @@ def fast_generate_moves(object state) -> list:
     for i in range(moves.count):
         result.append(cmove_to_dict(&moves.moves[i]))
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Compact-state API for interleaved self-play
+# ═══════════════════════════════════════════════════════════════════════
+# These functions operate on raw board bytes (64-byte int8 array) + player int,
+# bypassing GameState/Board/Move Python objects entirely. This eliminates
+# ~100-200μs of object creation per position in the interleaved game loop.
+# The board is passed as `bytes` (immutable 64-byte string) for zero-copy
+# Cython access via <const char*>.
+
+def init_board_bytes() -> bytes:
+    """Return the standard starting position as 64 raw bytes."""
+    cdef signed char board[64]
+    init_standard_board(board)
+    return (<char*>board)[:64]
+
+
+def gen_moves_from_board(bytes board_bytes, int player) -> list:
+    """Generate all legal moves from raw board bytes. Returns list of move dicts.
+
+    Drop-in replacement for fast_generate_moves() that takes raw board+player
+    instead of a GameState. Avoids _load_board() overhead (Python dict iteration
+    over Board._pieces).
+    """
+    cdef signed char board[64]
+    cdef CMoveList moves
+    cdef Rules rules
+    cdef int i
+
+    memcpy(board, <const char*>board_bytes, 64)
+    rules = _load_rules()
+
+    moves.count = 0
+    generate_all_moves_c(board, player, &rules, &moves)
+
+    result = []
+    for i in range(moves.count):
+        result.append(cmove_to_dict(&moves.moves[i]))
+    return result
+
+
+def apply_move_board(bytes board_bytes, int player, dict move_dict) -> tuple:
+    """Apply a move dict to raw board bytes. Returns (new_board_bytes, new_player, num_captures).
+
+    Entirely in C — no GameState/Move/Board Python objects created.
+    Replaces the Python-side ``state.apply_move(Move.from_dict(md))`` which
+    creates a Move object, a new Board (with _pieces dict), and a new GameState
+    per position.
+    """
+    cdef signed char board[64]
+    cdef signed char new_board[64]
+    cdef CMove cmove
+    cdef int i, n
+
+    memcpy(board, <const char*>board_bytes, 64)
+
+    # Convert move dict → CMove
+    path = move_dict['path']
+    n = len(path)
+    cmove.path_len = n
+    for i in range(n):
+        cmove.path_r[i] = path[i][0]
+        cmove.path_c[i] = path[i][1]
+
+    captures = move_dict.get('captures', ())
+    cmove.num_captures = len(captures)
+    for i in range(cmove.num_captures):
+        cmove.cap_r[i] = captures[i][0]
+        cmove.cap_c[i] = captures[i][1]
+
+    cmove.promotion = bool(move_dict.get('promotion', False))
+
+    apply_move_c(board, new_board, &cmove, player)
+
+    cdef int new_player = PLAYER_TWO if player == PLAYER_ONE else PLAYER_ONE
+    return ((<char*>new_board)[:64], new_player, cmove.num_captures)
+
+
+def board_bytes_to_compact(bytes board_bytes, int player, int move_count) -> dict:
+    """Convert raw board bytes to compact dict for replay recording."""
+    cdef signed char board[64]
+    memcpy(board, <const char*>board_bytes, 64)
+    return board_to_compact_dict(board, player, move_count)
 
 
 # ═══════════════════════════════════════════════════════════════════════

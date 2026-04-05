@@ -3247,7 +3247,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(void) {
  * 
  * cdef inline unsigned long long compute_hash(
 */
-    __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table = ((struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_TTEntry *)calloc(0x400000, (sizeof(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_TTEntry))));
+    __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table = ((struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_TTEntry *)calloc(0x800000, (sizeof(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_TTEntry))));
 
     /* "dama/ai/algorithmic/_fast_search.pyx":211
  *     """Allocate TT on first use (zero-initialized = all entries empty)."""
@@ -3422,7 +3422,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_stor
  *     cdef TTEntry *entry = &_tt_table[idx]
  *     # Always-replace: simpler than depth-preferred and works well with
 */
-  __pyx_v_idx = (__pyx_v_hash_key & 0x3FFFFF);
+  __pyx_v_idx = (__pyx_v_hash_key & 0x7FFFFF);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":235
  *     """Store a search result in the transposition table (always-replace)."""
@@ -3522,7 +3522,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *     cdef TTEntry *entry = &_tt_table[idx]
  *     cdef unsigned char gen, flag
 */
-  __pyx_v_idx = (__pyx_v_hash_key & 0x3FFFFF);
+  __pyx_v_idx = (__pyx_v_hash_key & 0x7FFFFF);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":257
  *     """
