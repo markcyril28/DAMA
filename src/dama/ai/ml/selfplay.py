@@ -546,22 +546,34 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
         entries = g['entries']
         if not entries:
             continue
-        state = g['state']
         # Use cached end reason to avoid redundant legal_moves() call in
         # winner() → is_terminal() → has_legal_moves().  The game loop
         # already determined why each game ended.
         end_reason = g.get('_ended')
-        if end_reason == 'no_moves':
-            winner = state.current_player.opponent()
-        elif end_reason == 'max_moves':
-            winner = None
+        if _use_compact:
+            # Compact path: use raw player int for winner detection
+            if end_reason == 'no_moves':
+                # g['pl'] is current player who has no moves → opponent wins
+                winner_int = 2 if g['pl'] == 1 else 1
+            elif end_reason == 'max_moves':
+                winner_int = None
+            else:
+                winner_int = None  # safety fallback (should not reach here)
+            final_state_dict = _board_to_compact(g['bb'], g['pl'], g['move_count'])
         else:
-            winner = state.winner()  # fallback for games still active
-        winner_int = int(winner) if winner is not None else None
+            state = g['state']
+            if end_reason == 'no_moves':
+                winner = state.current_player.opponent()
+            elif end_reason == 'max_moves':
+                winner = None
+            else:
+                winner = state.winner()  # fallback for games still active
+            winner_int = int(winner) if winner is not None else None
+            final_state_dict = state.to_compact()
 
         for entry in entries:
             turn = entry['state']['turn']
-            if winner is None:
+            if winner_int is None:
                 entry['result'] = 0
             elif turn == winner_int:
                 entry['result'] = 1
@@ -573,7 +585,7 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             winner_int=winner_int,
             total_moves=g['move_count'],
             max_moves=g['max_moves'],
-            final_state_dict=state.to_compact(),
+            final_state_dict=final_state_dict,
             p1_captures=g['captures'][Player.ONE],
             p2_captures=g['captures'][Player.TWO],
         )
