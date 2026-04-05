@@ -1533,26 +1533,6 @@ class Trainer:
                     }))
                 _fork_model.load_state_dict(_sd)
                 _fork_model.eval()
-                # [Pass 68] JIT-trace the fork model for faster CPU inference.
-                # TorchScript eliminates Python interpreter overhead between ops,
-                # giving 10-30% speedup on CPU forward passes.  Trace with
-                # max_moves=32 (config default) so traced shapes cover all games.
-                # Falls back to eager model if tracing fails.
-                try:
-                    _max_m = self.config.max_moves_per_sample
-                    _sample = (
-                        torch.zeros(1, 5, 8, 8),
-                        torch.zeros(1, _max_m, 8),
-                        torch.tensor([1], dtype=torch.int32),
-                    )
-                    # Warm up to allocate internal buffers (_mask_arange)
-                    with torch.inference_mode():
-                        _fork_model.forward_padded(*_sample)
-                    # Trace forward_padded via a thin wrapper so callers use __call__
-                    _fork_model.forward = _fork_model.forward_padded
-                    _fork_model = torch.jit.trace(_fork_model, _sample)
-                except Exception:
-                    pass  # Keep eager model
                 _sp_mod._FORK_MODEL = _fork_model
             except Exception:
                 _sp_mod._FORK_MODEL = None
