@@ -265,6 +265,12 @@ class MoveScorerNet(nn.Module):
         The MLP is <10% of total compute (CNN dominates), so computing padding
         slots costs less than the dynamic-shape overhead of skipping them.
 
+        The first MLP layer is decomposed: instead of cat([emb, feat]) → fc1,
+        we compute fc1_emb(emb) + fc1_feat(feat) with broadcasting.  This
+        avoids a ~245MB temporary from torch.cat at batch_size=8192.  The
+        decomposition is mathematically equivalent: W·[emb;feat] + b
+        = W_emb·emb + W_feat·feat + b.
+
         Args:
             board: (batch_size, BOARD_PLANES, 8, 8)
             move_features: (batch_size, max_moves, MOVE_FEATURE_SIZE) padded
@@ -277,15 +283,18 @@ class MoveScorerNet(nn.Module):
         max_moves = move_features.shape[1]
 
         board_embeddings = self.board_encoder(board)  # (batch, emb)
+        emb_size = board_embeddings.shape[-1]
 
-        # Expand board embeddings to (batch, max_moves, emb) — strided view, no copy.
-        # nn.Linear natively supports (..., features) via batched matmul,
-        # so we can work in 3D without reshape/contiguous.
-        expanded = board_embeddings.unsqueeze(1).expand(-1, max_moves, -1)
-        combined = torch.cat([expanded, move_features], dim=-1)  # (batch, max_moves, emb+feat)
+        # Decompose fc1 weight: W = [W_emb | W_feat] along input dim.
+        # W_emb·emb produces (batch, hidden) — 1MB vs 278MB for cat approach.
+        # W_feat·feat + bias produces (batch, max_moves, hidden).
+        # Broadcasting adds (batch, 1, hidden) + (batch, max_moves, hidden).
+        _fc1 = self.move_scorer.fc1
+        _W = _fc1.weight                  # (hidden, emb_size + feat_size)
+        emb_proj = F.linear(board_embeddings, _W[:, :emb_size])
+        feat_proj = F.linear(move_features, _W[:, emb_size:], _fc1.bias)
+        x = F.relu(emb_proj.unsqueeze(1) + feat_proj)
 
-        # MLP on all positions — fixed shapes, CUDAGraph-friendly
-        x = F.relu(self.move_scorer.fc1(combined))
         x = F.relu(self.move_scorer.fc2(x))
         x = self.move_scorer.fc3(x)
         scores = x.squeeze(-1)  # (batch, max_moves)
@@ -309,18 +318,21 @@ class MoveScorerNet(nn.Module):
         """Padded forward with value head (training-optimized path).
 
         Fixed-size MLP on all positions — CUDAGraph-friendly.
-        See forward_padded docstring for rationale.
+        Uses decomposed fc1 (see forward_padded docstring).
         """
         batch_size = board.shape[0]
         max_moves = move_features.shape[1]
 
         board_embeddings = self.board_encoder(board)
+        emb_size = board_embeddings.shape[-1]
 
-        # Full-pad MLP (fixed shapes, no boolean indexing)
-        expanded = board_embeddings.unsqueeze(1).expand(-1, max_moves, -1)
-        combined = torch.cat([expanded, move_features], dim=-1)
+        # Decomposed fc1 (avoids ~245MB cat allocation)
+        _fc1 = self.move_scorer.fc1
+        _W = _fc1.weight
+        emb_proj = F.linear(board_embeddings, _W[:, :emb_size])
+        feat_proj = F.linear(move_features, _W[:, emb_size:], _fc1.bias)
+        x = F.relu(emb_proj.unsqueeze(1) + feat_proj)
 
-        x = F.relu(self.move_scorer.fc1(combined))
         x = F.relu(self.move_scorer.fc2(x))
         x = self.move_scorer.fc3(x)
         scores = x.squeeze(-1)

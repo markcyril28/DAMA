@@ -477,12 +477,31 @@ class Trainer:
         if self.device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
 
+        # Determine AMP dtype (must come before optimizer — fused AdamW is
+        # incompatible with GradScaler's grad_scale/found_inf kwargs).
+        self.amp_dtype = torch.float16
+        if config.amp:
+            if config.amp_dtype == 'bfloat16':
+                if torch.cuda.is_bf16_supported():
+                    self.amp_dtype = torch.bfloat16
+                    print("Using BFloat16 mixed precision (no GradScaler needed)")
+                else:
+                    print("BFloat16 not supported, falling back to Float16")
+                    self.amp_dtype = torch.float16
+            else:
+                print("Using Float16 mixed precision with GradScaler")
+
+        # GradScaler only needed for float16, not bfloat16
+        _needs_scaler = config.amp and self.amp_dtype == torch.float16
+        self.scaler = GradScaler() if _needs_scaler else None
+
         # Use fused AdamW for faster training on CUDA (PyTorch 2.0+).
         # Fused AdamW runs the entire optimizer step in a single CUDA kernel
         # (vs ~N kernels for N parameter groups), reducing launch overhead.
-        # hasattr() checks class attributes, not init params — use try/except.
+        # Disabled when GradScaler is active: the fused kernel can fall back to
+        # _single_tensor_adam which rejects GradScaler's grad_scale/found_inf.
         use_fused = False
-        if config.device == 'cuda':
+        if config.device == 'cuda' and not _needs_scaler:
             try:
                 _test_opt = optim.AdamW([torch.zeros(1, device='cuda')], fused=True)
                 del _test_opt
@@ -497,22 +516,6 @@ class Trainer:
         )
         if use_fused:
             print("Using fused AdamW optimizer for faster training")
-        
-        # Determine AMP dtype
-        self.amp_dtype = torch.float16
-        if config.amp:
-            if config.amp_dtype == 'bfloat16':
-                if torch.cuda.is_bf16_supported():
-                    self.amp_dtype = torch.bfloat16
-                    print("Using BFloat16 mixed precision (no GradScaler needed)")
-                else:
-                    print("BFloat16 not supported, falling back to Float16")
-                    self.amp_dtype = torch.float16
-            else:
-                print("Using Float16 mixed precision with GradScaler")
-        
-        # GradScaler only needed for float16, not bfloat16
-        self.scaler = GradScaler() if (config.amp and self.amp_dtype == torch.float16) else None
 
         # Learning rate scheduler with optional warmup
         self.scheduler = None
@@ -1233,18 +1236,26 @@ class Trainer:
         # accesses them while the main thread runs optimizer.step(), the tensors
         # may be mid-update.  Copying to CPU on the main thread gives a consistent
         # snapshot and eliminates CUDA sync contention in the background thread.
+        #
+        # Batch all D2H copies with non_blocking=True and sync once at the end.
+        # Each individual .cpu() call forces a stream sync (~50μs); with ~120
+        # parameter tensors, batching saves ~6ms per checkpoint (120 × 50μs).
         _opt_sd = self.optimizer.state_dict()
         if self.device.type == 'cuda':
-            # Deep-copy optimizer state tensors to CPU
             _cpu_state = {}
             for k, v in _opt_sd['state'].items():
                 _cpu_state[k] = {
-                    sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv
+                    sk: sv.to('cpu', non_blocking=True) if isinstance(sv, torch.Tensor) else sv
                     for sk, sv in v.items()
                 }
             _opt_sd = {'state': _cpu_state, 'param_groups': _opt_sd['param_groups']}
+            _model_sd = {k: v.to('cpu', non_blocking=True) for k, v in self.model.state_dict().items()}
+            # Single sync: all D2H copies are on the default stream; wait for all.
+            torch.cuda.current_stream().synchronize()
+        else:
+            _model_sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
         checkpoint = {
-            'model_state_dict': {k: v.cpu() for k, v in self.model.state_dict().items()},
+            'model_state_dict': _model_sd,
             'optimizer_state_dict': _opt_sd,
             'step': self.step,
             'loss': loss,
@@ -2749,12 +2760,17 @@ class Trainer:
             loss = self.train_epoch(dataloader, use_scoring=self._should_use_scoring())
             self.epoch += 1
             self.stats.epochs_completed = self.epoch
-            scoring_label = "scoring" if self._should_use_scoring_for_epoch(self.epoch) else "no-scoring"
-            current_lr = (self.scheduler.get_last_lr()[0]
-                          if self.scheduler is not None
-                          else self.config.learning_rate)
-            print(f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
-                  f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
+            # Throttle epoch prints: with ~245 epochs per 60s self-play cycle,
+            # per-epoch prints add ~735ms of terminal I/O overhead on WSL2
+            # (~3ms per print call with stdout flush).  Print every 50 epochs
+            # to give periodic progress while keeping overhead at ~15 prints/cycle.
+            if self.epoch % 50 == 0 or self.epoch == 1:
+                scoring_label = "scoring" if self._should_use_scoring_for_epoch(self.epoch) else "no-scoring"
+                current_lr = (self.scheduler.get_last_lr()[0]
+                              if self.scheduler is not None
+                              else self.config.learning_rate)
+                print(f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
+                      f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
 
             # --- Dead-epoch recovery: detect & recover from stuck non-finite state ---
             if getattr(self, '_last_epoch_batches', -1) == 0:

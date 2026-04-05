@@ -1337,8 +1337,12 @@ class FastBatchIterator:
                     dev, non_blocking=True)
                 self._value_targets[keep_old:total] = new_dataset.value_targets.to(
                     dev, non_blocking=True)
-                # Sync to ensure all non_blocking transfers complete
-                torch.cuda.current_stream(dev).synchronize()
+                # No explicit synchronize() needed: all non_blocking transfers are
+                # enqueued on the default stream.  The next GPU operation (training
+                # forward pass) is also on the default stream and will automatically
+                # wait for these transfers to complete.  The CPU-side metadata
+                # updates below (self.n, print) only access tensor shapes/dtypes
+                # which don't require the data transfer to finish.
                 self.n = total
                 self.drop_last = total > self.batch_size
                 _kb_per = sum(t.element_size() * (t.nelement() // max(1, buf_cap))
@@ -1387,7 +1391,7 @@ class FastBatchIterator:
             new_tgt[keep_old:total] = new_dataset.targets.to(dev, non_blocking=True)
             new_rw[keep_old:total] = new_dataset.reward_weights.to(dev, non_blocking=True)
             new_vt[keep_old:total] = new_dataset.value_targets.to(dev, non_blocking=True)
-            torch.cuda.current_stream(dev).synchronize()
+            # No explicit sync — same-stream ordering guarantees (see in-place path).
 
             # Swap buffers — old ones freed by refcount
             self._boards = new_boards
