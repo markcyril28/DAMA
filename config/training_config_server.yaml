@@ -302,15 +302,19 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 10                    # Loss/gradients every 10 steps (1 CUDA sync per record)
-  system_every: 300                   # GPU/CPU/RAM metrics every 300 steps
-  model_health_every: 2000            # Parameter norms every 2000 steps. Was 500 — each check
-                                      # runs param.float().norm() on ~40 params + 1 batched CUDA
-                                      # sync. 2000 reduces overhead 4x while still catching
-                                      # embedding magnitude drift.
-  score_dist_every: 50                # Score distribution every 50 steps
+  record_every: 100                   # Was 10. Each record triggers loss.item() CUDA sync
+                                      # (~20-100μs). At 10, that's 10 syncs/100 steps — up to
+                                      # 1ms/sec GPU pipeline stalls. At 100, 90% fewer syncs.
+                                      # Still 1000+ data points per self-play cycle.
+  system_every: 1000                  # Was 300. System metrics (nvidia-smi/psutil) are expensive.
+                                      # 1000 steps = ~1 check per minute at high throughput.
+  model_health_every: 2000            # Parameter norms every 2000 steps.
+  score_dist_every: 500               # Was 50. Score stats do array-wide ops on GPU output
+                                      # tensors — significant overhead at high frequency.
+                                      # 500 still gives granular distribution tracking.
   buffer_size: 100000                 # Large ring buffer — 1TB RAM is abundant
-  flush_every: 1000                   # Flush to disk every 1000 steps
+  flush_every: 2000                   # Was 1000. Disk I/O on training thread.
+                                      # 2000 reduces flush overhead 2x.
   output_dir: "logs/stats"
 
 # -----------------------------------------------------------------------------
