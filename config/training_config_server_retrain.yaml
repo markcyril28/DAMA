@@ -101,12 +101,13 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 32768                       # MI210 has 64GB HBM2e — can fit the full
-                                          # effective batch in a single forward pass.
-                                          # VRAM at 32768 BF16: ~9.7GB (of 64GB).
-                                          # Maximizes CU occupancy on CDNA2.
-  learning_rate: 3.0e-4                   # Standard rate for fresh training with
-                                          # Adam. Not too aggressive, not too slow.
+  batch_size: 65536                       # Doubled from 32768. MI210 has 64GB HBM2e.
+                                          # VRAM at 65536 BF16: ~19.4GB (30% of 64GB).
+                                          # Still leaves ~38GB for GPU-resident data +
+                                          # torch.compile workspace. Better CU occupancy.
+  learning_rate: 4.2e-4                   # Sqrt-scaled from 3.0e-4 for 2x batch:
+                                          #   lr_new = 3.0e-4 × sqrt(2) = 4.24e-4
+                                          #   rounded to 4.2e-4.
   weight_decay: 1.0e-4                    # 10x higher than v5 — helps prevent
                                           # embedding magnitude explosion that caused
                                           # the original degeneration.
@@ -115,9 +116,9 @@ training:
   checkpoint_every: 1000                  # Frequent saves for fresh training —
                                           # lets eval_checkpoints.sh track progress
                                           # at fine granularity.
-  gradient_accumulation_steps: 1          # Not needed — MI210 64GB can fit batch=32768
-                                          # in a single forward pass. Effective batch
-                                          # equals batch_size (32768).
+  gradient_accumulation_steps: 1          # Not needed — MI210 64GB can fit batch=65536
+                                          # in a single forward pass (~19.4GB VRAM).
+                                          # Effective batch equals batch_size (65536).
 
   lr_scheduler:
     enabled: true
@@ -148,9 +149,8 @@ dataloader:
   pin_memory: true
   prefetch_factor: 2                          # Unused — FastBatchIterator bypasses DataLoader
   replay_max_entries: 5000000             # 5M entries x ~1.2KB (fp16 on GPU, 32 slots) = ~5.9GB VRAM (of 64GB).
-                                          # With batch=32768 activations ~10GB + data ~5.9GB = ~16GB total,
-                                          # leaving ~48GB free. Retains ~8.5 self-play cycles of data —
-                                          # 2.5x more historical diversity than 2M.
+                                          # With batch=65536 activations ~19.4GB + data ~5.9GB = ~25.4GB total,
+                                          # leaving ~38.6GB free. Retains ~8.5 self-play cycles of data.
   clear_replay_after_load: false          # Accumulate data across cycles
   max_moves_per_sample: 32                # Max legal moves in Dama is ~20; 32 saves 50% vs old default of 64
 
@@ -185,15 +185,16 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 10                        # Loss/gradients every 10 steps
-  system_every: 300                       # GPU/CPU/RAM metrics every 300 steps
-  model_health_every: 2000                # Monitor embedding magnitudes. Was 500 — each check
-                                          # computes norms on ~40 params + 1 batched CUDA sync.
-                                          # 2000 reduces overhead 4x while still catching drift.
-  score_dist_every: 50                    # Track score distributions to verify
-                                          # the model is actually differentiating moves.
+  record_every: 100                       # Was 10. Each record triggers loss.item() CUDA sync
+                                          # (~20-100μs). At 100, 90% fewer GPU pipeline stalls.
+                                          # Still 1000+ data points per self-play cycle.
+  system_every: 1000                      # Was 300. System metrics are expensive (nvidia-smi/psutil).
+  model_health_every: 2000                # Monitor embedding magnitudes. Each check computes
+                                          # norms on ~40 params + 1 batched CUDA sync.
+  score_dist_every: 500                   # Was 50. Score stats do array-wide ops on GPU tensors.
+                                          # 500 still gives granular distribution tracking.
   buffer_size: 100000                     # Large ring buffer — 1TB RAM is abundant
-  flush_every: 1000                       # Flush to disk every 1000 steps
+  flush_every: 2000                       # Was 1000. Disk I/O on training thread — reduce 2x.
   output_dir: "logs/stats"
 
 # -----------------------------------------------------------------------------

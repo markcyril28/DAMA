@@ -105,13 +105,16 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 4096                      # [Part 1] Reduced from 8192. Halving batch size gives 2x
-                                        # more gradient updates per epoch with smaller step magnitude.
-                                        # At 400K entries, ~98 batches/epoch vs ~49 with 8192.
-                                        # ~0.6GB activations — easily fits 8GB VRAM.
-  learning_rate: 1.5e-4                 # [Part 1] Reduced from 4.0e-4. Conservative fine-tuning rate
-                                        # for a model already at 43% WR. The crash was caused by
-                                        # LR swings up to 3.9e-4 — staying well below that.
+  batch_size: 8192                      # Doubled from 4096. At 4096: ~0.6GB VRAM activations.
+                                        # At 8192: ~1.2GB — only 15% of 8GB VRAM. Leaves ~6.8GB
+                                        # for model (~18MB) + GPU-resident data (~1.2GB for 1M
+                                        # entries fp16) + overhead. Better GPU warp occupancy.
+                                        # At 1M entries: ~122 batches/epoch — still plenty of
+                                        # gradient updates per data pass.
+  learning_rate: 2.0e-4                 # Sqrt-scaled from 1.5e-4 for 2x batch:
+                                        #   lr_new = 1.5e-4 × sqrt(8192/4096) = 2.12e-4
+                                        #   rounded to 2.0e-4.
+                                        # Still well below the 3.9e-4 that caused the crash.
   weight_decay: 1.0e-5                  # Model is underfitting — keep regularization minimal
   grad_clip_norm: 1.0                   # Standard clipping — stable with algo-only data
   train_steps: 100000000000             # Unlimited — time_limit controls stopping
@@ -256,8 +259,8 @@ profiles:
       cpu_workers: 11                   # Matches top-level
       games_per_epoch: 200              # [Part 3] Fixed: now matches top-level
     training:
-      batch_size: 4096                  # [Part 3] Fixed: now matches top-level
-      learning_rate: 1.5e-4             # [Part 3] Fixed: now matches top-level
+      batch_size: 8192                  # Matches top-level
+      learning_rate: 2.0e-4             # Matches top-level
 
   cpu:
     device:

@@ -212,14 +212,14 @@ profiles:
       games_per_epoch: 512            # Synced with training_config_server.yaml
       pipeline_mode: "simultaneous"
     training:
-      batch_size: 32768               # 64GB VRAM — ~9.7GB activations with BF16
-      learning_rate: 2.0e-4           # Synced with training_config_server.yaml
+      batch_size: 65536               # 64GB VRAM — ~19.4GB activations with BF16
+      learning_rate: 2.8e-4           # Synced with training_config_server.yaml
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: false                # LR scheduler disabled per v5 post-mortem
     dataloader:
       num_workers: 0                  # FastBatchIterator bypasses DataLoader
-      replay_max_entries: 5000000      # Synced with server configs (was 2M)
+      replay_max_entries: 5000000      # Synced with server configs
       ram_cache:
         enabled: true
         threshold_gb: 64.0
@@ -251,8 +251,8 @@ profiles:
           - "medium"
           - "hard"
     training:
-      batch_size: 4096
-      learning_rate: 1.5e-4
+      batch_size: 8192
+      learning_rate: 2.0e-4
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: false                  # LR scheduler caused catastrophic regression.

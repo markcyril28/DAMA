@@ -104,12 +104,13 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 4096                      # [Pass 20] Increased from 3600 for better tensor
-                                        # core alignment. ~146 batches/epoch at 600K entries.
-                                        # ~0.7GB activations — fits 8GB VRAM easily.
-  learning_rate: 1.5e-4                 # [Pass 20] Reduced from 3e-4. Model at step 2000
-                                        # has learned representations — conservative rate
-                                        # for continued training avoids catastrophic forgetting.
+  batch_size: 8192                      # Doubled from 4096. At 8192: ~1.2GB activations —
+                                        # only 15% of 8GB VRAM. Better GPU warp occupancy.
+                                        # At 600K entries: ~73 batches/epoch (was ~146).
+                                        # Still plenty of gradient updates per data pass.
+  learning_rate: 2.0e-4                 # Sqrt-scaled from 1.5e-4 for 2x batch:
+                                        #   lr_new = 1.5e-4 × sqrt(2) ≈ 2.12e-4, rounded to 2.0e-4.
+                                        # Conservative — well below 3.9e-4 crash threshold.
   weight_decay: 1.0e-5                  # [Pass 20] Reduced from 1e-4. Original clamp bug
                                         # is fixed — lower regularization lets the model
                                         # learn more freely.

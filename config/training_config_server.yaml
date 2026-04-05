@@ -178,8 +178,8 @@ selfplay:
 # -----------------------------------------------------------------------------
 # Model: 4.5M params, ~9MB BF16.
 # _compute_loss() is fully vectorized + masked MoveScorer eliminates ~84% of
-# MLP compute (only valid move slots, not all 64 padded). batch_size=32768
-# uses ~9.7 GB VRAM BF16 (of 64 GB). Step time is now GPU-bound, not Python-bound.
+# MLP compute (only valid move slots, not all 64 padded). batch_size=65536
+# uses ~19.4 GB VRAM BF16 (of 64 GB). Step time is now GPU-bound, not Python-bound.
 # -----------------------------------------------------------------------------
 training:
   batch_size: 65536                   # Doubled from 32768. 64GB VRAM is only 15% utilized
@@ -257,9 +257,9 @@ dataloader:
   pin_memory: true                    # Pinned memory for async HBM2e transfers via CUDAPrefetcher
   prefetch_factor: 2                  # Unused — FastBatchIterator bypasses DataLoader
   replay_max_entries: 5000000          # 5M entries. Float16 GPU storage: ~5.9GB of 64GB VRAM.
-                                      # Was 2M (~2.3GB). With batch=32768 activations ~10GB +
-                                      # optimizer ~0.1GB + data ~5.9GB = ~16GB total, leaving
-                                      # ~48GB free for torch.compile workspace + overhead.
+                                      # With batch=65536 activations ~19.4GB +
+                                      # optimizer ~0.1GB + data ~5.9GB = ~25.4GB total, leaving
+                                      # ~38.6GB free for torch.compile workspace + overhead.
                                       # 5M entries retains ~8.5 self-play cycles of data —
                                       # 2.5x more historical diversity than 2M.
   clear_replay_after_load: false      # Delete replay JSONL files after loading into memory
