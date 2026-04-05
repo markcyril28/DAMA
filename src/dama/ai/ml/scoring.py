@@ -625,10 +625,9 @@ def score_game_dicts(
             if col == 0 or col == 7:
                 pos_score += _EDGE_PEN
 
-        king_set = set()
+        king_set = set(my_kings_list)
         for pos in my_kings_list:
             row = pos[0]; col = pos[1]
-            king_set.add((row, col))
             if 2 <= row <= 5 and 2 <= col <= 5:
                 pos_score += _CENTER_BONUS
             if row == start_row:
@@ -646,7 +645,7 @@ def score_game_dicts(
             else:
                 mob_score += _MOB_W
             start = m['path'][0]
-            if (start[0], start[1]) in king_set:
+            if start in king_set:
                 mob_score += _KING_MOB
 
         # ── Combine position total ──
