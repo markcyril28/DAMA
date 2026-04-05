@@ -200,6 +200,11 @@ profiles:
   # NOTE: Use training_config_server.yaml or training_config_server_retrain.yaml
   # directly for server training. This profile is for reference only.
   server:
+    model:
+      channels: 128
+      num_blocks: 8
+      embedding_size: 256
+      hidden_size: 128
     device:
       type: "cuda"
       amp:
@@ -225,10 +230,12 @@ profiles:
         threshold_gb: 64.0
 
   # Local development (NVIDIA RTX 5050, 8GB VRAM, 12 CPU cores, 32GB RAM)
-  # WARNING: This profile does NOT override model architecture. The main config
-  # uses 64/4/128/64 which is INCOMPATIBLE with local checkpoints (128/8/256/128).
-  # Use training_config_local.yaml directly for local training.
   local:
+    model:
+      channels: 128
+      num_blocks: 8
+      embedding_size: 256
+      hidden_size: 128
     device:
       type: "cuda"
       amp:
@@ -270,6 +277,11 @@ profiles:
 
   # CPU-only training
   cpu:
+    model:
+      channels: 128
+      num_blocks: 8
+      embedding_size: 256
+      hidden_size: 128
     device:
       type: "cpu"
       amp:

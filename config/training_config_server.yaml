@@ -220,7 +220,7 @@ training:
   # eta_min=1e-4 and allowed LR to decay through 1e-4 down to 6.4e-5.
   # Disabling the scheduler stops this decay cold.
   #
-  # LR is now controlled entirely by config.learning_rate (2.0e-4). The trainer
+  # LR is now controlled entirely by config.learning_rate (2.8e-4). The trainer
   # was fixed to reset param_groups['lr'] after load_state_dict(), so the config
   # value is applied on every resume regardless of checkpoint state.
   lr_scheduler:

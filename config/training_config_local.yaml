@@ -9,7 +9,7 @@
 #
 # Key changes from previous config:
 #   1. LR scheduler DISABLED — caused 43%->0% WR crash via 31x LR oscillations
-#   2. LR reduced to 1.5e-4 — conservative fine-tuning rate for pre-trained model
+#   2. LR set to 2.0e-4 — sqrt-scaled from 1.5e-4 for 2x batch size
 #   3. opponent_focus changed to "algorithm" — at <50% WR, ML self-play teaches
 #      losing patterns. 100% algorithmic teachers provide consistent signal.
 #   4. games_per_epoch increased to 200 — more ML-vs-algo data per cycle
@@ -17,11 +17,10 @@
 #   6. focus_side "both" kept — board encoding correctly flips for P2
 #      (move_encoder.py:30-35). Balanced exposure ensures both sides train equally.
 #   7. testing every 1000 steps with 50 games — faster feedback loop
-#   8. batch_size reduced to 4096 — more gradient updates per epoch
+#   8. batch_size set to 8192 — doubled from 4096, better GPU warp occupancy
 #
 # Usage:
-#   python -m dama.ai.ml.trainer --config config/training_config_local.yaml \
-#       --resume models/checkpoints/model_step_050000.pt
+#   python -m dama.ai.ml.trainer --config config/training_config_local.yaml
 # =============================================================================
 
 # -----------------------------------------------------------------------------

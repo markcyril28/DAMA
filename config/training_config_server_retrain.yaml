@@ -126,7 +126,7 @@ training:
     T_0: 5000                             # Long first cycle — let the model learn
                                           # before any LR disruption.
     T_mult: 2                             # Doubling: 5000, 10000, 20000, ...
-    eta_min: 3.0e-5                       # Floor at 10% of base LR
+    eta_min: 4.2e-5                       # Floor at 10% of base LR (4.2e-4)
     warmup_steps: 500                     # Gentle warmup from near-zero to base LR.
                                           # Critical for fresh model — prevents
                                           # large early gradients from destabilizing.
@@ -168,7 +168,8 @@ testing:
   enabled: true
   every_n_steps: 1000                     # Test every 1000 steps
   num_games: 50                           # 50 games — reasonable eval signal
-  difficulty: "medium"                    # Benchmark target
+  difficulty: "easy"                      # Start easy — fresh model at 0% WR vs medium.
+                                          # Switch to medium once >50% WR vs easy.
 
 # -----------------------------------------------------------------------------
 # Paths
