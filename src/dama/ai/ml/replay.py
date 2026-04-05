@@ -50,7 +50,7 @@ class ReplayEntry:
     def from_dict(cls, data: dict) -> 'ReplayEntry':
         legal_moves = data['legal_moves']
         chosen_index = data['chosen_index']
-        if legal_moves and chosen_index >= len(legal_moves):
+        if legal_moves and (chosen_index < 0 or chosen_index >= len(legal_moves)):
             raise ValueError(
                 f"chosen_index {chosen_index} out of bounds for {len(legal_moves)} legal moves"
             )
@@ -140,7 +140,12 @@ class ReplayBuffer:
     def _close_current(self) -> None:
         """Close the current file and promote session entries to file cache."""
         if self._current_writer is not None:
-            self._current_writer.close()
+            try:
+                self._current_writer.close()
+            except OSError:
+                pass
+            finally:
+                self._current_writer = None
             # Promote in-memory entries to file cache so load_all_entries()
             # skips re-parsing the file we just wrote.
             path = self._current_file
@@ -156,7 +161,6 @@ class ReplayBuffer:
                         self._file_cache[path] = (mtime, self._session_entries.pop(path))
                     except OSError:
                         self._session_entries.pop(path, None)
-            self._current_writer = None
             self._current_file = None
 
     def close(self) -> None:
@@ -364,7 +368,7 @@ class ReplayBuffer:
             with open(path, 'r') as f:
                 return sum(1 for _ in f)
 
-        file_counts = []
+        file_counts: dict = {}  # path → count, preserves file order below
         with ThreadPoolExecutor(max_workers=min(8, len(files))) as executor:
             futures = {executor.submit(_count_file, p): p for p in files}
             for future in as_completed(futures):
@@ -374,9 +378,9 @@ class ReplayBuffer:
                 except Exception as e:
                     print(f"  Warning: failed to count entries in {path}: {e}")
                     count = 0
-                file_counts.append((path, count))
+                file_counts[path] = count
 
-        total = sum(c for _, c in file_counts)
+        total = sum(file_counts.values())
         if total == 0:
             return []
 
@@ -401,7 +405,10 @@ class ReplayBuffer:
                         loaded.append(ReplayEntry.from_dict(data))
             return loaded
 
-        for filepath, count in file_counts:
+        # Iterate in original file order (sorted by mtime from get_replay_files)
+        # so that index offsets are deterministic regardless of thread completion order.
+        for filepath in files:
+            count = file_counts[filepath]
             file_indices = set(
                 i - current_idx for i in indices
                 if current_idx <= i < current_idx + count

@@ -29,6 +29,12 @@ try:
 except ImportError:
     _HAS_CYTHON = False
 
+try:
+    from ._fast_encode import preprocess_dicts_chunk_cy as _cy_preprocess_dicts_chunk
+    _HAS_CYTHON_DICTS = True
+except ImportError:
+    _HAS_CYTHON_DICTS = False
+
 
 def get_available_ram_gb() -> float:
     """Get available system RAM in GB."""
@@ -168,36 +174,43 @@ def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
 
     boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
     all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
-    move_counts = np.zeros(n, dtype=np.int64)
-    targets = np.zeros(n, dtype=np.int64)
+    move_counts = np.zeros(n, dtype=np.int32)
+    targets = np.zeros(n, dtype=np.int32)
     reward_weights = np.zeros(n, dtype=np.float32)
     value_targets = np.zeros(n, dtype=np.float32)
     scores_arr = np.zeros(n, dtype=np.float32)
 
-    _cy_board = _cy_encode_board if _HAS_CYTHON else None
-    _cy_moves = _cy_encode_moves if _HAS_CYTHON else None
+    if _HAS_CYTHON_DICTS:
+        # Single Cython call for entire chunk — eliminates Python per-entry loop.
+        _cy_preprocess_dicts_chunk(
+            entry_dicts, 0, n, max_moves_per_sample,
+            boards, all_move_features, move_counts, targets, scores_arr, value_targets,
+        )
+    else:
+        _cy_board = _cy_encode_board if _HAS_CYTHON else None
+        _cy_moves = _cy_encode_moves if _HAS_CYTHON else None
 
-    for i, ed in enumerate(entry_dicts):
-        state_dict = ed['state']
-        if _cy_board is not None:
-            _cy_board(state_dict, boards[i])
-        else:
-            _encode_board_fast(state_dict, boards[i])
+        for i, ed in enumerate(entry_dicts):
+            state_dict = ed['state']
+            if _cy_board is not None:
+                _cy_board(state_dict, boards[i])
+            else:
+                _encode_board_fast(state_dict, boards[i])
 
-        legal_moves = ed['legal_moves']
-        if _cy_moves is not None:
-            num_moves = _cy_moves(state_dict, legal_moves, all_move_features[i])
-        else:
-            num_moves = _encode_moves_fast(state_dict, legal_moves, all_move_features[i])
+            legal_moves = ed['legal_moves']
+            if _cy_moves is not None:
+                num_moves = _cy_moves(state_dict, legal_moves, all_move_features[i])
+            else:
+                num_moves = _encode_moves_fast(state_dict, legal_moves, all_move_features[i])
 
-        move_counts[i] = num_moves
-        chosen_idx = ed['chosen_index']
-        if num_moves > 0:
-            targets[i] = min(chosen_idx, num_moves - 1)
-        else:
-            targets[i] = 0
-        scores_arr[i] = ed.get('score', 0.0)
-        value_targets[i] = float(ed.get('result', 0))
+            move_counts[i] = num_moves
+            chosen_idx = ed['chosen_index']
+            if num_moves > 0:
+                targets[i] = min(chosen_idx, num_moves - 1)
+            else:
+                targets[i] = 0
+            scores_arr[i] = ed.get('score', 0.0)
+            value_targets[i] = float(ed.get('result', 0))
 
     # Vectorized reward weight computation — single numpy call for the whole chunk.
     reward_weights[:] = compute_reward_weights_batch(scores_arr)
@@ -223,7 +236,7 @@ def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
 #   - peak 2× memory (worker arrays + concatenated arrays → 1× shared)
 # ---------------------------------------------------------------------------
 _fork_entries: Optional[list] = None
-_fork_max_moves: int = 64
+_fork_max_moves: int = 32
 
 # Shared-memory output globals (set by parent before forking)
 _fork_shm_names: Optional[dict] = None  # {'boards': name, 'move_features': name, ...}
@@ -254,50 +267,51 @@ def _preprocess_chunk_fork_shm(args: Tuple[int, int]) -> None:
     shm_rw = _SHM(name=names['reward_weights'], create=False)
     shm_vt = _SHM(name=names['value_targets'], create=False)
 
-    boards = np.ndarray((total_n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)
-    all_mf = np.ndarray((total_n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)
-    move_counts = np.ndarray(total_n, dtype=np.int64, buffer=shm_mc.buf)
-    targets = np.ndarray(total_n, dtype=np.int64, buffer=shm_tgt.buf)
-    reward_weights = np.ndarray(total_n, dtype=np.float32, buffer=shm_rw.buf)
-    value_targets = np.ndarray(total_n, dtype=np.float32, buffer=shm_vt.buf)
+    try:
+        boards = np.ndarray((total_n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)
+        all_mf = np.ndarray((total_n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)
+        move_counts = np.ndarray(total_n, dtype=np.int32, buffer=shm_mc.buf)
+        targets = np.ndarray(total_n, dtype=np.int32, buffer=shm_tgt.buf)
+        reward_weights = np.ndarray(total_n, dtype=np.float32, buffer=shm_rw.buf)
+        value_targets = np.ndarray(total_n, dtype=np.float32, buffer=shm_vt.buf)
 
-    # Slice views for this worker's chunk (writes go directly to shared memory)
-    b_slice = boards[start_idx:end_idx]
-    mf_slice = all_mf[start_idx:end_idx]
-    mc_slice = move_counts[start_idx:end_idx]
-    tgt_slice = targets[start_idx:end_idx]
-    vt_slice = value_targets[start_idx:end_idx]
+        # Slice views for this worker's chunk (writes go directly to shared memory)
+        b_slice = boards[start_idx:end_idx]
+        mf_slice = all_mf[start_idx:end_idx]
+        mc_slice = move_counts[start_idx:end_idx]
+        tgt_slice = targets[start_idx:end_idx]
+        vt_slice = value_targets[start_idx:end_idx]
 
-    scores_arr = np.zeros(n, dtype=np.float32)
+        scores_arr = np.zeros(n, dtype=np.float32)
 
-    if _HAS_CYTHON:
-        _cy_preprocess_chunk(
-            entries, start_idx, end_idx, max_moves_per_sample,
-            b_slice, mf_slice, mc_slice, tgt_slice, scores_arr, vt_slice,
-        )
-    else:
-        for i in range(n):
-            entry = entries[start_idx + i]
-            state_dict = entry.state
-            _encode_board_fast(state_dict, b_slice[i])
+        if _HAS_CYTHON:
+            _cy_preprocess_chunk(
+                entries, start_idx, end_idx, max_moves_per_sample,
+                b_slice, mf_slice, mc_slice, tgt_slice, scores_arr, vt_slice,
+            )
+        else:
+            for i in range(n):
+                entry = entries[start_idx + i]
+                state_dict = entry.state
+                _encode_board_fast(state_dict, b_slice[i])
 
-            num_moves = _encode_moves_fast(state_dict, entry.legal_moves, mf_slice[i])
+                num_moves = _encode_moves_fast(state_dict, entry.legal_moves, mf_slice[i])
 
-            mc_slice[i] = num_moves
-            chosen_idx = entry.chosen_index
-            tgt_slice[i] = min(chosen_idx, num_moves - 1) if num_moves > 0 else 0
-            scores_arr[i] = entry.score
-            vt_slice[i] = float(entry.result)
+                mc_slice[i] = num_moves
+                chosen_idx = entry.chosen_index
+                tgt_slice[i] = min(chosen_idx, num_moves - 1) if num_moves > 0 else 0
+                scores_arr[i] = entry.score
+                vt_slice[i] = float(entry.result)
 
-    reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
-
-    # Close (detach) shared memory handles — parent still owns them
-    shm_boards.close()
-    shm_mf.close()
-    shm_mc.close()
-    shm_tgt.close()
-    shm_rw.close()
-    shm_vt.close()
+        reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
+    finally:
+        # Close (detach) shared memory handles — parent still owns them
+        shm_boards.close()
+        shm_mf.close()
+        shm_mc.close()
+        shm_tgt.close()
+        shm_rw.close()
+        shm_vt.close()
 
 
 def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -312,8 +326,8 @@ def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarra
 
     boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
     all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
-    move_counts = np.zeros(n, dtype=np.int64)
-    targets = np.zeros(n, dtype=np.int64)
+    move_counts = np.zeros(n, dtype=np.int32)
+    targets = np.zeros(n, dtype=np.int32)
     reward_weights = np.zeros(n, dtype=np.float32)
     value_targets = np.zeros(n, dtype=np.float32)
     scores_arr = np.zeros(n, dtype=np.float32)
@@ -368,52 +382,63 @@ def _preprocess_dicts_fork_shm(args: Tuple[int, int]) -> None:
     shm_rw = _SHM(name=names['reward_weights'], create=False)
     shm_vt = _SHM(name=names['value_targets'], create=False)
 
-    boards = np.ndarray((total_n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)
-    all_mf = np.ndarray((total_n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)
-    move_counts = np.ndarray(total_n, dtype=np.int64, buffer=shm_mc.buf)
-    targets = np.ndarray(total_n, dtype=np.int64, buffer=shm_tgt.buf)
-    reward_weights = np.ndarray(total_n, dtype=np.float32, buffer=shm_rw.buf)
-    value_targets = np.ndarray(total_n, dtype=np.float32, buffer=shm_vt.buf)
+    try:
+        boards = np.ndarray((total_n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)
+        all_mf = np.ndarray((total_n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)
+        move_counts = np.ndarray(total_n, dtype=np.int32, buffer=shm_mc.buf)
+        targets = np.ndarray(total_n, dtype=np.int32, buffer=shm_tgt.buf)
+        reward_weights = np.ndarray(total_n, dtype=np.float32, buffer=shm_rw.buf)
+        value_targets = np.ndarray(total_n, dtype=np.float32, buffer=shm_vt.buf)
 
-    b_slice = boards[start_idx:end_idx]
-    mf_slice = all_mf[start_idx:end_idx]
-    mc_slice = move_counts[start_idx:end_idx]
-    tgt_slice = targets[start_idx:end_idx]
-    vt_slice = value_targets[start_idx:end_idx]
+        b_slice = boards[start_idx:end_idx]
+        mf_slice = all_mf[start_idx:end_idx]
+        mc_slice = move_counts[start_idx:end_idx]
+        tgt_slice = targets[start_idx:end_idx]
+        vt_slice = value_targets[start_idx:end_idx]
 
-    scores_arr = np.zeros(n, dtype=np.float32)
+        scores_arr = np.zeros(n, dtype=np.float32)
 
-    # Cython preprocess_chunk_cy handles both ReplayEntry and dict entries
-    if _HAS_CYTHON:
-        _cy_preprocess_chunk(
-            entries, start_idx, end_idx, max_moves_per_sample,
-            b_slice, mf_slice, mc_slice, tgt_slice, scores_arr, vt_slice,
-        )
-    else:
-        for i in range(n):
-            ed = entries[start_idx + i]
-            state_dict = ed['state']
-            _encode_board_fast(state_dict, b_slice[i])
-            num_moves = _encode_moves_fast(state_dict, ed['legal_moves'], mf_slice[i])
-            mc_slice[i] = num_moves
-            chosen_idx = ed['chosen_index']
-            tgt_slice[i] = min(chosen_idx, num_moves - 1) if num_moves > 0 else 0
-            scores_arr[i] = ed.get('score', 0.0)
-            vt_slice[i] = float(ed.get('result', 0))
+        if _HAS_CYTHON_DICTS:
+            # Single Cython call — eliminates Python per-entry loop.
+            _cy_preprocess_dicts_chunk(
+                entries, start_idx, end_idx, max_moves_per_sample,
+                b_slice, mf_slice, mc_slice, tgt_slice, scores_arr, vt_slice,
+            )
+        else:
+            _cy_board = _cy_encode_board if _HAS_CYTHON else None
+            _cy_moves = _cy_encode_moves if _HAS_CYTHON else None
 
-    reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
+            for i in range(n):
+                ed = entries[start_idx + i]
+                state_dict = ed['state']
+                if _cy_board is not None:
+                    _cy_board(state_dict, b_slice[i])
+                else:
+                    _encode_board_fast(state_dict, b_slice[i])
+                if _cy_moves is not None:
+                    num_moves = _cy_moves(state_dict, ed['legal_moves'], mf_slice[i])
+                else:
+                    num_moves = _encode_moves_fast(state_dict, ed['legal_moves'], mf_slice[i])
+                mc_slice[i] = num_moves
+                chosen_idx = ed['chosen_index']
+                tgt_slice[i] = min(chosen_idx, num_moves - 1) if num_moves > 0 else 0
+                scores_arr[i] = ed.get('score', 0.0)
+                vt_slice[i] = float(ed.get('result', 0))
 
-    shm_boards.close()
-    shm_mf.close()
-    shm_mc.close()
-    shm_tgt.close()
-    shm_rw.close()
-    shm_vt.close()
+        reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
+    finally:
+        # Close (detach) shared memory handles — parent still owns them
+        shm_boards.close()
+        shm_mf.close()
+        shm_mc.close()
+        shm_tgt.close()
+        shm_rw.close()
+        shm_vt.close()
 
 
 def preprocess_entries_to_tensors(
     entries: List[ReplayEntry],
-    max_moves_per_sample: int = 64,
+    max_moves_per_sample: int = 32,
     show_progress: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -431,8 +456,8 @@ def preprocess_entries_to_tensors(
         Tuple of:
         - boards: (N, BOARD_PLANES, 8, 8) float32 tensor
         - move_features: (N, max_moves, MOVE_FEATURE_SIZE) float32 tensor (padded)
-        - move_counts: (N,) int64 tensor (actual number of moves per sample)
-        - targets: (N,) int64 tensor (chosen move index)
+        - move_counts: (N,) int32 tensor (actual number of moves per sample)
+        - targets: (N,) int32 tensor (chosen move index)
         - reward_weights: (N,) float32 tensor (reward-based weights)
         - value_targets: (N,) float32 tensor (game result: +1, -1, 0)
     """
@@ -441,8 +466,8 @@ def preprocess_entries_to_tensors(
         return (
             torch.empty(0, BOARD_PLANES, 8, 8),
             torch.empty(0, max_moves_per_sample, MOVE_FEATURE_SIZE),
-            torch.empty(0, dtype=torch.long),
-            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
             torch.empty(0, dtype=torch.float32),
             torch.empty(0, dtype=torch.float32),
         )
@@ -503,20 +528,21 @@ def preprocess_entries_to_tensors(
                 # Pre-allocate shared memory for all output arrays
                 _boards_sz = n * BOARD_PLANES * 8 * 8 * 4  # float32
                 _mf_sz = n * max_moves_per_sample * MOVE_FEATURE_SIZE * 4
-                _mc_sz = n * 8  # int64
-                _tgt_sz = n * 8
+                _mc_sz = n * 4  # int32
+                _tgt_sz = n * 4
                 _rw_sz = n * 4  # float32
                 _vt_sz = n * 4
 
                 shm_list = []
                 try:
-                    shm_boards = _SHM(create=True, size=max(1, _boards_sz))
-                    shm_mf = _SHM(create=True, size=max(1, _mf_sz))
-                    shm_mc = _SHM(create=True, size=max(1, _mc_sz))
-                    shm_tgt = _SHM(create=True, size=max(1, _tgt_sz))
-                    shm_rw = _SHM(create=True, size=max(1, _rw_sz))
-                    shm_vt = _SHM(create=True, size=max(1, _vt_sz))
-                    shm_list = [shm_boards, shm_mf, shm_mc, shm_tgt, shm_rw, shm_vt]
+                    # Append incrementally so partially-allocated segments are
+                    # cleaned up by the finally block if a later allocation fails.
+                    shm_boards = _SHM(create=True, size=max(1, _boards_sz)); shm_list.append(shm_boards)
+                    shm_mf = _SHM(create=True, size=max(1, _mf_sz)); shm_list.append(shm_mf)
+                    shm_mc = _SHM(create=True, size=max(1, _mc_sz)); shm_list.append(shm_mc)
+                    shm_tgt = _SHM(create=True, size=max(1, _tgt_sz)); shm_list.append(shm_tgt)
+                    shm_rw = _SHM(create=True, size=max(1, _rw_sz)); shm_list.append(shm_rw)
+                    shm_vt = _SHM(create=True, size=max(1, _vt_sz)); shm_list.append(shm_vt)
 
                     _fork_shm_names = {
                         'boards': shm_boards.name,
@@ -537,8 +563,8 @@ def preprocess_entries_to_tensors(
                     # (shm → numpy copy → tensor share).
                     boards = torch.from_numpy(np.ndarray((n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)).clone()
                     all_move_features = torch.from_numpy(np.ndarray((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)).clone()
-                    move_counts = torch.from_numpy(np.ndarray(n, dtype=np.int64, buffer=shm_mc.buf)).clone()
-                    targets = torch.from_numpy(np.ndarray(n, dtype=np.int64, buffer=shm_tgt.buf)).clone()
+                    move_counts = torch.from_numpy(np.ndarray(n, dtype=np.int32, buffer=shm_mc.buf)).clone()
+                    targets = torch.from_numpy(np.ndarray(n, dtype=np.int32, buffer=shm_tgt.buf)).clone()
                     reward_weights = torch.from_numpy(np.ndarray(n, dtype=np.float32, buffer=shm_rw.buf)).clone()
                     value_targets = torch.from_numpy(np.ndarray(n, dtype=np.float32, buffer=shm_vt.buf)).clone()
                     # Mark as using shm path — skip from_numpy below
@@ -570,7 +596,8 @@ def preprocess_entries_to_tensors(
                 reward_weights = np.concatenate([r[4] for r in results])
                 value_targets = np.concatenate([r[5] for r in results])
 
-            _fork_entries = None  # Release reference
+            _fork_entries = None  # Release reference (runs for both shm and legacy paths)
+            _fork_total_n = 0
         else:
             # Spawn path: serialize entries to dicts for pickling across processes.
             entry_dicts = [e.to_dict() for e in entries]
@@ -608,8 +635,8 @@ def preprocess_entries_to_tensors(
     # Sequential fallback for small datasets — uses fast-path encoding
     boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
     all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
-    move_counts = np.zeros(n, dtype=np.int64)
-    targets = np.zeros(n, dtype=np.int64)
+    move_counts = np.zeros(n, dtype=np.int32)
+    targets = np.zeros(n, dtype=np.int32)
     scores_arr = np.zeros(n, dtype=np.float32)
     value_targets = np.zeros(n, dtype=np.float32)
 
@@ -723,7 +750,7 @@ class CachedTensorDataset(Dataset):
     def from_entries(
         cls,
         entries: List[ReplayEntry],
-        max_moves_per_sample: int = 64,
+        max_moves_per_sample: int = 32,
         show_progress: bool = True,
     ) -> 'CachedTensorDataset':
         """Create a CachedTensorDataset from replay entries."""
@@ -736,7 +763,7 @@ class CachedTensorDataset(Dataset):
     def from_dicts(
         cls,
         entry_dicts: List[dict],
-        max_moves_per_sample: int = 64,
+        max_moves_per_sample: int = 32,
         show_progress: bool = True,
     ) -> 'CachedTensorDataset':
         """Create a CachedTensorDataset directly from raw dicts.
@@ -754,8 +781,8 @@ class CachedTensorDataset(Dataset):
             return cls(
                 torch.empty(0, BOARD_PLANES, 8, 8),
                 torch.empty(0, max_moves_per_sample, MOVE_FEATURE_SIZE),
-                torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.int32),
+                torch.empty(0, dtype=torch.int32),
                 torch.empty(0, dtype=torch.float32),
                 torch.empty(0, dtype=torch.float32),
             )
@@ -802,20 +829,21 @@ class CachedTensorDataset(Dataset):
                 if _shm_ok:
                     _boards_sz = n * BOARD_PLANES * 8 * 8 * 4
                     _mf_sz = n * max_moves_per_sample * MOVE_FEATURE_SIZE * 4
-                    _mc_sz = n * 8
-                    _tgt_sz = n * 8
+                    _mc_sz = n * 4  # int32
+                    _tgt_sz = n * 4
                     _rw_sz = n * 4
                     _vt_sz = n * 4
 
                     shm_list = []
                     try:
-                        shm_boards = _SHM(create=True, size=max(1, _boards_sz))
-                        shm_mf = _SHM(create=True, size=max(1, _mf_sz))
-                        shm_mc = _SHM(create=True, size=max(1, _mc_sz))
-                        shm_tgt = _SHM(create=True, size=max(1, _tgt_sz))
-                        shm_rw = _SHM(create=True, size=max(1, _rw_sz))
-                        shm_vt = _SHM(create=True, size=max(1, _vt_sz))
-                        shm_list = [shm_boards, shm_mf, shm_mc, shm_tgt, shm_rw, shm_vt]
+                        # Append incrementally so partially-allocated segments
+                        # are cleaned up by the finally block on failure.
+                        shm_boards = _SHM(create=True, size=max(1, _boards_sz)); shm_list.append(shm_boards)
+                        shm_mf = _SHM(create=True, size=max(1, _mf_sz)); shm_list.append(shm_mf)
+                        shm_mc = _SHM(create=True, size=max(1, _mc_sz)); shm_list.append(shm_mc)
+                        shm_tgt = _SHM(create=True, size=max(1, _tgt_sz)); shm_list.append(shm_tgt)
+                        shm_rw = _SHM(create=True, size=max(1, _rw_sz)); shm_list.append(shm_rw)
+                        shm_vt = _SHM(create=True, size=max(1, _vt_sz)); shm_list.append(shm_vt)
 
                         _fork_shm_names = {
                             'boards': shm_boards.name,
@@ -836,9 +864,9 @@ class CachedTensorDataset(Dataset):
                             (n, max_moves_per_sample, MOVE_FEATURE_SIZE),
                             dtype=np.float32, buffer=shm_mf.buf)).clone()
                         mc = torch.from_numpy(np.ndarray(
-                            n, dtype=np.int64, buffer=shm_mc.buf)).clone()
+                            n, dtype=np.int32, buffer=shm_mc.buf)).clone()
                         tgt = torch.from_numpy(np.ndarray(
-                            n, dtype=np.int64, buffer=shm_tgt.buf)).clone()
+                            n, dtype=np.int32, buffer=shm_tgt.buf)).clone()
                         rw = torch.from_numpy(np.ndarray(
                             n, dtype=np.float32, buffer=shm_rw.buf)).clone()
                         vt = torch.from_numpy(np.ndarray(
@@ -855,6 +883,7 @@ class CachedTensorDataset(Dataset):
                     finally:
                         _fork_shm_names = None
                         _fork_entries = None
+                        _fork_total_n = 0
                         for shm in shm_list:
                             try:
                                 shm.close()
@@ -863,6 +892,7 @@ class CachedTensorDataset(Dataset):
                                 pass
 
                 _fork_entries = None
+                _fork_total_n = 0
 
             # Spawn path: pickle dict chunks across processes
             chunks = [
@@ -1036,6 +1066,7 @@ class FastBatchIterator:
         pin_memory: bool = False,
         device: Optional[torch.device] = None,
         capacity: int = 0,
+        amp_enabled: bool = False,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -1046,16 +1077,25 @@ class FastBatchIterator:
         # GPU-resident mode: move entire dataset to VRAM once.
         # Eliminates all pin_memory + CUDAPrefetcher + H2D transfer overhead.
         self.on_gpu = False
+
+        # When AMP is enabled, store boards and move_features as float16 on GPU.
+        # Board values are {0.0, 1.0} and move features are in [0.0, 1.0] — all
+        # exactly representable in float16.  AMP autocast handles float16→compute_dtype
+        # at kernel entry, so no manual casting needed.  Halves VRAM for these tensors.
+        _use_half = amp_enabled and device is not None and device.type == 'cuda'
+        self._storage_dtype = torch.float16 if _use_half else torch.float32
+
         if device is not None and device.type == 'cuda':
-            # Use capacity for VRAM budget check (pre-allocate for future updates)
+            # Use capacity for VRAM budget check (pre-allocate for future updates).
+            # Compute per-entry bytes using the actual storage dtype.
             _budget_n = max(self.n, capacity) if capacity > 0 else self.n
-            _per_entry = sum(
-                t.element_size() * (t.nelement() // max(1, len(dataset)))
-                for t in [
-                    dataset.boards, dataset.move_features, dataset.move_counts,
-                    dataset.targets, dataset.reward_weights, dataset.value_targets,
-                ]
-            ) if self.n > 0 else 3584  # fallback estimate ~3.5KB/entry
+            _float_bytes = 2 if _use_half else 4
+            if self.n > 0:
+                _b_elems = dataset.boards[0].nelement()
+                _mf_elems = dataset.move_features[0].nelement()
+                _per_entry = (_b_elems + _mf_elems) * _float_bytes + (4 + 4 + 4 + 4)
+            else:
+                _per_entry = 1168 if _use_half else 2320
             budget_bytes = _budget_n * _per_entry
 
             total_vram = torch.cuda.get_device_properties(device).total_memory
@@ -1069,17 +1109,18 @@ class FastBatchIterator:
                 alloc_n = _budget_n if capacity > 0 else self.n
                 b_shape = dataset.boards.shape[1:]
                 mf_shape = dataset.move_features.shape[1:]
+                _sd = self._storage_dtype
 
                 if alloc_n > self.n:
                     # Pre-allocate to capacity and fill the first n entries
                     self._boards = torch.empty(alloc_n, *b_shape, device=device,
-                                               dtype=dataset.boards.dtype).contiguous(
+                                               dtype=_sd).contiguous(
                                                    memory_format=torch.channels_last)
                     self._boards[:self.n] = dataset.boards.to(
-                        device, memory_format=torch.channels_last)
+                        device, dtype=_sd, memory_format=torch.channels_last)
                     self._move_features = torch.empty(alloc_n, *mf_shape, device=device,
-                                                      dtype=dataset.move_features.dtype)
-                    self._move_features[:self.n] = dataset.move_features.to(device)
+                                                      dtype=_sd)
+                    self._move_features[:self.n] = dataset.move_features.to(device, dtype=_sd)
                     self._move_counts = torch.empty(alloc_n, device=device,
                                                     dtype=dataset.move_counts.dtype)
                     self._move_counts[:self.n] = dataset.move_counts.to(device)
@@ -1092,25 +1133,28 @@ class FastBatchIterator:
                     self._value_targets = torch.empty(alloc_n, device=device,
                                                       dtype=dataset.value_targets.dtype)
                     self._value_targets[:self.n] = dataset.value_targets.to(device)
+                    _dtype_label = "fp16" if _use_half else "fp32"
                     print(f"  GPU-resident dataset: {self.n} entries in "
                           f"{alloc_n}-capacity buffer "
                           f"({budget_bytes / 1e6:.0f}MB reserved, "
-                          f"{available / 1e6:.0f}MB available, boards=channels_last)")
+                          f"{available / 1e6:.0f}MB available, {_dtype_label}, channels_last)")
                 else:
-                    # Store boards in channels_last (NHWC) format — cuDNN selects
-                    # faster convolution kernels and BoardEncoder.forward() skips
-                    # its per-batch is_contiguous check + conversion.
-                    self._boards = dataset.boards.to(device, memory_format=torch.channels_last)
-                    self._move_features = dataset.move_features.to(device)
+                    self._boards = dataset.boards.to(device, dtype=_sd,
+                                                     memory_format=torch.channels_last)
+                    self._move_features = dataset.move_features.to(device, dtype=_sd)
                     self._move_counts = dataset.move_counts.to(device)
                     self._targets = dataset.targets.to(device)
                     self._reward_weights = dataset.reward_weights.to(device)
                     self._value_targets = dataset.value_targets.to(device)
                     dataset_bytes = self.n * _per_entry
+                    _dtype_label = "fp16" if _use_half else "fp32"
                     print(f"  GPU-resident dataset: {dataset_bytes / 1e6:.0f}MB on GPU "
-                          f"({available / 1e6:.0f}MB available, boards=channels_last)")
+                          f"({available / 1e6:.0f}MB available, {_dtype_label}, channels_last)")
                 self.on_gpu = True
                 self._device = device
+                # Cache the pre-shuffle VRAM decision so __iter__ doesn't re-check
+                # VRAM every epoch.  Invalidated by update_data() when buffer grows.
+                self._can_preshuffle = self._check_preshuffle_budget()
             else:
                 print(f"  Dataset too large for GPU cache ({budget_bytes / 1e6:.0f}MB, "
                       f"{available / 1e6:.0f}MB available) — using CPU+pin")
@@ -1135,9 +1179,33 @@ class FastBatchIterator:
                 self._reward_weights = dataset.reward_weights
                 self._value_targets = dataset.value_targets
             self._device = None
+            self._can_preshuffle = False  # CPU data — no GPU pre-shuffle
 
         # Already pinned at construction (or GPU-resident) — no per-batch pinning needed
         self.pin_memory = False
+
+    def _check_preshuffle_budget(self) -> bool:
+        """Check if VRAM allows epoch-start pre-shuffle (gather all tensors).
+
+        Pre-shuffle creates a full copy of the active data (self.n entries).
+        When the buffer has pre-allocated capacity > n, the tensors are larger
+        than the active region.  Use per-entry element counts * self.n to
+        estimate the actual copy size, not t.nelement() which includes slack.
+        """
+        if not self.on_gpu or self.n == 0:
+            return False
+        _dev = self._boards.device
+        # Per-entry bytes for the active region (self.n entries, not full capacity)
+        _per_entry_bytes = sum(
+            (t.nelement() // max(1, t.shape[0])) * t.element_size()
+            for t in (self._boards, self._move_features, self._move_counts,
+                      self._targets, self._reward_weights, self._value_targets)
+        )
+        _data_bytes = self.n * _per_entry_bytes
+        _total_vram = torch.cuda.get_device_properties(_dev).total_memory
+        _allocated = torch.cuda.memory_allocated(_dev)
+        _free = _total_vram - _allocated
+        return _data_bytes < _free * 0.4
 
     def __len__(self) -> int:
         if self.drop_last:
@@ -1147,6 +1215,40 @@ class FastBatchIterator:
     def __iter__(self):
         # Generate indices on the same device as data — GPU randperm is faster
         _dev = self._boards.device
+
+        if self.shuffle and self._can_preshuffle:
+            # Pre-shuffle: gather all data once per epoch with a random
+            # permutation, then iterate with contiguous slices (zero-copy views).
+            # Trades 6 large gather ops at epoch start for ~1464 per-batch
+            # fancy-index kernel launches (batch_size=4096, 1M entries).
+            # Contiguous slicing is a view — no kernel launch, no data copy.
+            # _can_preshuffle is cached at init / update_data() to avoid
+            # re-checking VRAM every epoch.
+            b = mf = mc = tgt = rw = vt = None
+            try:
+                perm = torch.randperm(self.n, device=_dev)
+                b = self._boards[perm]
+                mf = self._move_features[perm]
+                mc = self._move_counts[perm]
+                tgt = self._targets[perm]
+                rw = self._reward_weights[perm]
+                vt = self._value_targets[perm]
+                del perm
+
+                for start in range(0, self.n, self.batch_size):
+                    end = min(start + self.batch_size, self.n)
+                    if self.drop_last and (end - start) < self.batch_size:
+                        break
+                    yield (b[start:end], mf[start:end], mc[start:end],
+                           tgt[start:end], rw[start:end], vt[start:end])
+            finally:
+                # Free shuffled copies immediately — they can be ~1.2GB on GPU.
+                # Without explicit del, generator frame locals persist until GC.
+                # Also covers OOM during gather: partially-allocated tensors freed.
+                del b, mf, mc, tgt, rw, vt
+            return
+
+        # Fallback: per-batch fancy-indexing (CPU data, non-shuffle, or low VRAM)
         if self.shuffle:
             indices = torch.randperm(self.n, device=_dev)
         else:
@@ -1203,19 +1305,30 @@ class FastBatchIterator:
                 # Buffer is large enough — shift old data left, append new.
                 # GPU→GPU copy: ~10× faster than equivalent CPU→GPU transfer.
                 if offset > 0 and keep_old > 0:
-                    # Source and destination overlap — clone to avoid in-place aliasing error
-                    self._boards[:keep_old] = self._boards[offset:offset + keep_old].clone()
-                    self._move_features[:keep_old] = self._move_features[offset:offset + keep_old].clone()
-                    self._move_counts[:keep_old] = self._move_counts[offset:offset + keep_old].clone()
-                    self._targets[:keep_old] = self._targets[offset:offset + keep_old].clone()
-                    self._reward_weights[:keep_old] = self._reward_weights[offset:offset + keep_old].clone()
-                    self._value_targets[:keep_old] = self._value_targets[offset:offset + keep_old].clone()
+                    # Left-shift by `offset`: copy [offset:offset+keep_old] → [0:keep_old].
+                    # Source and destination overlap — previous approach used .clone()
+                    # which allocated ~1.8GB temporary on GPU.  Instead, copy in
+                    # non-overlapping chunks of size `offset` (left-to-right memmove):
+                    #   chunk 0: [offset:2*offset] → [0:offset]        (disjoint)
+                    #   chunk 1: [2*offset:3*offset] → [offset:2*offset] (disjoint)
+                    #   ...
+                    # Zero temporary allocation, ~19 small GPU memcpy ops.
+                    _tensors = [self._boards, self._move_features, self._move_counts,
+                                self._targets, self._reward_weights, self._value_targets]
+                    for dst_start in range(0, keep_old, offset):
+                        dst_end = min(dst_start + offset, keep_old)
+                        src_start = dst_start + offset
+                        src_end = src_start + (dst_end - dst_start)
+                        for t in _tensors:
+                            t[dst_start:dst_end] = t[src_start:src_end]
 
-                # Upload only new entries (small PCIe transfer)
+                # Upload only new entries (small PCIe transfer).
+                # Match storage dtype (float16 when AMP) for consistency.
+                _sd = self._storage_dtype
                 self._boards[keep_old:total] = new_dataset.boards.to(
-                    dev, memory_format=torch.channels_last, non_blocking=True)
+                    dev, dtype=_sd, memory_format=torch.channels_last, non_blocking=True)
                 self._move_features[keep_old:total] = new_dataset.move_features.to(
-                    dev, non_blocking=True)
+                    dev, dtype=_sd, non_blocking=True)
                 self._move_counts[keep_old:total] = new_dataset.move_counts.to(
                     dev, non_blocking=True)
                 self._targets[keep_old:total] = new_dataset.targets.to(
@@ -1228,10 +1341,15 @@ class FastBatchIterator:
                 torch.cuda.current_stream(dev).synchronize()
                 self.n = total
                 self.drop_last = total > self.batch_size
+                _kb_per = sum(t.element_size() * (t.nelement() // max(1, buf_cap))
+                              for t in [self._boards, self._move_features, self._move_counts,
+                                        self._targets, self._reward_weights, self._value_targets]
+                              ) / 1024 if buf_cap > 0 else 1.9
                 print(f"  GPU buffer updated in-place: kept {keep_old} old + "
                       f"{new_n} new = {total} entries "
-                      f"(uploaded {new_n * 3.5 / 1024:.1f}MB, "
-                      f"avoided {keep_old * 3.5 / 1024:.1f}MB re-upload)")
+                      f"(uploaded {new_n * _kb_per / 1024:.1f}MB, "
+                      f"avoided {keep_old * _kb_per / 1024:.1f}MB re-upload)")
+                self._can_preshuffle = self._check_preshuffle_budget()
                 return
 
             # Buffer too small — must reallocate.  Allocate with slack to
@@ -1259,10 +1377,12 @@ class FastBatchIterator:
                 new_rw[:keep_old] = self._reward_weights[offset:offset + keep_old]
                 new_vt[:keep_old] = self._value_targets[offset:offset + keep_old]
 
-            # Upload new entries (small PCIe transfer)
+            # Upload new entries (small PCIe transfer, match storage dtype)
+            _sd = self._storage_dtype
             new_boards[keep_old:total] = new_dataset.boards.to(
-                dev, memory_format=torch.channels_last, non_blocking=True)
-            new_mf[keep_old:total] = new_dataset.move_features.to(dev, non_blocking=True)
+                dev, dtype=_sd, memory_format=torch.channels_last, non_blocking=True)
+            new_mf[keep_old:total] = new_dataset.move_features.to(dev, dtype=_sd,
+                                                                   non_blocking=True)
             new_mc[keep_old:total] = new_dataset.move_counts.to(dev, non_blocking=True)
             new_tgt[keep_old:total] = new_dataset.targets.to(dev, non_blocking=True)
             new_rw[keep_old:total] = new_dataset.reward_weights.to(dev, non_blocking=True)
@@ -1278,6 +1398,7 @@ class FastBatchIterator:
             self._value_targets = new_vt
             self.n = total
             self.drop_last = total > self.batch_size
+            self._can_preshuffle = self._check_preshuffle_budget()
             return
 
         # CPU path: rebuild from scratch (pinning is fast, no PCIe bottleneck)
@@ -1334,8 +1455,8 @@ def collate_batch(
     return (
         torch.stack(boards),
         torch.cat(all_move_features, dim=0).contiguous(),
-        torch.tensor(move_counts, dtype=torch.long),
-        torch.tensor(targets, dtype=torch.long),
+        torch.tensor(move_counts, dtype=torch.int32),
+        torch.tensor(targets, dtype=torch.int32),
         torch.tensor(reward_weights, dtype=torch.float32),
         torch.tensor(value_targets, dtype=torch.float32),
     )
@@ -1351,6 +1472,8 @@ def create_dataloader(
     ram_threshold_gb: float = 16.0,
     device: Optional[torch.device] = None,
     capacity: int = 0,
+    max_moves_per_sample: int = 32,
+    amp_enabled: bool = False,
 ) -> DataLoader:
     """
     Create a DataLoader from replay entries.
@@ -1371,9 +1494,11 @@ def create_dataloader(
     available_ram = get_available_ram_gb()
     total_ram = get_total_ram_gb()
     
-    # Estimate memory needed for cached dataset
-    # Each entry: ~5*8*8*4 (board) + 64*8*4 (moves) + 16 (counts/targets) ≈ 3.5 KB
-    estimated_size_gb = len(entries) * 3.5 / (1024 ** 2)
+    # Estimate memory needed for cached dataset (RAM: always float32; GPU may use float16)
+    # Each entry: ~5*8*8*B (board) + M*8*B (moves) + 16 (counts/targets/weights)
+    # B=4 (fp32): M=32→~1.9KB. B=2 (fp16 on GPU w/ AMP): M=32→~1.2KB
+    _per_entry_kb = (5 * 8 * 8 * 4 + max_moves_per_sample * 8 * 4 + 16) / 1024
+    estimated_size_gb = len(entries) * _per_entry_kb / (1024 ** 2)
     
     # Use RAM caching if:
     # 1. Explicitly enabled
@@ -1391,7 +1516,7 @@ def create_dataloader(
 
         cached_dataset = CachedTensorDataset.from_entries(
             entries,
-            max_moves_per_sample=64,
+            max_moves_per_sample=max_moves_per_sample,
             show_progress=True
         )
 
@@ -1410,6 +1535,7 @@ def create_dataloader(
             pin_memory=pin_memory,
             device=device,
             capacity=capacity,
+            amp_enabled=amp_enabled,
         )
 
     # Fall back to standard dataset
@@ -1453,6 +1579,7 @@ def create_dataloader_from_dataset(
     pin_memory: bool = True,
     device: Optional[torch.device] = None,
     capacity: int = 0,
+    amp_enabled: bool = False,
 ) -> FastBatchIterator:
     """Create a fast batch iterator from a pre-built CachedTensorDataset.
 
@@ -1472,6 +1599,7 @@ def create_dataloader_from_dataset(
         pin_memory=pin_memory,
         device=device,
         capacity=capacity,
+        amp_enabled=amp_enabled,
     )
 
 

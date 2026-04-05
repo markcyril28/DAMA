@@ -30,9 +30,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 
-# Enable TF32/medium precision for better performance on Ampere+ GPUs
-# 'medium' allows more aggressive use of TF32 tensor cores
-# Note: Check ROCm support for TF32 equivalent on AMD GPUs
+# Default matmul precision — overridden per config in Trainer.__init__().
+# 'medium' allows aggressive use of TF32 tensor cores on Ampere+ GPUs.
 torch.set_float32_matmul_precision('medium')
 
 # Enable cuDNN autotuning — finds the fastest convolution algorithm for
@@ -87,24 +86,36 @@ def _make_compiled_fwd_loss(model, compile_mode):
     Keeping forward and loss in one compiled graph lets the inductor fuse
     kernels across the boundary and capture everything in a single CUDAGraph,
     eliminating per-kernel launch overhead from separate forward and loss calls.
+
+    NaN/Inf loss is replaced with 0.0 inside the graph via nan_to_num, so the
+    caller never needs ``torch.isfinite(loss)`` (which forces a CUDA sync).
+    Zero loss produces zero gradients; the optimizer step becomes a near-no-op.
     """
     def _fwd_loss(boards, move_features, move_counts, targets, reward_weights):
         # Forward — model.forward_padded is inlined by the compiler
         scores = model.forward_padded(boards, move_features, move_counts)
 
-        # Loss — inlined from _compute_loss_padded for single-graph capture
-        counts = move_counts.long()
-        no_moves = counts == 0
+        # Loss — inlined from _compute_loss_padded for single-graph capture.
+        # move_counts/targets are int32 (sufficient for 0-32 range);
+        # cast to int64 once for gather (which requires LongTensor).
+        no_moves = move_counts == 0
         stable = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
         log_probs = nn.functional.log_softmax(stable.float(), dim=1)
         log_probs = torch.clamp(log_probs, min=-100.0)
         max_m = scores.shape[1]
         safe_tgt = targets.long().clamp(0, max_m - 1).unsqueeze(1)
         chosen_lp = log_probs.gather(1, safe_tgt).squeeze(1)
-        valid = (counts > 0) & (targets.long() >= 0) & (targets.long() < counts)
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
         w = reward_weights.float() * valid.float()
         tw = w.sum().clamp(min=1.0)
         loss = -(chosen_lp * w).sum() / tw
+
+        # Sanitize NaN/Inf loss inside the graph to eliminate the per-step
+        # ``not torch.isfinite(loss)`` CUDA sync in the training loop.
+        # Zero loss → zero gradients → optimizer applies only weight decay
+        # (negligible for the rare NaN batch).
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+
         return loss, scores.detach()
 
     return torch.compile(_fwd_loss, mode=compile_mode, fullgraph=True)
@@ -208,6 +219,9 @@ def _eval_expr(value):
         return value
 
 
+_STATS_HISTORY_CAP = 10000  # Max entries per history list (trim oldest on overflow)
+
+
 @dataclass
 class TrainingStats:
     """Training statistics tracking."""
@@ -217,7 +231,7 @@ class TrainingStats:
     epochs_completed: int = 0
     best_loss: float = float('inf')
     best_val_loss: float = float('inf')
-    
+
     # History lists (stored as lists for JSON serialization)
     loss_history: list = None
     val_loss_history: list = None
@@ -241,7 +255,12 @@ class TrainingStats:
             self.test_history = []
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
+        """Convert to dictionary for JSON serialization.
+
+        Returns shallow copies of all mutable lists so the dict is safe to
+        pass to a background thread (e.g., for async checkpoint writes) while
+        the main thread continues to append to the originals.
+        """
         return {
             'start_time': self.start_time,
             'end_time': self.end_time,
@@ -249,12 +268,12 @@ class TrainingStats:
             'epochs_completed': self.epochs_completed,
             'best_loss': self.best_loss,
             'best_val_loss': self.best_val_loss,
-            'loss_history': self.loss_history,
-            'val_loss_history': self.val_loss_history,
-            'lr_history': self.lr_history,
-            'gpu_mem_history': self.gpu_mem_history,
-            'step_times': self.step_times,
-            'test_history': self.test_history,
+            'loss_history': list(self.loss_history),
+            'val_loss_history': list(self.val_loss_history),
+            'lr_history': list(self.lr_history),
+            'gpu_mem_history': list(self.gpu_mem_history),
+            'step_times': list(self.step_times),
+            'test_history': list(self.test_history),
         }
     
     @classmethod
@@ -285,6 +304,7 @@ class TrainingConfig:
     amp_dtype: str = 'float16'  # 'float16' or 'bfloat16' (bfloat16 recommended for AMD MI210)
     compile_model: bool = True
     compile_mode: str = 'reduce-overhead'
+    matmul_precision: str = 'medium'  # 'highest', 'high', 'medium' — medium enables TF32
 
     # Model architecture settings
     model_channels: int = 64       # CNN channels in ResidualBlocks
@@ -301,6 +321,7 @@ class TrainingConfig:
     selfplay_noise_prob: float = 0.1  # Probability of random move for exploration
     selfplay_max_moves: int = 200  # Maximum moves per game
     pipeline_mode: str = 'simultaneous'  # 'simultaneous' or 'alternate'
+    max_stale_epochs: int = 0  # Max epochs on unchanged data before yielding (0 = unlimited)
 
     # Algo-vs-algo data generation (pure algorithmic games as training data)
     algo_vs_algo_enabled: bool = False
@@ -345,6 +366,7 @@ class TrainingConfig:
     ram_cache_threshold_gb: float = 8.0
     replay_max_entries: int = 100000  # Max entries to sample from replay buffer per epoch
     clear_replay_after_load: bool = False  # Delete replay files after loading into memory
+    max_moves_per_sample: int = 32  # Padding width for move features (max legal moves ~20)
 
     # Stability
     grad_clip_norm: Optional[float] = 1.0
@@ -410,6 +432,8 @@ class Trainer:
             sys.exit(1)
 
         self.device = torch.device(config.device)
+        # Apply config-driven matmul precision (overrides module-level default)
+        torch.set_float32_matmul_precision(config.matmul_precision)
         print(f"Using device: {self.device}")
 
         if self.device.type == 'cuda':
@@ -453,13 +477,23 @@ class Trainer:
         if self.device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
 
-        # Use fused AdamW for faster training on CUDA (PyTorch 2.0+)
-        use_fused = config.device == 'cuda' and hasattr(optim.AdamW, 'fused')
+        # Use fused AdamW for faster training on CUDA (PyTorch 2.0+).
+        # Fused AdamW runs the entire optimizer step in a single CUDA kernel
+        # (vs ~N kernels for N parameter groups), reducing launch overhead.
+        # hasattr() checks class attributes, not init params — use try/except.
+        use_fused = False
+        if config.device == 'cuda':
+            try:
+                _test_opt = optim.AdamW([torch.zeros(1, device='cuda')], fused=True)
+                del _test_opt
+                use_fused = True
+            except Exception:
+                pass
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
-            fused=use_fused if use_fused else False,
+            fused=use_fused,
         )
         if use_fused:
             print("Using fused AdamW optimizer for faster training")
@@ -532,6 +566,16 @@ class Trainer:
         self._bg_selfplay_dataset: Optional[CachedTensorDataset] = None
         self._bg_selfplay_incremental: Optional[CachedTensorDataset] = None
         self._bg_selfplay_lock = threading.Lock()
+        self._last_selfplay_dicts: Optional[list] = None
+        self._last_selfplay_preprocessed: Optional[CachedTensorDataset] = None
+        # Event signalled by the background thread when new data is ready.
+        # Replaces time.sleep(0.5) polling in the stale-data wait loop with
+        # zero-latency wakeup (~0ms vs up to 500ms).
+        self._data_ready_event = threading.Event()
+
+        # Background checkpoint write thread — tracked to avoid concurrent
+        # disk I/O from overlapping checkpoints.
+        self._checkpoint_thread: Optional[threading.Thread] = None
 
         # Padded training path flag (set when CachedTensorDataset is used)
         self._use_padded = False
@@ -616,7 +660,6 @@ class Trainer:
             # Fall back to 'default' mode which still provides inductor operator
             # fusion without CUDAGraphs — significant speedup vs eager mode.
             _MIN_SM_COUNT = 64  # safe threshold; MI210=104, A100=108, RTX 4090=128
-            _skip_compile = False
             if self.device.type == 'cuda':
                 _props = torch.cuda.get_device_properties(self.device)
                 _sm_count = _props.multi_processor_count
@@ -628,46 +671,54 @@ class Trainer:
                           f"(avoids Triton autotuner crash)")
                     sys.stdout.flush()
                     self.config.compile_mode = 'default'
-
-            if not _skip_compile:
                 _warmup_bs = self.config.batch_size
+                _warmup_max_moves = self.config.max_moves_per_sample
                 _wb = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
-                _wm = torch.randn(_warmup_bs, 64, 8, device=self.device)
-                _wc = torch.full((_warmup_bs,), 4, dtype=torch.long, device=self.device)
+                _wm = torch.randn(_warmup_bs, _warmup_max_moves, 8, device=self.device)
+                _wc = torch.full((_warmup_bs,), 4, dtype=torch.int32, device=self.device)
 
-                # Stage 1: try fused forward+loss compilation
-                try:
-                    print(f"Enabling torch.compile for fused forward+loss "
-                          f"(mode={self.config.compile_mode}, fullgraph=True)...")
-                    sys.stdout.flush()
-                    self._compiled_fwd_loss = _make_compiled_fwd_loss(
-                        self.model, self.config.compile_mode)
-                    print("  Running compile warmup (fused forward+loss)...")
-                    sys.stdout.flush()
-                    _wt = torch.zeros(_warmup_bs, dtype=torch.long, device=self.device)
-                    _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
-                    with torch.no_grad():
-                        if self.config.amp:
-                            with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
-                        else:
-                            self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
-                    del _wt, _wr
-                    print("torch.compile warmup OK — compiled fused forward+loss active")
-                    sys.stdout.flush()
-                except Exception as e:
-                    print(f"Fused compile failed ({e}), trying model-only compile...")
-                    sys.stdout.flush()
-                    self._compiled_fwd_loss = None
-
-                    # Stage 2: fall back to model-only compilation
+                # Stage 1: try fused forward+loss compilation (only useful
+                # without value head — value head needs a different fwd path)
+                if not config.value_head_enabled:
                     try:
+                        print(f"Enabling torch.compile for fused forward+loss "
+                              f"(mode={self.config.compile_mode}, fullgraph=True)...")
+                        sys.stdout.flush()
+                        self._compiled_fwd_loss = _make_compiled_fwd_loss(
+                            self.model, self.config.compile_mode)
+                        print("  Running compile warmup (fused forward+loss)...")
+                        sys.stdout.flush()
+                        _wt = torch.zeros(_warmup_bs, dtype=torch.int32, device=self.device)
+                        _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
+                        with torch.no_grad():
+                            if self.config.amp:
+                                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                    self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                            else:
+                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                        del _wt, _wr
+                        print("torch.compile warmup OK — compiled fused forward+loss active")
+                        sys.stdout.flush()
+                    except Exception as e:
+                        print(f"Fused compile failed ({e}), trying model-only compile...")
+                        sys.stdout.flush()
+                        self._compiled_fwd_loss = None
+
+                # Stage 2: model-only compilation — used as fallback when
+                # fused compile fails, or as primary when value_head is
+                # enabled (fused compile doesn't support the value path).
+                if self._compiled_fwd_loss is None:
+                    try:
+                        _stage2_label = ("value_head enabled"
+                                         if config.value_head_enabled
+                                         else "fused compile unavailable")
+                        print(f"Enabling torch.compile for model forward "
+                              f"(mode={self.config.compile_mode}, {_stage2_label})...")
+                        sys.stdout.flush()
                         compiled_model = torch.compile(
                             self.model, mode=self.config.compile_mode, fullgraph=True)
                         print("  Running compile warmup (model forward only)...")
                         sys.stdout.flush()
-                        # Non-padded forward() expects 2D move_features (total_moves, feat_size),
-                        # not the 3D padded tensor. Flatten to match the expected shape.
                         _total_moves = int(_wc.sum().item())
                         _wm_flat = torch.randn(_total_moves, _wm.shape[-1], device=self.device)
                         with torch.no_grad():
@@ -675,9 +726,15 @@ class Trainer:
                                 with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                                     compiled_model.forward_padded(_wb, _wm, _wc)
                                     compiled_model(_wb, _wm_flat, _wc)
+                                    if config.value_head_enabled:
+                                        compiled_model.forward_padded_with_value(
+                                            _wb, _wm, _wc)
                             else:
                                 compiled_model.forward_padded(_wb, _wm, _wc)
                                 compiled_model(_wb, _wm_flat, _wc)
+                                if config.value_head_enabled:
+                                    compiled_model.forward_padded_with_value(
+                                        _wb, _wm, _wc)
                         del _wm_flat
                         self.model = compiled_model
                         print("torch.compile warmup OK — compiled model active (loss uncompiled)")
@@ -686,10 +743,8 @@ class Trainer:
                         print(f"torch.compile failed ({e2}), falling back to eager mode")
                         sys.stdout.flush()
 
-            if not _skip_compile:
                 del _wb, _wm, _wc
-                if self.device.type == 'cuda':
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Thermal protection
@@ -833,16 +888,59 @@ class Trainer:
         self._last_thermal_check = time.time()
 
     def _has_non_finite_tensors(self) -> bool:
-        """Check if model parameters or buffers contain NaN/Inf."""
+        """Check if model parameters or buffers contain NaN/Inf.
+
+        Uses a single batched check (flatten + cat + isfinite) to avoid
+        N separate CUDA syncs (one per parameter). One sync for the whole
+        model instead of ~40.
+        """
+        all_tensors = [p.data.flatten() for p in self.model.parameters()]
+        all_tensors.extend(b.flatten() for b in self.model.buffers()
+                           if b is not None and b.numel() > 0)
+        if not all_tensors:
+            return False
+        combined = torch.cat(all_tensors)
+        if torch.isfinite(combined).all():
+            return False
+        # Detailed report: identify which parameter is bad (only on failure)
         for name, param in self.model.named_parameters():
             if not torch.isfinite(param).all():
                 print(f"  Non-finite parameter detected: {name}")
                 return True
         for name, buf in self.model.named_buffers():
-            if not torch.isfinite(buf).all():
+            if buf is not None and buf.numel() > 0 and not torch.isfinite(buf).all():
                 print(f"  Non-finite buffer detected: {name}")
                 return True
-        return False
+        # Combined check already found non-finite — individual checks may miss
+        # due to GPU state changes between reads.  Trust the batched result.
+        return True
+
+    def _repair_batchnorm_stats(self) -> bool:
+        """Check and repair corrupted BatchNorm running stats.
+
+        FP16 overflow during a forward pass can produce NaN activations that
+        corrupt BatchNorm running_mean / running_var.  The GradScaler catches
+        NaN *gradients* and skips the optimizer step, but running stats are
+        updated in the forward pass — before any loss/gradient check.  Once
+        corrupted, every subsequent forward pass outputs NaN, creating a
+        cascade that no amount of batch-skipping can break.
+
+        This method detects corrupted stats and resets them to defaults
+        (mean=0, var=1), allowing the next forward pass to re-estimate
+        clean statistics from the batch.
+        """
+        repaired = False
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.BatchNorm2d) and module.track_running_stats:
+                rm = module.running_mean
+                rv = module.running_var
+                if (rm is not None and not torch.isfinite(rm).all()) or \
+                   (rv is not None and not torch.isfinite(rv).all()):
+                    module.running_mean.zero_()
+                    module.running_var.fill_(1.0)
+                    module.num_batches_tracked.zero_()
+                    repaired = True
+        return repaired
 
     def _reset_model_state(self, reason: str) -> None:
         """Reset model/optimizer if checkpoint is corrupt."""
@@ -858,12 +956,16 @@ class Trainer:
         self.model.to(self.device)
         if self.device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
+        # Invalidate compiled function — it captured the old model's parameters.
+        # Next train_epoch() will use eager mode (recompilation would require
+        # re-running the full compile+warmup sequence).
+        self._compiled_fwd_loss = None
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
-        self.scaler = GradScaler() if (self.config.amp and self.amp_dtype == torch.float16) else None
+        self.scaler = GradScaler(init_scale=2**10) if (self.config.amp and self.amp_dtype == torch.float16) else None
         self.step = 0
         self.epoch = 0
         self.best_loss = float('inf')
@@ -913,6 +1015,24 @@ class Trainer:
                 print(f"Restored LR scheduler state")
             except Exception as e:
                 print(f"Warning: Could not restore scheduler state: {e}")
+
+        # Restore GradScaler state if available (prevents float16 overflow on resume)
+        if self.scaler is not None:
+            if 'scaler_state_dict' in checkpoint:
+                try:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                    print(f"Restored GradScaler state (scale={self.scaler.get_scale():.0f})")
+                except Exception as e:
+                    print(f"Warning: Could not restore GradScaler state: {e}. "
+                          f"Using conservative scale=1024.")
+                    self.scaler = GradScaler(init_scale=2**10)
+            else:
+                # Old checkpoint without scaler state: use conservative scale.
+                # Default init_scale=65536 causes float16 overflow on trained models
+                # whose parameter magnitudes have grown beyond the initial range.
+                self.scaler = GradScaler(init_scale=2**10)
+                print(f"GradScaler: no saved state in checkpoint, using conservative "
+                      f"scale={self.scaler.get_scale():.0f} (will auto-adjust)")
 
         # Restore RNG state if available
         if 'rng_state' in checkpoint:
@@ -990,16 +1110,51 @@ class Trainer:
             self.stats.test_history.sort(key=lambda x: x.get('step', 0))
             print(f"Merged {merged_count} test entries from log files into stats")
 
-    def _save_stats(self) -> None:
-        """Save training stats to file."""
+    def _save_stats(self, *, _snapshot: Optional[dict] = None) -> None:
+        """Save training stats to file.
+
+        When called from a background thread, pass a pre-computed ``_snapshot``
+        (from ``_snapshot_stats()``) to avoid reading ``self.stats`` while the
+        main thread mutates it.
+        """
         stats_path = Path(self.config.stats_file)
         stats_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
+        if _snapshot is None:
+            # Main-thread path: safe to touch self.stats directly
+            self.stats.total_steps = self.step
+            self.stats.end_time = datetime.now().isoformat()
+            _snapshot = self.stats.to_dict()
+
+        # Atomic write: temp file + os.replace() prevents corruption from
+        # concurrent writes (checkpoint bg thread vs main thread) and from
+        # process crashes mid-write.
+        _tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode='w', dir=stats_path.parent, suffix='.tmp',
+                    delete=False) as tmp:
+                _tmp_path = tmp.name
+                json.dump(_snapshot, tmp, indent=2)
+            os.replace(_tmp_path, stats_path)
+        except Exception as e:
+            print(f"Warning: Failed to save stats: {e}")
+            # Clean up temp file on failure
+            if _tmp_path is not None:
+                try:
+                    os.unlink(_tmp_path)
+                except Exception:
+                    pass
+
+    def _snapshot_stats(self) -> dict:
+        """Take a consistent snapshot of training stats for background I/O.
+
+        Must be called on the main thread (where self.stats is mutated).
+        The returned dict is a deep copy safe for use in a background thread.
+        """
         self.stats.total_steps = self.step
         self.stats.end_time = datetime.now().isoformat()
-        
-        with open(stats_path, 'w') as f:
-            json.dump(self.stats.to_dict(), f, indent=2)
+        return self.stats.to_dict()
 
     def _record_step_stats(self, loss: float, lr: float) -> None:
         """Record statistics for a training step."""
@@ -1009,7 +1164,7 @@ class Trainer:
         self.stats.loss_history.append({
             'step': self.step,
             'loss': loss,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
         })
         
         # Record learning rate
@@ -1034,7 +1189,19 @@ class Trainer:
                 'time_sec': step_time
             })
         self._last_step_time = current_time
-        
+
+        # Trim history lists to prevent unbounded memory growth.
+        # At stats_record_every=500 and cap=10000, this retains the last 5M steps.
+        _cap = _STATS_HISTORY_CAP
+        if len(self.stats.loss_history) > _cap:
+            _trim = len(self.stats.loss_history) - _cap
+            self.stats.loss_history = self.stats.loss_history[_trim:]
+            self.stats.lr_history = self.stats.lr_history[_trim:]
+            if self.stats.gpu_mem_history:
+                self.stats.gpu_mem_history = self.stats.gpu_mem_history[-_cap:]
+            if self.stats.step_times:
+                self.stats.step_times = self.stats.step_times[-_cap:]
+
         # Update best loss
         if loss < self.stats.best_loss:
             self.stats.best_loss = loss
@@ -1044,9 +1211,11 @@ class Trainer:
         self.stats.val_loss_history.append({
             'step': self.step,
             'val_loss': val_loss,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
         })
-        
+        if len(self.stats.val_loss_history) > _STATS_HISTORY_CAP:
+            self.stats.val_loss_history = self.stats.val_loss_history[-_STATS_HISTORY_CAP:]
+
         if val_loss < self.stats.best_val_loss:
             self.stats.best_val_loss = val_loss
 
@@ -1057,10 +1226,26 @@ class Trainer:
         but the actual disk I/O is offloaded to a background thread so the
         GPU can continue training while the file is being written.
         """
-        # Copy state dicts to CPU (requires CUDA sync — must be on main thread)
+        # Copy state dicts to CPU (requires CUDA sync — must be on main thread).
+        # Both model AND optimizer states must be moved to CPU here, not in the
+        # background thread.  optimizer.state_dict() returns references to live
+        # CUDA tensors (exp_avg, exp_avg_sq); if the background torch.save()
+        # accesses them while the main thread runs optimizer.step(), the tensors
+        # may be mid-update.  Copying to CPU on the main thread gives a consistent
+        # snapshot and eliminates CUDA sync contention in the background thread.
+        _opt_sd = self.optimizer.state_dict()
+        if self.device.type == 'cuda':
+            # Deep-copy optimizer state tensors to CPU
+            _cpu_state = {}
+            for k, v in _opt_sd['state'].items():
+                _cpu_state[k] = {
+                    sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv
+                    for sk, sv in v.items()
+                }
+            _opt_sd = {'state': _cpu_state, 'param_groups': _opt_sd['param_groups']}
         checkpoint = {
             'model_state_dict': {k: v.cpu() for k, v in self.model.state_dict().items()},
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_state_dict': _opt_sd,
             'step': self.step,
             'loss': loss,
             'epoch': self.epoch,
@@ -1080,6 +1265,9 @@ class Trainer:
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
+        if self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+
         if torch.cuda.is_available():
             checkpoint['rng_state']['cuda'] = torch.cuda.get_rng_state()
 
@@ -1087,6 +1275,9 @@ class Trainer:
         latest_path = Path(self.config.latest_path)
         _step = self.step
         _stats_collector = self.stats_collector
+        # Snapshot stats on main thread to avoid reading self.stats from the
+        # background thread while the main thread appends to history lists.
+        _stats_snapshot = self._snapshot_stats()
 
         # Offload disk I/O to background thread — GPU resumes training immediately.
         def _write_checkpoint():
@@ -1103,7 +1294,7 @@ class Trainer:
                     tmp_path = tmp.name
                 os.replace(tmp_path, latest_path)
 
-                self._save_stats()
+                self._save_stats(_snapshot=_stats_snapshot)
 
                 if _stats_collector:
                     ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
@@ -1115,11 +1306,14 @@ class Trainer:
             except Exception as e:
                 print(f"Checkpoint save error: {e}")
 
-        thread = threading.Thread(target=_write_checkpoint, daemon=True)
-        thread.start()
-        # Don't join — let it finish in the background while training continues.
-        # The next checkpoint will implicitly wait if the thread is still alive
-        # (via the GIL during state_dict copy).
+        # Wait for previous checkpoint write to finish before starting a new one.
+        # Prevents concurrent disk I/O to the same stats file and avoids
+        # accumulating background threads on slow storage.
+        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
+            self._checkpoint_thread.join(timeout=30)
+
+        self._checkpoint_thread = threading.Thread(target=_write_checkpoint, daemon=True)
+        self._checkpoint_thread.start()
 
         return str(checkpoint_path)
 
@@ -1131,7 +1325,8 @@ class Trainer:
 
     def run_selfplay(self, num_games: int, callback=None,
                      collect_dicts: bool = False,
-                     skip_replay: bool = False) -> int:
+                     skip_replay: bool = False,
+                     preprocess_inline: bool = False) -> int:
         """Run self-play to generate training data.
 
         Args:
@@ -1143,14 +1338,20 @@ class Trainer:
                 kept in memory via collect_dicts. Avoids json.dumps + disk writes
                 when the data won't be re-read from replay (background self-play
                 after the first cycle).
+            preprocess_inline: If True, preprocess each completed batch into
+                tensors immediately using Cython (or Python fallback) in the
+                as_completed() loop.  Eliminates the separate from_dicts()
+                preprocessing phase after self-play.  Result stored in
+                self._last_selfplay_preprocessed (a CachedTensorDataset).
 
         Returns:
             Total number of training entries generated.
         """
-        if skip_replay and not collect_dicts:
+        if skip_replay and not collect_dicts and not preprocess_inline:
             raise ValueError(
-                "skip_replay=True requires collect_dicts=True, otherwise "
-                "generated data is silently discarded (not saved to disk or memory)."
+                "skip_replay=True requires collect_dicts=True or "
+                "preprocess_inline=True, otherwise generated data is "
+                "silently discarded (not saved to disk or memory)."
             )
 
         _selfplay_start = time.time()
@@ -1159,6 +1360,19 @@ class Trainer:
         side_focus = self.config.selfplay_focus_side
         _collected = [] if collect_dicts else None
         self._last_selfplay_dicts = None  # Reset previous collection
+        self._last_selfplay_preprocessed = None  # Reset previous preprocessed data
+
+        # Inline preprocessing: preprocess each completed batch immediately
+        # using Cython/Python encoding in the as_completed() loop.
+        # Eliminates the separate CachedTensorDataset.from_dicts() call that
+        # spawns a ProcessPoolExecutor after all games finish.
+        # Each batch has ~420-1050 entries; Cython processes them in <2ms.
+        _preprocess_chunks = [] if preprocess_inline else None
+        _pp_max_moves = self.config.max_moves_per_sample if preprocess_inline else 0
+        if preprocess_inline:
+            from .dataset import _preprocess_chunk as _pp_chunk
+        else:
+            _pp_chunk = None
 
         # Algo-vs-algo games are additional (on top of regular self-play)
         algo_vs_algo_games = (
@@ -1191,14 +1405,7 @@ class Trainer:
             f"({focus_desc}; focus side: {side_focus})..."
         )
 
-        # Save current model for self-play inference
         temp_model_path = Path(self.config.checkpoint_dir) / "temp_selfplay_model.pt"
-        temp_model_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'arch_params': getattr(self.model, 'arch_params', {}),
-            'step': self.step,
-        }, temp_model_path)
 
         entries = 0
         completed_total = 0
@@ -1283,6 +1490,16 @@ class Trainer:
 
             random.shuffle(all_algo_tasks)
 
+        # Save model to disk only when ML games need it (avoids ~2ms CUDA sync
+        # for state_dict copy on algo-only cycles where no worker loads the model).
+        if all_ml_tasks:
+            temp_model_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'arch_params': getattr(self.model, 'arch_params', {}),
+                'step': self.step,
+            }, temp_model_path)
+
         # --- Batch tasks for the unified pool ---
         effective_workers = (
             min(self.config.cpu_workers, 8)
@@ -1292,10 +1509,12 @@ class Trainer:
 
         # Cap per-batch game count for finer-grained load balancing.
         # Without a cap, 3600 algo games / 10 workers = 360 per batch — one slow
-        # batch (e.g., heavy on hard matchups) starves other workers.  Cap at 50
-        # games gives 72 batches; workers pick up the next batch as each finishes,
-        # naturally balancing fast and slow matchups.
-        _ALGO_BATCH_CAP = 50
+        # batch (e.g., heavy on hard matchups) starves other workers.  Cap at 25
+        # games gives 144 batches; workers pick up the next batch as each finishes,
+        # naturally balancing fast and slow matchups.  Previous cap of 50 caused
+        # hard-hard batches to take ~19s each, creating straggler workers while
+        # others sat idle.  25 halves max straggler time to ~9.5s.
+        _ALGO_BATCH_CAP = 25
         _ML_BATCH_CAP = 10  # ML games are slower — smaller batches for balance
 
         def _make_batches(tasks, cap):
@@ -1341,6 +1560,13 @@ class Trainer:
                         entries += len(entries_data)
                         if _collected is not None:
                             _collected.extend(entries_data)
+                        # Inline preprocessing: convert dicts to tensors now,
+                        # while the thread is otherwise idle waiting for the
+                        # next game batch.  Cython processes ~1000 entries in
+                        # <2ms — negligible vs the seconds between batches.
+                        if _preprocess_chunks is not None and entries_data:
+                            _preprocess_chunks.append(
+                                _pp_chunk((entries_data, _pp_max_moves)))
                         completed_total += batch_game_count
                         if callback:
                             callback(completed_total, grand_total)
@@ -1359,6 +1585,9 @@ class Trainer:
                     entries += len(entries_data)
                     if _collected is not None:
                         _collected.extend(entries_data)
+                    if _preprocess_chunks is not None and entries_data:
+                        _preprocess_chunks.append(
+                            _pp_chunk((entries_data, _pp_max_moves)))
                     completed_total += 1
                     if callback:
                         callback(completed_total, grand_total)
@@ -1372,6 +1601,25 @@ class Trainer:
         # Store collected dicts for incremental preprocessing
         if _collected is not None:
             self._last_selfplay_dicts = _collected
+
+        # Assemble inline-preprocessed chunks into a CachedTensorDataset.
+        # All chunks were preprocessed during the as_completed() loop, so
+        # this is just numpy concatenation + torch.from_numpy (~1ms total).
+        if _preprocess_chunks is not None and _preprocess_chunks:
+            import numpy as _np
+            boards = _np.concatenate([c[0] for c in _preprocess_chunks])
+            mf = _np.concatenate([c[1] for c in _preprocess_chunks])
+            mc = _np.concatenate([c[2] for c in _preprocess_chunks])
+            tgt = _np.concatenate([c[3] for c in _preprocess_chunks])
+            rw = _np.concatenate([c[4] for c in _preprocess_chunks])
+            vt = _np.concatenate([c[5] for c in _preprocess_chunks])
+            self._last_selfplay_preprocessed = CachedTensorDataset(
+                torch.from_numpy(boards), torch.from_numpy(mf),
+                torch.from_numpy(mc), torch.from_numpy(tgt),
+                torch.from_numpy(rw), torch.from_numpy(vt),
+            )
+            print(f"  Inline preprocessing: {len(self._last_selfplay_preprocessed)} entries "
+                  f"({len(_preprocess_chunks)} chunks, zero extra latency)")
 
         # Record self-play stats
         if self.stats_collector:
@@ -1390,10 +1638,10 @@ class Trainer:
                 try:
                     buf_entries = self.replay_buffer.count_entries()
                     replay_dir = Path(self.config.replay_dir)
-                    num_files = len(list(replay_dir.glob("*.jsonl"))) if replay_dir.exists() else 0
-                    total_bytes = sum(
-                        f.stat().st_size for f in replay_dir.glob("*.jsonl")
-                    ) if replay_dir.exists() else 0
+                    # Single glob pass for both file count and total size
+                    _files = list(replay_dir.glob("*.jsonl")) if replay_dir.exists() else []
+                    num_files = len(_files)
+                    total_bytes = sum(f.stat().st_size for f in _files)
                     self.stats_collector.record_replay_buffer_state(
                         step=self.step,
                         total_entries=buf_entries,
@@ -1439,33 +1687,76 @@ class Trainer:
                     # workers → memory dicts → CachedTensorDataset → GPU, avoiding
                     # json serialization + disk writes + ReplayEntry conversion.
                     _skip = _existing is not None and len(_existing) > 0
+
+                    # Always use inline preprocessing: preprocess entries as each
+                    # game batch completes in the as_completed() loop.  Eliminates
+                    # the separate from_dicts() / from_entries() call that spawns
+                    # a ProcessPoolExecutor after all games finish.  Saves 5-30s
+                    # per cycle (entire preprocessing phase overlapped with games).
+                    # collect_dicts is still needed on first cycle for fallback.
                     self.run_selfplay(
-                        num_games, collect_dicts=True, skip_replay=_skip)
+                        num_games, collect_dicts=not _skip,
+                        skip_replay=_skip, preprocess_inline=True)
 
-                    new_dicts = getattr(self, '_last_selfplay_dicts', None)
+                    # Check for inline-preprocessed data first (fast path).
+                    incremental = getattr(self, '_last_selfplay_preprocessed', None)
 
-                    if new_dicts and _existing is not None and len(_existing) > 0:
-                        print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
-                              f"(existing: {len(_existing)})")
-                        incremental = CachedTensorDataset.from_dicts(
-                            new_dicts, max_moves_per_sample=64, show_progress=True)
+                    if incremental is not None and _existing is not None and len(_existing) > 0:
+                        # Inline preprocessing produced the incremental dataset
+                        # directly — no from_dicts() call needed.
                         dataset = _existing.concat(incremental, max_entries=_max_entries)
-                        print(f"  Merged dataset: {len(dataset)} entries")
+                        print(f"  Merged dataset: {len(dataset)} entries "
+                              f"(+{len(incremental)} inline-preprocessed)")
+                    elif incremental is not None:
+                        # First cycle with inline preprocessing, or no existing
+                        # data to concat with.  On first cycle, also load any
+                        # existing replay data from disk and merge.
+                        if _existing is None or len(_existing) == 0:
+                            # Check for existing replay data on disk
+                            train_entries, _ = prepare_training_data(
+                                self.replay_buffer, max_entries=_max_entries, val_split=0.0)
+                            if train_entries:
+                                existing_ds = CachedTensorDataset.from_entries(
+                                    train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
+                                dataset = existing_ds.concat(incremental, max_entries=_max_entries)
+                                print(f"  Loaded {len(existing_ds)} existing + "
+                                      f"{len(incremental)} inline-preprocessed = "
+                                      f"{len(dataset)} total entries")
+                            else:
+                                dataset = incremental
+                                print(f"  New dataset: {len(dataset)} entries (inline-preprocessed)")
+                        else:
+                            dataset = incremental
+                            print(f"  New dataset: {len(dataset)} entries (inline-preprocessed)")
                     else:
-                        incremental = None
-                        train_entries, _ = prepare_training_data(
-                            self.replay_buffer, max_entries=_max_entries, val_split=0.0)
-                        if self.config.clear_replay_after_load:
-                            deleted = self.replay_buffer.clear_files()
-                            if deleted:
-                                print(f"Cleared {deleted} replay files after loading")
-                        dataset = CachedTensorDataset.from_entries(
-                            train_entries, max_moves_per_sample=64, show_progress=True)
+                        # Fallback: no inline preprocessing available.
+                        # Use collected dicts or load from replay.
+                        new_dicts = getattr(self, '_last_selfplay_dicts', None)
+
+                        if new_dicts and _existing is not None and len(_existing) > 0:
+                            print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
+                                  f"(existing: {len(_existing)})")
+                            incremental = CachedTensorDataset.from_dicts(
+                                new_dicts, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
+                            dataset = _existing.concat(incremental, max_entries=_max_entries)
+                            print(f"  Merged dataset: {len(dataset)} entries")
+                        else:
+                            incremental = None
+                            train_entries, _ = prepare_training_data(
+                                self.replay_buffer, max_entries=_max_entries, val_split=0.0)
+                            if self.config.clear_replay_after_load:
+                                deleted = self.replay_buffer.clear_files()
+                                if deleted:
+                                    print(f"Cleared {deleted} replay files after loading")
+                            dataset = CachedTensorDataset.from_entries(
+                                train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
 
                     with self._bg_selfplay_lock:
                         self._bg_selfplay_entries = None
                         self._bg_selfplay_dataset = dataset
                         self._bg_selfplay_incremental = incremental
+                    # Wake the main thread immediately if it's waiting for data.
+                    self._data_ready_event.set()
 
                     # Use the just-produced dataset as base for next incremental cycle
                     _existing = dataset
@@ -1501,33 +1792,65 @@ class Trainer:
             self._bg_selfplay_entries = None
         return dataset, incremental
 
+    def _refresh_dataloader(self, dataloader, bg_dataset, bg_incremental,
+                            effective_workers):
+        """Apply new self-play data to the dataloader.
+
+        Handles both FastBatchIterator (in-place GPU update) and standard
+        DataLoader (full recreate) paths.  Returns the (possibly new)
+        dataloader and whether data is GPU-resident.
+        """
+        self._current_dataset = bg_dataset
+        _is_fast = isinstance(dataloader, FastBatchIterator)
+        if _is_fast:
+            _update_src = bg_incremental if bg_incremental is not None else bg_dataset
+            dataloader.update_data(
+                _update_src, max_entries=self.config.replay_max_entries)
+            dataloader.dataset = bg_dataset
+        else:
+            _was_gpu = getattr(dataloader, 'on_gpu', False)
+            if _was_gpu:
+                dataloader = None
+                torch.cuda.empty_cache()
+            dataloader = create_dataloader_from_dataset(
+                bg_dataset,
+                batch_size=self.config.batch_size,
+                num_workers=effective_workers,
+                pin_memory=self.config.pin_memory,
+                device=self.device,
+                amp_enabled=self.config.amp,
+            )
+        self._use_padded = True
+        _gpu_resident = getattr(dataloader, 'on_gpu', False)
+        return dataloader, _gpu_resident
+
     def run_test_vs_algo(self, num_games: int = None) -> Dict[str, Any]:
         """
         Run test games between current model and algorithmic AI.
-        
+
         Args:
             num_games: Number of test games (defaults to config)
-        
+
         Returns:
             Test statistics dictionary
         """
         if num_games is None:
             num_games = self.config.test_games
-        
+
         print(f"\nRunning {num_games} test games vs algorithm ({self.config.test_difficulty})...")
-        
+
         from .model_vs_algo import ModelVsAlgoTester
-        
+
         # Save current model temporarily for testing
         temp_path = Path(self.config.checkpoint_dir) / "temp_test_model.pt"
         temp_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'arch_params': getattr(self.model, 'arch_params', {}),
             'step': self.step,
         }, temp_path)
-        
+
         try:
             tester = ModelVsAlgoTester(
                 model_path=str(temp_path),
@@ -1535,13 +1858,13 @@ class Trainer:
                 num_workers=min(self.config.cpu_workers, 4),
                 max_moves=self.config.selfplay_max_moves,
             )
-            
+
             def progress(completed, total, stats):
                 if completed % 10 == 0:
                     print(f"  Test games: {completed}/{total} (ML: {stats.ml_win_rate*100:.1f}%)")
-            
+
             stats = tester.run_tests(num_games=num_games, callback=progress)
-            
+
             # Record in training stats
             test_record = {
                 'step': self.step,
@@ -1558,13 +1881,13 @@ class Trainer:
                 'timestamp': datetime.now().isoformat(),
             }
             self.stats.test_history.append(test_record)
-            
+
             # Record in enhanced stats collector
             if self.stats_collector:
                 self.stats_collector.record_evaluation(
                     step=self.step, epoch=self.epoch, test_record=test_record,
                 )
-            
+
             print(f"  ML Win Rate: {stats.ml_win_rate*100:.1f}%")
             print(f"    As P1 (White): {stats.ml_as_p1_win_rate*100:.1f}%")
             print(f"    As P2 (Black): {stats.ml_as_p2_win_rate*100:.1f}%")
@@ -1572,22 +1895,83 @@ class Trainer:
                 latest = self.stats_collector.eval_records[-1]
                 elo = latest.get('estimated_elo_diff', 0)
                 print(f"    Est. ELO diff:  {elo:+.0f}")
-            
+
             # Log to JSONL
             self._log({
                 'type': 'test_vs_algo',
                 **test_record
             })
-            
+
             # Save stats to JSON file immediately so plot_training.py can read them
             self._save_stats()
-            
+
             return test_record
-        
+
         finally:
             # Clean up temp file
             if temp_path.exists():
                 temp_path.unlink()
+
+    def _run_test_cpu_only(self, model_path: str, num_games: int,
+                           difficulty: str, max_moves: int,
+                           num_workers: int) -> Dict[str, Any]:
+        """Run test games using a pre-saved model path. CPU-only, thread-safe.
+
+        Does NOT access self.model or modify self.stats — safe to call from
+        a background thread while the main thread continues GPU training.
+        """
+        from .model_vs_algo import ModelVsAlgoTester
+
+        tester = ModelVsAlgoTester(
+            model_path=model_path,
+            algo_difficulty=difficulty,
+            num_workers=num_workers,
+            max_moves=max_moves,
+        )
+
+        def progress(completed, total, stats):
+            if completed % 10 == 0:
+                print(f"  [async test] {completed}/{total} "
+                      f"(ML: {stats.ml_win_rate*100:.1f}%)")
+
+        stats = tester.run_tests(num_games=num_games, callback=progress)
+
+        return {
+            'total_games': stats.total_games,
+            'ml_wins': stats.ml_wins,
+            'algo_wins': stats.algo_wins,
+            'draws': stats.draws,
+            'ml_win_rate': stats.ml_win_rate,
+            'draw_rate': stats.draw_rate,
+            'ml_as_p1_win_rate': stats.ml_as_p1_win_rate,
+            'ml_as_p2_win_rate': stats.ml_as_p2_win_rate,
+            'avg_game_length': stats.avg_game_length,
+        }
+
+    def _record_test_result(self, test_result: Dict[str, Any],
+                            at_step: int, at_epoch: int) -> None:
+        """Record a completed test result into stats. Main-thread only."""
+        test_record = {
+            'step': at_step,
+            'epoch': at_epoch,
+            'timestamp': datetime.now().isoformat(),
+            **test_result,
+        }
+        self.stats.test_history.append(test_record)
+
+        if self.stats_collector:
+            self.stats_collector.record_evaluation(
+                step=at_step, epoch=at_epoch, test_record=test_record,
+            )
+
+        wr = test_result.get('ml_win_rate', 0)
+        p1wr = test_result.get('ml_as_p1_win_rate', 0)
+        p2wr = test_result.get('ml_as_p2_win_rate', 0)
+        print(f"  [async test @ step {at_step}] ML Win Rate: {wr*100:.1f}%"
+              f"  (P1: {p1wr*100:.1f}%, P2: {p2wr*100:.1f}%)")
+
+        self._log({'type': 'test_vs_algo', **test_record})
+        self._save_stats()
 
     def _should_use_scoring_for_epoch(self, epoch: int) -> bool:
         """Determine whether to use the scoring system for a given epoch number."""
@@ -1681,7 +2065,6 @@ class Trainer:
             if first_batch:
                 print(f"  First batch loaded. Processing {total_batches} batches...")
                 sys.stdout.flush()
-                first_batch = False
 
             if self._stopped:
                 break
@@ -1695,12 +2078,6 @@ class Trainer:
             if _thermal_enabled:
                 self._check_thermal_and_rest()
 
-            # Only time steps when stats recording needs it (avoids 2× time.time() per step)
-            _will_record = (_stats_collector and
-                            (self.step + 1) % _stats_record_every == 0)
-            if _will_record:
-                _step_start = time.time()
-
             # Move to device — skip when CUDAPrefetcher already transferred
             # or when data is GPU-resident (already on device)
             if not _use_prefetcher and not _data_on_gpu:
@@ -1710,8 +2087,13 @@ class Trainer:
                 targets = targets.to(_device, non_blocking=True)
             # Conditionally load reward weights / value targets
             if not use_scoring:
-                # Compiled path needs a tensor (never None); reuse pre-allocated ones
-                reward_weights = _uniform_rw if _uniform_rw is not None else None
+                # Compiled path needs a tensor (never None); reuse pre-allocated ones.
+                # Slice to actual batch size in case drop_last=False yields a smaller batch.
+                if _uniform_rw is not None:
+                    _bs = boards.shape[0]
+                    reward_weights = _uniform_rw[:_bs] if _bs < _uniform_rw.shape[0] else _uniform_rw
+                else:
+                    reward_weights = None
             elif not _use_prefetcher and not _data_on_gpu:
                 reward_weights = reward_weights.to(_device, non_blocking=True)
             if not _value_head_enabled:
@@ -1741,6 +2123,8 @@ class Trainer:
 
             if _use_compiled:
                 # ── Compiled path: fused forward+loss in single CUDAGraph ──
+                # nan_to_num inside the compiled function sanitizes NaN/Inf loss
+                # without CUDA sync.  No per-step torch.isfinite() needed.
                 if _use_amp:
                     with autocast(device_type='cuda', dtype=_amp_dtype):
                         loss, _current_scores = _compiled_fwd_loss(
@@ -1749,16 +2133,15 @@ class Trainer:
                     loss, _current_scores = _compiled_fwd_loss(
                         boards, move_features, move_counts, targets, reward_weights)
 
-                if _do_sanity:
-                    # Compiled path is always padded — scores have -inf padding,
-                    # so only NaN indicates a real problem
-                    if (torch.isnan(_current_scores).any()
-                            or not torch.isfinite(loss)):
-                        print("  Warning: non-finite values detected; skipping batch")
-                        if _stats_collector:
-                            _stats_collector.record_non_finite_event(
-                                self.step, 'compiled_fwd_loss', 'Non-finite output')
-                        continue
+                # Score-level NaN check at sanity interval only (expensive array-wide check)
+                if _do_sanity and torch.isnan(_current_scores).any():
+                    print("  Warning: NaN scores detected; skipping batch")
+                    if self._repair_batchnorm_stats():
+                        print("  Repaired corrupted BatchNorm running stats")
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
+                            self.step, 'compiled_fwd_loss', 'NaN scores')
+                    continue
 
                 if accum_steps > 1:
                     loss = loss / accum_steps
@@ -1819,6 +2202,8 @@ class Trainer:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
                         print("  Warning: non-finite scores detected; skipping batch")
+                        if self._repair_batchnorm_stats():
+                            print("  Repaired corrupted BatchNorm running stats")
                         if _stats_collector:
                             _stats_collector.record_non_finite_event(
                                 self.step, 'model_scores', 'Non-finite output scores')
@@ -1838,12 +2223,12 @@ class Trainer:
                 if accum_steps > 1:
                     loss = loss / accum_steps
 
-                if _do_sanity and not torch.isfinite(loss):
-                    print("  Warning: non-finite loss detected; skipping batch")
-                    if _stats_collector:
-                        _stats_collector.record_non_finite_event(
-                            self.step, 'loss', 'Non-finite loss value')
-                    continue
+                # NaN-safe: replace non-finite loss with 0 to avoid CUDA sync.
+                # GradScaler path: scaler.step() already detects NaN grads and
+                # skips the optimizer step, so this is just belt-and-suspenders.
+                # No-scaler (bfloat16) path: prevents NaN gradient corruption.
+                # Zero loss → zero gradients → optimizer step is a near-no-op.
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
                 if _scaler is not None:
                     _scaler.scale(loss).backward()
@@ -1872,6 +2257,8 @@ class Trainer:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
                         print("  Warning: non-finite scores detected; skipping batch")
+                        if self._repair_batchnorm_stats():
+                            print("  Repaired corrupted BatchNorm running stats")
                         if _stats_collector:
                             _stats_collector.record_non_finite_event(
                                 self.step, 'model_scores', 'Non-finite output scores (FP32)')
@@ -1890,15 +2277,14 @@ class Trainer:
                 if accum_steps > 1:
                     loss = loss / accum_steps
 
-                if _do_sanity and not torch.isfinite(loss):
-                    print("  Warning: non-finite loss detected; skipping batch")
-                    if _stats_collector:
-                        _stats_collector.record_non_finite_event(
-                            self.step, 'loss', 'Non-finite loss value (FP32)')
-                    continue
+                # NaN-safe: replace non-finite loss with 0 (no CUDA sync needed).
+                # No-AMP path typically runs on CPU where sync isn't a concern,
+                # but consistency with AMP path and no behavioral change.
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
                 loss.backward()
 
             _micro_step += 1
+            first_batch = False
 
             # --- Optimizer step: only after accumulating enough gradients ---
             if _micro_step < accum_steps:
@@ -1909,6 +2295,13 @@ class Trainer:
 
             # Accumulated enough — clip, step, and reset
             _micro_step = 0
+
+            # Time the optimizer step (placed after accumulation continue so
+            # _step_start is always fresh for the step that actually records).
+            _will_record = (_stats_collector and
+                            (self.step + 1) % _stats_record_every == 0)
+            if _will_record:
+                _step_start = time.time()
 
             # Gradient clipping + stats.  clip_grad_norm_ returns the total
             # (unclipped) grad norm, so we capture it instead of iterating all
@@ -1959,7 +2352,21 @@ class Trainer:
                 _step % _stats_record_every == 0
                 or _step % _checkpoint_every == 0
             )
-            _loss_val = loss.item() if _need_loss_val else None
+            # `loss` was divided by accum_steps for gradient scaling; undo that
+            # for human-readable reporting (no extra sync — same .item() call).
+            _loss_val = (loss.item() * accum_steps) if _need_loss_val else None
+
+            # Periodic NaN monitoring: piggyback on the stats sync to check
+            # for NaN losses without an extra CUDA sync.  nan_to_num converts
+            # NaN → 0.0, so a zero loss at a stats interval signals a bad batch.
+            if _loss_val is not None and _loss_val == 0.0 and _step > 0:
+                # loss == 0.0 is extremely unlikely in normal training (cross-entropy
+                # is always > 0 for non-degenerate data).  Likely a nan_to_num replacement.
+                if self._repair_batchnorm_stats():
+                    print("  Repaired corrupted BatchNorm running stats (NaN loss detected)")
+                if _stats_collector:
+                    _stats_collector.record_non_finite_event(
+                        _step, 'nan_to_num', 'NaN/Inf loss replaced with 0 by nan_to_num')
 
             # Record step stats every N steps (to avoid excessive memory usage)
             if _loss_val is not None and _step % _stats_record_every == 0:
@@ -1997,9 +2404,14 @@ class Trainer:
             if _stats_collector and _step % _stats_model_health_every == 0:
                 _stats_collector.record_model_health(_model, _step)
 
-            # Checkpoint
+            # Checkpoint — reuse _loss_val if already computed at this step
+            # (avoids a redundant .item() CUDA sync when checkpoint and stats
+            # recording align on the same step).
             if _step % _checkpoint_every == 0:
-                avg_loss = (total_loss_acc / max(num_batches, 1)).item()
+                if _loss_val is not None:
+                    avg_loss = _loss_val
+                else:
+                    avg_loss = (total_loss_acc / max(num_batches, 1)).item()
                 self._save_checkpoint(avg_loss)
 
                 # Log metrics
@@ -2007,7 +2419,7 @@ class Trainer:
                 self._log({
                     'step': _step,
                     'loss': avg_loss,
-                    'lr': _cfg.learning_rate,
+                    'lr': current_lr,
                     'gpu_mem_mb': gpu_mem,
                 })
 
@@ -2024,24 +2436,19 @@ class Trainer:
         # Expose to caller for dead-epoch detection
         self._last_epoch_batches = num_batches
 
-        # Record epoch in stats collector — single sync for the whole epoch
+        # Single .item() CUDA sync for the epoch average — reuse for both
+        # stats recording and return value.
+        _avg_loss = (total_loss_acc / max(num_batches, 1)).item()
         if _stats_collector:
-            avg = (total_loss_acc / max(num_batches, 1)).item()
             _stats_collector.record_epoch(
                 epoch=self.epoch + 1,  # will be incremented by caller
                 step=self.step,
-                avg_loss=avg,
+                avg_loss=_avg_loss,
                 num_batches=num_batches,
                 epoch_time_sec=epoch_time,
             )
 
-        return (total_loss_acc / max(num_batches, 1)).item()
-
-    # Fixed pad width for the loss scatter matrix.  Avoids a CUDA sync from
-    # counts.max().item() on every step.  64 matches CachedTensorDataset's
-    # max_moves_per_sample; any position with more legal moves is safely
-    # clamped (impossible in standard Dama — max legal moves is ~20).
-    _LOSS_PAD_SIZE = 64
+        return _avg_loss
 
     def _compute_loss(
         self,
@@ -2061,23 +2468,26 @@ class Trainer:
         then applies log_softmax in one GPU call.
         """
         batch_size = move_counts.shape[0]
-        counts = move_counts.long()
 
-        # Use fixed pad size to avoid counts.max().item() CUDA sync every step.
+        # Use config pad size to avoid counts.max().item() CUDA sync every step.
         # -inf padding slots get zero probability from log_softmax, so over-padding
-        # is harmless (just a small allocation overhead: batch_size * 64 floats).
-        max_moves = self._LOSS_PAD_SIZE
+        # is harmless (just a small allocation overhead).
+        max_moves = self.config.max_moves_per_sample
 
         # Fast check: if total moves is zero, return zero loss (no sync needed —
         # scores.shape[0] is determined before the GPU kernel, by the collate).
         if scores.shape[0] == 0:
             return scores.sum() * 0
 
+        # move_counts/targets are int32; use directly for comparisons.
+        # Cast to int64 only where required (cumsum for indexing, gather).
+        counts_l = move_counts.long()
+
         # Build scatter indices without a Python loop.
         # exclusive_cumsum[i] = start offset of position i inside the flat scores tensor.
-        exclusive_cumsum = counts.cumsum(0) - counts          # (batch_size,)
+        exclusive_cumsum = counts_l.cumsum(0) - counts_l      # (batch_size,)
         row_idx = torch.repeat_interleave(
-            torch.arange(batch_size, device=scores.device), counts
+            torch.arange(batch_size, device=scores.device), counts_l
         )                                                      # (total_moves,)
         col_idx = (
             torch.arange(scores.shape[0], device=scores.device, dtype=torch.long)
@@ -2098,7 +2508,7 @@ class Trainer:
         # Positions with zero moves have an all-inf row: log_softmax(-inf,...) = nan.
         # Set those rows to 0 so softmax gives uniform output — their weight (w=0)
         # ensures they never contribute to the loss regardless.
-        no_moves = counts == 0
+        no_moves = move_counts == 0
         padded = torch.where(
             no_moves.unsqueeze(1).expand_as(padded), torch.zeros_like(padded), padded
         )
@@ -2111,8 +2521,8 @@ class Trainer:
         safe_targets = targets.long().clamp(0, max_moves - 1).unsqueeze(1)  # (batch_size, 1)
         chosen_log_probs = log_probs.gather(1, safe_targets).squeeze(1)     # (batch_size,)
 
-        # Mask entries with zero moves or out-of-range target index.
-        valid = (counts > 0) & (targets.long() >= 0) & (targets.long() < counts)
+        # Mask entries with zero moves or out-of-range target index (int32 comparisons).
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
 
         # Build per-sample weights (zero for invalid entries).
         if reward_weights is not None:
@@ -2143,10 +2553,10 @@ class Trainer:
         if batch_size == 0:
             return scores.sum() * 0
 
-        counts = move_counts.long()
-
+        # move_counts/targets are int32; use directly for comparisons,
+        # cast to int64 only for gather (which requires LongTensor).
         # Zero-move rows are all-inf → replace with 0 for stable softmax
-        no_moves = counts == 0
+        no_moves = move_counts == 0
         scores = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
 
         log_probs = torch.nn.functional.log_softmax(scores.float(), dim=1)
@@ -2156,7 +2566,7 @@ class Trainer:
         safe_targets = targets.long().clamp(0, max_moves - 1).unsqueeze(1)
         chosen_log_probs = log_probs.gather(1, safe_targets).squeeze(1)
 
-        valid = (counts > 0) & (targets.long() >= 0) & (targets.long() < counts)
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
 
         if reward_weights is not None:
             w = reward_weights.float().squeeze(-1) * valid.float()
@@ -2233,6 +2643,8 @@ class Trainer:
             ram_threshold_gb=self.config.ram_cache_threshold_gb,
             device=self.device,
             capacity=self.config.replay_max_entries if _simultaneous else 0,
+            max_moves_per_sample=self.config.max_moves_per_sample,
+            amp_enabled=self.config.amp,
         )
         _is_fast = isinstance(dataloader, FastBatchIterator)
         self._use_padded = _is_fast or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
@@ -2258,6 +2670,66 @@ class Trainer:
         loss = 0.0  # Initialize loss in case loop doesn't run
         _consecutive_dead_epochs = 0  # epochs where all batches were skipped (non-finite)
         _DEAD_EPOCH_RECOVERY_THRESHOLD = 3  # trigger checkpoint rollback after this many
+        _stale_epochs = 0  # epochs since last data refresh
+        _max_stale = self.config.max_stale_epochs  # 0 = unlimited
+
+        # Async testing: run model evaluation on CPU in a background thread
+        # so GPU training continues uninterrupted.  Testing uses CPU workers
+        # (ProcessPoolExecutor) and never touches the GPU, so the only sync
+        # cost is the ~2ms model save before spawning the thread.
+        _async_test_thread = None
+        _async_test_result = [None]   # mutable container for thread result
+        _async_test_step = [0]
+        _async_test_epoch = [0]
+
+        def _start_async_test():
+            nonlocal _async_test_thread
+            # Save model in main thread (brief CUDA sync for state_dict copy)
+            _test_path = Path(self.config.checkpoint_dir) / "temp_async_test.pt"
+            _test_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'arch_params': getattr(self.model, 'arch_params', {}),
+                'step': self.step,
+            }, _test_path)
+            _async_test_step[0] = self.step
+            _async_test_epoch[0] = self.epoch
+            _async_test_result[0] = None
+
+            _test_path_str = str(_test_path)
+            _n_games = self.config.test_games
+            _diff = self.config.test_difficulty
+            _max_mv = self.config.selfplay_max_moves
+            _n_wk = min(self.config.cpu_workers, 4)
+
+            def _worker():
+                try:
+                    _async_test_result[0] = self._run_test_cpu_only(
+                        _test_path_str, _n_games, _diff, _max_mv, _n_wk)
+                except Exception as e:
+                    print(f"  [async test] error: {e}")
+                finally:
+                    try:
+                        Path(_test_path_str).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            _async_test_thread = threading.Thread(target=_worker, daemon=True)
+            _async_test_thread.start()
+            print(f"  [async test] started ({_n_games} games vs {_diff})")
+
+        def _collect_async_test():
+            nonlocal _async_test_thread
+            if _async_test_thread is None:
+                return
+            if _async_test_thread.is_alive():
+                return  # still running
+            result = _async_test_result[0]
+            if result is not None:
+                self._record_test_result(
+                    result, _async_test_step[0], _async_test_epoch[0])
+            _async_test_thread = None
+            _async_test_result[0] = None
 
         # Start continuous background self-play immediately so CPU is never idle.
         # Full game count (not half) — GPU epochs are ~100x faster than self-play,
@@ -2304,10 +2776,13 @@ class Trainer:
                         last_ckpt = str(ckpts[-1])
                         print(f"  Rolling back to checkpoint: {last_ckpt}")
                         self._load_checkpoint(last_ckpt)
-                        # Reset GradScaler to prevent the same overflow pattern
+                        # Reset GradScaler with conservative scale to prevent
+                        # re-triggering the same overflow.  Default init_scale=65536
+                        # is too aggressive for trained models — use 1024 (same as
+                        # the resume-without-scaler-state path).
                         if self.scaler is not None:
-                            self.scaler = GradScaler()
-                            print("  GradScaler reset to default scale")
+                            self.scaler = GradScaler(init_scale=2**10)
+                            print(f"  GradScaler reset to conservative scale={self.scaler.get_scale():.0f}")
                     else:
                         print("  No checkpoints found — resetting model from scratch")
                         self._reset_model_state("No checkpoint for recovery")
@@ -2317,39 +2792,58 @@ class Trainer:
             else:
                 _consecutive_dead_epochs = 0
 
+            _stale_epochs += 1
+
             if _simultaneous:
                 # Continuous background self-play: check if new data is ready
                 bg_dataset, bg_incremental = self._collect_background_selfplay()
                 if bg_dataset is not None:
                     print(f"Background self-play complete — refreshing DataLoader "
                           f"({len(bg_dataset)} entries)...")
-                    # Track current dataset for incremental updates in next cycle
-                    self._current_dataset = bg_dataset
-                    # In-place GPU buffer update: when incremental data is available,
-                    # only upload the new entries via PCIe (~60MB) instead of the
-                    # full merged dataset (~2GB).  GPU-side shift handles old entries.
-                    _is_fast = isinstance(dataloader, FastBatchIterator)
-                    if _is_fast:
-                        _update_src = bg_incremental if bg_incremental is not None else bg_dataset
-                        dataloader.update_data(
-                            _update_src, max_entries=self.config.replay_max_entries)
-                        dataloader.dataset = bg_dataset
-                    else:
-                        # Fallback: recreate dataloader (non-FastBatchIterator path)
-                        _was_gpu = getattr(dataloader, 'on_gpu', False)
-                        if _was_gpu:
-                            dataloader = None
-                            torch.cuda.empty_cache()
-                        dataloader = create_dataloader_from_dataset(
-                            bg_dataset,
-                            batch_size=self.config.batch_size,
-                            num_workers=effective_workers,
-                            pin_memory=self.config.pin_memory,
-                            device=self.device,
-                        )
-                    self._use_padded = True
-                    _gpu_resident = getattr(dataloader, 'on_gpu', False)
+                    dataloader, _gpu_resident = self._refresh_dataloader(
+                        dataloader, bg_dataset, bg_incremental, effective_workers)
+                    _stale_epochs = 0  # Fresh data arrived — reset counter
                     # Background thread is continuous — no need to restart
+                elif _max_stale > 0 and _stale_epochs >= _max_stale:
+                    # GPU has exhausted the current data — yield until fresh data
+                    # arrives.  This saves thermal budget and prevents overfitting
+                    # on memorized data (GPU trains ~100-144x faster than self-play).
+                    # Use _data_ready_event for zero-latency wakeup instead of
+                    # time.sleep(0.5) polling (saves up to 500ms per data arrival).
+                    while not self._stopped:
+                        # Respect pause commands while waiting
+                        while self._paused and not self._stopped:
+                            time.sleep(0.1)
+                        if self._stopped:
+                            break
+                        # If background thread died, resume training on stale data
+                        # rather than spinning forever.
+                        if (self._bg_selfplay_thread is not None
+                                and not self._bg_selfplay_thread.is_alive()):
+                            print("Warning: background self-play thread died "
+                                  "— resuming training on existing data")
+                            _stale_epochs = 0
+                            break
+                        # Clear event BEFORE checking for data so that any
+                        # signal set by the bg thread after our check is
+                        # preserved for the wait() call.  Previous pattern
+                        # (check → clear → wait) lost signals that arrived
+                        # between check and clear, adding up to 2s latency.
+                        self._data_ready_event.clear()
+                        bg_dataset, bg_incremental = self._collect_background_selfplay()
+                        if bg_dataset is not None:
+                            print(f"Fresh data arrived after {_stale_epochs} stale epochs "
+                                  f"— refreshing ({len(bg_dataset)} entries)...")
+                            dataloader, _gpu_resident = self._refresh_dataloader(
+                                dataloader, bg_dataset, bg_incremental, effective_workers)
+                            _stale_epochs = 0
+                            break
+                        # No data yet — block until the bg thread signals or
+                        # 2s timeout for stop/pause/thermal checks.
+                        self._data_ready_event.wait(timeout=2.0)
+                        # Check stop conditions while waiting
+                        if self.config.stop_time and datetime.now() >= self.config.stop_time:
+                            break
             else:
                 # Alternate mode: generate data synchronously, then rebuild dataloader
                 print("Running self-play (alternate mode)...")
@@ -2362,7 +2856,7 @@ class Trainer:
                         print(f"Cleared {deleted} replay files after loading")
                 if train_entries:
                     dataset = CachedTensorDataset.from_entries(
-                        train_entries, max_moves_per_sample=64, show_progress=True,
+                        train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True,
                     )
                     # Free old GPU tensors before allocating new ones
                     _was_gpu = getattr(dataloader, 'on_gpu', False)
@@ -2375,19 +2869,30 @@ class Trainer:
                         num_workers=effective_workers,
                         pin_memory=self.config.pin_memory,
                         device=self.device,
+                        amp_enabled=self.config.amp,
                     )
                     self._use_padded = True
                     _gpu_resident = getattr(dataloader, 'on_gpu', False)
-            
-            # Periodic model testing vs algorithm
-            if (self.config.test_vs_algo and 
-                self.step > 0 and 
-                self.step - last_test_step >= self.config.test_every):
+
+            # Collect completed async test (non-blocking)
+            _collect_async_test()
+
+            # Start async test if due and no test currently running
+            if (self.config.test_vs_algo and
+                self.step > 0 and
+                self.step - last_test_step >= self.config.test_every and
+                (_async_test_thread is None or not _async_test_thread.is_alive())):
                 try:
-                    self.run_test_vs_algo()
+                    _start_async_test()
                     last_test_step = self.step
                 except Exception as e:
-                    print(f"Test vs algorithm failed: {e}")
+                    print(f"  [async test] failed to start: {e}")
+
+        # Collect any in-flight async test before exit
+        if _async_test_thread is not None and _async_test_thread.is_alive():
+            print("Waiting for async test to complete...")
+            _async_test_thread.join(timeout=30)
+        _collect_async_test()
 
         # Wait for any background self-play to finish before exit
         if _simultaneous and self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
@@ -2396,8 +2901,8 @@ class Trainer:
 
         # Final checkpoint
         self._save_checkpoint(loss)
-        
-        # Final test vs algorithm
+
+        # Final test vs algorithm (synchronous — training is done)
         if self.config.test_vs_algo:
             try:
                 print("\nRunning final model evaluation...")
@@ -2543,6 +3048,57 @@ def load_config_from_yaml(config_path: str, profile: Optional[str] = None) -> Di
     return config
 
 
+def _auto_detect_resume(resume_cfg: dict, paths_cfg: dict) -> Optional[str]:
+    """Resolve the resume checkpoint path from YAML config.
+
+    When ``resume.enabled`` is True and ``checkpoint_path`` is null (None),
+    auto-detects the latest valid checkpoint in the checkpoint directory.
+    Skips checkpoints whose model weights contain NaN/Inf when
+    ``skip_corrupted`` is True (default).
+    """
+    if not resume_cfg.get('enabled', False):
+        return None
+
+    explicit = resume_cfg.get('checkpoint_path')
+    if explicit:
+        return str(explicit)
+
+    # Auto-detect: find the latest checkpoint by step number.
+    ckpt_dir = Path(paths_cfg.get('checkpoint_dir', 'models/checkpoints'))
+    if not ckpt_dir.exists():
+        return None
+
+    import re as _re
+    checkpoints = sorted(
+        ckpt_dir.glob('model_step_*.pt'),
+        key=lambda p: int(_re.search(r'(\d+)', p.stem).group(1))
+        if _re.search(r'(\d+)', p.stem) else 0,
+        reverse=True,
+    )
+    if not checkpoints:
+        return None
+
+    skip_corrupted = resume_cfg.get('skip_corrupted', True)
+    if not skip_corrupted:
+        # Take the latest without validation
+        print(f"Auto-detected checkpoint: {checkpoints[0]}")
+        return str(checkpoints[0])
+
+    # Validate checkpoints (newest first), skip corrupted ones
+    for ckpt in checkpoints:
+        try:
+            c = torch.load(ckpt, map_location='cpu', weights_only=True)
+            sd = c.get('model_state_dict', c)
+            if all(torch.isfinite(v).all() for v in sd.values()
+                   if isinstance(v, torch.Tensor)):
+                print(f"Auto-detected checkpoint: {ckpt}")
+                return str(ckpt)
+            print(f"  Skipping corrupted checkpoint: {ckpt}")
+        except Exception as e:
+            print(f"  Skipping unreadable checkpoint {ckpt}: {e}")
+    return None
+
+
 def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     """
     Convert YAML config dictionary to TrainingConfig dataclass.
@@ -2588,6 +3144,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         amp_dtype=device_cfg.get('amp', {}).get('dtype', 'float16'),
         compile_model=device_cfg.get('compile', {}).get('enabled', True),
         compile_mode=device_cfg.get('compile', {}).get('mode', 'reduce-overhead'),
+        matmul_precision=device_cfg.get('matmul_precision', 'medium'),
         # Model architecture
         model_channels=model_cfg.get('channels', 64),
         model_blocks=model_cfg.get('num_blocks', 4),
@@ -2602,6 +3159,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         selfplay_noise_prob=selfplay_cfg.get('noise_prob', 0.1),
         selfplay_max_moves=selfplay_cfg.get('max_moves_per_game', 200),
         pipeline_mode=selfplay_cfg.get('pipeline_mode', 'simultaneous'),
+        max_stale_epochs=selfplay_cfg.get('max_stale_epochs', 0),
         # Algo-vs-algo settings
         algo_vs_algo_enabled=algo_vs_algo_cfg.get('enabled', False),
         algo_vs_algo_games=algo_vs_algo_cfg.get('games_per_epoch', 100),
@@ -2633,6 +3191,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         ram_cache_threshold_gb=dataloader_cfg.get('ram_cache', {}).get('threshold_gb', 8.0),
         replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
         clear_replay_after_load=dataloader_cfg.get('clear_replay_after_load', False),
+        max_moves_per_sample=dataloader_cfg.get('max_moves_per_sample', 32),
         # Testing settings
         test_vs_algo=testing_cfg.get('enabled', False),
         test_every=testing_cfg.get('every_n_steps', 5000),
@@ -2658,8 +3217,11 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         thermal_temp_limit_c=thermal_cfg.get('temp_limit_c', 90),
         thermal_rest_seconds=_parse_rest_duration(thermal_cfg.get('rest_duration', '5m')),
         thermal_check_every=thermal_cfg.get('check_every', 30),
-        # Resume (respect the enabled flag — don't resume when disabled even if path is set)
-        resume=resume_cfg.get('checkpoint_path') if resume_cfg.get('enabled', False) else None,
+        # Resume: when enabled with no specific path, auto-detect the latest checkpoint.
+        # This matches the documented behavior ("null = auto-detect latest") in all
+        # YAML configs.  Without this, resume.enabled=True + checkpoint_path=null
+        # silently starts fresh instead of resuming.
+        resume=_auto_detect_resume(resume_cfg, paths_cfg),
         stop_time=stop_time,
     )
 

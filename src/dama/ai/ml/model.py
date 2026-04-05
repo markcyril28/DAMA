@@ -147,6 +147,12 @@ class MoveScorerNet(nn.Module):
         self.board_encoder = BoardEncoder(embedding_size, num_blocks, channels)
         self.move_scorer = MoveScorer(embedding_size, hidden_size)
 
+        # Lazily-allocated arange buffer for forward_padded mask.
+        # Avoids creating a new tensor every forward call.  Registered as
+        # a non-persistent buffer so it moves with .to(device) but is NOT
+        # saved in checkpoints (it's reconstructed from max_moves at runtime).
+        self.register_buffer('_mask_arange', None, persistent=False)
+
         # Optional value head for TD/value learning
         self.value_head_enabled = value_head_enabled
         if value_head_enabled:
@@ -284,8 +290,11 @@ class MoveScorerNet(nn.Module):
         x = self.move_scorer.fc3(x)
         scores = x.squeeze(-1)  # (batch, max_moves)
 
-        # Mask invalid (padding) slots to -inf
-        arange = torch.arange(max_moves, device=board.device)
+        # Mask invalid (padding) slots to -inf.
+        # Reuse cached arange buffer (allocated once, moves with .to(device)).
+        if self._mask_arange is None or self._mask_arange.shape[0] < max_moves:
+            self._mask_arange = torch.arange(max_moves, device=board.device)
+        arange = self._mask_arange[:max_moves]
         valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
         scores = scores.masked_fill(~valid_mask, float('-inf'))
 
@@ -316,7 +325,9 @@ class MoveScorerNet(nn.Module):
         x = self.move_scorer.fc3(x)
         scores = x.squeeze(-1)
 
-        arange = torch.arange(max_moves, device=board.device)
+        if self._mask_arange is None or self._mask_arange.shape[0] < max_moves:
+            self._mask_arange = torch.arange(max_moves, device=board.device)
+        arange = self._mask_arange[:max_moves]
         valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
         scores = scores.masked_fill(~valid_mask, float('-inf'))
 
@@ -346,8 +357,9 @@ class MoveScorerNet(nn.Module):
         # Encode board
         board_embedding = self.board_encoder(board)  # (1, embedding_size)
 
-        # Expand for all moves (.contiguous() ensures a real copy for efficient matmul)
-        expanded_embedding = board_embedding.expand(num_moves, -1).contiguous()
+        # Expand for all moves (strided view — torch.cat in MoveScorer produces
+        # a contiguous tensor anyway, so an explicit .contiguous() is redundant)
+        expanded_embedding = board_embedding.expand(num_moves, -1)
 
         # Score moves
         scores = self.move_scorer(expanded_embedding, move_features)

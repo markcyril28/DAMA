@@ -804,7 +804,7 @@ class StatsCollector:
 
         # Compute ELO estimate
         wr = test_record.get('ml_win_rate', 0.0)
-        dr = test_record.get('draw_rate', 0.0) if 'draw_rate' in test_record else 0.0
+        dr = test_record.get('draw_rate', 0.0)
         record['estimated_elo_diff'] = _elo_from_win_rate(wr, dr)
 
         # Win rate trend (rolling over last 5 evaluations)
