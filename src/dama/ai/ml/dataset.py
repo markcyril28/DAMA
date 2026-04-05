@@ -473,12 +473,12 @@ def preprocess_entries_to_tensors(
         )
 
     # Parallelize for large datasets where IPC cost is amortized.
-    # Scale workers with core count, tiered caps to avoid IPC bottlenecks:
-    #   128+ cores → 48 workers, 48+ → 24, else → 16.
-    # Beyond ~48 workers, pickle serialization and scheduling overhead
-    # dominate over compute gains.
+    # Scale workers with core count, tiered caps to avoid IPC bottlenecks.
+    # Fork+SharedMemory path has near-zero IPC: workers read from inherited
+    # globals and write directly to shared memory — no pickle serialization
+    # of input OR output. Higher worker counts pay off on high-core machines.
     _cores = os.cpu_count() or 1
-    _worker_cap = 48 if _cores >= 96 else (24 if _cores >= 48 else 16)
+    _worker_cap = 64 if _cores >= 128 else (48 if _cores >= 96 else (24 if _cores >= 48 else 16))
     num_workers = max(1, min(_worker_cap, _cores // 2))
 
     # Fork path (Linux) has near-zero serialization cost — lower threshold.
@@ -798,7 +798,7 @@ class CachedTensorDataset(Dataset):
 
         if n >= _parallel_threshold:
             _cores = os.cpu_count() or 1
-            _worker_cap = 48 if _cores >= 96 else (24 if _cores >= 48 else 16)
+            _worker_cap = 64 if _cores >= 128 else (48 if _cores >= 96 else (24 if _cores >= 48 else 16))
             num_workers = max(1, min(_worker_cap, _cores // 2))
             _MIN_CHUNK = 500
             chunk_size = max(_MIN_CHUNK, (n + num_workers - 1) // num_workers)
