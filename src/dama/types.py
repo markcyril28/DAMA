@@ -21,7 +21,7 @@ class PieceType(Enum):
     KING = "king"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Piece:
     """A game piece on the board."""
     player: Player
@@ -30,7 +30,7 @@ class Piece:
     @property
     def is_king(self) -> bool:
         """Check if this piece is a king."""
-        return self.piece_type == PieceType.KING
+        return self.piece_type is PieceType.KING
 
     def promote(self) -> "Piece":
         """Return a promoted (king) version of this piece."""
@@ -41,7 +41,7 @@ class Piece:
 Position = Tuple[int, int]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Move:
     """
     Represents a move in Filipino Dama.
@@ -77,10 +77,15 @@ class Move:
         return len(self.captures)
 
     def to_dict(self) -> dict:
-        """Convert move to a JSON-serializable dict."""
+        """Convert move to a JSON-serializable dict.
+
+        Returns tuples as-is — they serialize identically to lists in JSON
+        and all consumers use [0]/[1] indexing which works for both types.
+        Avoids ~24 list() constructor calls per position.
+        """
         return {
-            "path": [list(p) for p in self.path],
-            "captures": [list(c) for c in self.captures],
+            "path": self.path,
+            "captures": self.captures,
             "promotion": self.promotion,
         }
 
