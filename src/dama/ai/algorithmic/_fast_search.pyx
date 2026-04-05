@@ -1368,7 +1368,7 @@ def fast_search(
     cdef CMoveList moves
     cdef SearchState ss
     cdef Rules rules
-    cdef int best_idx, best_depth
+    cdef int best_idx, best_depth, idx
     cdef int depth
 
     # Parse difficulty
@@ -1414,78 +1414,84 @@ def fast_search(
     global _tt_generation
     _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
 
-    # Compute initial Zobrist hash and initialize killer/history tables
-    h = compute_hash(board, player)
-    _init_search_tables(&ss)
-
-    # Order moves using full heuristic (TT move from prior searches + killers + history)
+    # Declare C variables before the nogil block
     cdef int _tt_from = -1, _tt_to = -1
     cdef float _d_score, _d_alpha, _d_beta
-    if _tt_table != NULL:
-        _d_alpha = -100000.0; _d_beta = 100000.0
-        tt_probe(h, 0, &_d_score, &_d_alpha, &_d_beta, &_tt_from, &_tt_to)
-    _order_moves_full(&moves, 0, &ss, _tt_from, _tt_to, board, -1, -1)
-
-    deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
-    ss.deadline = deadline
-    ss.nodes = 0
-    ss.timeout = False
+    cdef CMove _tmp_move
+    cdef float prev_score = 0.0
+    cdef float asp_delta, asp_alpha, asp_beta
 
     best_idx = 0
     best_depth = 0
 
-    cdef CMove _tmp_move
+    # Release the GIL for the entire compute-intensive section.
+    # All operations below are pure C — no Python objects touched.
+    # This enables true multi-threading when fast_search is called from
+    # concurrent threads (e.g. ThreadPoolExecutor in self-play workers).
+    # The transposition table (_tt_table) uses lockless sharing — concurrent
+    # reads/writes may occasionally corrupt entries, but this is a well-
+    # established technique in parallel game-tree search (cf. Stockfish).
+    # Corrupted TT entries only reduce search efficiency, never correctness
+    # (move generation is deterministic, TT probes have hash verification).
+    with nogil:
+        # Compute initial Zobrist hash and initialize killer/history tables
+        h = compute_hash(board, player)
+        _init_search_tables(&ss)
 
-    # Aspiration window: at depth >= 5 (medium+), narrow the search window
-    # around the previous iteration's score. If the result falls outside the
-    # window, widen progressively (2×) and retry before falling back to a full
-    # window. Payoff increases with depth — the savings from narrower windows
-    # outweigh the occasional re-search cost when the tree is large.
-    # At depth < 5 (easy), the tree is small enough that full-window PVS
-    # is faster than the overhead of fail/retry cycles.
-    cdef float prev_score = 0.0
-    cdef float asp_delta, asp_alpha, asp_beta
+        # Order moves using full heuristic (TT move from prior searches + killers + history)
+        if _tt_table != NULL:
+            _d_alpha = -100000.0; _d_beta = 100000.0
+            tt_probe(h, 0, &_d_score, &_d_alpha, &_d_beta, &_tt_from, &_tt_to)
+        _order_moves_full(&moves, 0, &ss, _tt_from, _tt_to, board, -1, -1)
 
-    for depth in range(1, max_depth + 1):
+        deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
+        ss.deadline = deadline
+        ss.nodes = 0
         ss.timeout = False
 
-        if depth < 5:
-            # Full window for shallow depths
-            idx = search_root(board, player, &moves, depth,
-                              -100000.0, 100000.0, &rules, &ss, h)
-        else:
-            # Aspiration window with progressive widening on fail
-            asp_delta = 75.0  # ~3/4 man value — wide enough for typical depth changes
-            while True:
-                asp_alpha = prev_score - asp_delta
-                asp_beta = prev_score + asp_delta
-                idx = search_root(board, player, &moves, depth,
-                                  asp_alpha, asp_beta, &rules, &ss, h)
-                if ss.timeout:
-                    break
-                if ss.root_score > asp_alpha and ss.root_score < asp_beta:
-                    break  # Score within window — accept result
-                # Fail-low or fail-high: widen window
-                asp_delta = asp_delta * 2.0
-                if asp_delta >= 5000.0:
-                    # Window is wide enough — fall back to full window
-                    ss.timeout = False
-                    idx = search_root(board, player, &moves, depth,
-                                      -100000.0, 100000.0, &rules, &ss, h)
-                    break
+        # Iterative deepening with aspiration windows.
+        # At depth < 5 (easy), the tree is small enough that full-window PVS
+        # is faster than the overhead of fail/retry cycles.
+        for depth in range(1, max_depth + 1):
+            ss.timeout = False
 
-        if not ss.timeout:
-            best_idx = idx
-            best_depth = depth
-            prev_score = ss.root_score
-            # Swap best move to position 0 for next ID iteration
-            if best_idx != 0:
-                _tmp_move = moves.moves[0]
-                moves.moves[0] = moves.moves[best_idx]
-                moves.moves[best_idx] = _tmp_move
-                best_idx = 0
-        if ss.timeout or _check_deadline(&ss):
-            break
+            if depth < 5:
+                # Full window for shallow depths
+                idx = search_root(board, player, &moves, depth,
+                                  -100000.0, 100000.0, &rules, &ss, h)
+            else:
+                # Aspiration window with progressive widening on fail
+                asp_delta = 75.0  # ~3/4 man value
+                while True:
+                    asp_alpha = prev_score - asp_delta
+                    asp_beta = prev_score + asp_delta
+                    idx = search_root(board, player, &moves, depth,
+                                      asp_alpha, asp_beta, &rules, &ss, h)
+                    if ss.timeout:
+                        break
+                    if ss.root_score > asp_alpha and ss.root_score < asp_beta:
+                        break  # Score within window — accept result
+                    # Fail-low or fail-high: widen window
+                    asp_delta = asp_delta * 2.0
+                    if asp_delta >= 5000.0:
+                        # Window is wide enough — fall back to full window
+                        ss.timeout = False
+                        idx = search_root(board, player, &moves, depth,
+                                          -100000.0, 100000.0, &rules, &ss, h)
+                        break
+
+            if not ss.timeout:
+                best_idx = idx
+                best_depth = depth
+                prev_score = ss.root_score
+                # Swap best move to position 0 for next ID iteration
+                if best_idx != 0:
+                    _tmp_move = moves.moves[0]
+                    moves.moves[0] = moves.moves[best_idx]
+                    moves.moves[best_idx] = _tmp_move
+                    best_idx = 0
+            if ss.timeout or _check_deadline(&ss):
+                break
 
     return {
         'move': cmove_to_dict(&moves.moves[best_idx]),
