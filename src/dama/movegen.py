@@ -32,20 +32,22 @@ def get_move_directions(piece: Piece) -> List[Tuple[int, int]]:
     return get_forward_directions(piece.player)
 
 
-def get_capture_directions(piece: Piece, config=None) -> List[Tuple[int, int]]:
+def get_capture_directions(piece: Piece, config=None, _rules=None) -> List[Tuple[int, int]]:
     """Get all valid capture directions for a piece (considering backward capture rule)."""
     if piece.is_king:
         return ALL_DIRECTIONS
 
-    if config is None:
-        config = get_config()
+    if _rules is None:
+        if config is None:
+            config = get_config()
+        _rules = config.game.rules
     forward = get_forward_directions(piece.player)
-    
-    if config.game.rules.backward_capture:
+
+    if _rules.backward_capture:
         # Include backward directions for capture
         backward = get_backward_directions(piece.player)
         return forward + backward
-    
+
     return forward
 
 
@@ -56,9 +58,10 @@ def generate_simple_moves(board: Board, pos: Position, piece: Piece, config=None
     directions = get_move_directions(piece)
     if config is None:
         config = get_config()
+    rules = config.game.rules
 
     for dr, dc in directions:
-        if piece.is_king and config.game.rules.king_flying_capture:
+        if piece.is_king and rules.king_flying_capture:
             # Flying king: can move any number of squares along diagonal
             distance = 1
             while True:
@@ -126,14 +129,15 @@ def generate_captures_from_position(
     row, col = pos
     if config is None:
         config = get_config()
+    rules = config.game.rules
 
-    directions = get_capture_directions(piece, config)
+    directions = get_capture_directions(piece, config, _rules=rules)
     captures_found = []
     # Direct dict access for speed in hot loop
     _pieces = board._pieces
 
     for dr, dc in directions:
-        if piece.is_king and config.game.rules.king_flying_capture:
+        if piece.is_king and rules.king_flying_capture:
             # Flying king: scan along the diagonal for capture opportunities
             captures_found.extend(
                 _generate_flying_king_captures(
@@ -332,9 +336,9 @@ def generate_all_moves(board: Board, player: Player) -> List[Move]:
     Returns:
         List of legal Move objects.
     """
-    simple_moves = []
     capture_moves = []
     config = get_config()
+    rules = config.game.rules
 
     # Materialize pieces list: capture generation now mutates the board
     # temporarily (undo/redo), so iterating a live generator would break.
@@ -345,13 +349,18 @@ def generate_all_moves(board: Board, player: Player) -> List[Move]:
         captures = generate_captures(board, pos, piece, config)
         capture_moves.extend(captures)
 
+    # Early exit: when forced_capture is enabled (always true for Filipino
+    # Dama) and any captures exist, simple moves are illegal.  Skip
+    # generate_simple_moves entirely — avoids ~50% of Move object
+    # allocations in mid/late game where captures are common.
+    if rules.forced_capture and capture_moves:
+        return capture_moves
+
+    simple_moves = []
+    for pos, piece in pieces:
         # Generate simple moves
         simple = generate_simple_moves(board, pos, piece, config)
         simple_moves.extend(simple)
-
-    # Apply forced capture rule from config
-    if config.game.rules.forced_capture and capture_moves:
-        return capture_moves
 
     return simple_moves + capture_moves
 
