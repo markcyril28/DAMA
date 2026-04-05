@@ -372,12 +372,14 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 g['_ended'] = 'max_moves'  # draw
                 continue
 
-            state = g['state']
-            if _use_fast_movegen:
-                # Cython C movegen → dicts directly (no Move objects)
-                md = _fast_gen_moves(state)
+            # [Pass 75] Compact path: movegen + to_compact from raw board bytes.
+            # Avoids _load_board (Python dict iteration) and to_compact overhead.
+            if _use_compact:
+                md = _gen_moves_board(g['bb'], g['pl'])
+            elif _use_fast_movegen:
+                md = _fast_gen_moves(g['state'])
             else:
-                legal_moves = state.legal_moves()
+                legal_moves = g['state'].legal_moves()
                 md = [m.to_dict() for m in legal_moves]
 
             if not md:
@@ -385,14 +387,20 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 continue
             new_active.append(i)
 
-            sd = state.to_compact()
+            if _use_compact:
+                sd = _board_to_compact(g['bb'], g['pl'], g['move_count'])
+            else:
+                sd = g['state'].to_compact()
 
             # Single legal move — no inference needed
             if len(md) == 1:
                 immediate.append((i, 0, sd, md))
                 continue
 
-            policy = g['p1_policy'] if state.current_player == Player.ONE else g['p2_policy']
+            if _use_compact:
+                policy = g['p1_policy'] if g['pl'] == 1 else g['p2_policy']
+            else:
+                policy = g['p1_policy'] if g['state'].current_player == Player.ONE else g['p2_policy']
 
             # Exploration noise
             if random.random() < g['noise_prob']:
