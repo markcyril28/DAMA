@@ -139,6 +139,57 @@ def get_ml_move(
     return moves[best_idx]
 
 
+def get_ml_move_idx(
+    state: GameState,
+    legal_moves: List[Move],
+    model_path: str = "models/latest.pt",
+    device: Optional[torch.device] = None,
+) -> Optional[int]:
+    """Get index of the best move according to the ML model.
+
+    Like get_ml_move() but accepts pre-computed legal_moves and returns
+    the index directly, avoiding:
+      1. Redundant state.legal_moves() call (~0.2ms)
+      2. O(n) legal_moves.index(move) search
+      3. Move object comparison overhead
+
+    Args:
+        state: Current game state
+        legal_moves: Pre-computed legal moves for this position
+        model_path: Path to the model checkpoint
+        device: Device to run inference on
+
+    Returns:
+        Index of the best move, or None if no legal moves
+    """
+    if not legal_moves:
+        return None
+
+    if len(legal_moves) == 1:
+        return 0
+
+    try:
+        model = get_model(model_path, device)
+    except FileNotFoundError:
+        raise
+
+    # Encode state and moves
+    board_tensor = torch.from_numpy(encode_board(state)).unsqueeze(0)
+    move_tensor = torch.from_numpy(encode_moves(state, legal_moves))
+
+    # Move to device (skip no-op .to() when already on CPU)
+    if device is None or isinstance(device, str):
+        device = next(model.parameters()).device
+    if device.type != 'cpu':
+        board_tensor = board_tensor.to(device)
+        move_tensor = move_tensor.to(device)
+
+    with torch.inference_mode():
+        scores = model.score_single(board_tensor, move_tensor)
+
+    return scores.argmax().item()
+
+
 def get_move_scores(
     state: GameState,
     model_path: str = "models/latest.pt",
