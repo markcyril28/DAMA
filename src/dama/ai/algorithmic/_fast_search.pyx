@@ -13,7 +13,7 @@ passed as ints through the C call tree — zero per-node Python overhead.
 """
 
 from libc.string cimport memcpy, memset
-from libc.math cimport fabs
+from libc.math cimport fabs, sqrt
 from libc.time cimport clock, CLOCKS_PER_SEC
 from libc.stdlib cimport malloc, free, calloc
 
@@ -32,6 +32,8 @@ DEF PLAYER_TWO = 2
 DEF MAX_PATH = 8
 DEF MAX_CAPTURES = 7
 DEF MAX_MOVES = 64
+DEF MAX_PLY = 32
+DEF NUM_KILLERS = 2
 
 cdef struct CMove:
     int path_r[MAX_PATH]
@@ -84,10 +86,63 @@ cdef void _init_center():
     cdef int i
     for i in range(64):
         CENTER_SQ[i] = 0
-    CENTER_SQ[3*8+2] = 1; CENTER_SQ[3*8+4] = 1; CENTER_SQ[3*8+6] = 1
-    CENTER_SQ[4*8+1] = 1; CENTER_SQ[4*8+3] = 1; CENTER_SQ[4*8+5] = 1; CENTER_SQ[4*8+7] = 1
+    # Dark squares in the 4x4 center zone (rows 2-5, cols 2-5),
+    # matching the scoring system's CENTER_BONUS definition.
+    CENTER_SQ[2*8+3] = 1; CENTER_SQ[2*8+5] = 1   # (2,3), (2,5)
+    CENTER_SQ[3*8+2] = 1; CENTER_SQ[3*8+4] = 1   # (3,2), (3,4)
+    CENTER_SQ[4*8+3] = 1; CENTER_SQ[4*8+5] = 1   # (4,3), (4,5)
+    CENTER_SQ[5*8+2] = 1; CENTER_SQ[5*8+4] = 1   # (5,2), (5,4)
 
 _init_center()
+
+# Precomputed dark square indices — only dark squares ((r+c)%2==1) can hold
+# pieces. Iterating 32 dark squares instead of 64 total squares halves the
+# loop count in evaluate_c, _has_pieces, _count_player_pieces, compute_hash,
+# and move generation (which all skipped light squares via branch anyway).
+DEF NUM_DARK_SQ = 32
+cdef int DARK_SQ[32]       # flat index (r*8+c)
+cdef int DARK_SQ_R[32]     # row
+cdef int DARK_SQ_C[32]     # col
+
+cdef void _init_dark_sq():
+    cdef int i = 0, r, c
+    for r in range(8):
+        for c in range(8):
+            if (r + c) % 2 == 1:
+                DARK_SQ[i] = r * 8 + c
+                DARK_SQ_R[i] = r
+                DARK_SQ_C[i] = c
+                i += 1
+
+_init_dark_sq()
+
+
+# ── Precomputed LMR (Late Move Reduction) table ──
+# LMR_TABLE[depth][move_index] = reduction amount.
+# Graduated reductions replace the fixed R=1: later moves at deeper depths
+# get stronger reductions. Formula: R = sqrt(depth-1) * sqrt(i-1) / 3.0,
+# clamped to [1, depth-2].  Typical values:
+#   depth 3, move 3: R=1   depth 8, move 5: R=1   depth 12, move 8: R=2
+#   depth 3, move 8: R=1   depth 8, move 10: R=2  depth 12, move 16: R=4
+DEF LMR_MAX_D = 33
+DEF LMR_MAX_M = 65
+cdef int LMR_TABLE[33][65]
+
+cdef void _init_lmr_table() noexcept nogil:
+    cdef int d, m, r
+    for d in range(LMR_MAX_D):
+        for m in range(LMR_MAX_M):
+            if d < 3 or m < 3:
+                LMR_TABLE[d][m] = 0
+            else:
+                r = <int>(sqrt(<double>(d - 1)) * sqrt(<double>(m - 1)) / 3.0)
+                if r < 1:
+                    r = 1
+                if r > d - 2:
+                    r = d - 2
+                LMR_TABLE[d][m] = r
+
+_init_lmr_table()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -98,21 +153,29 @@ _init_center()
 # via different move orders (transpositions) reuse prior work.
 # Typical hit rates are 30-60%, giving ~2-4x speedup at deeper depths.
 
-DEF TT_SIZE_BITS = 20
-DEF TT_SIZE = 1048576          # 1 << 20 = 1M entries (~16MB)
-DEF TT_MASK = 1048575          # TT_SIZE - 1
+DEF TT_SIZE_BITS = 22
+DEF TT_SIZE = 4194304          # 1 << 22 = 4M entries (~64MB)
+DEF TT_MASK = 4194303          # TT_SIZE - 1
 
 # TT entry flags
 DEF TT_EXACT = 0
 DEF TT_LOWERBOUND = 1
 DEF TT_UPPERBOUND = 2
 
+# Packed generation+flag byte: (generation << 2) | flag
+# 6-bit generation (0-63) wraps more often but fits best-move in 16 bytes.
+DEF TT_GEN_SHIFT = 2
+DEF TT_GEN_MASK = 63            # 0x3F — 6 bits for generation
+DEF TT_FLAG_MASK = 3            # 0x03 — 2 bits for flag
+
 cdef struct TTEntry:
-    unsigned long long hash_key  # Full hash for collision verification
-    float score
-    short depth
-    unsigned char flag           # TT_EXACT / TT_LOWERBOUND / TT_UPPERBOUND
-    unsigned char generation     # Search generation — entries from old generations are stale
+    unsigned long long hash_key  # 8 bytes: full hash for collision verification
+    float score                  # 4 bytes
+    unsigned char depth          # 1 byte: search depth (max 32, was short)
+    unsigned char gen_flag       # 1 byte: (generation << 2) | flag
+    unsigned char best_from      # 1 byte: best move from-square (0-63), 0xFF = none
+    unsigned char best_to        # 1 byte: best move to-square (0-63), 0xFF = none
+    # Total: 16 bytes — same as before, no padding increase
 
 # Zobrist keys: 5 piece types × 64 squares, plus side-to-move toggle.
 # Piece indices: 0=EMPTY (unused), 1=P1_MAN, 2=P1_KING, 3=P2_MAN, 4=P2_KING
@@ -153,8 +216,9 @@ cdef inline unsigned long long compute_hash(
 ) noexcept nogil:
     """Compute full Zobrist hash for a board position."""
     cdef unsigned long long h = 0
-    cdef int sq, piece
-    for sq in range(64):
+    cdef int i, sq, piece
+    for i in range(NUM_DARK_SQ):
+        sq = DARK_SQ[i]
         piece = board[sq]
         if piece != EMPTY:
             h = h ^ ZOBRIST_PIECES[piece][sq]
@@ -163,7 +227,8 @@ cdef inline unsigned long long compute_hash(
     return h
 
 cdef inline void tt_store(
-    unsigned long long hash_key, float score, int depth, int flag
+    unsigned long long hash_key, float score, int depth, int flag,
+    int best_from, int best_to
 ) noexcept nogil:
     """Store a search result in the transposition table (always-replace)."""
     cdef unsigned long long idx = hash_key & TT_MASK
@@ -172,34 +237,51 @@ cdef inline void tt_store(
     # iterative deepening (newer results from deeper searches overwrite).
     entry.hash_key = hash_key
     entry.score = score
-    entry.depth = <short>depth
-    entry.flag = <unsigned char>flag
-    entry.generation = _tt_generation
+    entry.depth = <unsigned char>depth
+    entry.gen_flag = (_tt_generation << TT_GEN_SHIFT) | (<unsigned char>flag & TT_FLAG_MASK)
+    entry.best_from = <unsigned char>best_from
+    entry.best_to = <unsigned char>best_to
 
 cdef inline bint tt_probe(
     unsigned long long hash_key, int depth,
-    float *score, float *alpha, float *beta
+    float *score, float *alpha, float *beta,
+    int *tt_from, int *tt_to
 ) noexcept nogil:
     """Probe the transposition table. Returns True if a cutoff occurred.
 
     On a hit with sufficient depth, adjusts alpha/beta or returns exact score.
-    The caller should check if alpha >= beta after this returns True.
+    Always sets tt_from/tt_to when hash matches (even if depth insufficient)
+    so the caller can use the TT move for ordering.
     """
     cdef unsigned long long idx = hash_key & TT_MASK
     cdef TTEntry *entry = &_tt_table[idx]
-    if entry.generation != _tt_generation:
+    cdef unsigned char gen, flag
+
+    tt_from[0] = -1
+    tt_to[0] = -1
+
+    gen = (entry.gen_flag >> TT_GEN_SHIFT) & TT_GEN_MASK
+    if gen != _tt_generation:
         return False
     if entry.hash_key != hash_key:
         return False
+
+    # Hash match — extract best move for ordering (even if depth insufficient)
+    if entry.best_from != 0xFF:
+        tt_from[0] = <int>entry.best_from
+        tt_to[0] = <int>entry.best_to
+
     if entry.depth < depth:
         return False
-    if entry.flag == TT_EXACT:
+
+    flag = entry.gen_flag & TT_FLAG_MASK
+    if flag == TT_EXACT:
         score[0] = entry.score
         return True
-    elif entry.flag == TT_LOWERBOUND:
+    elif flag == TT_LOWERBOUND:
         if entry.score > alpha[0]:
             alpha[0] = entry.score
-    elif entry.flag == TT_UPPERBOUND:
+    elif flag == TT_UPPERBOUND:
         if entry.score < beta[0]:
             beta[0] = entry.score
     if alpha[0] >= beta[0]:
@@ -535,20 +617,20 @@ cdef void generate_all_moves_c(
     """Generate all legal moves for a player. Forced capture applied if rules say so."""
     cdef CMoveList simple_moves
     cdef CMoveList capture_moves
-    cdef int r, c, piece, i
+    cdef int r, c, piece, i, sq
 
     simple_moves.count = 0
     capture_moves.count = 0
 
-    for r in range(8):
-        for c in range(8):
-            if (r + c) % 2 != 1:
-                continue
-            piece = cell(board, r, c)
-            if piece == EMPTY or not is_player(piece, player):
-                continue
-            generate_captures(board, r, c, piece, player, rules, &capture_moves)
-            generate_simple_moves(board, r, c, piece, player, rules, &simple_moves)
+    for i in range(NUM_DARK_SQ):
+        sq = DARK_SQ[i]
+        piece = board[sq]
+        if piece == EMPTY or not is_player(piece, player):
+            continue
+        r = DARK_SQ_R[i]
+        c = DARK_SQ_C[i]
+        generate_captures(board, r, c, piece, player, rules, &capture_moves)
+        generate_simple_moves(board, r, c, piece, player, rules, &simple_moves)
 
     if rules.forced_capture and capture_moves.count > 0:
         out.count = capture_moves.count
@@ -560,6 +642,31 @@ cdef void generate_all_moves_c(
             out.moves[i] = capture_moves.moves[i]
         for i in range(simple_moves.count):
             out.moves[capture_moves.count + i] = simple_moves.moves[i]
+
+
+cdef int generate_captures_only_c(
+    signed char *board, int player, Rules *rules, CMoveList *out
+) noexcept nogil:
+    """Generate only capture moves (no simple moves). For quiescence search."""
+    cdef int i, sq, piece
+    out.count = 0
+    for i in range(NUM_DARK_SQ):
+        sq = DARK_SQ[i]
+        piece = board[sq]
+        if piece == EMPTY or not is_player(piece, player):
+            continue
+        generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
+    return out.count
+
+
+cdef inline bint _has_pieces(signed char *board, int player) noexcept nogil:
+    """Fast check if player has any pieces. O(32) worst, early-exit on first find."""
+    cdef int i, piece
+    for i in range(NUM_DARK_SQ):
+        piece = board[DARK_SQ[i]]
+        if piece != EMPTY and is_player(piece, player):
+            return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -589,73 +696,149 @@ cdef void apply_move_c(
 
 cdef float evaluate_c(signed char *board, int player) noexcept nogil:
     """Evaluate board from perspective of `player` (material + position, no mobility)."""
-    cdef int r, c, piece, idx
+    cdef int i, r, c, piece, idx
     cdef int cur_men = 0, cur_kings = 0, opp_men = 0, opp_kings = 0
     cdef float score = 0.0
     cdef int advancement
     cdef float mult
 
-    for r in range(8):
-        for c in range(8):
-            if (r + c) % 2 != 1:
-                continue
-            piece = cell(board, r, c)
-            if piece == EMPTY:
-                continue
+    for i in range(NUM_DARK_SQ):
+        idx = DARK_SQ[i]
+        piece = board[idx]
+        if piece == EMPTY:
+            continue
 
-            idx = r * 8 + c
-            if is_player(piece, player):
-                mult = 1.0
-                if is_king(piece):
-                    cur_kings += 1
-                else:
-                    cur_men += 1
-            else:
-                mult = -1.0
-                if is_king(piece):
-                    opp_kings += 1
-                else:
-                    opp_men += 1
+        r = DARK_SQ_R[i]
+        c = DARK_SQ_C[i]
 
-            if not is_king(piece):
-                advancement = r if piece == P1_MAN else 7 - r
-                score += advancement * W_ADVANCEMENT * mult
-
-            if CENTER_SQ[idx]:
-                score += W_CENTER * mult
-
+        if is_player(piece, player):
+            mult = 1.0
             if is_king(piece):
-                if piece == P1_KING and r == 0:
-                    score += W_BACK_RANK * mult
-                elif piece == P2_KING and r == 7:
-                    score += W_BACK_RANK * mult
+                cur_kings += 1
+            else:
+                cur_men += 1
+        else:
+            mult = -1.0
+            if is_king(piece):
+                opp_kings += 1
+            else:
+                opp_men += 1
+
+        if not is_king(piece):
+            advancement = r if piece == P1_MAN else 7 - r
+            score += advancement * W_ADVANCEMENT * mult
+
+        if CENTER_SQ[idx]:
+            score += W_CENTER * mult
+
+        if is_king(piece):
+            if piece == P1_KING and r == 0:
+                score += W_BACK_RANK * mult
+            elif piece == P2_KING and r == 7:
+                score += W_BACK_RANK * mult
 
     score += (cur_men - opp_men) * W_MAN
     score += (cur_kings - opp_kings) * W_KING
     return score
 
 
-cdef float evaluate_with_mobility(
-    signed char *board, int player, Rules *rules
-) noexcept nogil:
-    """Full evaluation including mobility."""
-    cdef CMoveList cur_moves, opp_moves
-    cdef float score
-    cdef int opp = opponent(player)
+# Maximum depth for quiescence capture-only search (prevents explosion)
+DEF MAX_QS_DEPTH = 6
 
-    cur_moves.count = 0
-    generate_all_moves_c(board, player, rules, &cur_moves)
-    if cur_moves.count == 0:
+cdef float quiescence(
+    signed char *board, int player, float alpha, float beta,
+    Rules *rules, SearchState *ss, unsigned long long h, int qs_depth
+) noexcept nogil:
+    """Quiescence search: extend search with captures until position is quiet.
+
+    At depth 0, instead of calling evaluate_with_mobility() which generates
+    ALL moves for BOTH sides (expensive), quiescence does:
+    1. Stand-pat eval using evaluate_c() (material+positional, no mobility)
+    2. Generate captures only (much cheaper than full move generation)
+    3. If no captures: position is quiet, return stand-pat
+    4. If captures: search them recursively (typically 1-3 captures)
+
+    Cost: ~1 capture-only generation per QS node vs 2 full generations
+    in evaluate_with_mobility(). Most leaves are quiet (0 captures),
+    so the common case is O(32 squares scan) + O(64 squares eval) ≈ O(96).
+    """
+    cdef float stand_pat, score
+    cdef CMoveList captures
+    cdef signed char new_board[64]
+    cdef unsigned long long child_h
+    cdef int i, j, opp
+
+    ss.nodes += 1
+
+    # Deadline check (shared counter with main search)
+    if (ss.nodes & 4095) == 0:
+        if _check_deadline(ss):
+            return 0.0
+
+    # Terminal detection: if current player has no pieces, they lost
+    if not _has_pieces(board, player):
         return -10000.0
 
-    opp_moves.count = 0
-    generate_all_moves_c(board, opp, rules, &opp_moves)
-    if opp_moves.count == 0:
-        return 10000.0
+    # Stand-pat: use material+positional eval (no mobility — too expensive)
+    stand_pat = evaluate_c(board, player)
 
-    score = evaluate_c(board, player)
-    score += (cur_moves.count - opp_moves.count) * W_MOBILITY
-    return score
+    # Beta cutoff: standing pat is already good enough
+    if stand_pat >= beta:
+        return beta
+    if stand_pat > alpha:
+        alpha = stand_pat
+
+    # Depth limit: stop extending captures at MAX_QS_DEPTH
+    if qs_depth <= 0:
+        return alpha
+
+    # Generate captures only (skip simple moves entirely)
+    captures.count = 0
+    generate_captures_only_c(board, player, rules, &captures)
+
+    if captures.count == 0:
+        # No captures — position is quiet
+        return alpha
+
+    opp = opponent(player)
+
+    # Search each capture with delta pruning.
+    # Delta pruning: if the stand-pat score plus the maximum possible material
+    # gain from a capture (sum of captured piece values + safety margin) is
+    # still below alpha, skip the capture — it can't improve our position.
+    cdef int cap_sq_dp, cap_gain
+    cdef int DELTA_MARGIN = 50  # Small safety margin for positional gains
+
+    for i in range(captures.count):
+        # Delta prune: estimate maximum material gain from this capture
+        cap_gain = 0
+        for j in range(captures.moves[i].num_captures):
+            cap_sq_dp = captures.moves[i].cap_r[j] * 8 + captures.moves[i].cap_c[j]
+            if is_king(board[cap_sq_dp]):
+                cap_gain += W_KING
+            else:
+                cap_gain += W_MAN
+        # Add promotion bonus if applicable
+        if captures.moves[i].promotion:
+            cap_gain += W_KING - W_MAN  # Gaining king value from promotion
+        if stand_pat + cap_gain + DELTA_MARGIN <= alpha:
+            continue  # This capture can't raise alpha — prune it
+
+        apply_move_c(board, new_board, &captures.moves[i], player)
+        child_h = _hash_after_move(h, board, &captures.moves[i], player)
+
+        score = -quiescence(new_board, opp, -beta, -alpha,
+                            rules, ss, child_h, qs_depth - 1)
+
+        if ss.timeout:
+            return 0.0
+
+        if score >= beta:
+            return beta  # Beta cutoff
+        if score > alpha:
+            alpha = score
+
+    return alpha
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -666,33 +849,250 @@ cdef struct SearchState:
     double deadline
     int nodes
     bint timeout
+    float root_score         # Best score from most recent search_root call
+    # Killer moves: 2 per ply (moves that caused beta cutoffs)
+    int killers_from[MAX_PLY][NUM_KILLERS]
+    int killers_to[MAX_PLY][NUM_KILLERS]
+    # History heuristic: history[from_sq][to_sq] — cutoff frequency
+    int history[64][64]
+    # Countermove heuristic: when opponent plays prev_from→prev_to, the
+    # stored response move is a good candidate (caused cutoffs historically).
+    int countermove_from[64][64]
+    int countermove_to[64][64]
+
+cdef inline void _init_search_tables(SearchState *ss) noexcept nogil:
+    """Zero killer, history, and countermove tables for a new search."""
+    memset(ss.killers_from, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))  # -1
+    memset(ss.killers_to, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))
+    memset(ss.history, 0, 64 * 64 * sizeof(int))
+    memset(ss.countermove_from, 0xFF, 64 * 64 * sizeof(int))  # -1
+    memset(ss.countermove_to, 0xFF, 64 * 64 * sizeof(int))
+
+
+cdef inline void _store_killer(SearchState *ss, int ply, CMove *m) noexcept nogil:
+    """Store a quiet move that caused beta cutoff as a killer."""
+    if ply >= MAX_PLY:
+        return
+    cdef int from_sq = m.path_r[0] * 8 + m.path_c[0]
+    cdef int to_sq = m.path_r[m.path_len - 1] * 8 + m.path_c[m.path_len - 1]
+    # Don't store duplicate
+    if ss.killers_from[ply][0] == from_sq and ss.killers_to[ply][0] == to_sq:
+        return
+    # Shift slot 0 to slot 1, insert new at slot 0
+    ss.killers_from[ply][1] = ss.killers_from[ply][0]
+    ss.killers_to[ply][1] = ss.killers_to[ply][0]
+    ss.killers_from[ply][0] = from_sq
+    ss.killers_to[ply][0] = to_sq
+
+
+cdef inline void _update_history(SearchState *ss, CMove *m, int depth) noexcept nogil:
+    """Increment history table on cutoff (depth^2 weighting)."""
+    cdef int from_sq = m.path_r[0] * 8 + m.path_c[0]
+    cdef int to_sq = m.path_r[m.path_len - 1] * 8 + m.path_c[m.path_len - 1]
+    cdef int bonus = depth * depth
+    ss.history[from_sq][to_sq] += bonus
+    if ss.history[from_sq][to_sq] > 10000:
+        ss.history[from_sq][to_sq] = 10000
+
+
+cdef inline void _update_history_malus(SearchState *ss, CMove *m, int depth) noexcept nogil:
+    """Decrease history score for a quiet move that failed to cause cutoff.
+    Standard complement to _update_history: moves that were searched but didn't
+    cut should be ordered lower in future searches."""
+    cdef int from_sq = m.path_r[0] * 8 + m.path_c[0]
+    cdef int to_sq = m.path_r[m.path_len - 1] * 8 + m.path_c[m.path_len - 1]
+    cdef int malus = depth * depth
+    ss.history[from_sq][to_sq] -= malus
+    if ss.history[from_sq][to_sq] < -10000:
+        ss.history[from_sq][to_sq] = -10000
+
+
+cdef inline void _store_countermove(
+    SearchState *ss, int prev_from, int prev_to, CMove *m
+) noexcept nogil:
+    """Store a response move as countermove for the opponent's previous move.
+    On beta cutoff, the current move is a good response to prev_from→prev_to."""
+    cdef int from_sq = m.path_r[0] * 8 + m.path_c[0]
+    cdef int to_sq = m.path_r[m.path_len - 1] * 8 + m.path_c[m.path_len - 1]
+    ss.countermove_from[prev_from][prev_to] = from_sq
+    ss.countermove_to[prev_from][prev_to] = to_sq
+
+
+cdef inline void _age_history(SearchState *ss) noexcept nogil:
+    """Halve all history table entries to prevent saturation over long games.
+    Called once per move. Without aging, all entries eventually reach the cap
+    (10000) and the history heuristic loses its discriminative power."""
+    cdef int i, j
+    for i in range(64):
+        for j in range(64):
+            ss.history[i][j] >>= 1  # Right-shift by 1 = halve
+
+
+cdef inline unsigned long long _hash_after_move(
+    unsigned long long h, signed char *board, CMove *m, int player
+) noexcept nogil:
+    """Compute Zobrist hash after move, incrementally (O(captures) not O(64))."""
+    cdef int from_sq = m.path_r[0] * 8 + m.path_c[0]
+    cdef int to_sq = m.path_r[m.path_len - 1] * 8 + m.path_c[m.path_len - 1]
+    cdef int piece = board[from_sq]
+    cdef int i, cap_sq, cap_piece, end_piece
+
+    # Remove piece from start square
+    h = h ^ ZOBRIST_PIECES[piece][from_sq]
+
+    # Remove captured pieces
+    for i in range(m.num_captures):
+        cap_sq = m.cap_r[i] * 8 + m.cap_c[i]
+        cap_piece = board[cap_sq]
+        h = h ^ ZOBRIST_PIECES[cap_piece][cap_sq]
+
+    # Add piece to end square (with possible promotion)
+    end_piece = promote_piece(piece) if m.promotion else piece
+    h = h ^ ZOBRIST_PIECES[end_piece][to_sq]
+
+    # Toggle side to move
+    h = h ^ ZOBRIST_SIDE
+
+    return h
+
+
+cdef inline int _count_player_pieces(
+    signed char *board, int player
+) noexcept nogil:
+    """Count pieces for the given player (for NMP zugzwang guard).
+    Early-exits once threshold (4) is met — avoids scanning remaining squares."""
+    cdef int count = 0, i, piece
+    for i in range(NUM_DARK_SQ):
+        piece = board[DARK_SQ[i]]
+        if piece != EMPTY and is_player(piece, player):
+            count += 1
+            if count >= 4:
+                return count
+    return count
+
+
+cdef void _order_moves_full(
+    CMoveList *moves, int ply, SearchState *ss, int tt_from, int tt_to,
+    signed char *board, int prev_from, int prev_to
+) noexcept nogil:
+    """Enhanced move ordering: TT > captures (by value) > killers > countermove > history > position."""
+    cdef int i, j, best_idx
+    cdef int scores[MAX_MOVES]
+    cdef int er, ec, s, from_sq, to_sq, k
+    cdef int cap_sq, cap_value
+    cdef CMove temp
+
+    for i in range(moves.count):
+        from_sq = moves.moves[i].path_r[0] * 8 + moves.moves[i].path_c[0]
+        er = moves.moves[i].path_r[moves.moves[i].path_len - 1]
+        ec = moves.moves[i].path_c[moves.moves[i].path_len - 1]
+        to_sq = er * 8 + ec
+
+        # TT move: absolute highest priority — search this first
+        if tt_from >= 0 and from_sq == tt_from and to_sq == tt_to:
+            scores[i] = 50000
+            continue
+
+        s = 0
+
+        # Captures: highest priority, scored by material value of captured pieces.
+        if moves.moves[i].num_captures > 0:
+            cap_value = 0
+            for j in range(moves.moves[i].num_captures):
+                cap_sq = moves.moves[i].cap_r[j] * 8 + moves.moves[i].cap_c[j]
+                if is_king(board[cap_sq]):
+                    cap_value += W_KING
+                else:
+                    cap_value += W_MAN
+            s = 20000 + cap_value
+        else:
+            # Killer move bonus
+            if ply < MAX_PLY:
+                for k in range(NUM_KILLERS):
+                    if (ss.killers_from[ply][k] == from_sq and
+                            ss.killers_to[ply][k] == to_sq):
+                        s = 15000
+                        break
+            # Countermove bonus: if opponent just played prev_from→prev_to,
+            # the stored response that previously caused a cutoff gets priority.
+            if s == 0 and prev_from >= 0:
+                if (ss.countermove_from[prev_from][prev_to] == from_sq and
+                        ss.countermove_to[prev_from][prev_to] == to_sq):
+                    s = 12000
+            # History heuristic for quiet moves
+            if s == 0:
+                s = ss.history[from_sq][to_sq]
+
+        # Promotion bonus
+        if moves.moves[i].promotion:
+            s += 10000
+
+        # Center bias
+        s += 7 - <int>(fabs(3.5 - er) + fabs(3.5 - ec))
+        scores[i] = s
+
+    # Insertion sort — O(n) best case on nearly-ordered input (common with
+    # TT/killer pre-ordering), O(n²) worst case. Better than selection sort
+    # for the typical 10-20 move lists in Dama.
+    for i in range(1, moves.count):
+        s = scores[i]
+        temp = moves.moves[i]
+        j = i - 1
+        while j >= 0 and scores[j] < s:
+            scores[j + 1] = scores[j]
+            moves.moves[j + 1] = moves.moves[j]
+            j -= 1
+        scores[j + 1] = s
+        moves.moves[j + 1] = temp
+
 
 cdef float alphabeta(
     signed char *board, int player, int depth, float alpha, float beta,
-    Rules *rules, SearchState *ss
+    Rules *rules, SearchState *ss, unsigned long long h, int ply,
+    bint allow_null, int prev_from, int prev_to
 ) noexcept nogil:
-    """Negamax alpha-beta search with transposition table."""
+    """Negamax alpha-beta with TT, NMP, PVS, LMR, LMP, IID, countermove, killers, history, and futility pruning."""
     cdef CMoveList moves
     cdef signed char new_board[64]
-    cdef float score, best, orig_alpha
-    cdef int i, opp, tt_flag
-    cdef unsigned long long h
+    cdef float score, best, orig_alpha, static_eval, null_score
+    cdef int i, j, opp, tt_flag, reduced, nmp_R, lmp_limit
+    cdef unsigned long long child_h, null_h
+    cdef bint futility_ok
+    cdef int tt_from_sq, tt_to_sq, best_move_idx
+    cdef int best_from_sq, best_to_sq
+    cdef int mv_from, mv_to  # from/to squares of each move for countermove passing
+    # IID variables (Internal Iterative Deepening)
+    cdef float _iid_score, _iid_alpha, _iid_beta
 
     ss.nodes += 1
 
-    if (ss.nodes & 1023) == 0:
+    if (ss.nodes & 4095) == 0:
         if _check_deadline(ss):
             return 0.0
 
     if depth == 0:
-        return evaluate_with_mobility(board, player, rules)
+        return quiescence(board, player, alpha, beta, rules, ss, h, MAX_QS_DEPTH)
 
     # ── TT probe ──
-    h = compute_hash(board, player)
     orig_alpha = alpha
+    tt_from_sq = -1
+    tt_to_sq = -1
     if _tt_table != NULL:
-        if tt_probe(h, depth, &score, &alpha, &beta):
+        if tt_probe(h, depth, &score, &alpha, &beta, &tt_from_sq, &tt_to_sq):
             return score
+
+    # ── Internal Iterative Deepening (IID) ──
+    # When no TT move is available for ordering at depth >= 6, do a shallow
+    # search first to populate the TT. The resulting best move dramatically
+    # improves ordering for the full-depth search, making PVS and LMR more
+    # effective. Cost: one depth-(depth-3) search. Payoff: better move
+    # ordering reduces the full-depth tree by 20-40% at these depths.
+    if tt_from_sq < 0 and depth >= 6 and not ss.timeout:
+        alphabeta(board, player, depth - 3, alpha, beta, rules, ss, h, ply, True, prev_from, prev_to)
+        if _tt_table != NULL and not ss.timeout:
+            _iid_alpha = -100000.0; _iid_beta = 100000.0
+            tt_probe(h, 0, &_iid_score, &_iid_alpha, &_iid_beta,
+                     &tt_from_sq, &tt_to_sq)
 
     moves.count = 0
     generate_all_moves_c(board, player, rules, &moves)
@@ -700,26 +1100,136 @@ cdef float alphabeta(
     if moves.count == 0:
         return -10000.0
 
-    _order_moves(&moves)
-
     opp = opponent(player)
+
+    # ── Null Move Pruning ──
+    # In quiet positions (no forced captures), pass the turn and search at
+    # reduced depth with a null window around beta. If the opponent can't
+    # beat beta even with a free move, our position is strong enough to prune.
+    # Guards: depth >= 4 (overhead exceeds savings at shallower depths),
+    # not near mate, no captures (quiet position), not after a null move
+    # (prevent double-null), >= 4 pieces (avoid zugzwang in endgames).
+    # No eval guard: in balanced positions NMP still cuts effectively at depth 4+
+    # and the straggler reduction on hard games outweighs the rare wasted search.
+    if (allow_null and depth >= 4
+            and not (alpha > 9000 or alpha < -9000)
+            and moves.moves[0].num_captures == 0
+            and _count_player_pieces(board, player) >= 4):
+        nmp_R = 2 + depth // 6  # Adaptive reduction: deeper → more aggressive
+        null_h = h ^ ZOBRIST_SIDE
+        null_score = -alphabeta(board, opp, depth - 1 - nmp_R, -beta, -beta + 1,
+                                rules, ss, null_h, ply + 1, False, -1, -1)
+        if not ss.timeout and null_score >= beta:
+            # Don't trust mate scores from null move
+            if null_score >= 9000:
+                return beta
+            return null_score
+
+    # ── Futility pruning ──
+    # At shallow depth (1-2), if the static eval is far below alpha even with
+    # an optimistic margin, quiet moves (non-captures, non-promotions) are
+    # unlikely to raise the score above alpha. Skip them.
+    futility_ok = False
+    if depth <= 2 and not (alpha > 9000 or alpha < -9000):
+        static_eval = evaluate_c(board, player)
+        if static_eval + depth * 100 <= alpha:
+            futility_ok = True
+
+    # ── Late Move Pruning (LMP) limit ──
+    # At shallow depths, skip late quiet moves entirely. With good move
+    # ordering (TT > captures > killers > history), moves beyond the LMP
+    # threshold are almost certainly bad. More aggressive than LMR (which
+    # just reduces depth). Thresholds chosen conservatively — captures and
+    # promotions always searched regardless.
+    # depth 1: 6, depth 2: 8, depth 3: 12, depth 4: 16
+    if depth <= 4 and not (alpha > 9000 or alpha < -9000):
+        lmp_limit = 2 + depth * depth * 2  # 4,10,20,34 → but capped below
+        if depth == 1: lmp_limit = 6
+        elif depth == 2: lmp_limit = 8
+        elif depth == 3: lmp_limit = 12
+        elif depth == 4: lmp_limit = 16
+    else:
+        lmp_limit = 999  # No LMP at deeper depths
+
+    # Enhanced move ordering with killers, countermove, history, and TT best move
+    _order_moves_full(&moves, ply, ss, tt_from_sq, tt_to_sq, board, prev_from, prev_to)
+
     best = -100000.0
+    best_move_idx = 0
 
     for i in range(moves.count):
+        # Futility prune: skip quiet moves when static eval + margin <= alpha.
+        # Always search the first move (we need at least one legal move result)
+        # and always search captures and promotions.
+        if (futility_ok and i > 0
+                and moves.moves[i].num_captures == 0
+                and not moves.moves[i].promotion):
+            continue
+
+        # LMP: skip late quiet moves at shallow depths
+        if (i >= lmp_limit
+                and moves.moves[i].num_captures == 0
+                and not moves.moves[i].promotion
+                and best > -9000):  # Don't prune if we haven't found any good move yet
+            continue
+
         apply_move_c(board, new_board, &moves.moves[i], player)
-        score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha, rules, ss)
+        # Incremental hash update (O(captures) not O(64))
+        child_h = _hash_after_move(h, board, &moves.moves[i], player)
+
+        # Compute from/to for countermove passing to child
+        mv_from = moves.moves[i].path_r[0] * 8 + moves.moves[i].path_c[0]
+        mv_to = (moves.moves[i].path_r[moves.moves[i].path_len - 1] * 8
+                 + moves.moves[i].path_c[moves.moves[i].path_len - 1])
+
+        if i == 0:
+            # First move (expected best): full window, full depth
+            score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+                               rules, ss, child_h, ply + 1, True, mv_from, mv_to)
+        else:
+            # Graduated LMR: reduce depth for late quiet moves using precomputed
+            # table. Later moves at deeper depths get stronger reductions.
+            reduced = 0
+            if (i >= 3 and depth >= 3
+                    and moves.moves[i].num_captures == 0
+                    and not moves.moves[i].promotion):
+                reduced = LMR_TABLE[depth][i] if depth < LMR_MAX_D and i < LMR_MAX_M else 1
+
+            # PVS + LMR: scout with null window at (potentially reduced) depth
+            score = -alphabeta(new_board, opp, depth - 1 - reduced,
+                               -alpha - 1, -alpha,
+                               rules, ss, child_h, ply + 1, True, mv_from, mv_to)
+            if score > alpha and not ss.timeout:
+                # Promising — re-search at full depth, full window
+                score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+                                   rules, ss, child_h, ply + 1, True, mv_from, mv_to)
 
         if ss.timeout:
             return 0.0
 
         if score > best:
             best = score
+            best_move_idx = i
         if score > alpha:
             alpha = score
         if alpha >= beta:
+            # Beta cutoff — update killer, history, and countermove for quiet moves
+            if moves.moves[i].num_captures == 0:
+                _store_killer(ss, ply, &moves.moves[i])
+                _update_history(ss, &moves.moves[i], depth)
+                if prev_from >= 0:
+                    _store_countermove(ss, prev_from, prev_to, &moves.moves[i])
+            # History malus: penalize previously searched quiet moves that
+            # didn't cause a cutoff. Only at depth >= 3 where history ordering
+            # matters and the penalty is meaningful.
+            if depth >= 3:
+                for j in range(i):
+                    if (moves.moves[j].num_captures == 0
+                            and not moves.moves[j].promotion):
+                        _update_history_malus(ss, &moves.moves[j], depth)
             break
 
-    # ── TT store ──
+    # ── TT store (with best move from/to for future ordering) ──
     if _tt_table != NULL and not ss.timeout:
         if best <= orig_alpha:
             tt_flag = TT_UPPERBOUND
@@ -727,7 +1237,10 @@ cdef float alphabeta(
             tt_flag = TT_LOWERBOUND
         else:
             tt_flag = TT_EXACT
-        tt_store(h, best, depth, tt_flag)
+        best_from_sq = moves.moves[best_move_idx].path_r[0] * 8 + moves.moves[best_move_idx].path_c[0]
+        best_to_sq = (moves.moves[best_move_idx].path_r[moves.moves[best_move_idx].path_len - 1] * 8
+                      + moves.moves[best_move_idx].path_c[moves.moves[best_move_idx].path_len - 1])
+        tt_store(h, best, depth, tt_flag, best_from_sq, best_to_sq)
 
     return best
 
@@ -740,54 +1253,45 @@ cdef bint _check_deadline(SearchState *ss) noexcept nogil:
     return False
 
 
-cdef void _order_moves(CMoveList *moves) noexcept nogil:
-    """Selection sort by priority (captures > promotions > center)."""
-    cdef int i, j, best_idx
-    cdef int scores[MAX_MOVES]
-    cdef int er, ec, s
-    cdef CMove temp
-
-    for i in range(moves.count):
-        er = moves.moves[i].path_r[moves.moves[i].path_len - 1]
-        ec = moves.moves[i].path_c[moves.moves[i].path_len - 1]
-        s = moves.moves[i].num_captures * 10
-        if moves.moves[i].promotion:
-            s += 5
-        s += 7 - <int>(fabs(3.5 - er) + fabs(3.5 - ec))
-        scores[i] = s
-
-    for i in range(moves.count - 1):
-        best_idx = i
-        for j in range(i + 1, moves.count):
-            if scores[j] > scores[best_idx]:
-                best_idx = j
-        if best_idx != i:
-            temp = moves.moves[i]
-            moves.moves[i] = moves.moves[best_idx]
-            moves.moves[best_idx] = temp
-            s = scores[i]; scores[i] = scores[best_idx]; scores[best_idx] = s
-
-
 cdef int search_root(
     signed char *board, int player, CMoveList *moves, int depth,
-    Rules *rules, SearchState *ss
+    float alpha, float beta,
+    Rules *rules, SearchState *ss, unsigned long long h
 ) noexcept nogil:
-    """Search at root level. Returns index of best move."""
-    cdef float alpha = -100000.0
-    cdef float beta = 100000.0
+    """Search at root level with PVS. Returns index of best move.
+
+    Stores the best score in ss.root_score for aspiration window logic.
+    """
     cdef float best_score = -100000.0
     cdef float score
     cdef int best_idx = 0
     cdef int i, opp
     cdef signed char new_board[64]
+    cdef unsigned long long child_h
+    cdef int mv_from, mv_to
 
     opp = opponent(player)
 
     for i in range(moves.count):
         apply_move_c(board, new_board, &moves.moves[i], player)
-        score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha, rules, ss)
+        child_h = _hash_after_move(h, board, &moves.moves[i], player)
+        mv_from = moves.moves[i].path_r[0] * 8 + moves.moves[i].path_c[0]
+        mv_to = (moves.moves[i].path_r[moves.moves[i].path_len - 1] * 8
+                 + moves.moves[i].path_c[moves.moves[i].path_len - 1])
+
+        if i == 0:
+            score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+                               rules, ss, child_h, 1, True, mv_from, mv_to)
+        else:
+            # PVS: null window scout
+            score = -alphabeta(new_board, opp, depth - 1, -alpha - 1, -alpha,
+                               rules, ss, child_h, 1, True, mv_from, mv_to)
+            if score > alpha and score < beta and not ss.timeout:
+                score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+                                   rules, ss, child_h, 1, True, mv_from, mv_to)
 
         if ss.timeout:
+            ss.root_score = best_score
             return best_idx
 
         if score > best_score:
@@ -795,9 +1299,10 @@ cdef int search_root(
             best_idx = i
         if score > alpha:
             alpha = score
-        if best_score >= 9000:
+        if alpha >= beta or best_score >= 9000:
             break
 
+    ss.root_score = best_score
     return best_idx
 
 
@@ -889,6 +1394,8 @@ def fast_search(
     else:
         max_depth = 5
 
+    cdef unsigned long long h
+
     _load_board(state, board)
     player = int(state.current_player)
     rules = _load_rules()
@@ -901,13 +1408,23 @@ def fast_search(
     if moves.count == 1:
         return {'move': cmove_to_dict(&moves.moves[0]), 'score': 0, 'depth': 0, 'nodes': 1}
 
-    _order_moves(&moves)
-
     # Allocate TT on first use. Bump generation counter to logically invalidate
     # all stale entries — avoids a 16MB memset (~1ms) per search call.
     _ensure_tt()
     global _tt_generation
-    _tt_generation = (_tt_generation + 1) & 0xFF
+    _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
+
+    # Compute initial Zobrist hash and initialize killer/history tables
+    h = compute_hash(board, player)
+    _init_search_tables(&ss)
+
+    # Order moves using full heuristic (TT move from prior searches + killers + history)
+    cdef int _tt_from = -1, _tt_to = -1
+    cdef float _d_score, _d_alpha, _d_beta
+    if _tt_table != NULL:
+        _d_alpha = -100000.0; _d_beta = 100000.0
+        tt_probe(h, 0, &_d_score, &_d_alpha, &_d_beta, &_tt_from, &_tt_to)
+    _order_moves_full(&moves, 0, &ss, _tt_from, _tt_to, board, -1, -1)
 
     deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
     ss.deadline = deadline
@@ -917,12 +1434,56 @@ def fast_search(
     best_idx = 0
     best_depth = 0
 
+    cdef CMove _tmp_move
+
+    # Aspiration window: at depth >= 5 (medium+), narrow the search window
+    # around the previous iteration's score. If the result falls outside the
+    # window, widen progressively (2×) and retry before falling back to a full
+    # window. Payoff increases with depth — the savings from narrower windows
+    # outweigh the occasional re-search cost when the tree is large.
+    # At depth < 5 (easy), the tree is small enough that full-window PVS
+    # is faster than the overhead of fail/retry cycles.
+    cdef float prev_score = 0.0
+    cdef float asp_delta, asp_alpha, asp_beta
+
     for depth in range(1, max_depth + 1):
         ss.timeout = False
-        idx = search_root(board, player, &moves, depth, &rules, &ss)
+
+        if depth < 5:
+            # Full window for shallow depths
+            idx = search_root(board, player, &moves, depth,
+                              -100000.0, 100000.0, &rules, &ss, h)
+        else:
+            # Aspiration window with progressive widening on fail
+            asp_delta = 75.0  # ~3/4 man value — wide enough for typical depth changes
+            while True:
+                asp_alpha = prev_score - asp_delta
+                asp_beta = prev_score + asp_delta
+                idx = search_root(board, player, &moves, depth,
+                                  asp_alpha, asp_beta, &rules, &ss, h)
+                if ss.timeout:
+                    break
+                if ss.root_score > asp_alpha and ss.root_score < asp_beta:
+                    break  # Score within window — accept result
+                # Fail-low or fail-high: widen window
+                asp_delta = asp_delta * 2.0
+                if asp_delta >= 5000.0:
+                    # Window is wide enough — fall back to full window
+                    ss.timeout = False
+                    idx = search_root(board, player, &moves, depth,
+                                      -100000.0, 100000.0, &rules, &ss, h)
+                    break
+
         if not ss.timeout:
             best_idx = idx
             best_depth = depth
+            prev_score = ss.root_score
+            # Swap best move to position 0 for next ID iteration
+            if best_idx != 0:
+                _tmp_move = moves.moves[0]
+                moves.moves[0] = moves.moves[best_idx]
+                moves.moves[best_idx] = _tmp_move
+                best_idx = 0
         if ss.timeout or _check_deadline(&ss):
             break
 
@@ -982,20 +1543,21 @@ cdef void init_standard_board(signed char *board) noexcept nogil:
 cdef dict board_to_compact_dict(signed char *board, int player, int move_count):
     """Convert flat board array to compact Python dict (same as Board.to_compact + turn)."""
     cdef list p1_men = [], p1_kings = [], p2_men = [], p2_kings = []
-    cdef int r, c, piece
-    for r in range(8):
-        for c in range(8):
-            if (r + c) % 2 != 1:
-                continue
-            piece = board[r * 8 + c]
-            if piece == P1_MAN:
-                p1_men.append([r, c])
-            elif piece == P1_KING:
-                p1_kings.append([r, c])
-            elif piece == P2_MAN:
-                p2_men.append([r, c])
-            elif piece == P2_KING:
-                p2_kings.append([r, c])
+    cdef int i, r, c, piece
+    for i in range(NUM_DARK_SQ):
+        piece = board[DARK_SQ[i]]
+        if piece == EMPTY:
+            continue
+        r = DARK_SQ_R[i]
+        c = DARK_SQ_C[i]
+        if piece == P1_MAN:
+            p1_men.append([r, c])
+        elif piece == P1_KING:
+            p1_kings.append([r, c])
+        elif piece == P2_MAN:
+            p2_men.append([r, c])
+        elif piece == P2_KING:
+            p2_kings.append([r, c])
     return {
         'p1_men': p1_men,
         'p1_kings': p1_kings,
@@ -1029,12 +1591,18 @@ def play_full_game_cy(
     cdef signed char new_board[64]
     cdef CMoveList moves
     cdef Rules rules
-    cdef int player, chosen_idx, move_num, depth, idx, i
+    cdef int player, chosen_idx, apply_idx, move_num, depth, idx, i, j
     cdef double time_budget
     cdef int max_depth, best_idx
     cdef SearchState ss
     cdef int p1_caps = 0, p2_caps = 0
     cdef bint game_over = False
+    cdef unsigned long long h
+    cdef float _prev_score, _asp_a, _asp_b
+    cdef int root_order[MAX_MOVES]  # Maps current pos → original pos for replay
+    cdef CMove temp_move
+    cdef float dummy_score, dummy_alpha, dummy_beta
+    cdef int tt_from_sq, tt_to_sq
 
     rules = _load_rules()
     init_standard_board(board)
@@ -1046,7 +1614,13 @@ def play_full_game_cy(
     # means entries from prior moves in THIS game are accepted (free hits).
     _ensure_tt()
     global _tt_generation
-    _tt_generation = (_tt_generation + 1) & 0xFF
+    _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
+
+    # Compute initial hash and initialize killer/history tables.
+    # Killers and history persist across moves within a game — moves that
+    # cause cutoffs at ply N tend to be good at the same ply in later positions.
+    h = compute_hash(board, player)
+    _init_search_tables(&ss)
 
     cdef list entries = []
     cdef list moves_list
@@ -1063,8 +1637,19 @@ def play_full_game_cy(
             game_over = True
             break
 
-        # Order moves for search efficiency + consistent ordering
-        _order_moves(&moves)
+        # Order moves using full heuristic (TT move, killers, history).
+        # TT probe extracts best move from prior search of this position
+        # (iterative deepening reuses TT entries). Killers/history from prior
+        # moves in this game provide additional ordering signal.
+        tt_from_sq = -1; tt_to_sq = -1
+        if _tt_table != NULL:
+            dummy_alpha = -100000.0; dummy_beta = 100000.0
+            tt_probe(h, 0, &dummy_score, &dummy_alpha, &dummy_beta,
+                     &tt_from_sq, &tt_to_sq)
+        _order_moves_full(&moves, 0, &ss, tt_from_sq, tt_to_sq, board, -1, -1)
+        # Initialize index mapping (current pos → original pos for replay)
+        for i in range(moves.count):
+            root_order[i] = i
 
         # Convert board and moves to Python dicts for replay recording
         state_dict = board_to_compact_dict(board, player, move_num)
@@ -1073,10 +1658,14 @@ def play_full_game_cy(
             moves_list.append(cmove_to_dict(&moves.moves[i]))
 
         # Choose move: noise (exploration) or alpha-beta search
+        # chosen_idx: index into moves_list (original pre-ID-swap order) for replay
+        # apply_idx:  index into moves.moves[] (current, possibly swapped order)
         if moves.count == 1:
             chosen_idx = 0
+            apply_idx = 0
         elif _rng.random() < noise_prob:
             chosen_idx = _rng.randint(0, moves.count - 1)
+            apply_idx = chosen_idx  # no ID swaps in noise path
         else:
             cur_diff = p1_difficulty if player == PLAYER_ONE else p2_difficulty
 
@@ -1091,28 +1680,63 @@ def play_full_game_cy(
 
             # TT is NOT cleared between moves — entries from prior searches are
             # still valid (same game, related positions) and provide free hits.
+            # Age history table: halve all entries to prevent long-game saturation.
+            # Without aging, entries cap at 10000 and all quiet moves look equally
+            # good after ~50 moves. Halving preserves relative ordering while
+            # letting recent cutoffs dominate older ones.
+            _age_history(&ss)
             ss.deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
             ss.nodes = 0
             ss.timeout = False
 
             best_idx = 0
+            _prev_score = 0.0
             for depth in range(1, max_depth + 1):
                 ss.timeout = False
-                idx = search_root(board, player, &moves, depth, &rules, &ss)
+                if depth < 5:
+                    idx = search_root(board, player, &moves, depth,
+                                      -100000.0, 100000.0, &rules, &ss, h)
+                else:
+                    _asp_a = _prev_score - 75.0
+                    _asp_b = _prev_score + 75.0
+                    idx = search_root(board, player, &moves, depth,
+                                      _asp_a, _asp_b, &rules, &ss, h)
+                    if not ss.timeout and (ss.root_score <= _asp_a or ss.root_score >= _asp_b):
+                        ss.timeout = False
+                        idx = search_root(board, player, &moves, depth,
+                                          -100000.0, 100000.0, &rules, &ss, h)
                 if not ss.timeout:
                     best_idx = idx
+                    _prev_score = ss.root_score
+                    # Swap best move to position 0 for next ID iteration.
+                    # PVS searches move 0 with full window — putting the
+                    # best move from depth N at position 0 for depth N+1
+                    # maximizes PVS effectiveness (the PV move is usually
+                    # still best at the next depth).
+                    if best_idx != 0:
+                        temp_move = moves.moves[0]
+                        moves.moves[0] = moves.moves[best_idx]
+                        moves.moves[best_idx] = temp_move
+                        j = root_order[0]
+                        root_order[0] = root_order[best_idx]
+                        root_order[best_idx] = j
+                        best_idx = 0
                 if ss.timeout or _check_deadline(&ss):
                     break
-            chosen_idx = best_idx
+            # chosen_idx: original index for replay entry (maps to moves_list)
+            # apply_idx:  actual position in the (swapped) C array
+            chosen_idx = root_order[best_idx]
+            apply_idx = best_idx
 
-        # Track captures per player
-        if moves.moves[chosen_idx].num_captures > 0:
+        # Track captures per player (use apply_idx for swapped C array)
+        if moves.moves[apply_idx].num_captures > 0:
             if player == PLAYER_ONE:
-                p1_caps += moves.moves[chosen_idx].num_captures
+                p1_caps += moves.moves[apply_idx].num_captures
             else:
-                p2_caps += moves.moves[chosen_idx].num_captures
+                p2_caps += moves.moves[apply_idx].num_captures
 
         # Record entry (format matches ReplayEntry.to_dict())
+        # chosen_idx indexes into moves_list (original pre-swap order)
         entries.append({
             'state': state_dict,
             'legal_moves': moves_list,
@@ -1122,7 +1746,9 @@ def play_full_game_cy(
         })
 
         # Apply move in C (board → new_board, then copy back)
-        apply_move_c(board, new_board, &moves.moves[chosen_idx], player)
+        # Use apply_idx for the actual move in the (possibly swapped) C array
+        h = _hash_after_move(h, board, &moves.moves[apply_idx], player)
+        apply_move_c(board, new_board, &moves.moves[apply_idx], player)
         memcpy(board, new_board, 64)
         player = opponent(player)
         actual_moves += 1
