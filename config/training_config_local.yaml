@@ -1,11 +1,11 @@
 # =============================================================================
 # Local Training Configuration (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
 # =============================================================================
-# Updated 2026-04-05 based on training analysis pass 47.
+# Updated 2026-04-05 based on training analysis pass 59.
 #
-# NOTE: model_step_050000.pt no longer exists. Use auto-detect (checkpoint_path=null)
-# or specify a valid checkpoint path. The step 50K checkpoint had 43% WR vs medium
-# but was lost. Current best checkpoint is at step 2000.
+# Current state: model at step 2000, 0% WR vs medium/easy. All prior high-WR
+# checkpoints (step 50K, 43% WR) were lost. Use auto-detect (checkpoint_path=null)
+# or use training_config_local_retrain.yaml for fresh training.
 #
 # Key changes from previous config:
 #   1. LR scheduler DISABLED — caused 43%->0% WR crash via 31x LR oscillations
@@ -59,10 +59,9 @@ value_head:
 # -----------------------------------------------------------------------------
 # Self-Play Settings
 # -----------------------------------------------------------------------------
-# At 43% WR (step 50K peak), the model is strong enough for medium-only training.
-# 100% algorithmic opponents: at <50% WR, ML self-play still produces more
-# losing games than winning ones, teaching losing patterns. Pure algorithmic
-# teachers provide consistent, learnable move selection signal.
+# Current model at 0% WR — 100% algorithmic opponents provide consistent
+# learning signal. ML self-play at <50% WR produces mostly losing patterns.
+# Re-enable ML self-play (opponent_focus: "both") once WR exceeds 30%.
 # -----------------------------------------------------------------------------
 selfplay:
   cpu_workers: 11                       # 11 of 12 cores — 1 for GPU thread + system

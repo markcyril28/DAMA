@@ -74,9 +74,9 @@ model:
 # losing patterns. algo_vs_algo provides high-quality baseline data.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 8                        # 8 of 12 cores — leaves 4 for GPU thread, dataloader,
+  cpu_workers: 10                        # 8 of 12 cores — leaves 4 for GPU thread, dataloader,
                                         # system, and thermal monitoring overhead.
-  games_per_epoch: 300                  # [Pass 57] Increased from 200. More ML-vs-algo data.
+  games_per_epoch: 500                  # [Pass 57] Increased from 200. More ML-vs-algo data.
                                         # 300 games x ~40 moves = ~12K entries/cycle.
                                         # With algo_vs_algo=200, total ~20K entries/cycle.
                                         # 150 as P1 + 150 as P2 (focus_side: "both").
@@ -96,7 +96,7 @@ selfplay:
                                         # Thermal protection handles GPU temperature.
 
   algo_vs_algo:
-    enabled: true
+    enabled: false
     games_per_epoch: 200                # [Pass 56] Reduced from 900. Algo-vs-algo had 99.7%
                                         # P1 win rate, creating extreme bias in training data.
                                         # 200 algo + 300 ML = 40% algo (was 82%).
@@ -156,7 +156,7 @@ training:
 # includes a trained value head.
 # -----------------------------------------------------------------------------
 value_head:
-  enabled: false
+  enabled: true
   hidden_size: 128                        # Match server config for future compatibility
   value_weight: 0.15                      # 85% policy / 15% value if enabled
 
@@ -170,7 +170,7 @@ dataloader:
                                         # slots, fp16 on GPU) = ~0.7GB VRAM. Fits easily in 8GB.
                                         # At batch_size=8192, gives ~73 batches/epoch.
   max_moves_per_sample: 32              # Max legal moves in Dama is ~20; saves 50% memory
-  clear_replay_after_load: true         # [Pass 56] Clear replay files after loading into buffer.
+  clear_replay_after_load: false         # [Pass 56] Clear replay files after loading into buffer.
                                         # Prevents disk from filling with stale data. Buffer holds
                                         # the most recent entries up to replay_max_entries.
 

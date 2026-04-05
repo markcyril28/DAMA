@@ -249,14 +249,14 @@ profiles:
       difficulties:
         - "easy"
         - "medium"
-        - "hard"
+        # - "hard"                          # Re-enable when model beats medium >40% WR
       pipeline_mode: "simultaneous"
       algo_vs_algo:
-        games_per_epoch: 900
+        games_per_epoch: 200              # Synced with training_config_local_retrain.yaml
         difficulties:
           - "easy"
           - "medium"
-          - "hard"
+          # - "hard"                        # Re-enable when model is competitive
     training:
       batch_size: 8192
       learning_rate: 2.0e-4

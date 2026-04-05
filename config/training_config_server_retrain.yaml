@@ -68,8 +68,10 @@ selfplay:
                                           # for preprocessing + OS. With 14400 algo games
                                           # / 25 per batch = 576 batches, 96 workers
                                           # complete in ~6 waves vs ~11 with 52 (~45% faster).
-  games_per_epoch: 200                    # ML-vs-algo games per cycle.
-                                          # 200 games x ~40 moves = ~8K entries/cycle.
+  games_per_epoch: 600                    # Increased from 200. More ML-vs-algo data to
+                                          # balance the algo_vs_algo P1 bias.
+                                          # 600 games x ~40 moves = ~24K entries/cycle.
+                                          # 300 as P1 + 300 as P2 (focus_side="both").
   difficulties:
     - "easy"                              # Start with easy — learnable signal for
     - "medium"                            # a random model. Medium adds challenge.
@@ -86,11 +88,11 @@ selfplay:
 
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 14400                # 16x local (900) — aggressive data generation
-                                          # for fresh training. 96 Cython workers process
-                                          # ~3ms/easy, ~378ms/hard per game.
-                                          # Fills replay buffer quickly with high-quality
-                                          # data from scratch.
+    games_per_epoch: 3600                 # Reduced from 14400. At 14400: 98.6% algo data
+                                          # (14400/(14400+200)). Algo-vs-algo has 99.7% P1
+                                          # win rate — extreme P1 bias in reward weighting.
+                                          # At 3600: 85.7% algo (3600/(3600+200+600)), still
+                                          # plenty of data from 96 Cython workers.
     difficulties:                         # Exclude super_hard — per pass 8 analysis,
       - "easy"                            # super_hard matchups cause 60% longer cycles
       - "medium"                          # (~39min -> ~15min). Cython TT helps but
@@ -131,7 +133,10 @@ training:
                                           # Critical for fresh model — prevents
                                           # large early gradients from destabilizing.
 
-  reward_mode: "cycle"                    # Alternate scoring/uniform epochs
+  reward_mode: "scoring"                  # Consistent reward signal. "cycle" amplifies
+                                          # P1 bias on scoring epochs (high weight for P1
+                                          # winning moves, low for P2 losing moves).
+                                          # Matches local_retrain rationale (pass 56).
 
 # -----------------------------------------------------------------------------
 # Value Head / TD Learning Settings
