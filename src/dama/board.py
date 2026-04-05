@@ -23,7 +23,7 @@ class Board:
     def clone(self) -> "Board":
         """Create a copy of this board."""
         new_board = Board()
-        new_board._pieces = dict(self._pieces)
+        new_board._pieces = self._pieces.copy()
         return new_board
 
     @classmethod
@@ -122,14 +122,16 @@ class Board:
         p2_men = []
         p2_kings = []
 
+        _KING = PieceType.KING
+        _P1 = Player.ONE
         for pos, piece in self._pieces.items():
-            if piece.player == Player.ONE:
-                if piece.is_king:
+            if piece.player is _P1:
+                if piece.piece_type is _KING:
                     p1_kings.append(pos)
                 else:
                     p1_men.append(pos)
             else:
-                if piece.is_king:
+                if piece.piece_type is _KING:
                     p2_kings.append(pos)
                 else:
                     p2_men.append(pos)
