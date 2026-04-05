@@ -2344,8 +2344,9 @@ class Trainer:
 
             # --- Optimizer step: only after accumulating enough gradients ---
             if _micro_step < accum_steps:
-                # Accumulate loss for reporting (unscaled)
-                total_loss_acc += loss.detach() * accum_steps
+                # Accumulate loss for reporting (unscaled).  In-place add_
+                # with alpha avoids a temporary tensor from loss * accum_steps.
+                total_loss_acc.add_(loss.detach(), alpha=accum_steps)
                 num_batches += 1
                 continue
 
@@ -2371,7 +2372,8 @@ class Trainer:
                 if _grad_clip_norm is not None:
                     _scaler.unscale_(_optimizer)
                     _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        _model.parameters(), _grad_clip_norm)
+                        _model.parameters(), _grad_clip_norm,
+                        foreach=True)
                     if _want_grad_stats:
                         _grad_norm = _clip_norm.item()
                 _scaler.step(_optimizer)
@@ -2379,14 +2381,16 @@ class Trainer:
             else:
                 if _grad_clip_norm is not None:
                     _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        _model.parameters(), _grad_clip_norm)
+                        _model.parameters(), _grad_clip_norm,
+                        foreach=True)
                     if _want_grad_stats:
                         _grad_norm = _clip_norm.item()
                 _optimizer.step()
 
             # Accumulate on GPU — no sync. Only .item() when needed for logging.
             # Undo the /accum_steps scaling so total_loss_acc reflects true loss.
-            total_loss_acc += loss.detach() * accum_steps
+            # In-place add_ with alpha avoids a temporary tensor allocation.
+            total_loss_acc.add_(loss.detach(), alpha=accum_steps)
             num_batches += 1
             self.step += 1
             _step_elapsed = (time.time() - _step_start) if _will_record else 0.0
