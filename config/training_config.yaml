@@ -38,6 +38,14 @@ model:
   hidden_size: 64                     # MoveScorer MLP hidden layer size
 
 # -----------------------------------------------------------------------------
+# Value Head (optional auxiliary head for position evaluation)
+# -----------------------------------------------------------------------------
+value_head:
+  enabled: false                        # Enable value head for TD/value learning
+  hidden_size: 128                      # Value head MLP hidden size
+  value_weight: 0.15                    # Weight of value loss relative to policy loss
+
+# -----------------------------------------------------------------------------
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 selfplay:
@@ -54,6 +62,9 @@ selfplay:
   max_moves_per_game: 100             # Maximum moves per game
   pipeline_mode: "simultaneous"       # "simultaneous" = generate data on CPU while training on GPU (overlapped)
                                       # "alternate"     = generate all data first, then train (sequential)
+  max_stale_epochs: 0                  # Max epochs on unchanged data before yielding to wait
+                                      # for fresh self-play data (simultaneous mode only).
+                                      # 0 = unlimited (train continuously on stale data).
 
   # Algo-vs-algo: pure algorithmic games as additional training data.
   # Generates games between all difficulty matchup pairs (e.g., easy-vs-easy,
@@ -102,11 +113,15 @@ training:
 dataloader:
   num_workers: 16                     # Number of dataloader worker processes
   pin_memory: true                    # Pin memory for faster GPU transfer
-  prefetch_factor: 3                  # Batches to prefetch per worker
+  prefetch_factor: 3                  # Only used when DataLoader is active (num_workers>0).
+                                      # FastBatchIterator (RAM cache path) bypasses DataLoader.
   replay_max_entries: 100000          # Max entries sampled from replay buffer per epoch
   clear_replay_after_load: false      # Delete replay JSONL files after loading into memory
                                       # Frees disk space and prevents re-training on stale data.
                                       # New self-play data is generated fresh each epoch regardless.
+  max_moves_per_sample: 32            # Padding width for move feature tensors.
+                                      # Max legal moves in Dama is ~20; 32 saves 50% memory
+                                      # vs the old default of 64 with safe margin.
 
   # RAM Caching (see IMPROVEMENTS.md)
   ram_cache:
@@ -182,6 +197,8 @@ time_limit:
 
 profiles:
   # AMD MI210 Server (64GB VRAM, 128 CPU threads, 1TB RAM)
+  # NOTE: Use training_config_server.yaml or training_config_server_retrain.yaml
+  # directly for server training. This profile is for reference only.
   server:
     device:
       type: "cuda"
@@ -191,19 +208,18 @@ profiles:
       compile:
         mode: "max-autotune"          # MI210 benefits from max-autotune (large VRAM)
     selfplay:
-      cpu_workers: 112                # 128 cores − 16 reserved for training I/O + preprocessing
-      games_per_epoch: 32768          # Proportional to batch size — keeps GPU fed
-      pipeline_mode: "simultaneous"   # Overlap CPU self-play with GPU training
+      cpu_workers: 96                 # Synced with server configs (was 52)
+      games_per_epoch: 512            # Synced with training_config_server.yaml
+      pipeline_mode: "simultaneous"
     training:
-      batch_size: 32768               # 64GB VRAM — ~6.4GB activations, still <10% VRAM
-      learning_rate: 5.6e-4           # Sqrt-scaled from 4e-4 at 16384 (x1.41)
+      batch_size: 32768               # 64GB VRAM — ~9.7GB activations with BF16
+      learning_rate: 2.0e-4           # Synced with training_config_server.yaml
       gradient_accumulation_steps: 1
       lr_scheduler:
-        enabled: true
-        warmup_steps: 400             # Longer warmup for larger batch (proportional to sqrt(batch))
+        enabled: false                # LR scheduler disabled per v5 post-mortem
     dataloader:
-      num_workers: 0                  # FastBatchIterator bypasses DataLoader — workers unused
-      replay_max_entries: 2000000     # 1TB RAM — ~7GB for 2M entries, maximize diversity
+      num_workers: 0                  # FastBatchIterator bypasses DataLoader
+      replay_max_entries: 5000000      # Synced with server configs (was 2M)
       ram_cache:
         enabled: true
         threshold_gb: 64.0
@@ -219,33 +235,30 @@ profiles:
         enabled: true
         dtype: "float16"
       compile:
-        enabled: true
-        mode: "reduce-overhead"        # SM-count guard auto-downgrades to 'default' on small GPUs
+        enabled: false                  # [Pass 20]: Always fails on RTX 5050
     selfplay:
-      cpu_workers: 10
+      cpu_workers: 11
       games_per_epoch: 200
-      difficulties:                       # Exclude super_hard — 5s/move is too slow for 12 cores
+      difficulties:
         - "easy"
         - "medium"
         - "hard"
       pipeline_mode: "simultaneous"
       algo_vs_algo:
-        games_per_epoch: 900              # [Pass 17 fix]: Was 200 (stale). Matches local.yaml.
-        difficulties:                     # Exclude super_hard for local hardware
+        games_per_epoch: 900
+        difficulties:
           - "easy"
           - "medium"
           - "hard"
     training:
-      batch_size: 4096                  # [Pass 17 fix]: Was 8192 (stale). Matches local.yaml.
+      batch_size: 4096
       learning_rate: 1.5e-4
       gradient_accumulation_steps: 1
       lr_scheduler:
-        enabled: false                  # [Pass 17 fix]: Was true (fell through from base).
-                                        # LR scheduler caused catastrophic regression in prior run.
-        warmup_steps: 100
+        enabled: false                  # LR scheduler caused catastrophic regression.
     dataloader:
       num_workers: 0
-      replay_max_entries: 600000        # 32GB RAM — ~2.1GB cached, ~1.8GB on GPU
+      replay_max_entries: 1000000        # Synced with training_config_local.yaml
       ram_cache:
         enabled: true
         threshold_gb: 16.0

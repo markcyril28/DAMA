@@ -1,11 +1,11 @@
 # =============================================================================
 # Local Training Configuration (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
 # =============================================================================
-# Updated 2026-04-05 based on training analysis v6.
+# Updated 2026-04-05 based on training analysis pass 47.
 #
-# CRITICAL: Resume from models/checkpoints/model_step_050000.pt (not latest.pt).
-# Steps 50K-56K suffered catastrophic LR-scheduler-induced forgetting.
-# The step 50K checkpoint had 43% WR vs medium — the best ever recorded.
+# NOTE: model_step_050000.pt no longer exists. Use auto-detect (checkpoint_path=null)
+# or specify a valid checkpoint path. The step 50K checkpoint had 43% WR vs medium
+# but was lost. Current best checkpoint is at step 2000.
 #
 # Key changes from previous config:
 #   1. LR scheduler DISABLED — caused 43%->0% WR crash via 31x LR oscillations
@@ -14,8 +14,8 @@
 #      losing patterns. 100% algorithmic teachers provide consistent signal.
 #   4. games_per_epoch increased to 200 — more ML-vs-algo data per cycle
 #   5. algo_vs_algo reduced to 900 — rebalances ratio (was 94.7% algo data)
-#   6. focus_side "both" kept — P1/P2 asymmetry root cause is board encoding
-#      (no position flip for P2), not data imbalance. Balanced exposure is correct.
+#   6. focus_side "both" kept — board encoding correctly flips for P2
+#      (move_encoder.py:30-35). Balanced exposure ensures both sides train equally.
 #   7. testing every 1000 steps with 50 games — faster feedback loop
 #   8. batch_size reduced to 4096 — more gradient updates per epoch
 #
@@ -33,8 +33,8 @@ device:
     enabled: true
     dtype: "float16"                    # float16 + GradScaler for RTX 5050 (no native bfloat16)
   compile:
-    enabled: true                       # Auto-falls back to eager on failure
-    mode: "reduce-overhead"             # CUDAGraphs — avoid "max-autotune" (Triton fails on RTX 5050)
+    enabled: false                      # [Pass 20] Always fails on RTX 5050 ("device kernel image
+                                        # is invalid"). Disabling avoids 5s warmup overhead.
   matmul_precision: "medium"            # TF32 enabled
 
 # -----------------------------------------------------------------------------
@@ -50,6 +50,14 @@ model:
   hidden_size: 128                      # MoveScorer MLP hidden layer size
 
 # -----------------------------------------------------------------------------
+# Value Head (optional)
+# -----------------------------------------------------------------------------
+value_head:
+  enabled: false                         # Not used in local training yet
+  hidden_size: 128
+  value_weight: 0.15                     # Matches server configs (default 0.5 is too high)
+
+# -----------------------------------------------------------------------------
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 # At 43% WR (step 50K peak), the model is strong enough for medium-only training.
@@ -58,7 +66,7 @@ model:
 # teachers provide consistent, learnable move selection signal.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                       # 10 of 12 cores — 2 for GPU driver + training thread
+  cpu_workers: 11                       # 11 of 12 cores — 1 for GPU thread + system
   games_per_epoch: 200                  # [Part 2] Doubled from 100. More ML-vs-algo data per cycle.
                                         # 200 games x ~42 moves = ~8.4K entries/cycle from ML games.
                                         # With algo-vs-algo, total ~57K entries/cycle.
@@ -68,8 +76,8 @@ selfplay:
     # - "hard"                          # Re-enable when model beats medium at >40% WR consistently
     # - "super_hard"                    # Re-enable when model beats hard consistently
   focus_side: "both"                    # [Part 2] Balanced P1/P2 exposure. 100 games as P1, 100 as P2.
-                                        # P1/P2 asymmetry root cause is board encoding (no position
-                                        # flip), not data imbalance. Both sides need equal training.
+                                        # Board encoding correctly flips for P2 (move_encoder.py:30-35).
+                                        # P1/P2 asymmetry was due to under-training, not encoding bugs.
   opponent_focus: "algorithm"           # [Part 1] 100% algorithmic opponents. Was "both" (50% ML
                                         # self-play). At <50% WR, ML-vs-ML generates mostly losing
                                         # games. Pure algo teachers give consistent learning signal.
@@ -134,10 +142,11 @@ training:
 dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
-  prefetch_factor: 4
-  replay_max_entries: 400000            # Large buffer. 400K entries x ~3.5KB = ~1.4GB RAM.
-                                        # At batch_size=4096, gives ~98 batches/epoch.
+  prefetch_factor: 4                   # Unused — FastBatchIterator bypasses DataLoader
+  replay_max_entries: 1000000            # 1M entries x ~1.2KB (fp16 on GPU) = ~1.2GB VRAM.
+                                        # Float16 GPU storage halves VRAM; was 400K at ~0.7GB.
   clear_replay_after_load: false        # Accumulate data across self-play cycles for diversity
+  max_moves_per_sample: 32              # Max legal moves in Dama is ~20; 32 saves 50% vs old default of 64
 
   ram_cache:
     enabled: true
@@ -155,7 +164,8 @@ testing:
   enabled: true
   every_n_steps: 1000                   # [Part 1] Was 2000. Faster feedback to catch regressions.
   num_games: 50                         # [Part 1] Was 30. Slightly more reliable signal.
-  difficulty: "medium"                  # Benchmark target
+  difficulty: "easy"                    # [Pass 56] Changed from "medium". At 0% WR vs medium,
+                                        # testing against medium gives no signal. Test easy first.
 
 # -----------------------------------------------------------------------------
 # Paths
@@ -222,15 +232,15 @@ profiles:
       compile:
         mode: "max-autotune"
     selfplay:
-      cpu_workers: 48
-      games_per_epoch: 2048
+      cpu_workers: 96                   # Synced with training_config_server.yaml
+      games_per_epoch: 512              # Synced with training_config_server.yaml
     training:
       batch_size: 32768
       learning_rate: 2.0e-4
       lr_scheduler:
-        enabled: false                  # Match server config v5 decision
+        enabled: false                  # LR scheduler disabled per v5 post-mortem
     dataloader:
-      replay_max_entries: 500000
+      replay_max_entries: 5000000       # Synced with training_config_server.yaml
       ram_cache:
         threshold_gb: 64.0
     thermal_protection:
@@ -243,7 +253,7 @@ profiles:
       compile:
         mode: "reduce-overhead"
     selfplay:
-      cpu_workers: 10                   # [Part 3] Fixed: now matches top-level
+      cpu_workers: 11                   # Matches top-level
       games_per_epoch: 200              # [Part 3] Fixed: now matches top-level
     training:
       batch_size: 4096                  # [Part 3] Fixed: now matches top-level

@@ -1,20 +1,20 @@
 # =============================================================================
 # Micro Training Configuration - SERVER (v5)
 # =============================================================================
-# Hardware: AMD Instinct MI210 (64GB HBM2e) + 64 CPU threads + 1TB DDR4 RAM
+# Hardware: AMD Instinct MI210 (64GB HBM2e) + 128 CPU threads + 1TB DDR4 RAM
 # Platform: ROCm 6.x, gfx90a (CDNA2)
 #
-# Thread Allocation (64 total — auto-configured by trainer):
-#   - Self-play workers:   52 (~81%)  ← game generation (NOTE: GIL limits true
-#                                        parallelism; actual ~5x speedup observed)
-#   - PyTorch intra-op:    32 (50%)   ← tensor ops, preprocessing (auto: cores//2, cap 64)
-#   - PyTorch inter-op:     8 (12.5%) ← parallel independent ops (auto: cores//8, cap 8)
+# Thread Allocation (128 total — auto-configured by trainer):
+#   - Self-play workers:   96 (75%)   ← game generation via ProcessPoolExecutor
+#                                        (separate processes, no GIL contention)
+#   - PyTorch intra-op:    64 (50%)   ← tensor ops, preprocessing (auto: cores//2, cap 64)
+#   - PyTorch inter-op:    16 (12.5%) ← parallel independent ops (auto: cores//8, cap 8)
 #   - DataLoader workers:   0         ← FastBatchIterator bypasses DataLoader
 #
-# GPU VRAM: batch_size=32768 BF16 uses ~9.7 GB of 64 GB (model+activations+optimizer).
+# GPU VRAM: batch_size=65536 BF16 uses ~19.4 GB of 64 GB (model+activations+optimizer).
 # _compute_loss() is fully vectorized — 3 GPU kernels for the entire batch.
 # Masked MoveScorer only computes valid move slots (~84% less MLP compute vs
-# full-padded — avg ~10 legal moves vs 64 padded slots).
+# full-padded — avg ~10 legal moves vs 32 padded slots).
 # Dataset preprocessing parallelized across CPU cores (ProcessPoolExecutor).
 #
 # Usage:
@@ -128,16 +128,16 @@ model:
 #   Total cycle: ~212 min. 6h session ≈ 1.7 cycles ≈ 945 training steps.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 52                     # 52 of 64 threads — maximize game generation.
+  cpu_workers: 96                     # 96 of 128 cores — maximize game generation.
+                                      # ProcessPoolExecutor creates separate processes (no GIL).
+                                      # Training uses only 1 CPU thread (torch.set_num_threads(1)
+                                      # when device=cuda), leaving 127 cores available.
+                                      # 96 uses 75% of cores; 32 remain for preprocessing + OS.
   games_per_epoch: 512                # *** Reduced from 1024 ***
-                                      # Self-play blocks training for ~90 min per cycle
-                                      # (GIL limits effective parallelism to ~5 workers).
-                                      # 512 games ≈ 45 min self-play, freeing 45 min more
-                                      # for training. Gains ~135 steps per 6h session (+16%).
                                       # 512 × ~41 moves = ~21K new positions per cycle.
-                                      # Dataset already has 561K positions (105 replay files).
-                                      # In simultaneous mode, self-play runs continuously in background.
-                                      # GPU trains on existing data while CPU generates fresh data.
+                                      # In simultaneous mode, self-play runs continuously in
+                                      # background — GPU trains on existing data while 96 CPU
+                                      # workers generate fresh data via Cython fast search.
   difficulties:                       # Train against medium difficulty only.
     - "medium"                        #   Medium: 0.8s/move, depth 5 — optimal learning signal.
     # - "super_hard"                  #   5.0s/move, depth 12 — enable when model beats hard
@@ -182,20 +182,17 @@ selfplay:
 # uses ~9.7 GB VRAM BF16 (of 64 GB). Step time is now GPU-bound, not Python-bound.
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 32768                   # *** Increased from 4096 ***
-                                      # _compute_loss() is now vectorized; the entire
-                                      # batch runs in 3 GPU kernel calls (scatter,
-                                      # log_softmax, gather) regardless of size.
-                                      # 8× larger batch → better GPU CU occupancy.
-                                      # VRAM at 32768 BF16: ~9.7 GB (of 64 GB).
-                                      # 32768 × ~22 batches/epoch = ~4 batches per epoch.
-  learning_rate: 2.0e-4               # *** Updated from 5.0e-4 ***
-                                      # Sqrt-scaled from previous effective LR 6.4e-5:
-                                      #   lr_new = 6.4e-5 × sqrt(32768/4096) ≈ 1.81e-4
-                                      #   rounded to 2.0e-4.
-                                      # The LR reset fix in trainer.py now ensures this
-                                      # config value is applied on every resume (previously
-                                      # the checkpoint's saved LR overrode this).
+  batch_size: 65536                   # Doubled from 32768. 64GB VRAM is only 15% utilized
+                                      # at 32768 (~9.7GB). At 65536 BF16: ~19.4GB (30% of 64GB).
+                                      # Still leaves ~38GB for GPU-resident data (~5.9GB) +
+                                      # torch.compile workspace + overhead.
+                                      # 5M entries / 65536 = ~76 batches/epoch — still plenty
+                                      # of gradient updates per data pass.
+  learning_rate: 2.8e-4               # Sqrt-scaled from 2.0e-4 for 2x batch:
+                                      #   lr_new = 2.0e-4 × sqrt(65536/32768) = 2.83e-4
+                                      #   rounded to 2.8e-4.
+                                      # Linear scaling rule (sqrt variant) maintains
+                                      # effective gradient magnitude per sample.
   weight_decay: 1.0e-5                # *** Reduced from 5e-5 ***
                                       # Model still underfitting (loss=1.59 vs best=1.31).
                                       # Regularization is working against us; minimize it.
@@ -258,11 +255,17 @@ value_head:
 dataloader:
   num_workers: 0                      # FastBatchIterator bypasses DataLoader — workers unused.
   pin_memory: true                    # Pinned memory for async HBM2e transfers via CUDAPrefetcher
-  prefetch_factor: 2                  # 2 is plenty with RAM cache
-  replay_max_entries: 500000          # 1TB RAM — maximize data diversity per epoch
+  prefetch_factor: 2                  # Unused — FastBatchIterator bypasses DataLoader
+  replay_max_entries: 5000000          # 5M entries. Float16 GPU storage: ~5.9GB of 64GB VRAM.
+                                      # Was 2M (~2.3GB). With batch=32768 activations ~10GB +
+                                      # optimizer ~0.1GB + data ~5.9GB = ~16GB total, leaving
+                                      # ~48GB free for torch.compile workspace + overhead.
+                                      # 5M entries retains ~8.5 self-play cycles of data —
+                                      # 2.5x more historical diversity than 2M.
   clear_replay_after_load: false      # Delete replay JSONL files after loading into memory
                                       # Frees disk space and prevents re-training on stale data.
                                       # New self-play data is generated fresh each epoch regardless.
+  max_moves_per_sample: 32            # Max legal moves in Dama is ~20; 32 saves 50% vs old default of 64
 
   # RAM Caching (1TB DDR4 available)
   ram_cache:
@@ -299,9 +302,12 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 10                    # Loss/gradients every 10 steps
+  record_every: 10                    # Loss/gradients every 10 steps (1 CUDA sync per record)
   system_every: 300                   # GPU/CPU/RAM metrics every 300 steps
-  model_health_every: 500             # Parameter norms every 500 steps
+  model_health_every: 2000            # Parameter norms every 2000 steps. Was 500 — each check
+                                      # runs param.float().norm() on ~40 params + 1 batched CUDA
+                                      # sync. 2000 reduces overhead 4x while still catching
+                                      # embedding magnitude drift.
   score_dist_every: 50                # Score distribution every 50 steps
   buffer_size: 100000                 # Large ring buffer — 1TB RAM is abundant
   flush_every: 1000                   # Flush to disk every 1000 steps
