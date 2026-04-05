@@ -10,7 +10,7 @@ import numpy as np
 
 from ...types import Move
 from ...game_state import GameState
-from .model import MoveScorerNet, load_model, create_model
+from .model import MoveScorerNet, load_model, create_model, fold_batchnorm
 from .move_encoder import encode_board, encode_moves
 
 
@@ -77,6 +77,14 @@ def get_model(model_path: str, device: Optional[torch.device] = None) -> MoveSco
                     raise FileNotFoundError(f"Model not found: {path}")
 
                 model = load_model(str(path), device)
+                # Fold BatchNorm into Conv2d on CPU for ~10-20% faster
+                # inference.  GPU inference benefits less (cuDNN already
+                # fuses BN+Conv internally), so only fold on CPU.
+                if device.type == 'cpu':
+                    try:
+                        fold_batchnorm(model)
+                    except Exception:
+                        pass  # Folding is optional; fall back to unfused
                 _model_cache[cache_key] = model
 
     return _model_cache[cache_key]
