@@ -4,6 +4,11 @@
 {
     "distutils": {
         "depends": [],
+        "extra_compile_args": [
+            "-O3",
+            "-ffast-math",
+            "-march=native"
+        ],
         "name": "dama.ai.ml._fast_score",
         "sources": [
             "dama/ai/ml/_fast_score.pyx"
@@ -1131,6 +1136,72 @@ static int __Pyx_init_co_variables(void) {
 #define __PYX_HAVE_API__dama__ai__ml___fast_score
 /* Early includes */
 #include <math.h>
+#include <string.h>
+#include <stdio.h>
+
+    #if PY_MAJOR_VERSION <= 2
+    #define PyDict_GetItemWithError _PyDict_GetItemWithError
+    #endif
+
+    #if __PYX_LIMITED_VERSION_HEX < 0x030d0000
+    static CYTHON_INLINE int
+    __Pyx_CAPI_PyDict_GetItemStringRef(PyObject *mp, const char *key, PyObject **result)
+    {
+        int res;
+        PyObject *key_obj = PyUnicode_FromString(key);
+        if (key_obj == NULL) {
+            *result = NULL;
+            return -1;
+        }
+        res = __Pyx_PyDict_GetItemRef(mp, key_obj, result);
+        Py_DECREF(key_obj);
+        return res;
+    }
+    #else
+    #define __Pyx_CAPI_PyDict_GetItemStringRef PyDict_GetItemStringRef
+    #endif
+    #if PY_VERSION_HEX < 0x030d0000 || (CYTHON_COMPILING_IN_LIMITED_API && __PYX_LIMITED_VERSION_HEX < 0x030F0000)
+    static CYTHON_INLINE int
+    __Pyx_CAPI_PyDict_SetDefaultRef(PyObject *d, PyObject *key, PyObject *default_value,
+                        PyObject **result)
+    {
+        PyObject *value;
+        if (__Pyx_PyDict_GetItemRef(d, key, &value) < 0) {
+            // get error
+            if (result) {
+                *result = NULL;
+            }
+            return -1;
+        }
+        if (value != NULL) {
+            // present
+            if (result) {
+                *result = value;
+            }
+            else {
+                Py_DECREF(value);
+            }
+            return 1;
+        }
+
+        // missing: set the item
+        if (PyDict_SetItem(d, key, default_value) < 0) {
+            // set error
+            if (result) {
+                *result = NULL;
+            }
+            return -1;
+        }
+        if (result) {
+            Py_INCREF(default_value);
+            *result = default_value;
+        }
+        return 0;
+    }
+    #else
+    #define __Pyx_CAPI_PyDict_SetDefaultRef PyDict_SetDefaultRef
+    #endif
+    
 #ifdef _OPENMP
 #include <omp.h>
 #endif /* _OPENMP */
@@ -1348,6 +1419,7 @@ static const char *__pyx_filename;
 
 static const char* const __pyx_f[] = {
   "dama/ai/ml/_fast_score.pyx",
+  "cpython/type.pxd",
 };
 /* #### Code section: utility_code_proto_before_types ### */
 /* Atomics.proto (used by UnpackUnboundCMethod) */
@@ -1600,118 +1672,6 @@ static const char* const __pyx_f[] = {
 #define __Pyx_CLEAR(r)    do { PyObject* tmp = ((PyObject*)(r)); r = NULL; __Pyx_DECREF(tmp);} while(0)
 #define __Pyx_XCLEAR(r)   do { if((r) != NULL) {PyObject* tmp = ((PyObject*)(r)); r = NULL; __Pyx_DECREF(tmp);}} while(0)
 
-/* dict_getitem_default.proto */
-static PyObject* __Pyx_PyDict_GetItemDefault(PyObject* d, PyObject* key, PyObject* default_value);
-
-/* CallCFunction.proto (used by CallUnboundCMethod1) */
-#define __Pyx_CallCFunction(cfunc, self, args)\
-    ((PyCFunction)(void(*)(void))(cfunc)->func)(self, args)
-#define __Pyx_CallCFunctionWithKeywords(cfunc, self, args, kwargs)\
-    ((PyCFunctionWithKeywords)(void(*)(void))(cfunc)->func)(self, args, kwargs)
-#define __Pyx_CallCFunctionFast(cfunc, self, args, nargs)\
-    ((__Pyx_PyCFunctionFast)(void(*)(void))(PyCFunction)(cfunc)->func)(self, args, nargs)
-#define __Pyx_CallCFunctionFastWithKeywords(cfunc, self, args, nargs, kwnames)\
-    ((__Pyx_PyCFunctionFastWithKeywords)(void(*)(void))(PyCFunction)(cfunc)->func)(self, args, nargs, kwnames)
-
-/* PyObjectCall.proto (used by PyObjectFastCall) */
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject* __Pyx_PyObject_Call(PyObject *func, PyObject *arg, PyObject *kw);
-#else
-#define __Pyx_PyObject_Call(func, arg, kw) PyObject_Call(func, arg, kw)
-#endif
-
-/* PyObjectCallMethO.proto (used by PyObjectFastCall) */
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject* __Pyx_PyObject_CallMethO(PyObject *func, PyObject *arg);
-#endif
-
-/* PyObjectFastCall.proto (used by PyObjectCall2Args) */
-#define __Pyx_PyObject_FastCall(func, args, nargs)  __Pyx_PyObject_FastCallDict(func, args, (size_t)(nargs), NULL)
-static CYTHON_INLINE PyObject* __Pyx_PyObject_FastCallDict(PyObject *func, PyObject * const*args, size_t nargs, PyObject *kwargs);
-
-/* PyObjectCall2Args.proto (used by CallUnboundCMethod1) */
-static CYTHON_INLINE PyObject* __Pyx_PyObject_Call2Args(PyObject* function, PyObject* arg1, PyObject* arg2);
-
-/* PyObjectGetAttrStr.proto (used by UnpackUnboundCMethod) */
-#if CYTHON_USE_TYPE_SLOTS
-static CYTHON_INLINE PyObject* __Pyx_PyObject_GetAttrStr(PyObject* obj, PyObject* attr_name);
-#else
-#define __Pyx_PyObject_GetAttrStr(o,n) PyObject_GetAttr(o,n)
-#endif
-
-/* UnpackUnboundCMethod.proto (used by CallUnboundCMethod1) */
-typedef struct {
-    PyObject *type;
-    PyObject **method_name;
-#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING && CYTHON_ATOMICS
-    __pyx_atomic_int_type initialized;
-#endif
-    PyCFunction func;
-    PyObject *method;
-    int flag;
-} __Pyx_CachedCFunction;
-#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
-static CYTHON_INLINE int __Pyx_CachedCFunction_GetAndSetInitializing(__Pyx_CachedCFunction *cfunc) {
-#if !CYTHON_ATOMICS
-    return 1;
-#else
-    __pyx_nonatomic_int_type expected = 0;
-    if (__pyx_atomic_int_cmp_exchange(&cfunc->initialized, &expected, 1)) {
-        return 0;
-    }
-    return expected;
-#endif
-}
-static CYTHON_INLINE void __Pyx_CachedCFunction_SetFinishedInitializing(__Pyx_CachedCFunction *cfunc) {
-#if CYTHON_ATOMICS
-    __pyx_atomic_store(&cfunc->initialized, 2);
-#endif
-}
-#else
-#define __Pyx_CachedCFunction_GetAndSetInitializing(cfunc) 2
-#define __Pyx_CachedCFunction_SetFinishedInitializing(cfunc)
-#endif
-
-/* CallUnboundCMethod1.proto */
-CYTHON_UNUSED
-static PyObject* __Pyx__CallUnboundCMethod1(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg);
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject* __Pyx_CallUnboundCMethod1(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg);
-#else
-#define __Pyx_CallUnboundCMethod1(cfunc, self, arg)  __Pyx__CallUnboundCMethod1(cfunc, self, arg)
-#endif
-
-/* CallUnboundCMethod2.proto */
-CYTHON_UNUSED
-static PyObject* __Pyx__CallUnboundCMethod2(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg1, PyObject* arg2);
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject *__Pyx_CallUnboundCMethod2(__Pyx_CachedCFunction *cfunc, PyObject *self, PyObject *arg1, PyObject *arg2);
-#else
-#define __Pyx_CallUnboundCMethod2(cfunc, self, arg1, arg2)  __Pyx__CallUnboundCMethod2(cfunc, self, arg1, arg2)
-#endif
-
-/* GetItemInt.proto */
-#define __Pyx_GetItemInt(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil, unsafe_shared)\
-    (__Pyx_fits_Py_ssize_t(i, type, is_signed) ?\
-    __Pyx_GetItemInt_Fast(o, (Py_ssize_t)i, is_list, wraparound, boundscheck, unsafe_shared) :\
-    (is_list ? (PyErr_SetString(PyExc_IndexError, "list index out of range"), (PyObject*)NULL) :\
-               __Pyx_GetItemInt_Generic(o, to_py_func(i))))
-#define __Pyx_GetItemInt_List(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil, unsafe_shared)\
-    (__Pyx_fits_Py_ssize_t(i, type, is_signed) ?\
-    __Pyx_GetItemInt_List_Fast(o, (Py_ssize_t)i, wraparound, boundscheck, unsafe_shared) :\
-    (PyErr_SetString(PyExc_IndexError, "list index out of range"), (PyObject*)NULL))
-static CYTHON_INLINE PyObject *__Pyx_GetItemInt_List_Fast(PyObject *o, Py_ssize_t i,
-                                                              int wraparound, int boundscheck, int unsafe_shared);
-#define __Pyx_GetItemInt_Tuple(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil, unsafe_shared)\
-    (__Pyx_fits_Py_ssize_t(i, type, is_signed) ?\
-    __Pyx_GetItemInt_Tuple_Fast(o, (Py_ssize_t)i, wraparound, boundscheck, unsafe_shared) :\
-    (PyErr_SetString(PyExc_IndexError, "tuple index out of range"), (PyObject*)NULL))
-static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Tuple_Fast(PyObject *o, Py_ssize_t i,
-                                                              int wraparound, int boundscheck, int unsafe_shared);
-static PyObject *__Pyx_GetItemInt_Generic(PyObject *o, PyObject* j);
-static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Fast(PyObject *o, Py_ssize_t i,
-                                                     int is_list, int wraparound, int boundscheck, int unsafe_shared);
-
 /* TupleAndListFromArray.proto (used by fastcall) */
 #if CYTHON_COMPILING_IN_CPYTHON
 static CYTHON_INLINE PyObject* __Pyx_PyList_FromArray(PyObject *const *src, Py_ssize_t n);
@@ -1768,8 +1728,74 @@ static CYTHON_INLINE int __Pyx_PyUnicode_Equals(PyObject* s1, PyObject* s2, int 
 /* py_dict_items.proto (used by OwnedDictNext) */
 static CYTHON_INLINE PyObject* __Pyx_PyDict_Items(PyObject* d);
 
+/* CallCFunction.proto (used by CallUnboundCMethod0) */
+#define __Pyx_CallCFunction(cfunc, self, args)\
+    ((PyCFunction)(void(*)(void))(cfunc)->func)(self, args)
+#define __Pyx_CallCFunctionWithKeywords(cfunc, self, args, kwargs)\
+    ((PyCFunctionWithKeywords)(void(*)(void))(cfunc)->func)(self, args, kwargs)
+#define __Pyx_CallCFunctionFast(cfunc, self, args, nargs)\
+    ((__Pyx_PyCFunctionFast)(void(*)(void))(PyCFunction)(cfunc)->func)(self, args, nargs)
+#define __Pyx_CallCFunctionFastWithKeywords(cfunc, self, args, nargs, kwnames)\
+    ((__Pyx_PyCFunctionFastWithKeywords)(void(*)(void))(PyCFunction)(cfunc)->func)(self, args, nargs, kwnames)
+
+/* PyObjectCall.proto (used by PyObjectFastCall) */
+#if CYTHON_COMPILING_IN_CPYTHON
+static CYTHON_INLINE PyObject* __Pyx_PyObject_Call(PyObject *func, PyObject *arg, PyObject *kw);
+#else
+#define __Pyx_PyObject_Call(func, arg, kw) PyObject_Call(func, arg, kw)
+#endif
+
+/* PyObjectCallMethO.proto (used by PyObjectFastCall) */
+#if CYTHON_COMPILING_IN_CPYTHON
+static CYTHON_INLINE PyObject* __Pyx_PyObject_CallMethO(PyObject *func, PyObject *arg);
+#endif
+
+/* PyObjectFastCall.proto (used by PyObjectCallOneArg) */
+#define __Pyx_PyObject_FastCall(func, args, nargs)  __Pyx_PyObject_FastCallDict(func, args, (size_t)(nargs), NULL)
+static CYTHON_INLINE PyObject* __Pyx_PyObject_FastCallDict(PyObject *func, PyObject * const*args, size_t nargs, PyObject *kwargs);
+
 /* PyObjectCallOneArg.proto (used by CallUnboundCMethod0) */
 static CYTHON_INLINE PyObject* __Pyx_PyObject_CallOneArg(PyObject *func, PyObject *arg);
+
+/* PyObjectGetAttrStr.proto (used by UnpackUnboundCMethod) */
+#if CYTHON_USE_TYPE_SLOTS
+static CYTHON_INLINE PyObject* __Pyx_PyObject_GetAttrStr(PyObject* obj, PyObject* attr_name);
+#else
+#define __Pyx_PyObject_GetAttrStr(o,n) PyObject_GetAttr(o,n)
+#endif
+
+/* UnpackUnboundCMethod.proto (used by CallUnboundCMethod0) */
+typedef struct {
+    PyObject *type;
+    PyObject **method_name;
+#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING && CYTHON_ATOMICS
+    __pyx_atomic_int_type initialized;
+#endif
+    PyCFunction func;
+    PyObject *method;
+    int flag;
+} __Pyx_CachedCFunction;
+#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
+static CYTHON_INLINE int __Pyx_CachedCFunction_GetAndSetInitializing(__Pyx_CachedCFunction *cfunc) {
+#if !CYTHON_ATOMICS
+    return 1;
+#else
+    __pyx_nonatomic_int_type expected = 0;
+    if (__pyx_atomic_int_cmp_exchange(&cfunc->initialized, &expected, 1)) {
+        return 0;
+    }
+    return expected;
+#endif
+}
+static CYTHON_INLINE void __Pyx_CachedCFunction_SetFinishedInitializing(__Pyx_CachedCFunction *cfunc) {
+#if CYTHON_ATOMICS
+    __pyx_atomic_store(&cfunc->initialized, 2);
+#endif
+}
+#else
+#define __Pyx_CachedCFunction_GetAndSetInitializing(cfunc) 2
+#define __Pyx_CachedCFunction_SetFinishedInitializing(cfunc)
+#endif
 
 /* CallUnboundCMethod0.proto */
 CYTHON_UNUSED
@@ -1824,6 +1850,15 @@ static int __Pyx_ParseKeywordDict(
     int ignore_unknown_kwargs
 );
 
+/* CallUnboundCMethod2.proto */
+CYTHON_UNUSED
+static PyObject* __Pyx__CallUnboundCMethod2(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg1, PyObject* arg2);
+#if CYTHON_COMPILING_IN_CPYTHON
+static CYTHON_INLINE PyObject *__Pyx_CallUnboundCMethod2(__Pyx_CachedCFunction *cfunc, PyObject *self, PyObject *arg1, PyObject *arg2);
+#else
+#define __Pyx_CallUnboundCMethod2(cfunc, self, arg1, arg2)  __Pyx__CallUnboundCMethod2(cfunc, self, arg1, arg2)
+#endif
+
 /* ParseKeywords.proto */
 static CYTHON_INLINE int __Pyx_ParseKeywords(
     PyObject *kwds, PyObject *const *kwvalues, PyObject ** const argnames[],
@@ -1857,6 +1892,47 @@ static PyObject *__Pyx_PyDict_GetItem(PyObject *d, PyObject* key);
 #else
 #define __Pyx_PyDict_GetItem(d, key) PyObject_GetItem(d, key)
 #define __Pyx_PyObject_Dict_GetItem(obj, name)  PyObject_GetItem(obj, name)
+#endif
+
+/* GetItemInt.proto */
+#define __Pyx_GetItemInt(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil, unsafe_shared)\
+    (__Pyx_fits_Py_ssize_t(i, type, is_signed) ?\
+    __Pyx_GetItemInt_Fast(o, (Py_ssize_t)i, is_list, wraparound, boundscheck, unsafe_shared) :\
+    (is_list ? (PyErr_SetString(PyExc_IndexError, "list index out of range"), (PyObject*)NULL) :\
+               __Pyx_GetItemInt_Generic(o, to_py_func(i))))
+#define __Pyx_GetItemInt_List(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil, unsafe_shared)\
+    (__Pyx_fits_Py_ssize_t(i, type, is_signed) ?\
+    __Pyx_GetItemInt_List_Fast(o, (Py_ssize_t)i, wraparound, boundscheck, unsafe_shared) :\
+    (PyErr_SetString(PyExc_IndexError, "list index out of range"), (PyObject*)NULL))
+static CYTHON_INLINE PyObject *__Pyx_GetItemInt_List_Fast(PyObject *o, Py_ssize_t i,
+                                                              int wraparound, int boundscheck, int unsafe_shared);
+#define __Pyx_GetItemInt_Tuple(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil, unsafe_shared)\
+    (__Pyx_fits_Py_ssize_t(i, type, is_signed) ?\
+    __Pyx_GetItemInt_Tuple_Fast(o, (Py_ssize_t)i, wraparound, boundscheck, unsafe_shared) :\
+    (PyErr_SetString(PyExc_IndexError, "tuple index out of range"), (PyObject*)NULL))
+static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Tuple_Fast(PyObject *o, Py_ssize_t i,
+                                                              int wraparound, int boundscheck, int unsafe_shared);
+static PyObject *__Pyx_GetItemInt_Generic(PyObject *o, PyObject* j);
+static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Fast(PyObject *o, Py_ssize_t i,
+                                                     int is_list, int wraparound, int boundscheck, int unsafe_shared);
+
+/* TypeImport.proto */
+#ifndef __PYX_HAVE_RT_ImportType_proto_3_2_4
+#define __PYX_HAVE_RT_ImportType_proto_3_2_4
+#if defined (__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#include <stdalign.h>
+#endif
+#if (defined (__STDC_VERSION__) && __STDC_VERSION__ >= 201112L) || __cplusplus >= 201103L
+#define __PYX_GET_STRUCT_ALIGNMENT_3_2_4(s) alignof(s)
+#else
+#define __PYX_GET_STRUCT_ALIGNMENT_3_2_4(s) sizeof(void*)
+#endif
+enum __Pyx_ImportType_CheckSize_3_2_4 {
+   __Pyx_ImportType_CheckSize_Error_3_2_4 = 0,
+   __Pyx_ImportType_CheckSize_Warn_3_2_4 = 1,
+   __Pyx_ImportType_CheckSize_Ignore_3_2_4 = 2
+};
+static PyTypeObject *__Pyx_ImportType_3_2_4(PyObject* module, const char *module_name, const char *class_name, size_t size, size_t alignment, enum __Pyx_ImportType_CheckSize_3_2_4 check_size);
 #endif
 
 /* dict_setdefault.proto (used by FetchCommonType) */
@@ -2258,6 +2334,28 @@ static int __Pyx_State_RemoveModule(void*);
 
 /* Module declarations from "libc.math" */
 
+/* Module declarations from "libc.string" */
+
+/* Module declarations from "libc.stdio" */
+
+/* Module declarations from "__builtin__" */
+
+/* Module declarations from "cpython.type" */
+
+/* Module declarations from "cpython" */
+
+/* Module declarations from "cpython.object" */
+
+/* Module declarations from "cpython.pyport" */
+
+/* Module declarations from "cpython.dict" */
+
+/* Module declarations from "cpython.tuple" */
+
+/* Module declarations from "cpython.long" */
+
+/* Module declarations from "cpython.ref" */
+
 /* Module declarations from "cython" */
 
 /* Module declarations from "dama.ai.ml._fast_score" */
@@ -2278,6 +2376,17 @@ static double __pyx_v_4dama_2ai_2ml_11_fast_score_QUICK_WIN_HALF_MOVES;
 static double __pyx_v_4dama_2ai_2ml_11_fast_score_DOMINATION_BONUS;
 static double __pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_EFFICIENCY;
 static double __pyx_v_4dama_2ai_2ml_11_fast_score_LN2;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_TURN = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_STATE = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_LEGAL_MOVES = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_SCORE = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_CAPTURES = 0;
+static PyObject *__pyx_v_4dama_2ai_2ml_11_fast_score__K_PATH = 0;
+static CYTHON_INLINE PyObject *__pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(PyObject *, PyObject *); /*proto*/
 static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int, PyObject *, int, int, PyObject *, int); /*proto*/
 static double __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(PyObject *, int); /*proto*/
 static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *, int); /*proto*/
@@ -2290,7 +2399,7 @@ int __pyx_module_is_main_dama__ai__ml___fast_score = 0;
 /* Implementation of "dama.ai.ml._fast_score" */
 /* #### Code section: global_var ### */
 /* #### Code section: string_decls ### */
-static const char __pyx_k_Cython_accelerated_game_scoring[] = "Cython-accelerated game scoring for self-play data.\n\nDrop-in replacement for score_game_dicts() in scoring.py.\nEliminates Python interpreter overhead in the per-entry scoring loop\n(~100 entries per game \303\227 thousands of games per self-play cycle).\n";
+static const char __pyx_k_Cython_accelerated_game_scoring[] = "Cython-accelerated game scoring for self-play data.\n\nDrop-in replacement for score_game_dicts() in scoring.py.\nEliminates Python interpreter overhead in the per-entry scoring loop\n(~100 entries per game \303\227 thousands of games per self-play cycle).\n\n[Pass 82] Uses CPython C API (PyDict_GetItem, PyTuple_GET_ITEM,\nPyLong_AsLong) to bypass Python method dispatch and sequence protocol\nin the hot scoring loop.  ~30-40% faster than .get() + pos[0]/pos[1].\n";
 /* #### Code section: decls ### */
 static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON_UNUSED PyObject *__pyx_self, PyObject *__pyx_v_entry_dicts, PyObject *__pyx_v_winner_int, int __pyx_v_total_moves, int __pyx_v_max_moves, PyObject *__pyx_v_final_state_dict, int __pyx_v_p1_captures, int __pyx_v_p2_captures); /* proto */
 /* #### Code section: late_includes ### */
@@ -2313,12 +2422,12 @@ typedef struct {
   PyObject *__pyx_empty_tuple;
   PyObject *__pyx_empty_bytes;
   PyObject *__pyx_empty_unicode;
-  __Pyx_CachedCFunction __pyx_umethod_PyDict_Type_get;
+  PyTypeObject *__pyx_ptype_7cpython_4type_type;
   __Pyx_CachedCFunction __pyx_umethod_PyDict_Type_items;
   __Pyx_CachedCFunction __pyx_umethod_PyDict_Type_pop;
   __Pyx_CachedCFunction __pyx_umethod_PyDict_Type_values;
   PyObject *__pyx_codeobj_tab[1];
-  PyObject *__pyx_string_tab[72];
+  PyObject *__pyx_string_tab[71];
 /* #### Code section: module_state_contents ### */
 /* CommonTypesMetaclass.module_state_decls */
 PyTypeObject *__pyx_CommonTypesMetaclassType;
@@ -2376,61 +2485,60 @@ static __pyx_mstatetype * const __pyx_mstate_global = &__pyx_mstate_global_stati
 #define __pyx_n_u_game_score __pyx_string_tab[14]
 #define __pyx_n_u_game_score_p1 __pyx_string_tab[15]
 #define __pyx_n_u_game_score_p2 __pyx_string_tab[16]
-#define __pyx_n_u_get __pyx_string_tab[17]
-#define __pyx_n_u_i __pyx_string_tab[18]
-#define __pyx_n_u_inv_total __pyx_string_tab[19]
-#define __pyx_n_u_is_coroutine __pyx_string_tab[20]
-#define __pyx_n_u_is_king __pyx_string_tab[21]
-#define __pyx_n_u_items __pyx_string_tab[22]
-#define __pyx_n_u_j __pyx_string_tab[23]
-#define __pyx_n_u_king_cols __pyx_string_tab[24]
-#define __pyx_n_u_king_rows __pyx_string_tab[25]
-#define __pyx_n_u_legal_moves __pyx_string_tab[26]
-#define __pyx_n_u_m __pyx_string_tab[27]
-#define __pyx_n_u_main __pyx_string_tab[28]
-#define __pyx_n_u_material_adv __pyx_string_tab[29]
-#define __pyx_n_u_max_moves __pyx_string_tab[30]
-#define __pyx_n_u_mob_score __pyx_string_tab[31]
-#define __pyx_n_u_module __pyx_string_tab[32]
-#define __pyx_n_u_my_kings_list __pyx_string_tab[33]
-#define __pyx_n_u_my_mat __pyx_string_tab[34]
-#define __pyx_n_u_my_men_list __pyx_string_tab[35]
-#define __pyx_n_u_n __pyx_string_tab[36]
-#define __pyx_n_u_name __pyx_string_tab[37]
-#define __pyx_n_u_num_captures __pyx_string_tab[38]
-#define __pyx_n_u_num_kings __pyx_string_tab[39]
-#define __pyx_n_u_opp_mat __pyx_string_tab[40]
-#define __pyx_n_u_outcome_weight __pyx_string_tab[41]
-#define __pyx_n_u_p1_captures __pyx_string_tab[42]
-#define __pyx_n_u_p1_kings __pyx_string_tab[43]
-#define __pyx_n_u_p1_men __pyx_string_tab[44]
-#define __pyx_n_u_p2_captures __pyx_string_tab[45]
-#define __pyx_n_u_p2_kings __pyx_string_tab[46]
-#define __pyx_n_u_p2_men __pyx_string_tab[47]
-#define __pyx_n_u_path __pyx_string_tab[48]
-#define __pyx_n_u_player_int __pyx_string_tab[49]
-#define __pyx_n_u_pop __pyx_string_tab[50]
-#define __pyx_n_u_pos __pyx_string_tab[51]
-#define __pyx_n_u_pos_score __pyx_string_tab[52]
-#define __pyx_n_u_progress __pyx_string_tab[53]
-#define __pyx_n_u_qualname __pyx_string_tab[54]
-#define __pyx_n_u_row __pyx_string_tab[55]
-#define __pyx_n_u_sc __pyx_string_tab[56]
-#define __pyx_n_u_score __pyx_string_tab[57]
-#define __pyx_n_u_score_game_dicts_cy __pyx_string_tab[58]
-#define __pyx_n_u_set_name __pyx_string_tab[59]
-#define __pyx_n_u_setdefault __pyx_string_tab[60]
-#define __pyx_n_u_sr __pyx_string_tab[61]
-#define __pyx_n_u_start_row __pyx_string_tab[62]
-#define __pyx_n_u_state __pyx_string_tab[63]
-#define __pyx_n_u_state_dict __pyx_string_tab[64]
-#define __pyx_n_u_test __pyx_string_tab[65]
-#define __pyx_n_u_total_moves __pyx_string_tab[66]
-#define __pyx_n_u_total_pos __pyx_string_tab[67]
-#define __pyx_n_u_turn __pyx_string_tab[68]
-#define __pyx_n_u_values __pyx_string_tab[69]
-#define __pyx_n_u_winner_int __pyx_string_tab[70]
-#define __pyx_kp_b_iso88591_4_A_K_A_A_K_A_Bo_7_1A_U_1_Rq_Zq __pyx_string_tab[71]
+#define __pyx_n_u_i __pyx_string_tab[17]
+#define __pyx_n_u_inv_total __pyx_string_tab[18]
+#define __pyx_n_u_is_coroutine __pyx_string_tab[19]
+#define __pyx_n_u_is_king __pyx_string_tab[20]
+#define __pyx_n_u_items __pyx_string_tab[21]
+#define __pyx_n_u_j __pyx_string_tab[22]
+#define __pyx_n_u_king_cols __pyx_string_tab[23]
+#define __pyx_n_u_king_rows __pyx_string_tab[24]
+#define __pyx_n_u_legal_moves __pyx_string_tab[25]
+#define __pyx_n_u_m __pyx_string_tab[26]
+#define __pyx_n_u_main __pyx_string_tab[27]
+#define __pyx_n_u_material_adv __pyx_string_tab[28]
+#define __pyx_n_u_max_moves __pyx_string_tab[29]
+#define __pyx_n_u_mob_score __pyx_string_tab[30]
+#define __pyx_n_u_module __pyx_string_tab[31]
+#define __pyx_n_u_my_kings_list __pyx_string_tab[32]
+#define __pyx_n_u_my_mat __pyx_string_tab[33]
+#define __pyx_n_u_my_men_list __pyx_string_tab[34]
+#define __pyx_n_u_n __pyx_string_tab[35]
+#define __pyx_n_u_name __pyx_string_tab[36]
+#define __pyx_n_u_num_captures __pyx_string_tab[37]
+#define __pyx_n_u_num_kings __pyx_string_tab[38]
+#define __pyx_n_u_opp_mat __pyx_string_tab[39]
+#define __pyx_n_u_outcome_weight __pyx_string_tab[40]
+#define __pyx_n_u_p1_captures __pyx_string_tab[41]
+#define __pyx_n_u_p1_kings __pyx_string_tab[42]
+#define __pyx_n_u_p1_men __pyx_string_tab[43]
+#define __pyx_n_u_p2_captures __pyx_string_tab[44]
+#define __pyx_n_u_p2_kings __pyx_string_tab[45]
+#define __pyx_n_u_p2_men __pyx_string_tab[46]
+#define __pyx_n_u_path __pyx_string_tab[47]
+#define __pyx_n_u_player_int __pyx_string_tab[48]
+#define __pyx_n_u_pop __pyx_string_tab[49]
+#define __pyx_n_u_pos __pyx_string_tab[50]
+#define __pyx_n_u_pos_score __pyx_string_tab[51]
+#define __pyx_n_u_progress __pyx_string_tab[52]
+#define __pyx_n_u_qualname __pyx_string_tab[53]
+#define __pyx_n_u_row __pyx_string_tab[54]
+#define __pyx_n_u_sc __pyx_string_tab[55]
+#define __pyx_n_u_score __pyx_string_tab[56]
+#define __pyx_n_u_score_game_dicts_cy __pyx_string_tab[57]
+#define __pyx_n_u_set_name __pyx_string_tab[58]
+#define __pyx_n_u_setdefault __pyx_string_tab[59]
+#define __pyx_n_u_sr __pyx_string_tab[60]
+#define __pyx_n_u_start_row __pyx_string_tab[61]
+#define __pyx_n_u_state __pyx_string_tab[62]
+#define __pyx_n_u_state_dict __pyx_string_tab[63]
+#define __pyx_n_u_test __pyx_string_tab[64]
+#define __pyx_n_u_total_moves __pyx_string_tab[65]
+#define __pyx_n_u_total_pos __pyx_string_tab[66]
+#define __pyx_n_u_turn __pyx_string_tab[67]
+#define __pyx_n_u_values __pyx_string_tab[68]
+#define __pyx_n_u_winner_int __pyx_string_tab[69]
+#define __pyx_kp_b_iso88591_A_K_A_A_K_A_Bo_7_1A_U_1_Rq_Zq_k __pyx_string_tab[70]
 /* #### Code section: module_state_clear ### */
 #if CYTHON_USE_MODULE_STATE
 static CYTHON_SMALL_CODE int __pyx_m_clear(PyObject *m) {
@@ -2445,8 +2553,9 @@ static CYTHON_SMALL_CODE int __pyx_m_clear(PyObject *m) {
   #if CYTHON_PEP489_MULTI_PHASE_INIT
   __Pyx_State_RemoveModule(NULL);
   #endif
+  Py_CLEAR(clear_module_state->__pyx_ptype_7cpython_4type_type);
   for (int i=0; i<1; ++i) { Py_CLEAR(clear_module_state->__pyx_codeobj_tab[i]); }
-  for (int i=0; i<72; ++i) { Py_CLEAR(clear_module_state->__pyx_string_tab[i]); }
+  for (int i=0; i<71; ++i) { Py_CLEAR(clear_module_state->__pyx_string_tab[i]); }
 /* #### Code section: module_state_clear_contents ### */
 /* CommonTypesMetaclass.module_state_clear */
 Py_CLEAR(clear_module_state->__pyx_CommonTypesMetaclassType);
@@ -2469,8 +2578,9 @@ static CYTHON_SMALL_CODE int __pyx_m_traverse(PyObject *m, visitproc visit, void
   __Pyx_VISIT_CONST(traverse_module_state->__pyx_empty_tuple);
   __Pyx_VISIT_CONST(traverse_module_state->__pyx_empty_bytes);
   __Pyx_VISIT_CONST(traverse_module_state->__pyx_empty_unicode);
+  Py_VISIT(traverse_module_state->__pyx_ptype_7cpython_4type_type);
   for (int i=0; i<1; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_codeobj_tab[i]); }
-  for (int i=0; i<72; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_string_tab[i]); }
+  for (int i=0; i<71; ++i) { __Pyx_VISIT_CONST(traverse_module_state->__pyx_string_tab[i]); }
 /* #### Code section: module_state_traverse_contents ### */
 /* CommonTypesMetaclass.module_state_traverse */
 Py_VISIT(traverse_module_state->__pyx_CommonTypesMetaclassType);
@@ -2484,7 +2594,89 @@ return 0;
 #endif
 /* #### Code section: module_code ### */
 
-/* "dama/ai/ml/_fast_score.pyx":37
+/* "dama/ai/ml/_fast_score.pyx":60
+ * #  Inline helper: get dict value or empty tuple
+ * 
+ * cdef inline object _dict_get(dict d, object key):             # <<<<<<<<<<<<<<
+ *     """Get value from dict, return empty tuple if key missing.
+ * 
+*/
+
+static CYTHON_INLINE PyObject *__pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(PyObject *__pyx_v_d, PyObject *__pyx_v_key) {
+  PyObject *__pyx_v_result;
+  PyObject *__pyx_r = NULL;
+  __Pyx_RefNannyDeclarations
+  int __pyx_t_1;
+  __Pyx_RefNannySetupContext("_dict_get", 0);
+
+  /* "dama/ai/ml/_fast_score.pyx":67
+ *     ~40% faster per call: eliminates __getattr__ + __call__ overhead.
+ *     """
+ *     cdef PyObject* result = PyDict_GetItem(d, key)             # <<<<<<<<<<<<<<
+ *     if result == NULL:
+ *         return ()
+*/
+  __pyx_v_result = PyDict_GetItem(__pyx_v_d, __pyx_v_key);
+
+  /* "dama/ai/ml/_fast_score.pyx":68
+ *     """
+ *     cdef PyObject* result = PyDict_GetItem(d, key)
+ *     if result == NULL:             # <<<<<<<<<<<<<<
+ *         return ()
+ *     return <object>result
+*/
+  __pyx_t_1 = (__pyx_v_result == NULL);
+  if (__pyx_t_1) {
+
+    /* "dama/ai/ml/_fast_score.pyx":69
+ *     cdef PyObject* result = PyDict_GetItem(d, key)
+ *     if result == NULL:
+ *         return ()             # <<<<<<<<<<<<<<
+ *     return <object>result
+ * 
+*/
+    __Pyx_XDECREF(__pyx_r);
+    __Pyx_INCREF(__pyx_mstate_global->__pyx_empty_tuple);
+    __pyx_r = __pyx_mstate_global->__pyx_empty_tuple;
+    goto __pyx_L0;
+
+    /* "dama/ai/ml/_fast_score.pyx":68
+ *     """
+ *     cdef PyObject* result = PyDict_GetItem(d, key)
+ *     if result == NULL:             # <<<<<<<<<<<<<<
+ *         return ()
+ *     return <object>result
+*/
+  }
+
+  /* "dama/ai/ml/_fast_score.pyx":70
+ *     if result == NULL:
+ *         return ()
+ *     return <object>result             # <<<<<<<<<<<<<<
+ * 
+ * 
+*/
+  __Pyx_XDECREF(__pyx_r);
+  __Pyx_INCREF(((PyObject *)__pyx_v_result));
+  __pyx_r = ((PyObject *)__pyx_v_result);
+  goto __pyx_L0;
+
+  /* "dama/ai/ml/_fast_score.pyx":60
+ * #  Inline helper: get dict value or empty tuple
+ * 
+ * cdef inline object _dict_get(dict d, object key):             # <<<<<<<<<<<<<<
+ *     """Get value from dict, return empty tuple if key missing.
+ * 
+*/
+
+  /* function exit code */
+  __pyx_L0:;
+  __Pyx_XGIVEREF(__pyx_r);
+  __Pyx_RefNannyFinishContext();
+  return __pyx_r;
+}
+
+/* "dama/ai/ml/_fast_score.pyx":75
  * #  Helper: game-level score from compact dict
  * 
  * cdef double _game_score_from_compact(             # <<<<<<<<<<<<<<
@@ -2506,16 +2698,16 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
   const char *__pyx_filename = NULL;
   int __pyx_clineno = 0;
 
-  /* "dama/ai/ml/_fast_score.pyx":46
+  /* "dama/ai/ml/_fast_score.pyx":84
  * ):
  *     """Compute game score from compact dict (C-level, no Python calls)."""
  *     cdef double score = 0.0             # <<<<<<<<<<<<<<
  *     cdef double decay, final_adv, pos_score
- *     cdef int is_winner, is_loser
+ * 
 */
   __pyx_v_score = 0.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":51
+  /* "dama/ai/ml/_fast_score.pyx":88
  * 
  *     # Outcome base score
  *     if winner_int is None:             # <<<<<<<<<<<<<<
@@ -2525,7 +2717,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
   __pyx_t_1 = (__pyx_v_winner_int == Py_None);
   if (__pyx_t_1) {
 
-    /* "dama/ai/ml/_fast_score.pyx":52
+    /* "dama/ai/ml/_fast_score.pyx":89
  *     # Outcome base score
  *     if winner_int is None:
  *         score = DRAW_SCORE             # <<<<<<<<<<<<<<
@@ -2534,7 +2726,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
     __pyx_v_score = __pyx_v_4dama_2ai_2ml_11_fast_score_DRAW_SCORE;
 
-    /* "dama/ai/ml/_fast_score.pyx":51
+    /* "dama/ai/ml/_fast_score.pyx":88
  * 
  *     # Outcome base score
  *     if winner_int is None:             # <<<<<<<<<<<<<<
@@ -2544,18 +2736,18 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
     goto __pyx_L3;
   }
 
-  /* "dama/ai/ml/_fast_score.pyx":53
+  /* "dama/ai/ml/_fast_score.pyx":90
  *     if winner_int is None:
  *         score = DRAW_SCORE
  *     elif <int>winner_int == player_int:             # <<<<<<<<<<<<<<
  *         score = WIN_SCORE
  *     else:
 */
-  __pyx_t_2 = __Pyx_PyLong_As_int(__pyx_v_winner_int); if (unlikely((__pyx_t_2 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 53, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyLong_As_int(__pyx_v_winner_int); if (unlikely((__pyx_t_2 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 90, __pyx_L1_error)
   __pyx_t_1 = (((int)__pyx_t_2) == __pyx_v_player_int);
   if (__pyx_t_1) {
 
-    /* "dama/ai/ml/_fast_score.pyx":54
+    /* "dama/ai/ml/_fast_score.pyx":91
  *         score = DRAW_SCORE
  *     elif <int>winner_int == player_int:
  *         score = WIN_SCORE             # <<<<<<<<<<<<<<
@@ -2564,7 +2756,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
     __pyx_v_score = __pyx_v_4dama_2ai_2ml_11_fast_score_WIN_SCORE;
 
-    /* "dama/ai/ml/_fast_score.pyx":53
+    /* "dama/ai/ml/_fast_score.pyx":90
  *     if winner_int is None:
  *         score = DRAW_SCORE
  *     elif <int>winner_int == player_int:             # <<<<<<<<<<<<<<
@@ -2574,7 +2766,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
     goto __pyx_L3;
   }
 
-  /* "dama/ai/ml/_fast_score.pyx":56
+  /* "dama/ai/ml/_fast_score.pyx":93
  *         score = WIN_SCORE
  *     else:
  *         score = LOSS_SCORE             # <<<<<<<<<<<<<<
@@ -2586,7 +2778,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
   }
   __pyx_L3:;
 
-  /* "dama/ai/ml/_fast_score.pyx":59
+  /* "dama/ai/ml/_fast_score.pyx":96
  * 
  *     # Winner bonuses
  *     if winner_int is not None and <int>winner_int == player_int:             # <<<<<<<<<<<<<<
@@ -2599,13 +2791,13 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
     __pyx_t_1 = __pyx_t_3;
     goto __pyx_L5_bool_binop_done;
   }
-  __pyx_t_2 = __Pyx_PyLong_As_int(__pyx_v_winner_int); if (unlikely((__pyx_t_2 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 59, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyLong_As_int(__pyx_v_winner_int); if (unlikely((__pyx_t_2 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 96, __pyx_L1_error)
   __pyx_t_3 = (((int)__pyx_t_2) == __pyx_v_player_int);
   __pyx_t_1 = __pyx_t_3;
   __pyx_L5_bool_binop_done:;
   if (__pyx_t_1) {
 
-    /* "dama/ai/ml/_fast_score.pyx":60
+    /* "dama/ai/ml/_fast_score.pyx":97
  *     # Winner bonuses
  *     if winner_int is not None and <int>winner_int == player_int:
  *         decay = exp(-total_moves / QUICK_WIN_HALF_MOVES * LN2)             # <<<<<<<<<<<<<<
@@ -2614,7 +2806,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
     __pyx_v_decay = exp(((((double)(-__pyx_v_total_moves)) / __pyx_v_4dama_2ai_2ml_11_fast_score_QUICK_WIN_HALF_MOVES) * __pyx_v_4dama_2ai_2ml_11_fast_score_LN2));
 
-    /* "dama/ai/ml/_fast_score.pyx":61
+    /* "dama/ai/ml/_fast_score.pyx":98
  *     if winner_int is not None and <int>winner_int == player_int:
  *         decay = exp(-total_moves / QUICK_WIN_HALF_MOVES * LN2)
  *         score += QUICK_WIN_BONUS_MAX * decay             # <<<<<<<<<<<<<<
@@ -2623,17 +2815,17 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
     __pyx_v_score = (__pyx_v_score + (__pyx_v_4dama_2ai_2ml_11_fast_score_QUICK_WIN_BONUS_MAX * __pyx_v_decay));
 
-    /* "dama/ai/ml/_fast_score.pyx":62
+    /* "dama/ai/ml/_fast_score.pyx":99
  *         decay = exp(-total_moves / QUICK_WIN_HALF_MOVES * LN2)
  *         score += QUICK_WIN_BONUS_MAX * decay
  *         final_adv = _material_adv_compact(final_state_dict, player_int)             # <<<<<<<<<<<<<<
  *         if final_adv > 3.0:
  *             score += DOMINATION_BONUS * (final_adv / 6.0 if final_adv < 6.0 else 1.0)
 */
-    __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(__pyx_v_final_state_dict, __pyx_v_player_int); if (unlikely(__pyx_t_4 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 62, __pyx_L1_error)
+    __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(__pyx_v_final_state_dict, __pyx_v_player_int); if (unlikely(__pyx_t_4 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 99, __pyx_L1_error)
     __pyx_v_final_adv = __pyx_t_4;
 
-    /* "dama/ai/ml/_fast_score.pyx":63
+    /* "dama/ai/ml/_fast_score.pyx":100
  *         score += QUICK_WIN_BONUS_MAX * decay
  *         final_adv = _material_adv_compact(final_state_dict, player_int)
  *         if final_adv > 3.0:             # <<<<<<<<<<<<<<
@@ -2643,7 +2835,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
     __pyx_t_1 = (__pyx_v_final_adv > 3.0);
     if (__pyx_t_1) {
 
-      /* "dama/ai/ml/_fast_score.pyx":64
+      /* "dama/ai/ml/_fast_score.pyx":101
  *         final_adv = _material_adv_compact(final_state_dict, player_int)
  *         if final_adv > 3.0:
  *             score += DOMINATION_BONUS * (final_adv / 6.0 if final_adv < 6.0 else 1.0)             # <<<<<<<<<<<<<<
@@ -2658,7 +2850,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
       }
       __pyx_v_score = (__pyx_v_score + (__pyx_v_4dama_2ai_2ml_11_fast_score_DOMINATION_BONUS * __pyx_t_4));
 
-      /* "dama/ai/ml/_fast_score.pyx":63
+      /* "dama/ai/ml/_fast_score.pyx":100
  *         score += QUICK_WIN_BONUS_MAX * decay
  *         final_adv = _material_adv_compact(final_state_dict, player_int)
  *         if final_adv > 3.0:             # <<<<<<<<<<<<<<
@@ -2667,7 +2859,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":65
+    /* "dama/ai/ml/_fast_score.pyx":102
  *         if final_adv > 3.0:
  *             score += DOMINATION_BONUS * (final_adv / 6.0 if final_adv < 6.0 else 1.0)
  *         score += captures_made * CAPTURE_EFFICIENCY             # <<<<<<<<<<<<<<
@@ -2676,7 +2868,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
     __pyx_v_score = (__pyx_v_score + (__pyx_v_captures_made * __pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_EFFICIENCY));
 
-    /* "dama/ai/ml/_fast_score.pyx":59
+    /* "dama/ai/ml/_fast_score.pyx":96
  * 
  *     # Winner bonuses
  *     if winner_int is not None and <int>winner_int == player_int:             # <<<<<<<<<<<<<<
@@ -2686,7 +2878,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
     goto __pyx_L4;
   }
 
-  /* "dama/ai/ml/_fast_score.pyx":68
+  /* "dama/ai/ml/_fast_score.pyx":105
  * 
  *     # Loser adjustment
  *     elif winner_int is not None:             # <<<<<<<<<<<<<<
@@ -2696,17 +2888,17 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
   __pyx_t_1 = (__pyx_v_winner_int != Py_None);
   if (__pyx_t_1) {
 
-    /* "dama/ai/ml/_fast_score.pyx":69
+    /* "dama/ai/ml/_fast_score.pyx":106
  *     # Loser adjustment
  *     elif winner_int is not None:
  *         final_adv = _material_adv_compact(final_state_dict, player_int)             # <<<<<<<<<<<<<<
  *         score += final_adv * 0.2
  * 
 */
-    __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(__pyx_v_final_state_dict, __pyx_v_player_int); if (unlikely(__pyx_t_4 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 69, __pyx_L1_error)
+    __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(__pyx_v_final_state_dict, __pyx_v_player_int); if (unlikely(__pyx_t_4 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 106, __pyx_L1_error)
     __pyx_v_final_adv = __pyx_t_4;
 
-    /* "dama/ai/ml/_fast_score.pyx":70
+    /* "dama/ai/ml/_fast_score.pyx":107
  *     elif winner_int is not None:
  *         final_adv = _material_adv_compact(final_state_dict, player_int)
  *         score += final_adv * 0.2             # <<<<<<<<<<<<<<
@@ -2715,7 +2907,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
     __pyx_v_score = (__pyx_v_score + (__pyx_v_final_adv * 0.2));
 
-    /* "dama/ai/ml/_fast_score.pyx":68
+    /* "dama/ai/ml/_fast_score.pyx":105
  * 
  *     # Loser adjustment
  *     elif winner_int is not None:             # <<<<<<<<<<<<<<
@@ -2725,17 +2917,17 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
   }
   __pyx_L4:;
 
-  /* "dama/ai/ml/_fast_score.pyx":73
+  /* "dama/ai/ml/_fast_score.pyx":110
  * 
  *     # Positional adjustment
  *     pos_score = _positional_compact(final_state_dict, player_int)             # <<<<<<<<<<<<<<
  *     score += pos_score * 0.3
  * 
 */
-  __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(__pyx_v_final_state_dict, __pyx_v_player_int); if (unlikely(__pyx_t_4 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 73, __pyx_L1_error)
+  __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(__pyx_v_final_state_dict, __pyx_v_player_int); if (unlikely(__pyx_t_4 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 110, __pyx_L1_error)
   __pyx_v_pos_score = __pyx_t_4;
 
-  /* "dama/ai/ml/_fast_score.pyx":74
+  /* "dama/ai/ml/_fast_score.pyx":111
  *     # Positional adjustment
  *     pos_score = _positional_compact(final_state_dict, player_int)
  *     score += pos_score * 0.3             # <<<<<<<<<<<<<<
@@ -2744,7 +2936,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
 */
   __pyx_v_score = (__pyx_v_score + (__pyx_v_pos_score * 0.3));
 
-  /* "dama/ai/ml/_fast_score.pyx":76
+  /* "dama/ai/ml/_fast_score.pyx":113
  *     score += pos_score * 0.3
  * 
  *     return score             # <<<<<<<<<<<<<<
@@ -2754,7 +2946,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
   __pyx_r = __pyx_v_score;
   goto __pyx_L0;
 
-  /* "dama/ai/ml/_fast_score.pyx":37
+  /* "dama/ai/ml/_fast_score.pyx":75
  * #  Helper: game-level score from compact dict
  * 
  * cdef double _game_score_from_compact(             # <<<<<<<<<<<<<<
@@ -2770,7 +2962,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(int _
   return __pyx_r;
 }
 
-/* "dama/ai/ml/_fast_score.pyx":81
+/* "dama/ai/ml/_fast_score.pyx":118
  * #  Helper: material advantage
  * 
  * cdef double _material_adv_compact(dict state_dict, int player_int):             # <<<<<<<<<<<<<<
@@ -2789,187 +2981,180 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(PyObject
   __Pyx_RefNannyDeclarations
   int __pyx_t_1;
   PyObject *__pyx_t_2 = NULL;
-  Py_ssize_t __pyx_t_3;
+  PyObject *__pyx_t_3 = NULL;
   Py_ssize_t __pyx_t_4;
+  Py_ssize_t __pyx_t_5;
   int __pyx_lineno = 0;
   const char *__pyx_filename = NULL;
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("_material_adv_compact", 0);
 
-  /* "dama/ai/ml/_fast_score.pyx":86
+  /* "dama/ai/ml/_fast_score.pyx":123
  *     cdef double my_mat, opp_mat
  * 
  *     if player_int == 1:             # <<<<<<<<<<<<<<
- *         my_men = state_dict.get('p1_men', ())
- *         my_kings = state_dict.get('p1_kings', ())
+ *         my_men = _dict_get(state_dict, _K_P1_MEN)
+ *         my_kings = _dict_get(state_dict, _K_P1_KINGS)
 */
   __pyx_t_1 = (__pyx_v_player_int == 1);
   if (__pyx_t_1) {
 
-    /* "dama/ai/ml/_fast_score.pyx":87
+    /* "dama/ai/ml/_fast_score.pyx":124
  * 
  *     if player_int == 1:
- *         my_men = state_dict.get('p1_men', ())             # <<<<<<<<<<<<<<
- *         my_kings = state_dict.get('p1_kings', ())
- *         opp_men = state_dict.get('p2_men', ())
+ *         my_men = _dict_get(state_dict, _K_P1_MEN)             # <<<<<<<<<<<<<<
+ *         my_kings = _dict_get(state_dict, _K_P1_KINGS)
+ *         opp_men = _dict_get(state_dict, _K_P2_MEN)
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 87, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 87, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_2);
-    __pyx_v_my_men = __pyx_t_2;
-    __pyx_t_2 = 0;
+    __pyx_t_2 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN;
+    __Pyx_INCREF(__pyx_t_2);
+    __pyx_t_3 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_2); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 124, __pyx_L1_error)
+    __Pyx_GOTREF(__pyx_t_3);
+    __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
+    __pyx_v_my_men = __pyx_t_3;
+    __pyx_t_3 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":88
+    /* "dama/ai/ml/_fast_score.pyx":125
  *     if player_int == 1:
- *         my_men = state_dict.get('p1_men', ())
- *         my_kings = state_dict.get('p1_kings', ())             # <<<<<<<<<<<<<<
- *         opp_men = state_dict.get('p2_men', ())
- *         opp_kings = state_dict.get('p2_kings', ())
+ *         my_men = _dict_get(state_dict, _K_P1_MEN)
+ *         my_kings = _dict_get(state_dict, _K_P1_KINGS)             # <<<<<<<<<<<<<<
+ *         opp_men = _dict_get(state_dict, _K_P2_MEN)
+ *         opp_kings = _dict_get(state_dict, _K_P2_KINGS)
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 88, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 88, __pyx_L1_error)
+    __pyx_t_3 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS;
+    __Pyx_INCREF(__pyx_t_3);
+    __pyx_t_2 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_3); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 125, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
+    __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
     __pyx_v_my_kings = __pyx_t_2;
     __pyx_t_2 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":89
- *         my_men = state_dict.get('p1_men', ())
- *         my_kings = state_dict.get('p1_kings', ())
- *         opp_men = state_dict.get('p2_men', ())             # <<<<<<<<<<<<<<
- *         opp_kings = state_dict.get('p2_kings', ())
+    /* "dama/ai/ml/_fast_score.pyx":126
+ *         my_men = _dict_get(state_dict, _K_P1_MEN)
+ *         my_kings = _dict_get(state_dict, _K_P1_KINGS)
+ *         opp_men = _dict_get(state_dict, _K_P2_MEN)             # <<<<<<<<<<<<<<
+ *         opp_kings = _dict_get(state_dict, _K_P2_KINGS)
  *     else:
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 89, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 89, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_2);
-    __pyx_v_opp_men = __pyx_t_2;
-    __pyx_t_2 = 0;
+    __pyx_t_2 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN;
+    __Pyx_INCREF(__pyx_t_2);
+    __pyx_t_3 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_2); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 126, __pyx_L1_error)
+    __Pyx_GOTREF(__pyx_t_3);
+    __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
+    __pyx_v_opp_men = __pyx_t_3;
+    __pyx_t_3 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":90
- *         my_kings = state_dict.get('p1_kings', ())
- *         opp_men = state_dict.get('p2_men', ())
- *         opp_kings = state_dict.get('p2_kings', ())             # <<<<<<<<<<<<<<
+    /* "dama/ai/ml/_fast_score.pyx":127
+ *         my_kings = _dict_get(state_dict, _K_P1_KINGS)
+ *         opp_men = _dict_get(state_dict, _K_P2_MEN)
+ *         opp_kings = _dict_get(state_dict, _K_P2_KINGS)             # <<<<<<<<<<<<<<
  *     else:
- *         my_men = state_dict.get('p2_men', ())
+ *         my_men = _dict_get(state_dict, _K_P2_MEN)
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 90, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 90, __pyx_L1_error)
+    __pyx_t_3 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS;
+    __Pyx_INCREF(__pyx_t_3);
+    __pyx_t_2 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_3); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 127, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
+    __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
     __pyx_v_opp_kings = __pyx_t_2;
     __pyx_t_2 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":86
+    /* "dama/ai/ml/_fast_score.pyx":123
  *     cdef double my_mat, opp_mat
  * 
  *     if player_int == 1:             # <<<<<<<<<<<<<<
- *         my_men = state_dict.get('p1_men', ())
- *         my_kings = state_dict.get('p1_kings', ())
+ *         my_men = _dict_get(state_dict, _K_P1_MEN)
+ *         my_kings = _dict_get(state_dict, _K_P1_KINGS)
 */
     goto __pyx_L3;
   }
 
-  /* "dama/ai/ml/_fast_score.pyx":92
- *         opp_kings = state_dict.get('p2_kings', ())
+  /* "dama/ai/ml/_fast_score.pyx":129
+ *         opp_kings = _dict_get(state_dict, _K_P2_KINGS)
  *     else:
- *         my_men = state_dict.get('p2_men', ())             # <<<<<<<<<<<<<<
- *         my_kings = state_dict.get('p2_kings', ())
- *         opp_men = state_dict.get('p1_men', ())
+ *         my_men = _dict_get(state_dict, _K_P2_MEN)             # <<<<<<<<<<<<<<
+ *         my_kings = _dict_get(state_dict, _K_P2_KINGS)
+ *         opp_men = _dict_get(state_dict, _K_P1_MEN)
 */
   /*else*/ {
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 92, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 92, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_2);
-    __pyx_v_my_men = __pyx_t_2;
-    __pyx_t_2 = 0;
+    __pyx_t_2 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN;
+    __Pyx_INCREF(__pyx_t_2);
+    __pyx_t_3 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_2); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 129, __pyx_L1_error)
+    __Pyx_GOTREF(__pyx_t_3);
+    __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
+    __pyx_v_my_men = __pyx_t_3;
+    __pyx_t_3 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":93
+    /* "dama/ai/ml/_fast_score.pyx":130
  *     else:
- *         my_men = state_dict.get('p2_men', ())
- *         my_kings = state_dict.get('p2_kings', ())             # <<<<<<<<<<<<<<
- *         opp_men = state_dict.get('p1_men', ())
- *         opp_kings = state_dict.get('p1_kings', ())
+ *         my_men = _dict_get(state_dict, _K_P2_MEN)
+ *         my_kings = _dict_get(state_dict, _K_P2_KINGS)             # <<<<<<<<<<<<<<
+ *         opp_men = _dict_get(state_dict, _K_P1_MEN)
+ *         opp_kings = _dict_get(state_dict, _K_P1_KINGS)
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 93, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 93, __pyx_L1_error)
+    __pyx_t_3 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS;
+    __Pyx_INCREF(__pyx_t_3);
+    __pyx_t_2 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_3); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 130, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
+    __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
     __pyx_v_my_kings = __pyx_t_2;
     __pyx_t_2 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":94
- *         my_men = state_dict.get('p2_men', ())
- *         my_kings = state_dict.get('p2_kings', ())
- *         opp_men = state_dict.get('p1_men', ())             # <<<<<<<<<<<<<<
- *         opp_kings = state_dict.get('p1_kings', ())
+    /* "dama/ai/ml/_fast_score.pyx":131
+ *         my_men = _dict_get(state_dict, _K_P2_MEN)
+ *         my_kings = _dict_get(state_dict, _K_P2_KINGS)
+ *         opp_men = _dict_get(state_dict, _K_P1_MEN)             # <<<<<<<<<<<<<<
+ *         opp_kings = _dict_get(state_dict, _K_P1_KINGS)
  * 
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 94, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 94, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_2);
-    __pyx_v_opp_men = __pyx_t_2;
-    __pyx_t_2 = 0;
+    __pyx_t_2 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN;
+    __Pyx_INCREF(__pyx_t_2);
+    __pyx_t_3 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_2); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 131, __pyx_L1_error)
+    __Pyx_GOTREF(__pyx_t_3);
+    __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
+    __pyx_v_opp_men = __pyx_t_3;
+    __pyx_t_3 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":95
- *         my_kings = state_dict.get('p2_kings', ())
- *         opp_men = state_dict.get('p1_men', ())
- *         opp_kings = state_dict.get('p1_kings', ())             # <<<<<<<<<<<<<<
+    /* "dama/ai/ml/_fast_score.pyx":132
+ *         my_kings = _dict_get(state_dict, _K_P2_KINGS)
+ *         opp_men = _dict_get(state_dict, _K_P1_MEN)
+ *         opp_kings = _dict_get(state_dict, _K_P1_KINGS)             # <<<<<<<<<<<<<<
  * 
  *     my_mat = len(my_men) * MAN_VALUE + len(my_kings) * KING_VALUE
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 95, __pyx_L1_error)
-    }
-    __pyx_t_2 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 95, __pyx_L1_error)
+    __pyx_t_3 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS;
+    __Pyx_INCREF(__pyx_t_3);
+    __pyx_t_2 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_3); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 132, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
+    __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
     __pyx_v_opp_kings = __pyx_t_2;
     __pyx_t_2 = 0;
   }
   __pyx_L3:;
 
-  /* "dama/ai/ml/_fast_score.pyx":97
- *         opp_kings = state_dict.get('p1_kings', ())
+  /* "dama/ai/ml/_fast_score.pyx":134
+ *         opp_kings = _dict_get(state_dict, _K_P1_KINGS)
  * 
  *     my_mat = len(my_men) * MAN_VALUE + len(my_kings) * KING_VALUE             # <<<<<<<<<<<<<<
  *     opp_mat = len(opp_men) * MAN_VALUE + len(opp_kings) * KING_VALUE
  *     return my_mat - opp_mat
 */
-  __pyx_t_3 = PyObject_Length(__pyx_v_my_men); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 97, __pyx_L1_error)
-  __pyx_t_4 = PyObject_Length(__pyx_v_my_kings); if (unlikely(__pyx_t_4 == ((Py_ssize_t)-1))) __PYX_ERR(0, 97, __pyx_L1_error)
-  __pyx_v_my_mat = ((__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_4 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
+  __pyx_t_4 = PyObject_Length(__pyx_v_my_men); if (unlikely(__pyx_t_4 == ((Py_ssize_t)-1))) __PYX_ERR(0, 134, __pyx_L1_error)
+  __pyx_t_5 = PyObject_Length(__pyx_v_my_kings); if (unlikely(__pyx_t_5 == ((Py_ssize_t)-1))) __PYX_ERR(0, 134, __pyx_L1_error)
+  __pyx_v_my_mat = ((__pyx_t_4 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_5 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
 
-  /* "dama/ai/ml/_fast_score.pyx":98
+  /* "dama/ai/ml/_fast_score.pyx":135
  * 
  *     my_mat = len(my_men) * MAN_VALUE + len(my_kings) * KING_VALUE
  *     opp_mat = len(opp_men) * MAN_VALUE + len(opp_kings) * KING_VALUE             # <<<<<<<<<<<<<<
  *     return my_mat - opp_mat
  * 
 */
-  __pyx_t_4 = PyObject_Length(__pyx_v_opp_men); if (unlikely(__pyx_t_4 == ((Py_ssize_t)-1))) __PYX_ERR(0, 98, __pyx_L1_error)
-  __pyx_t_3 = PyObject_Length(__pyx_v_opp_kings); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 98, __pyx_L1_error)
-  __pyx_v_opp_mat = ((__pyx_t_4 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
+  __pyx_t_5 = PyObject_Length(__pyx_v_opp_men); if (unlikely(__pyx_t_5 == ((Py_ssize_t)-1))) __PYX_ERR(0, 135, __pyx_L1_error)
+  __pyx_t_4 = PyObject_Length(__pyx_v_opp_kings); if (unlikely(__pyx_t_4 == ((Py_ssize_t)-1))) __PYX_ERR(0, 135, __pyx_L1_error)
+  __pyx_v_opp_mat = ((__pyx_t_5 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_4 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
 
-  /* "dama/ai/ml/_fast_score.pyx":99
+  /* "dama/ai/ml/_fast_score.pyx":136
  *     my_mat = len(my_men) * MAN_VALUE + len(my_kings) * KING_VALUE
  *     opp_mat = len(opp_men) * MAN_VALUE + len(opp_kings) * KING_VALUE
  *     return my_mat - opp_mat             # <<<<<<<<<<<<<<
@@ -2979,7 +3164,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(PyObject
   __pyx_r = (__pyx_v_my_mat - __pyx_v_opp_mat);
   goto __pyx_L0;
 
-  /* "dama/ai/ml/_fast_score.pyx":81
+  /* "dama/ai/ml/_fast_score.pyx":118
  * #  Helper: material advantage
  * 
  * cdef double _material_adv_compact(dict state_dict, int player_int):             # <<<<<<<<<<<<<<
@@ -2990,6 +3175,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(PyObject
   /* function exit code */
   __pyx_L1_error:;
   __Pyx_XDECREF(__pyx_t_2);
+  __Pyx_XDECREF(__pyx_t_3);
   __Pyx_AddTraceback("dama.ai.ml._fast_score._material_adv_compact", __pyx_clineno, __pyx_lineno, __pyx_filename);
   __pyx_r = -1;
   __pyx_L0:;
@@ -3001,7 +3187,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__material_adv_compact(PyObject
   return __pyx_r;
 }
 
-/* "dama/ai/ml/_fast_score.pyx":104
+/* "dama/ai/ml/_fast_score.pyx":141
  * #  Helper: positional score
  * 
  * cdef double _positional_compact(dict state_dict, int player_int):             # <<<<<<<<<<<<<<
@@ -3017,32 +3203,34 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
   int __pyx_v_advancement;
   PyObject *__pyx_v_men_list = 0;
   PyObject *__pyx_v_kings_list = 0;
-  PyObject *__pyx_v_pos = NULL;
+  PyObject *__pyx_v_pos = 0;
   double __pyx_r;
   __Pyx_RefNannyDeclarations
   int __pyx_t_1;
   int __pyx_t_2;
   PyObject *__pyx_t_3 = NULL;
-  Py_ssize_t __pyx_t_4;
-  PyObject *(*__pyx_t_5)(PyObject *);
-  PyObject *__pyx_t_6 = NULL;
-  int __pyx_t_7;
+  PyObject *__pyx_t_4 = NULL;
+  Py_ssize_t __pyx_t_5;
+  PyObject *(*__pyx_t_6)(PyObject *);
+  PyObject *__pyx_t_7;
+  long __pyx_t_8;
+  int __pyx_t_9;
   int __pyx_lineno = 0;
   const char *__pyx_filename = NULL;
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("_positional_compact", 0);
 
-  /* "dama/ai/ml/_fast_score.pyx":106
+  /* "dama/ai/ml/_fast_score.pyx":143
  * cdef double _positional_compact(dict state_dict, int player_int):
  *     """Positional score from compact dict."""
  *     cdef double score = 0.0             # <<<<<<<<<<<<<<
  *     cdef int start_row, row, col, advancement
- *     cdef object men_list, kings_list
+ *     cdef object men_list, kings_list, pos
 */
   __pyx_v_score = 0.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":110
- *     cdef object men_list, kings_list
+  /* "dama/ai/ml/_fast_score.pyx":148
+ *     cdef PyObject* raw
  * 
  *     start_row = 0 if player_int == 1 else 7             # <<<<<<<<<<<<<<
  * 
@@ -3056,204 +3244,196 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
   }
   __pyx_v_start_row = __pyx_t_1;
 
-  /* "dama/ai/ml/_fast_score.pyx":112
+  /* "dama/ai/ml/_fast_score.pyx":150
  *     start_row = 0 if player_int == 1 else 7
  * 
  *     if player_int == 1:             # <<<<<<<<<<<<<<
- *         men_list = state_dict.get('p1_men', ())
- *         kings_list = state_dict.get('p1_kings', ())
+ *         men_list = _dict_get(state_dict, _K_P1_MEN)
+ *         kings_list = _dict_get(state_dict, _K_P1_KINGS)
 */
   __pyx_t_2 = (__pyx_v_player_int == 1);
   if (__pyx_t_2) {
 
-    /* "dama/ai/ml/_fast_score.pyx":113
+    /* "dama/ai/ml/_fast_score.pyx":151
  * 
  *     if player_int == 1:
- *         men_list = state_dict.get('p1_men', ())             # <<<<<<<<<<<<<<
- *         kings_list = state_dict.get('p1_kings', ())
+ *         men_list = _dict_get(state_dict, _K_P1_MEN)             # <<<<<<<<<<<<<<
+ *         kings_list = _dict_get(state_dict, _K_P1_KINGS)
  *     else:
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 113, __pyx_L1_error)
-    }
-    __pyx_t_3 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 113, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_3);
-    __pyx_v_men_list = __pyx_t_3;
-    __pyx_t_3 = 0;
+    __pyx_t_3 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN;
+    __Pyx_INCREF(__pyx_t_3);
+    __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_3); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 151, __pyx_L1_error)
+    __Pyx_GOTREF(__pyx_t_4);
+    __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
+    __pyx_v_men_list = __pyx_t_4;
+    __pyx_t_4 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":114
+    /* "dama/ai/ml/_fast_score.pyx":152
  *     if player_int == 1:
- *         men_list = state_dict.get('p1_men', ())
- *         kings_list = state_dict.get('p1_kings', ())             # <<<<<<<<<<<<<<
+ *         men_list = _dict_get(state_dict, _K_P1_MEN)
+ *         kings_list = _dict_get(state_dict, _K_P1_KINGS)             # <<<<<<<<<<<<<<
  *     else:
- *         men_list = state_dict.get('p2_men', ())
+ *         men_list = _dict_get(state_dict, _K_P2_MEN)
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 114, __pyx_L1_error)
-    }
-    __pyx_t_3 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 114, __pyx_L1_error)
+    __pyx_t_4 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS;
+    __Pyx_INCREF(__pyx_t_4);
+    __pyx_t_3 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 152, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_3);
+    __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
     __pyx_v_kings_list = __pyx_t_3;
     __pyx_t_3 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":112
+    /* "dama/ai/ml/_fast_score.pyx":150
  *     start_row = 0 if player_int == 1 else 7
  * 
  *     if player_int == 1:             # <<<<<<<<<<<<<<
- *         men_list = state_dict.get('p1_men', ())
- *         kings_list = state_dict.get('p1_kings', ())
+ *         men_list = _dict_get(state_dict, _K_P1_MEN)
+ *         kings_list = _dict_get(state_dict, _K_P1_KINGS)
 */
     goto __pyx_L3;
   }
 
-  /* "dama/ai/ml/_fast_score.pyx":116
- *         kings_list = state_dict.get('p1_kings', ())
+  /* "dama/ai/ml/_fast_score.pyx":154
+ *         kings_list = _dict_get(state_dict, _K_P1_KINGS)
  *     else:
- *         men_list = state_dict.get('p2_men', ())             # <<<<<<<<<<<<<<
- *         kings_list = state_dict.get('p2_kings', ())
+ *         men_list = _dict_get(state_dict, _K_P2_MEN)             # <<<<<<<<<<<<<<
+ *         kings_list = _dict_get(state_dict, _K_P2_KINGS)
  * 
 */
   /*else*/ {
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 116, __pyx_L1_error)
-    }
-    __pyx_t_3 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 116, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_3);
-    __pyx_v_men_list = __pyx_t_3;
-    __pyx_t_3 = 0;
+    __pyx_t_3 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN;
+    __Pyx_INCREF(__pyx_t_3);
+    __pyx_t_4 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_3); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 154, __pyx_L1_error)
+    __Pyx_GOTREF(__pyx_t_4);
+    __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
+    __pyx_v_men_list = __pyx_t_4;
+    __pyx_t_4 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":117
+    /* "dama/ai/ml/_fast_score.pyx":155
  *     else:
- *         men_list = state_dict.get('p2_men', ())
- *         kings_list = state_dict.get('p2_kings', ())             # <<<<<<<<<<<<<<
+ *         men_list = _dict_get(state_dict, _K_P2_MEN)
+ *         kings_list = _dict_get(state_dict, _K_P2_KINGS)             # <<<<<<<<<<<<<<
  * 
  *     for pos in men_list:
 */
-    if (unlikely(__pyx_v_state_dict == Py_None)) {
-      PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-      __PYX_ERR(0, 117, __pyx_L1_error)
-    }
-    __pyx_t_3 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 117, __pyx_L1_error)
+    __pyx_t_4 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS;
+    __Pyx_INCREF(__pyx_t_4);
+    __pyx_t_3 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 155, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_3);
+    __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
     __pyx_v_kings_list = __pyx_t_3;
     __pyx_t_3 = 0;
   }
   __pyx_L3:;
 
-  /* "dama/ai/ml/_fast_score.pyx":119
- *         kings_list = state_dict.get('p2_kings', ())
+  /* "dama/ai/ml/_fast_score.pyx":157
+ *         kings_list = _dict_get(state_dict, _K_P2_KINGS)
  * 
  *     for pos in men_list:             # <<<<<<<<<<<<<<
- *         row = pos[0]
- *         col = pos[1]
+ *         # C-level tuple element access: no bounds check, no __getitem__
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
 */
   if (likely(PyList_CheckExact(__pyx_v_men_list)) || PyTuple_CheckExact(__pyx_v_men_list)) {
     __pyx_t_3 = __pyx_v_men_list; __Pyx_INCREF(__pyx_t_3);
-    __pyx_t_4 = 0;
-    __pyx_t_5 = NULL;
+    __pyx_t_5 = 0;
+    __pyx_t_6 = NULL;
   } else {
-    __pyx_t_4 = -1; __pyx_t_3 = PyObject_GetIter(__pyx_v_men_list); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 119, __pyx_L1_error)
+    __pyx_t_5 = -1; __pyx_t_3 = PyObject_GetIter(__pyx_v_men_list); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 157, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_3);
-    __pyx_t_5 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_3); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 119, __pyx_L1_error)
+    __pyx_t_6 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_3); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 157, __pyx_L1_error)
   }
   for (;;) {
-    if (likely(!__pyx_t_5)) {
+    if (likely(!__pyx_t_6)) {
       if (likely(PyList_CheckExact(__pyx_t_3))) {
         {
           Py_ssize_t __pyx_temp = __Pyx_PyList_GET_SIZE(__pyx_t_3);
           #if !CYTHON_ASSUME_SAFE_SIZE
-          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 119, __pyx_L1_error)
+          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 157, __pyx_L1_error)
           #endif
-          if (__pyx_t_4 >= __pyx_temp) break;
+          if (__pyx_t_5 >= __pyx_temp) break;
         }
-        __pyx_t_6 = __Pyx_PyList_GetItemRefFast(__pyx_t_3, __pyx_t_4, __Pyx_ReferenceSharing_OwnStrongReference);
-        ++__pyx_t_4;
+        __pyx_t_4 = __Pyx_PyList_GetItemRefFast(__pyx_t_3, __pyx_t_5, __Pyx_ReferenceSharing_OwnStrongReference);
+        ++__pyx_t_5;
       } else {
         {
           Py_ssize_t __pyx_temp = __Pyx_PyTuple_GET_SIZE(__pyx_t_3);
           #if !CYTHON_ASSUME_SAFE_SIZE
-          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 119, __pyx_L1_error)
+          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 157, __pyx_L1_error)
           #endif
-          if (__pyx_t_4 >= __pyx_temp) break;
+          if (__pyx_t_5 >= __pyx_temp) break;
         }
         #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
-        __pyx_t_6 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_3, __pyx_t_4));
+        __pyx_t_4 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_3, __pyx_t_5));
         #else
-        __pyx_t_6 = __Pyx_PySequence_ITEM(__pyx_t_3, __pyx_t_4);
+        __pyx_t_4 = __Pyx_PySequence_ITEM(__pyx_t_3, __pyx_t_5);
         #endif
-        ++__pyx_t_4;
+        ++__pyx_t_5;
       }
-      if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 119, __pyx_L1_error)
+      if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 157, __pyx_L1_error)
     } else {
-      __pyx_t_6 = __pyx_t_5(__pyx_t_3);
-      if (unlikely(!__pyx_t_6)) {
+      __pyx_t_4 = __pyx_t_6(__pyx_t_3);
+      if (unlikely(!__pyx_t_4)) {
         PyObject* exc_type = PyErr_Occurred();
         if (exc_type) {
-          if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 119, __pyx_L1_error)
+          if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 157, __pyx_L1_error)
           PyErr_Clear();
         }
         break;
       }
     }
-    __Pyx_GOTREF(__pyx_t_6);
-    __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_6);
-    __pyx_t_6 = 0;
+    __Pyx_GOTREF(__pyx_t_4);
+    __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_4);
+    __pyx_t_4 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":120
- * 
+    /* "dama/ai/ml/_fast_score.pyx":159
  *     for pos in men_list:
- *         row = pos[0]             # <<<<<<<<<<<<<<
- *         col = pos[1]
+ *         # C-level tuple element access: no bounds check, no __getitem__
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))             # <<<<<<<<<<<<<<
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:
 */
-    __pyx_t_6 = __Pyx_GetItemInt(__pyx_v_pos, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 120, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_6);
-    __pyx_t_1 = __Pyx_PyLong_As_int(__pyx_t_6); if (unlikely((__pyx_t_1 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 120, __pyx_L1_error)
-    __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
-    __pyx_v_row = __pyx_t_1;
+    __pyx_t_7 = PyTuple_GET_ITEM(__pyx_v_pos, 0);
+    __pyx_t_8 = PyLong_AsLong(((PyObject *)__pyx_t_7)); if (unlikely(__pyx_t_8 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 159, __pyx_L1_error)
+    __pyx_v_row = __pyx_t_8;
 
-    /* "dama/ai/ml/_fast_score.pyx":121
- *     for pos in men_list:
- *         row = pos[0]
- *         col = pos[1]             # <<<<<<<<<<<<<<
+    /* "dama/ai/ml/_fast_score.pyx":160
+ *         # C-level tuple element access: no bounds check, no __getitem__
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))             # <<<<<<<<<<<<<<
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS
 */
-    __pyx_t_6 = __Pyx_GetItemInt(__pyx_v_pos, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 121, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_6);
-    __pyx_t_1 = __Pyx_PyLong_As_int(__pyx_t_6); if (unlikely((__pyx_t_1 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 121, __pyx_L1_error)
-    __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
-    __pyx_v_col = __pyx_t_1;
+    __pyx_t_7 = PyTuple_GET_ITEM(__pyx_v_pos, 1);
+    __pyx_t_8 = PyLong_AsLong(((PyObject *)__pyx_t_7)); if (unlikely(__pyx_t_8 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 160, __pyx_L1_error)
+    __pyx_v_col = __pyx_t_8;
 
-    /* "dama/ai/ml/_fast_score.pyx":122
- *         row = pos[0]
- *         col = pos[1]
+    /* "dama/ai/ml/_fast_score.pyx":161
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *             score += CENTER_BONUS
  *         if player_int == 1:
 */
-    __pyx_t_7 = (2 <= __pyx_v_row);
-    if (__pyx_t_7) {
-      __pyx_t_7 = (__pyx_v_row <= 5);
+    __pyx_t_9 = (2 <= __pyx_v_row);
+    if (__pyx_t_9) {
+      __pyx_t_9 = (__pyx_v_row <= 5);
     }
-    if (__pyx_t_7) {
+    if (__pyx_t_9) {
     } else {
-      __pyx_t_2 = __pyx_t_7;
+      __pyx_t_2 = __pyx_t_9;
       goto __pyx_L7_bool_binop_done;
     }
-    __pyx_t_7 = (2 <= __pyx_v_col);
-    if (__pyx_t_7) {
-      __pyx_t_7 = (__pyx_v_col <= 5);
+    __pyx_t_9 = (2 <= __pyx_v_col);
+    if (__pyx_t_9) {
+      __pyx_t_9 = (__pyx_v_col <= 5);
     }
-    __pyx_t_2 = __pyx_t_7;
+    __pyx_t_2 = __pyx_t_9;
     __pyx_L7_bool_binop_done:;
     if (__pyx_t_2) {
 
-      /* "dama/ai/ml/_fast_score.pyx":123
- *         col = pos[1]
+      /* "dama/ai/ml/_fast_score.pyx":162
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS             # <<<<<<<<<<<<<<
  *         if player_int == 1:
@@ -3261,16 +3441,16 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
       __pyx_v_score = (__pyx_v_score + __pyx_v_4dama_2ai_2ml_11_fast_score_CENTER_BONUS);
 
-      /* "dama/ai/ml/_fast_score.pyx":122
- *         row = pos[0]
- *         col = pos[1]
+      /* "dama/ai/ml/_fast_score.pyx":161
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *             score += CENTER_BONUS
  *         if player_int == 1:
 */
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":124
+    /* "dama/ai/ml/_fast_score.pyx":163
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS
  *         if player_int == 1:             # <<<<<<<<<<<<<<
@@ -3280,7 +3460,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
     __pyx_t_2 = (__pyx_v_player_int == 1);
     if (__pyx_t_2) {
 
-      /* "dama/ai/ml/_fast_score.pyx":125
+      /* "dama/ai/ml/_fast_score.pyx":164
  *             score += CENTER_BONUS
  *         if player_int == 1:
  *             advancement = row             # <<<<<<<<<<<<<<
@@ -3289,7 +3469,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
       __pyx_v_advancement = __pyx_v_row;
 
-      /* "dama/ai/ml/_fast_score.pyx":124
+      /* "dama/ai/ml/_fast_score.pyx":163
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS
  *         if player_int == 1:             # <<<<<<<<<<<<<<
@@ -3299,7 +3479,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
       goto __pyx_L9;
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":127
+    /* "dama/ai/ml/_fast_score.pyx":166
  *             advancement = row
  *         else:
  *             advancement = 7 - row             # <<<<<<<<<<<<<<
@@ -3311,7 +3491,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
     }
     __pyx_L9:;
 
-    /* "dama/ai/ml/_fast_score.pyx":128
+    /* "dama/ai/ml/_fast_score.pyx":167
  *         else:
  *             advancement = 7 - row
  *         score += advancement * ADVANCE_BONUS_PER_ROW             # <<<<<<<<<<<<<<
@@ -3320,7 +3500,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
     __pyx_v_score = (__pyx_v_score + (__pyx_v_advancement * __pyx_v_4dama_2ai_2ml_11_fast_score_ADVANCE_BONUS_PER_ROW));
 
-    /* "dama/ai/ml/_fast_score.pyx":129
+    /* "dama/ai/ml/_fast_score.pyx":168
  *             advancement = 7 - row
  *         score += advancement * ADVANCE_BONUS_PER_ROW
  *         if row == start_row:             # <<<<<<<<<<<<<<
@@ -3330,7 +3510,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
     __pyx_t_2 = (__pyx_v_row == __pyx_v_start_row);
     if (__pyx_t_2) {
 
-      /* "dama/ai/ml/_fast_score.pyx":130
+      /* "dama/ai/ml/_fast_score.pyx":169
  *         score += advancement * ADVANCE_BONUS_PER_ROW
  *         if row == start_row:
  *             score += BACK_ROW_BONUS             # <<<<<<<<<<<<<<
@@ -3339,7 +3519,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
       __pyx_v_score = (__pyx_v_score + __pyx_v_4dama_2ai_2ml_11_fast_score_BACK_ROW_BONUS);
 
-      /* "dama/ai/ml/_fast_score.pyx":129
+      /* "dama/ai/ml/_fast_score.pyx":168
  *             advancement = 7 - row
  *         score += advancement * ADVANCE_BONUS_PER_ROW
  *         if row == start_row:             # <<<<<<<<<<<<<<
@@ -3348,7 +3528,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":131
+    /* "dama/ai/ml/_fast_score.pyx":170
  *         if row == start_row:
  *             score += BACK_ROW_BONUS
  *         if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -3359,7 +3539,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
       case 0:
       case 7:
 
-      /* "dama/ai/ml/_fast_score.pyx":132
+      /* "dama/ai/ml/_fast_score.pyx":171
  *             score += BACK_ROW_BONUS
  *         if col == 0 or col == 7:
  *             score += EDGE_PENALTY             # <<<<<<<<<<<<<<
@@ -3368,7 +3548,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
       __pyx_v_score = (__pyx_v_score + __pyx_v_4dama_2ai_2ml_11_fast_score_EDGE_PENALTY);
 
-      /* "dama/ai/ml/_fast_score.pyx":131
+      /* "dama/ai/ml/_fast_score.pyx":170
  *         if row == start_row:
  *             score += BACK_ROW_BONUS
  *         if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -3379,127 +3559,123 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
       default: break;
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":119
- *         kings_list = state_dict.get('p2_kings', ())
+    /* "dama/ai/ml/_fast_score.pyx":157
+ *         kings_list = _dict_get(state_dict, _K_P2_KINGS)
  * 
  *     for pos in men_list:             # <<<<<<<<<<<<<<
- *         row = pos[0]
- *         col = pos[1]
+ *         # C-level tuple element access: no bounds check, no __getitem__
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
 */
   }
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
 
-  /* "dama/ai/ml/_fast_score.pyx":134
+  /* "dama/ai/ml/_fast_score.pyx":173
  *             score += EDGE_PENALTY
  * 
  *     for pos in kings_list:             # <<<<<<<<<<<<<<
- *         row = pos[0]
- *         col = pos[1]
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
 */
   if (likely(PyList_CheckExact(__pyx_v_kings_list)) || PyTuple_CheckExact(__pyx_v_kings_list)) {
     __pyx_t_3 = __pyx_v_kings_list; __Pyx_INCREF(__pyx_t_3);
-    __pyx_t_4 = 0;
-    __pyx_t_5 = NULL;
+    __pyx_t_5 = 0;
+    __pyx_t_6 = NULL;
   } else {
-    __pyx_t_4 = -1; __pyx_t_3 = PyObject_GetIter(__pyx_v_kings_list); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 134, __pyx_L1_error)
+    __pyx_t_5 = -1; __pyx_t_3 = PyObject_GetIter(__pyx_v_kings_list); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 173, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_3);
-    __pyx_t_5 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_3); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 134, __pyx_L1_error)
+    __pyx_t_6 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_3); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 173, __pyx_L1_error)
   }
   for (;;) {
-    if (likely(!__pyx_t_5)) {
+    if (likely(!__pyx_t_6)) {
       if (likely(PyList_CheckExact(__pyx_t_3))) {
         {
           Py_ssize_t __pyx_temp = __Pyx_PyList_GET_SIZE(__pyx_t_3);
           #if !CYTHON_ASSUME_SAFE_SIZE
-          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 134, __pyx_L1_error)
+          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 173, __pyx_L1_error)
           #endif
-          if (__pyx_t_4 >= __pyx_temp) break;
+          if (__pyx_t_5 >= __pyx_temp) break;
         }
-        __pyx_t_6 = __Pyx_PyList_GetItemRefFast(__pyx_t_3, __pyx_t_4, __Pyx_ReferenceSharing_OwnStrongReference);
-        ++__pyx_t_4;
+        __pyx_t_4 = __Pyx_PyList_GetItemRefFast(__pyx_t_3, __pyx_t_5, __Pyx_ReferenceSharing_OwnStrongReference);
+        ++__pyx_t_5;
       } else {
         {
           Py_ssize_t __pyx_temp = __Pyx_PyTuple_GET_SIZE(__pyx_t_3);
           #if !CYTHON_ASSUME_SAFE_SIZE
-          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 134, __pyx_L1_error)
+          if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 173, __pyx_L1_error)
           #endif
-          if (__pyx_t_4 >= __pyx_temp) break;
+          if (__pyx_t_5 >= __pyx_temp) break;
         }
         #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
-        __pyx_t_6 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_3, __pyx_t_4));
+        __pyx_t_4 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_3, __pyx_t_5));
         #else
-        __pyx_t_6 = __Pyx_PySequence_ITEM(__pyx_t_3, __pyx_t_4);
+        __pyx_t_4 = __Pyx_PySequence_ITEM(__pyx_t_3, __pyx_t_5);
         #endif
-        ++__pyx_t_4;
+        ++__pyx_t_5;
       }
-      if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 134, __pyx_L1_error)
+      if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 173, __pyx_L1_error)
     } else {
-      __pyx_t_6 = __pyx_t_5(__pyx_t_3);
-      if (unlikely(!__pyx_t_6)) {
+      __pyx_t_4 = __pyx_t_6(__pyx_t_3);
+      if (unlikely(!__pyx_t_4)) {
         PyObject* exc_type = PyErr_Occurred();
         if (exc_type) {
-          if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 134, __pyx_L1_error)
+          if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 173, __pyx_L1_error)
           PyErr_Clear();
         }
         break;
       }
     }
-    __Pyx_GOTREF(__pyx_t_6);
-    __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_6);
-    __pyx_t_6 = 0;
+    __Pyx_GOTREF(__pyx_t_4);
+    __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_4);
+    __pyx_t_4 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":135
+    /* "dama/ai/ml/_fast_score.pyx":174
  * 
  *     for pos in kings_list:
- *         row = pos[0]             # <<<<<<<<<<<<<<
- *         col = pos[1]
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))             # <<<<<<<<<<<<<<
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:
 */
-    __pyx_t_6 = __Pyx_GetItemInt(__pyx_v_pos, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 135, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_6);
-    __pyx_t_1 = __Pyx_PyLong_As_int(__pyx_t_6); if (unlikely((__pyx_t_1 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 135, __pyx_L1_error)
-    __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
-    __pyx_v_row = __pyx_t_1;
+    __pyx_t_7 = PyTuple_GET_ITEM(__pyx_v_pos, 0);
+    __pyx_t_8 = PyLong_AsLong(((PyObject *)__pyx_t_7)); if (unlikely(__pyx_t_8 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 174, __pyx_L1_error)
+    __pyx_v_row = __pyx_t_8;
 
-    /* "dama/ai/ml/_fast_score.pyx":136
+    /* "dama/ai/ml/_fast_score.pyx":175
  *     for pos in kings_list:
- *         row = pos[0]
- *         col = pos[1]             # <<<<<<<<<<<<<<
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))             # <<<<<<<<<<<<<<
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS
 */
-    __pyx_t_6 = __Pyx_GetItemInt(__pyx_v_pos, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 136, __pyx_L1_error)
-    __Pyx_GOTREF(__pyx_t_6);
-    __pyx_t_1 = __Pyx_PyLong_As_int(__pyx_t_6); if (unlikely((__pyx_t_1 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 136, __pyx_L1_error)
-    __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
-    __pyx_v_col = __pyx_t_1;
+    __pyx_t_7 = PyTuple_GET_ITEM(__pyx_v_pos, 1);
+    __pyx_t_8 = PyLong_AsLong(((PyObject *)__pyx_t_7)); if (unlikely(__pyx_t_8 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 175, __pyx_L1_error)
+    __pyx_v_col = __pyx_t_8;
 
-    /* "dama/ai/ml/_fast_score.pyx":137
- *         row = pos[0]
- *         col = pos[1]
+    /* "dama/ai/ml/_fast_score.pyx":176
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *             score += CENTER_BONUS
  *         if row == start_row:
 */
-    __pyx_t_7 = (2 <= __pyx_v_row);
-    if (__pyx_t_7) {
-      __pyx_t_7 = (__pyx_v_row <= 5);
+    __pyx_t_9 = (2 <= __pyx_v_row);
+    if (__pyx_t_9) {
+      __pyx_t_9 = (__pyx_v_row <= 5);
     }
-    if (__pyx_t_7) {
+    if (__pyx_t_9) {
     } else {
-      __pyx_t_2 = __pyx_t_7;
+      __pyx_t_2 = __pyx_t_9;
       goto __pyx_L15_bool_binop_done;
     }
-    __pyx_t_7 = (2 <= __pyx_v_col);
-    if (__pyx_t_7) {
-      __pyx_t_7 = (__pyx_v_col <= 5);
+    __pyx_t_9 = (2 <= __pyx_v_col);
+    if (__pyx_t_9) {
+      __pyx_t_9 = (__pyx_v_col <= 5);
     }
-    __pyx_t_2 = __pyx_t_7;
+    __pyx_t_2 = __pyx_t_9;
     __pyx_L15_bool_binop_done:;
     if (__pyx_t_2) {
 
-      /* "dama/ai/ml/_fast_score.pyx":138
- *         col = pos[1]
+      /* "dama/ai/ml/_fast_score.pyx":177
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS             # <<<<<<<<<<<<<<
  *         if row == start_row:
@@ -3507,16 +3683,16 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
       __pyx_v_score = (__pyx_v_score + __pyx_v_4dama_2ai_2ml_11_fast_score_CENTER_BONUS);
 
-      /* "dama/ai/ml/_fast_score.pyx":137
- *         row = pos[0]
- *         col = pos[1]
+      /* "dama/ai/ml/_fast_score.pyx":176
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *         if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *             score += CENTER_BONUS
  *         if row == start_row:
 */
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":139
+    /* "dama/ai/ml/_fast_score.pyx":178
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS
  *         if row == start_row:             # <<<<<<<<<<<<<<
@@ -3526,7 +3702,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
     __pyx_t_2 = (__pyx_v_row == __pyx_v_start_row);
     if (__pyx_t_2) {
 
-      /* "dama/ai/ml/_fast_score.pyx":140
+      /* "dama/ai/ml/_fast_score.pyx":179
  *             score += CENTER_BONUS
  *         if row == start_row:
  *             score += BACK_ROW_BONUS             # <<<<<<<<<<<<<<
@@ -3535,7 +3711,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
       __pyx_v_score = (__pyx_v_score + __pyx_v_4dama_2ai_2ml_11_fast_score_BACK_ROW_BONUS);
 
-      /* "dama/ai/ml/_fast_score.pyx":139
+      /* "dama/ai/ml/_fast_score.pyx":178
  *         if 2 <= row <= 5 and 2 <= col <= 5:
  *             score += CENTER_BONUS
  *         if row == start_row:             # <<<<<<<<<<<<<<
@@ -3544,7 +3720,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":141
+    /* "dama/ai/ml/_fast_score.pyx":180
  *         if row == start_row:
  *             score += BACK_ROW_BONUS
  *         if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -3555,7 +3731,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
       case 0:
       case 7:
 
-      /* "dama/ai/ml/_fast_score.pyx":142
+      /* "dama/ai/ml/_fast_score.pyx":181
  *             score += BACK_ROW_BONUS
  *         if col == 0 or col == 7:
  *             score += EDGE_PENALTY             # <<<<<<<<<<<<<<
@@ -3564,7 +3740,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
 */
       __pyx_v_score = (__pyx_v_score + __pyx_v_4dama_2ai_2ml_11_fast_score_EDGE_PENALTY);
 
-      /* "dama/ai/ml/_fast_score.pyx":141
+      /* "dama/ai/ml/_fast_score.pyx":180
  *         if row == start_row:
  *             score += BACK_ROW_BONUS
  *         if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -3575,17 +3751,17 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
       default: break;
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":134
+    /* "dama/ai/ml/_fast_score.pyx":173
  *             score += EDGE_PENALTY
  * 
  *     for pos in kings_list:             # <<<<<<<<<<<<<<
- *         row = pos[0]
- *         col = pos[1]
+ *         row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *         col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
 */
   }
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
 
-  /* "dama/ai/ml/_fast_score.pyx":144
+  /* "dama/ai/ml/_fast_score.pyx":183
  *             score += EDGE_PENALTY
  * 
  *     return score             # <<<<<<<<<<<<<<
@@ -3595,7 +3771,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
   __pyx_r = __pyx_v_score;
   goto __pyx_L0;
 
-  /* "dama/ai/ml/_fast_score.pyx":104
+  /* "dama/ai/ml/_fast_score.pyx":141
  * #  Helper: positional score
  * 
  * cdef double _positional_compact(dict state_dict, int player_int):             # <<<<<<<<<<<<<<
@@ -3606,7 +3782,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
   /* function exit code */
   __pyx_L1_error:;
   __Pyx_XDECREF(__pyx_t_3);
-  __Pyx_XDECREF(__pyx_t_6);
+  __Pyx_XDECREF(__pyx_t_4);
   __Pyx_AddTraceback("dama.ai.ml._fast_score._positional_compact", __pyx_clineno, __pyx_lineno, __pyx_filename);
   __pyx_r = -1;
   __pyx_L0:;
@@ -3617,7 +3793,7 @@ static double __pyx_f_4dama_2ai_2ml_11_fast_score__positional_compact(PyObject *
   return __pyx_r;
 }
 
-/* "dama/ai/ml/_fast_score.pyx":149
+/* "dama/ai/ml/_fast_score.pyx":188
  * #  Main entry point: score_game_dicts
  * 
  * def score_game_dicts_cy(             # <<<<<<<<<<<<<<
@@ -3633,7 +3809,7 @@ PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 PyObject *__pyx_args, PyObject *__pyx_kwds
 #endif
 ); /*proto*/
-PyDoc_STRVAR(__pyx_doc_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy, "Score a list of entry dicts in place (Cython-accelerated).\n\n    Drop-in replacement for scoring.score_game_dicts().  Inlines all\n    scoring computations with C-level arithmetic and avoids Python\n    set/tuple creation in the per-entry loop.\n    ");
+PyDoc_STRVAR(__pyx_doc_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy, "Score a list of entry dicts in place (Cython-accelerated).\n\n    Drop-in replacement for scoring.score_game_dicts().  Inlines all\n    scoring computations with C-level arithmetic and avoids Python\n    set/tuple creation in the per-entry loop.\n\n    [Pass 82] Uses CPython C API for dict lookups and tuple element\n    access, eliminating Python method dispatch overhead (~30-40% faster).\n    ");
 static PyMethodDef __pyx_mdef_4dama_2ai_2ml_11_fast_score_1score_game_dicts_cy = {"score_game_dicts_cy", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_2ml_11_fast_score_1score_game_dicts_cy, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy};
 static PyObject *__pyx_pw_4dama_2ai_2ml_11_fast_score_1score_game_dicts_cy(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
@@ -3671,89 +3847,89 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_entry_dicts,&__pyx_mstate_global->__pyx_n_u_winner_int,&__pyx_mstate_global->__pyx_n_u_total_moves,&__pyx_mstate_global->__pyx_n_u_max_moves,&__pyx_mstate_global->__pyx_n_u_final_state_dict,&__pyx_mstate_global->__pyx_n_u_p1_captures,&__pyx_mstate_global->__pyx_n_u_p2_captures,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len) < 0) __PYX_ERR(0, 149, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len) < 0) __PYX_ERR(0, 188, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case  7:
         values[6] = __Pyx_ArgRef_FASTCALL(__pyx_args, 6);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  6:
         values[5] = __Pyx_ArgRef_FASTCALL(__pyx_args, 5);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  5:
         values[4] = __Pyx_ArgRef_FASTCALL(__pyx_args, 4);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  4:
         values[3] = __Pyx_ArgRef_FASTCALL(__pyx_args, 3);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  3:
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "score_game_dicts_cy", 0) < (0)) __PYX_ERR(0, 149, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "score_game_dicts_cy", 0) < (0)) __PYX_ERR(0, 188, __pyx_L3_error)
       for (Py_ssize_t i = __pyx_nargs; i < 5; i++) {
-        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("score_game_dicts_cy", 0, 5, 7, i); __PYX_ERR(0, 149, __pyx_L3_error) }
+        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("score_game_dicts_cy", 0, 5, 7, i); __PYX_ERR(0, 188, __pyx_L3_error) }
       }
     } else {
       switch (__pyx_nargs) {
         case  7:
         values[6] = __Pyx_ArgRef_FASTCALL(__pyx_args, 6);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  6:
         values[5] = __Pyx_ArgRef_FASTCALL(__pyx_args, 5);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 188, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  5:
         values[4] = __Pyx_ArgRef_FASTCALL(__pyx_args, 4);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 188, __pyx_L3_error)
         values[3] = __Pyx_ArgRef_FASTCALL(__pyx_args, 3);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 188, __pyx_L3_error)
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 188, __pyx_L3_error)
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 188, __pyx_L3_error)
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 149, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 188, __pyx_L3_error)
         break;
         default: goto __pyx_L5_argtuple_error;
       }
     }
     __pyx_v_entry_dicts = ((PyObject*)values[0]);
     __pyx_v_winner_int = values[1];
-    __pyx_v_total_moves = __Pyx_PyLong_As_int(values[2]); if (unlikely((__pyx_v_total_moves == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 152, __pyx_L3_error)
-    __pyx_v_max_moves = __Pyx_PyLong_As_int(values[3]); if (unlikely((__pyx_v_max_moves == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 153, __pyx_L3_error)
+    __pyx_v_total_moves = __Pyx_PyLong_As_int(values[2]); if (unlikely((__pyx_v_total_moves == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 191, __pyx_L3_error)
+    __pyx_v_max_moves = __Pyx_PyLong_As_int(values[3]); if (unlikely((__pyx_v_max_moves == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 192, __pyx_L3_error)
     __pyx_v_final_state_dict = ((PyObject*)values[4]);
     if (values[5]) {
-      __pyx_v_p1_captures = __Pyx_PyLong_As_int(values[5]); if (unlikely((__pyx_v_p1_captures == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 155, __pyx_L3_error)
+      __pyx_v_p1_captures = __Pyx_PyLong_As_int(values[5]); if (unlikely((__pyx_v_p1_captures == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 194, __pyx_L3_error)
     } else {
       __pyx_v_p1_captures = ((int)((int)0));
     }
     if (values[6]) {
-      __pyx_v_p2_captures = __Pyx_PyLong_As_int(values[6]); if (unlikely((__pyx_v_p2_captures == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 156, __pyx_L3_error)
+      __pyx_v_p2_captures = __Pyx_PyLong_As_int(values[6]); if (unlikely((__pyx_v_p2_captures == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 195, __pyx_L3_error)
     } else {
       __pyx_v_p2_captures = ((int)((int)0));
     }
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("score_game_dicts_cy", 0, 5, 7, __pyx_nargs); __PYX_ERR(0, 149, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("score_game_dicts_cy", 0, 5, 7, __pyx_nargs); __PYX_ERR(0, 188, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -3764,8 +3940,8 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   __Pyx_RefNannyFinishContext();
   return NULL;
   __pyx_L4_argument_unpacking_done:;
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_entry_dicts), (&PyList_Type), 1, "entry_dicts", 1))) __PYX_ERR(0, 150, __pyx_L1_error)
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_final_state_dict), (&PyDict_Type), 1, "final_state_dict", 1))) __PYX_ERR(0, 154, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_entry_dicts), (&PyList_Type), 1, "entry_dicts", 1))) __PYX_ERR(0, 189, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_final_state_dict), (&PyDict_Type), 1, "final_state_dict", 1))) __PYX_ERR(0, 193, __pyx_L1_error)
   __pyx_r = __pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(__pyx_self, __pyx_v_entry_dicts, __pyx_v_winner_int, __pyx_v_total_moves, __pyx_v_max_moves, __pyx_v_final_state_dict, __pyx_v_p1_captures, __pyx_v_p2_captures);
 
   /* function exit code */
@@ -3814,13 +3990,13 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
   PyObject *__pyx_v_legal_moves = 0;
   PyObject *__pyx_v_path = 0;
   PyObject *__pyx_v_captures = 0;
+  PyObject *__pyx_v_pos = 0;
   int __pyx_v_king_rows[12];
   int __pyx_v_king_cols[12];
   int __pyx_v_j;
   int __pyx_v_sr;
   int __pyx_v_sc;
   int __pyx_v_is_king;
-  PyObject *__pyx_v_pos = NULL;
   PyObject *__pyx_r = NULL;
   __Pyx_RefNannyDeclarations
   double __pyx_t_1;
@@ -3831,40 +4007,40 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
   int __pyx_t_6;
   PyObject *__pyx_t_7 = NULL;
   int __pyx_t_8;
-  Py_ssize_t __pyx_t_9;
-  PyObject *(*__pyx_t_10)(PyObject *);
-  PyObject *__pyx_t_11 = NULL;
-  int __pyx_t_12;
-  int __pyx_t_13;
+  PyObject *__pyx_t_9 = NULL;
+  Py_ssize_t __pyx_t_10;
+  PyObject *(*__pyx_t_11)(PyObject *);
+  PyObject *__pyx_t_12;
+  long __pyx_t_13;
   int __pyx_t_14;
   int __pyx_t_15;
-  PyObject *__pyx_t_16 = NULL;
+  int __pyx_t_16;
   int __pyx_lineno = 0;
   const char *__pyx_filename = NULL;
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("score_game_dicts_cy", 0);
 
-  /* "dama/ai/ml/_fast_score.pyx":182
+  /* "dama/ai/ml/_fast_score.pyx":224
  * 
  *     # Pre-compute game scores for both players (2 calls total)
  *     game_score_p1 = _game_score_from_compact(             # <<<<<<<<<<<<<<
  *         1, winner_int, total_moves, max_moves, final_state_dict, p1_captures)
  *     game_score_p2 = _game_score_from_compact(
 */
-  __pyx_t_1 = __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(1, __pyx_v_winner_int, __pyx_v_total_moves, __pyx_v_max_moves, __pyx_v_final_state_dict, __pyx_v_p1_captures); if (unlikely(__pyx_t_1 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 182, __pyx_L1_error)
+  __pyx_t_1 = __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(1, __pyx_v_winner_int, __pyx_v_total_moves, __pyx_v_max_moves, __pyx_v_final_state_dict, __pyx_v_p1_captures); if (unlikely(__pyx_t_1 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 224, __pyx_L1_error)
   __pyx_v_game_score_p1 = __pyx_t_1;
 
-  /* "dama/ai/ml/_fast_score.pyx":184
+  /* "dama/ai/ml/_fast_score.pyx":226
  *     game_score_p1 = _game_score_from_compact(
  *         1, winner_int, total_moves, max_moves, final_state_dict, p1_captures)
  *     game_score_p2 = _game_score_from_compact(             # <<<<<<<<<<<<<<
  *         2, winner_int, total_moves, max_moves, final_state_dict, p2_captures)
  * 
 */
-  __pyx_t_1 = __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(2, __pyx_v_winner_int, __pyx_v_total_moves, __pyx_v_max_moves, __pyx_v_final_state_dict, __pyx_v_p2_captures); if (unlikely(__pyx_t_1 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 184, __pyx_L1_error)
+  __pyx_t_1 = __pyx_f_4dama_2ai_2ml_11_fast_score__game_score_from_compact(2, __pyx_v_winner_int, __pyx_v_total_moves, __pyx_v_max_moves, __pyx_v_final_state_dict, __pyx_v_p2_captures); if (unlikely(__pyx_t_1 == ((double)-1) && PyErr_Occurred())) __PYX_ERR(0, 226, __pyx_L1_error)
   __pyx_v_game_score_p2 = __pyx_t_1;
 
-  /* "dama/ai/ml/_fast_score.pyx":187
+  /* "dama/ai/ml/_fast_score.pyx":229
  *         2, winner_int, total_moves, max_moves, final_state_dict, p2_captures)
  * 
  *     inv_total = 1.0 / total_moves if total_moves > 0 else 0.0             # <<<<<<<<<<<<<<
@@ -3879,7 +4055,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
   }
   __pyx_v_inv_total = __pyx_t_1;
 
-  /* "dama/ai/ml/_fast_score.pyx":188
+  /* "dama/ai/ml/_fast_score.pyx":230
  * 
  *     inv_total = 1.0 / total_moves if total_moves > 0 else 0.0
  *     n = len(entry_dicts)             # <<<<<<<<<<<<<<
@@ -3888,79 +4064,79 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
   if (unlikely(__pyx_v_entry_dicts == Py_None)) {
     PyErr_SetString(PyExc_TypeError, "object of type 'NoneType' has no len()");
-    __PYX_ERR(0, 188, __pyx_L1_error)
+    __PYX_ERR(0, 230, __pyx_L1_error)
   }
-  __pyx_t_3 = __Pyx_PyList_GET_SIZE(__pyx_v_entry_dicts); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 188, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyList_GET_SIZE(__pyx_v_entry_dicts); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 230, __pyx_L1_error)
   __pyx_v_n = __pyx_t_3;
 
-  /* "dama/ai/ml/_fast_score.pyx":190
+  /* "dama/ai/ml/_fast_score.pyx":232
  *     n = len(entry_dicts)
  * 
  *     for i in range(n):             # <<<<<<<<<<<<<<
  *         ed = entry_dicts[i]
- *         state_dict = ed['state']
+ *         state_dict = ed[_K_STATE]
 */
   __pyx_t_4 = __pyx_v_n;
   __pyx_t_5 = __pyx_t_4;
   for (__pyx_t_6 = 0; __pyx_t_6 < __pyx_t_5; __pyx_t_6+=1) {
     __pyx_v_i = __pyx_t_6;
 
-    /* "dama/ai/ml/_fast_score.pyx":191
+    /* "dama/ai/ml/_fast_score.pyx":233
  * 
  *     for i in range(n):
  *         ed = entry_dicts[i]             # <<<<<<<<<<<<<<
- *         state_dict = ed['state']
- *         player_int = state_dict['turn']
+ *         state_dict = ed[_K_STATE]
+ *         player_int = state_dict[_K_TURN]
 */
     if (unlikely(__pyx_v_entry_dicts == Py_None)) {
       PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-      __PYX_ERR(0, 191, __pyx_L1_error)
+      __PYX_ERR(0, 233, __pyx_L1_error)
     }
     __pyx_t_7 = __Pyx_PyList_GET_ITEM(__pyx_v_entry_dicts, __pyx_v_i);
     __Pyx_INCREF(__pyx_t_7);
-    if (!(likely(PyDict_CheckExact(__pyx_t_7))||((__pyx_t_7) == Py_None) || __Pyx_RaiseUnexpectedTypeError("dict", __pyx_t_7))) __PYX_ERR(0, 191, __pyx_L1_error)
+    if (!(likely(PyDict_CheckExact(__pyx_t_7))||((__pyx_t_7) == Py_None) || __Pyx_RaiseUnexpectedTypeError("dict", __pyx_t_7))) __PYX_ERR(0, 233, __pyx_L1_error)
     __Pyx_XDECREF_SET(__pyx_v_ed, ((PyObject*)__pyx_t_7));
     __pyx_t_7 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":192
+    /* "dama/ai/ml/_fast_score.pyx":234
  *     for i in range(n):
  *         ed = entry_dicts[i]
- *         state_dict = ed['state']             # <<<<<<<<<<<<<<
- *         player_int = state_dict['turn']
+ *         state_dict = ed[_K_STATE]             # <<<<<<<<<<<<<<
+ *         player_int = state_dict[_K_TURN]
  *         game_score = game_score_p1 if player_int == 1 else game_score_p2
 */
     if (unlikely(__pyx_v_ed == Py_None)) {
       PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-      __PYX_ERR(0, 192, __pyx_L1_error)
+      __PYX_ERR(0, 234, __pyx_L1_error)
     }
-    __pyx_t_7 = __Pyx_PyDict_GetItem(__pyx_v_ed, __pyx_mstate_global->__pyx_n_u_state); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 192, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_PyDict_GetItem(__pyx_v_ed, __pyx_v_4dama_2ai_2ml_11_fast_score__K_STATE); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 234, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
-    if (!(likely(PyDict_CheckExact(__pyx_t_7))||((__pyx_t_7) == Py_None) || __Pyx_RaiseUnexpectedTypeError("dict", __pyx_t_7))) __PYX_ERR(0, 192, __pyx_L1_error)
+    if (!(likely(PyDict_CheckExact(__pyx_t_7))||((__pyx_t_7) == Py_None) || __Pyx_RaiseUnexpectedTypeError("dict", __pyx_t_7))) __PYX_ERR(0, 234, __pyx_L1_error)
     __Pyx_XDECREF_SET(__pyx_v_state_dict, ((PyObject*)__pyx_t_7));
     __pyx_t_7 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":193
+    /* "dama/ai/ml/_fast_score.pyx":235
  *         ed = entry_dicts[i]
- *         state_dict = ed['state']
- *         player_int = state_dict['turn']             # <<<<<<<<<<<<<<
+ *         state_dict = ed[_K_STATE]
+ *         player_int = state_dict[_K_TURN]             # <<<<<<<<<<<<<<
  *         game_score = game_score_p1 if player_int == 1 else game_score_p2
- *         legal_moves = ed['legal_moves']
+ *         legal_moves = ed[_K_LEGAL_MOVES]
 */
     if (unlikely(__pyx_v_state_dict == Py_None)) {
       PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-      __PYX_ERR(0, 193, __pyx_L1_error)
+      __PYX_ERR(0, 235, __pyx_L1_error)
     }
-    __pyx_t_7 = __Pyx_PyDict_GetItem(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_turn); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 193, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_PyDict_GetItem(__pyx_v_state_dict, __pyx_v_4dama_2ai_2ml_11_fast_score__K_TURN); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 235, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
-    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 193, __pyx_L1_error)
+    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 235, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
     __pyx_v_player_int = __pyx_t_8;
 
-    /* "dama/ai/ml/_fast_score.pyx":194
- *         state_dict = ed['state']
- *         player_int = state_dict['turn']
+    /* "dama/ai/ml/_fast_score.pyx":236
+ *         state_dict = ed[_K_STATE]
+ *         player_int = state_dict[_K_TURN]
  *         game_score = game_score_p1 if player_int == 1 else game_score_p2             # <<<<<<<<<<<<<<
- *         legal_moves = ed['legal_moves']
+ *         legal_moves = ed[_K_LEGAL_MOVES]
  * 
 */
     __pyx_t_2 = (__pyx_v_player_int == 1);
@@ -3971,187 +4147,179 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
     }
     __pyx_v_game_score = __pyx_t_1;
 
-    /* "dama/ai/ml/_fast_score.pyx":195
- *         player_int = state_dict['turn']
+    /* "dama/ai/ml/_fast_score.pyx":237
+ *         player_int = state_dict[_K_TURN]
  *         game_score = game_score_p1 if player_int == 1 else game_score_p2
- *         legal_moves = ed['legal_moves']             # <<<<<<<<<<<<<<
+ *         legal_moves = ed[_K_LEGAL_MOVES]             # <<<<<<<<<<<<<<
  * 
  *         #  Material
 */
     if (unlikely(__pyx_v_ed == Py_None)) {
       PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-      __PYX_ERR(0, 195, __pyx_L1_error)
+      __PYX_ERR(0, 237, __pyx_L1_error)
     }
-    __pyx_t_7 = __Pyx_PyDict_GetItem(__pyx_v_ed, __pyx_mstate_global->__pyx_n_u_legal_moves); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 195, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_PyDict_GetItem(__pyx_v_ed, __pyx_v_4dama_2ai_2ml_11_fast_score__K_LEGAL_MOVES); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 237, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
     __Pyx_XDECREF_SET(__pyx_v_legal_moves, __pyx_t_7);
     __pyx_t_7 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":198
+    /* "dama/ai/ml/_fast_score.pyx":240
  * 
  *         #  Material
  *         if player_int == 1:             # <<<<<<<<<<<<<<
- *             my_men_list = state_dict.get('p1_men', ())
- *             my_kings_list = state_dict.get('p1_kings', ())
+ *             my_men_list = _dict_get(state_dict, _K_P1_MEN)
+ *             my_kings_list = _dict_get(state_dict, _K_P1_KINGS)
 */
     __pyx_t_2 = (__pyx_v_player_int == 1);
     if (__pyx_t_2) {
 
-      /* "dama/ai/ml/_fast_score.pyx":199
+      /* "dama/ai/ml/_fast_score.pyx":241
  *         #  Material
  *         if player_int == 1:
- *             my_men_list = state_dict.get('p1_men', ())             # <<<<<<<<<<<<<<
- *             my_kings_list = state_dict.get('p1_kings', ())
- *             opp_mat = (len(state_dict.get('p2_men', ())) * MAN_VALUE
+ *             my_men_list = _dict_get(state_dict, _K_P1_MEN)             # <<<<<<<<<<<<<<
+ *             my_kings_list = _dict_get(state_dict, _K_P1_KINGS)
+ *             opp_mat = (len(_dict_get(state_dict, _K_P2_MEN)) * MAN_VALUE
 */
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 199, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 199, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __Pyx_XDECREF_SET(__pyx_v_my_men_list, __pyx_t_7);
-      __pyx_t_7 = 0;
+      __pyx_t_7 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN;
+      __Pyx_INCREF(__pyx_t_7);
+      __pyx_t_9 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_7); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 241, __pyx_L1_error)
+      __Pyx_GOTREF(__pyx_t_9);
+      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
+      __Pyx_XDECREF_SET(__pyx_v_my_men_list, __pyx_t_9);
+      __pyx_t_9 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":200
+      /* "dama/ai/ml/_fast_score.pyx":242
  *         if player_int == 1:
- *             my_men_list = state_dict.get('p1_men', ())
- *             my_kings_list = state_dict.get('p1_kings', ())             # <<<<<<<<<<<<<<
- *             opp_mat = (len(state_dict.get('p2_men', ())) * MAN_VALUE
- *                        + len(state_dict.get('p2_kings', ())) * KING_VALUE)
+ *             my_men_list = _dict_get(state_dict, _K_P1_MEN)
+ *             my_kings_list = _dict_get(state_dict, _K_P1_KINGS)             # <<<<<<<<<<<<<<
+ *             opp_mat = (len(_dict_get(state_dict, _K_P2_MEN)) * MAN_VALUE
+ *                        + len(_dict_get(state_dict, _K_P2_KINGS)) * KING_VALUE)
 */
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 200, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 200, __pyx_L1_error)
+      __pyx_t_9 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS;
+      __Pyx_INCREF(__pyx_t_9);
+      __pyx_t_7 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_9); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 242, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_7);
+      __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
       __Pyx_XDECREF_SET(__pyx_v_my_kings_list, __pyx_t_7);
       __pyx_t_7 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":201
- *             my_men_list = state_dict.get('p1_men', ())
- *             my_kings_list = state_dict.get('p1_kings', ())
- *             opp_mat = (len(state_dict.get('p2_men', ())) * MAN_VALUE             # <<<<<<<<<<<<<<
- *                        + len(state_dict.get('p2_kings', ())) * KING_VALUE)
+      /* "dama/ai/ml/_fast_score.pyx":243
+ *             my_men_list = _dict_get(state_dict, _K_P1_MEN)
+ *             my_kings_list = _dict_get(state_dict, _K_P1_KINGS)
+ *             opp_mat = (len(_dict_get(state_dict, _K_P2_MEN)) * MAN_VALUE             # <<<<<<<<<<<<<<
+ *                        + len(_dict_get(state_dict, _K_P2_KINGS)) * KING_VALUE)
  *         else:
 */
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 201, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 201, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_3 = PyObject_Length(__pyx_t_7); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 201, __pyx_L1_error)
+      __pyx_t_7 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN;
+      __Pyx_INCREF(__pyx_t_7);
+      __pyx_t_9 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_7); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 243, __pyx_L1_error)
+      __Pyx_GOTREF(__pyx_t_9);
       __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
+      __pyx_t_3 = PyObject_Length(__pyx_t_9); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 243, __pyx_L1_error)
+      __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":202
- *             my_kings_list = state_dict.get('p1_kings', ())
- *             opp_mat = (len(state_dict.get('p2_men', ())) * MAN_VALUE
- *                        + len(state_dict.get('p2_kings', ())) * KING_VALUE)             # <<<<<<<<<<<<<<
+      /* "dama/ai/ml/_fast_score.pyx":244
+ *             my_kings_list = _dict_get(state_dict, _K_P1_KINGS)
+ *             opp_mat = (len(_dict_get(state_dict, _K_P2_MEN)) * MAN_VALUE
+ *                        + len(_dict_get(state_dict, _K_P2_KINGS)) * KING_VALUE)             # <<<<<<<<<<<<<<
  *         else:
- *             my_men_list = state_dict.get('p2_men', ())
+ *             my_men_list = _dict_get(state_dict, _K_P2_MEN)
 */
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 202, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 202, __pyx_L1_error)
+      __pyx_t_9 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS;
+      __Pyx_INCREF(__pyx_t_9);
+      __pyx_t_7 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_9); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 244, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_9 = PyObject_Length(__pyx_t_7); if (unlikely(__pyx_t_9 == ((Py_ssize_t)-1))) __PYX_ERR(0, 202, __pyx_L1_error)
+      __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
+      __pyx_t_10 = PyObject_Length(__pyx_t_7); if (unlikely(__pyx_t_10 == ((Py_ssize_t)-1))) __PYX_ERR(0, 244, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-      __pyx_v_opp_mat = ((__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_9 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
+      __pyx_v_opp_mat = ((__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_10 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
 
-      /* "dama/ai/ml/_fast_score.pyx":198
+      /* "dama/ai/ml/_fast_score.pyx":240
  * 
  *         #  Material
  *         if player_int == 1:             # <<<<<<<<<<<<<<
- *             my_men_list = state_dict.get('p1_men', ())
- *             my_kings_list = state_dict.get('p1_kings', ())
+ *             my_men_list = _dict_get(state_dict, _K_P1_MEN)
+ *             my_kings_list = _dict_get(state_dict, _K_P1_KINGS)
 */
       goto __pyx_L5;
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":204
- *                        + len(state_dict.get('p2_kings', ())) * KING_VALUE)
+    /* "dama/ai/ml/_fast_score.pyx":246
+ *                        + len(_dict_get(state_dict, _K_P2_KINGS)) * KING_VALUE)
  *         else:
- *             my_men_list = state_dict.get('p2_men', ())             # <<<<<<<<<<<<<<
- *             my_kings_list = state_dict.get('p2_kings', ())
- *             opp_mat = (len(state_dict.get('p1_men', ())) * MAN_VALUE
+ *             my_men_list = _dict_get(state_dict, _K_P2_MEN)             # <<<<<<<<<<<<<<
+ *             my_kings_list = _dict_get(state_dict, _K_P2_KINGS)
+ *             opp_mat = (len(_dict_get(state_dict, _K_P1_MEN)) * MAN_VALUE
 */
     /*else*/ {
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 204, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 204, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __Pyx_XDECREF_SET(__pyx_v_my_men_list, __pyx_t_7);
-      __pyx_t_7 = 0;
+      __pyx_t_7 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN;
+      __Pyx_INCREF(__pyx_t_7);
+      __pyx_t_9 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_7); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 246, __pyx_L1_error)
+      __Pyx_GOTREF(__pyx_t_9);
+      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
+      __Pyx_XDECREF_SET(__pyx_v_my_men_list, __pyx_t_9);
+      __pyx_t_9 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":205
+      /* "dama/ai/ml/_fast_score.pyx":247
  *         else:
- *             my_men_list = state_dict.get('p2_men', ())
- *             my_kings_list = state_dict.get('p2_kings', ())             # <<<<<<<<<<<<<<
- *             opp_mat = (len(state_dict.get('p1_men', ())) * MAN_VALUE
- *                        + len(state_dict.get('p1_kings', ())) * KING_VALUE)
+ *             my_men_list = _dict_get(state_dict, _K_P2_MEN)
+ *             my_kings_list = _dict_get(state_dict, _K_P2_KINGS)             # <<<<<<<<<<<<<<
+ *             opp_mat = (len(_dict_get(state_dict, _K_P1_MEN)) * MAN_VALUE
+ *                        + len(_dict_get(state_dict, _K_P1_KINGS)) * KING_VALUE)
 */
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 205, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p2_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 205, __pyx_L1_error)
+      __pyx_t_9 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS;
+      __Pyx_INCREF(__pyx_t_9);
+      __pyx_t_7 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_9); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 247, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_7);
+      __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
       __Pyx_XDECREF_SET(__pyx_v_my_kings_list, __pyx_t_7);
       __pyx_t_7 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":206
- *             my_men_list = state_dict.get('p2_men', ())
- *             my_kings_list = state_dict.get('p2_kings', ())
- *             opp_mat = (len(state_dict.get('p1_men', ())) * MAN_VALUE             # <<<<<<<<<<<<<<
- *                        + len(state_dict.get('p1_kings', ())) * KING_VALUE)
+      /* "dama/ai/ml/_fast_score.pyx":248
+ *             my_men_list = _dict_get(state_dict, _K_P2_MEN)
+ *             my_kings_list = _dict_get(state_dict, _K_P2_KINGS)
+ *             opp_mat = (len(_dict_get(state_dict, _K_P1_MEN)) * MAN_VALUE             # <<<<<<<<<<<<<<
+ *                        + len(_dict_get(state_dict, _K_P1_KINGS)) * KING_VALUE)
  * 
 */
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 206, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_men, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 206, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_9 = PyObject_Length(__pyx_t_7); if (unlikely(__pyx_t_9 == ((Py_ssize_t)-1))) __PYX_ERR(0, 206, __pyx_L1_error)
+      __pyx_t_7 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN;
+      __Pyx_INCREF(__pyx_t_7);
+      __pyx_t_9 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_7); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 248, __pyx_L1_error)
+      __Pyx_GOTREF(__pyx_t_9);
       __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
+      __pyx_t_10 = PyObject_Length(__pyx_t_9); if (unlikely(__pyx_t_10 == ((Py_ssize_t)-1))) __PYX_ERR(0, 248, __pyx_L1_error)
+      __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":207
- *             my_kings_list = state_dict.get('p2_kings', ())
- *             opp_mat = (len(state_dict.get('p1_men', ())) * MAN_VALUE
- *                        + len(state_dict.get('p1_kings', ())) * KING_VALUE)             # <<<<<<<<<<<<<<
+      /* "dama/ai/ml/_fast_score.pyx":249
+ *             my_kings_list = _dict_get(state_dict, _K_P2_KINGS)
+ *             opp_mat = (len(_dict_get(state_dict, _K_P1_MEN)) * MAN_VALUE
+ *                        + len(_dict_get(state_dict, _K_P1_KINGS)) * KING_VALUE)             # <<<<<<<<<<<<<<
  * 
  *         my_mat = len(my_men_list) * MAN_VALUE + len(my_kings_list) * KING_VALUE
 */
-      if (unlikely(__pyx_v_state_dict == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 207, __pyx_L1_error)
-      }
-      __pyx_t_7 = __Pyx_PyDict_GetItemDefault(__pyx_v_state_dict, __pyx_mstate_global->__pyx_n_u_p1_kings, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 207, __pyx_L1_error)
+      __pyx_t_9 = __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS;
+      __Pyx_INCREF(__pyx_t_9);
+      __pyx_t_7 = __pyx_f_4dama_2ai_2ml_11_fast_score__dict_get(__pyx_v_state_dict, __pyx_t_9); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 249, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_3 = PyObject_Length(__pyx_t_7); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 207, __pyx_L1_error)
+      __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
+      __pyx_t_3 = PyObject_Length(__pyx_t_7); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 249, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-      __pyx_v_opp_mat = ((__pyx_t_9 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
+      __pyx_v_opp_mat = ((__pyx_t_10 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
     }
     __pyx_L5:;
 
-    /* "dama/ai/ml/_fast_score.pyx":209
- *                        + len(state_dict.get('p1_kings', ())) * KING_VALUE)
+    /* "dama/ai/ml/_fast_score.pyx":251
+ *                        + len(_dict_get(state_dict, _K_P1_KINGS)) * KING_VALUE)
  * 
  *         my_mat = len(my_men_list) * MAN_VALUE + len(my_kings_list) * KING_VALUE             # <<<<<<<<<<<<<<
  *         material_adv = my_mat - opp_mat
  * 
 */
-    __pyx_t_3 = PyObject_Length(__pyx_v_my_men_list); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 209, __pyx_L1_error)
-    __pyx_t_9 = PyObject_Length(__pyx_v_my_kings_list); if (unlikely(__pyx_t_9 == ((Py_ssize_t)-1))) __PYX_ERR(0, 209, __pyx_L1_error)
-    __pyx_v_my_mat = ((__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_9 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
+    __pyx_t_3 = PyObject_Length(__pyx_v_my_men_list); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 251, __pyx_L1_error)
+    __pyx_t_10 = PyObject_Length(__pyx_v_my_kings_list); if (unlikely(__pyx_t_10 == ((Py_ssize_t)-1))) __PYX_ERR(0, 251, __pyx_L1_error)
+    __pyx_v_my_mat = ((__pyx_t_3 * __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE) + (__pyx_t_10 * __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE));
 
-    /* "dama/ai/ml/_fast_score.pyx":210
+    /* "dama/ai/ml/_fast_score.pyx":252
  * 
  *         my_mat = len(my_men_list) * MAN_VALUE + len(my_kings_list) * KING_VALUE
  *         material_adv = my_mat - opp_mat             # <<<<<<<<<<<<<<
@@ -4160,7 +4328,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
     __pyx_v_material_adv = (__pyx_v_my_mat - __pyx_v_opp_mat);
 
-    /* "dama/ai/ml/_fast_score.pyx":213
+    /* "dama/ai/ml/_fast_score.pyx":255
  * 
  *         #  Positional
  *         pos_score = 0.0             # <<<<<<<<<<<<<<
@@ -4169,7 +4337,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
     __pyx_v_pos_score = 0.0;
 
-    /* "dama/ai/ml/_fast_score.pyx":214
+    /* "dama/ai/ml/_fast_score.pyx":256
  *         #  Positional
  *         pos_score = 0.0
  *         start_row = 0 if player_int == 1 else 7             # <<<<<<<<<<<<<<
@@ -4184,117 +4352,113 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
     }
     __pyx_v_start_row = __pyx_t_8;
 
-    /* "dama/ai/ml/_fast_score.pyx":216
+    /* "dama/ai/ml/_fast_score.pyx":258
  *         start_row = 0 if player_int == 1 else 7
  * 
  *         for pos in my_men_list:             # <<<<<<<<<<<<<<
- *             row = pos[0]
- *             col = pos[1]
+ *             row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
 */
     if (likely(PyList_CheckExact(__pyx_v_my_men_list)) || PyTuple_CheckExact(__pyx_v_my_men_list)) {
       __pyx_t_7 = __pyx_v_my_men_list; __Pyx_INCREF(__pyx_t_7);
-      __pyx_t_9 = 0;
-      __pyx_t_10 = NULL;
+      __pyx_t_10 = 0;
+      __pyx_t_11 = NULL;
     } else {
-      __pyx_t_9 = -1; __pyx_t_7 = PyObject_GetIter(__pyx_v_my_men_list); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 216, __pyx_L1_error)
+      __pyx_t_10 = -1; __pyx_t_7 = PyObject_GetIter(__pyx_v_my_men_list); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 258, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_10 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_7); if (unlikely(!__pyx_t_10)) __PYX_ERR(0, 216, __pyx_L1_error)
+      __pyx_t_11 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_7); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 258, __pyx_L1_error)
     }
     for (;;) {
-      if (likely(!__pyx_t_10)) {
+      if (likely(!__pyx_t_11)) {
         if (likely(PyList_CheckExact(__pyx_t_7))) {
           {
             Py_ssize_t __pyx_temp = __Pyx_PyList_GET_SIZE(__pyx_t_7);
             #if !CYTHON_ASSUME_SAFE_SIZE
-            if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 216, __pyx_L1_error)
+            if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 258, __pyx_L1_error)
             #endif
-            if (__pyx_t_9 >= __pyx_temp) break;
+            if (__pyx_t_10 >= __pyx_temp) break;
           }
-          __pyx_t_11 = __Pyx_PyList_GetItemRefFast(__pyx_t_7, __pyx_t_9, __Pyx_ReferenceSharing_OwnStrongReference);
-          ++__pyx_t_9;
+          __pyx_t_9 = __Pyx_PyList_GetItemRefFast(__pyx_t_7, __pyx_t_10, __Pyx_ReferenceSharing_OwnStrongReference);
+          ++__pyx_t_10;
         } else {
           {
             Py_ssize_t __pyx_temp = __Pyx_PyTuple_GET_SIZE(__pyx_t_7);
             #if !CYTHON_ASSUME_SAFE_SIZE
-            if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 216, __pyx_L1_error)
+            if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 258, __pyx_L1_error)
             #endif
-            if (__pyx_t_9 >= __pyx_temp) break;
+            if (__pyx_t_10 >= __pyx_temp) break;
           }
           #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
-          __pyx_t_11 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_7, __pyx_t_9));
+          __pyx_t_9 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_7, __pyx_t_10));
           #else
-          __pyx_t_11 = __Pyx_PySequence_ITEM(__pyx_t_7, __pyx_t_9);
+          __pyx_t_9 = __Pyx_PySequence_ITEM(__pyx_t_7, __pyx_t_10);
           #endif
-          ++__pyx_t_9;
+          ++__pyx_t_10;
         }
-        if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 216, __pyx_L1_error)
+        if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 258, __pyx_L1_error)
       } else {
-        __pyx_t_11 = __pyx_t_10(__pyx_t_7);
-        if (unlikely(!__pyx_t_11)) {
+        __pyx_t_9 = __pyx_t_11(__pyx_t_7);
+        if (unlikely(!__pyx_t_9)) {
           PyObject* exc_type = PyErr_Occurred();
           if (exc_type) {
-            if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 216, __pyx_L1_error)
+            if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 258, __pyx_L1_error)
             PyErr_Clear();
           }
           break;
         }
       }
-      __Pyx_GOTREF(__pyx_t_11);
-      __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_11);
-      __pyx_t_11 = 0;
+      __Pyx_GOTREF(__pyx_t_9);
+      __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_9);
+      __pyx_t_9 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":217
+      /* "dama/ai/ml/_fast_score.pyx":259
  * 
  *         for pos in my_men_list:
- *             row = pos[0]             # <<<<<<<<<<<<<<
- *             col = pos[1]
+ *             row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))             # <<<<<<<<<<<<<<
+ *             col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *             if 2 <= row <= 5 and 2 <= col <= 5:
 */
-      __pyx_t_11 = __Pyx_GetItemInt(__pyx_v_pos, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 217, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_11);
-      __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_11); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 217, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_11); __pyx_t_11 = 0;
-      __pyx_v_row = __pyx_t_8;
+      __pyx_t_12 = PyTuple_GET_ITEM(__pyx_v_pos, 0);
+      __pyx_t_13 = PyLong_AsLong(((PyObject *)__pyx_t_12)); if (unlikely(__pyx_t_13 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 259, __pyx_L1_error)
+      __pyx_v_row = __pyx_t_13;
 
-      /* "dama/ai/ml/_fast_score.pyx":218
+      /* "dama/ai/ml/_fast_score.pyx":260
  *         for pos in my_men_list:
- *             row = pos[0]
- *             col = pos[1]             # <<<<<<<<<<<<<<
+ *             row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))             # <<<<<<<<<<<<<<
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS
 */
-      __pyx_t_11 = __Pyx_GetItemInt(__pyx_v_pos, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 218, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_11);
-      __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_11); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 218, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_11); __pyx_t_11 = 0;
-      __pyx_v_col = __pyx_t_8;
+      __pyx_t_12 = PyTuple_GET_ITEM(__pyx_v_pos, 1);
+      __pyx_t_13 = PyLong_AsLong(((PyObject *)__pyx_t_12)); if (unlikely(__pyx_t_13 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 260, __pyx_L1_error)
+      __pyx_v_col = __pyx_t_13;
 
-      /* "dama/ai/ml/_fast_score.pyx":219
- *             row = pos[0]
- *             col = pos[1]
+      /* "dama/ai/ml/_fast_score.pyx":261
+ *             row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *             if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *                 pos_score += CENTER_BONUS
  *             if player_int == 1:
 */
-      __pyx_t_12 = (2 <= __pyx_v_row);
-      if (__pyx_t_12) {
-        __pyx_t_12 = (__pyx_v_row <= 5);
+      __pyx_t_14 = (2 <= __pyx_v_row);
+      if (__pyx_t_14) {
+        __pyx_t_14 = (__pyx_v_row <= 5);
       }
-      if (__pyx_t_12) {
+      if (__pyx_t_14) {
       } else {
-        __pyx_t_2 = __pyx_t_12;
+        __pyx_t_2 = __pyx_t_14;
         goto __pyx_L9_bool_binop_done;
       }
-      __pyx_t_12 = (2 <= __pyx_v_col);
-      if (__pyx_t_12) {
-        __pyx_t_12 = (__pyx_v_col <= 5);
+      __pyx_t_14 = (2 <= __pyx_v_col);
+      if (__pyx_t_14) {
+        __pyx_t_14 = (__pyx_v_col <= 5);
       }
-      __pyx_t_2 = __pyx_t_12;
+      __pyx_t_2 = __pyx_t_14;
       __pyx_L9_bool_binop_done:;
       if (__pyx_t_2) {
 
-        /* "dama/ai/ml/_fast_score.pyx":220
- *             col = pos[1]
+        /* "dama/ai/ml/_fast_score.pyx":262
+ *             col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS             # <<<<<<<<<<<<<<
  *             if player_int == 1:
@@ -4302,16 +4466,16 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
         __pyx_v_pos_score = (__pyx_v_pos_score + __pyx_v_4dama_2ai_2ml_11_fast_score_CENTER_BONUS);
 
-        /* "dama/ai/ml/_fast_score.pyx":219
- *             row = pos[0]
- *             col = pos[1]
+        /* "dama/ai/ml/_fast_score.pyx":261
+ *             row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
  *             if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *                 pos_score += CENTER_BONUS
  *             if player_int == 1:
 */
       }
 
-      /* "dama/ai/ml/_fast_score.pyx":221
+      /* "dama/ai/ml/_fast_score.pyx":263
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS
  *             if player_int == 1:             # <<<<<<<<<<<<<<
@@ -4321,7 +4485,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
       __pyx_t_2 = (__pyx_v_player_int == 1);
       if (__pyx_t_2) {
 
-        /* "dama/ai/ml/_fast_score.pyx":222
+        /* "dama/ai/ml/_fast_score.pyx":264
  *                 pos_score += CENTER_BONUS
  *             if player_int == 1:
  *                 pos_score += row * ADVANCE_BONUS_PER_ROW             # <<<<<<<<<<<<<<
@@ -4330,7 +4494,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
         __pyx_v_pos_score = (__pyx_v_pos_score + (__pyx_v_row * __pyx_v_4dama_2ai_2ml_11_fast_score_ADVANCE_BONUS_PER_ROW));
 
-        /* "dama/ai/ml/_fast_score.pyx":221
+        /* "dama/ai/ml/_fast_score.pyx":263
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS
  *             if player_int == 1:             # <<<<<<<<<<<<<<
@@ -4340,7 +4504,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
         goto __pyx_L11;
       }
 
-      /* "dama/ai/ml/_fast_score.pyx":224
+      /* "dama/ai/ml/_fast_score.pyx":266
  *                 pos_score += row * ADVANCE_BONUS_PER_ROW
  *             else:
  *                 pos_score += (7 - row) * ADVANCE_BONUS_PER_ROW             # <<<<<<<<<<<<<<
@@ -4352,7 +4516,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
       }
       __pyx_L11:;
 
-      /* "dama/ai/ml/_fast_score.pyx":225
+      /* "dama/ai/ml/_fast_score.pyx":267
  *             else:
  *                 pos_score += (7 - row) * ADVANCE_BONUS_PER_ROW
  *             if row == start_row:             # <<<<<<<<<<<<<<
@@ -4362,7 +4526,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
       __pyx_t_2 = (__pyx_v_row == __pyx_v_start_row);
       if (__pyx_t_2) {
 
-        /* "dama/ai/ml/_fast_score.pyx":226
+        /* "dama/ai/ml/_fast_score.pyx":268
  *                 pos_score += (7 - row) * ADVANCE_BONUS_PER_ROW
  *             if row == start_row:
  *                 pos_score += BACK_ROW_BONUS             # <<<<<<<<<<<<<<
@@ -4371,7 +4535,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
         __pyx_v_pos_score = (__pyx_v_pos_score + __pyx_v_4dama_2ai_2ml_11_fast_score_BACK_ROW_BONUS);
 
-        /* "dama/ai/ml/_fast_score.pyx":225
+        /* "dama/ai/ml/_fast_score.pyx":267
  *             else:
  *                 pos_score += (7 - row) * ADVANCE_BONUS_PER_ROW
  *             if row == start_row:             # <<<<<<<<<<<<<<
@@ -4380,7 +4544,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
       }
 
-      /* "dama/ai/ml/_fast_score.pyx":227
+      /* "dama/ai/ml/_fast_score.pyx":269
  *             if row == start_row:
  *                 pos_score += BACK_ROW_BONUS
  *             if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -4391,7 +4555,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
         case 0:
         case 7:
 
-        /* "dama/ai/ml/_fast_score.pyx":228
+        /* "dama/ai/ml/_fast_score.pyx":270
  *                 pos_score += BACK_ROW_BONUS
  *             if col == 0 or col == 7:
  *                 pos_score += EDGE_PENALTY             # <<<<<<<<<<<<<<
@@ -4400,7 +4564,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
         __pyx_v_pos_score = (__pyx_v_pos_score + __pyx_v_4dama_2ai_2ml_11_fast_score_EDGE_PENALTY);
 
-        /* "dama/ai/ml/_fast_score.pyx":227
+        /* "dama/ai/ml/_fast_score.pyx":269
  *             if row == start_row:
  *                 pos_score += BACK_ROW_BONUS
  *             if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -4411,27 +4575,27 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
         default: break;
       }
 
-      /* "dama/ai/ml/_fast_score.pyx":216
+      /* "dama/ai/ml/_fast_score.pyx":258
  *         start_row = 0 if player_int == 1 else 7
  * 
  *         for pos in my_men_list:             # <<<<<<<<<<<<<<
- *             row = pos[0]
- *             col = pos[1]
+ *             row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
 */
     }
     __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
 
-    /* "dama/ai/ml/_fast_score.pyx":231
+    /* "dama/ai/ml/_fast_score.pyx":273
  * 
  *         # Build king position array (replaces Python set)
  *         num_kings = len(my_kings_list)             # <<<<<<<<<<<<<<
  *         if num_kings > 12:
  *             num_kings = 12
 */
-    __pyx_t_9 = PyObject_Length(__pyx_v_my_kings_list); if (unlikely(__pyx_t_9 == ((Py_ssize_t)-1))) __PYX_ERR(0, 231, __pyx_L1_error)
-    __pyx_v_num_kings = __pyx_t_9;
+    __pyx_t_10 = PyObject_Length(__pyx_v_my_kings_list); if (unlikely(__pyx_t_10 == ((Py_ssize_t)-1))) __PYX_ERR(0, 273, __pyx_L1_error)
+    __pyx_v_num_kings = __pyx_t_10;
 
-    /* "dama/ai/ml/_fast_score.pyx":232
+    /* "dama/ai/ml/_fast_score.pyx":274
  *         # Build king position array (replaces Python set)
  *         num_kings = len(my_kings_list)
  *         if num_kings > 12:             # <<<<<<<<<<<<<<
@@ -4441,7 +4605,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
     __pyx_t_2 = (__pyx_v_num_kings > 12);
     if (__pyx_t_2) {
 
-      /* "dama/ai/ml/_fast_score.pyx":233
+      /* "dama/ai/ml/_fast_score.pyx":275
  *         num_kings = len(my_kings_list)
  *         if num_kings > 12:
  *             num_kings = 12             # <<<<<<<<<<<<<<
@@ -4450,7 +4614,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
       __pyx_v_num_kings = 12;
 
-      /* "dama/ai/ml/_fast_score.pyx":232
+      /* "dama/ai/ml/_fast_score.pyx":274
  *         # Build king position array (replaces Python set)
  *         num_kings = len(my_kings_list)
  *         if num_kings > 12:             # <<<<<<<<<<<<<<
@@ -4459,108 +4623,96 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":234
+    /* "dama/ai/ml/_fast_score.pyx":276
  *         if num_kings > 12:
  *             num_kings = 12
  *         for j in range(num_kings):             # <<<<<<<<<<<<<<
  *             pos = my_kings_list[j]
- *             king_rows[j] = pos[0]
+ *             king_rows[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
 */
     __pyx_t_8 = __pyx_v_num_kings;
-    __pyx_t_13 = __pyx_t_8;
-    for (__pyx_t_14 = 0; __pyx_t_14 < __pyx_t_13; __pyx_t_14+=1) {
-      __pyx_v_j = __pyx_t_14;
+    __pyx_t_15 = __pyx_t_8;
+    for (__pyx_t_16 = 0; __pyx_t_16 < __pyx_t_15; __pyx_t_16+=1) {
+      __pyx_v_j = __pyx_t_16;
 
-      /* "dama/ai/ml/_fast_score.pyx":235
+      /* "dama/ai/ml/_fast_score.pyx":277
  *             num_kings = 12
  *         for j in range(num_kings):
  *             pos = my_kings_list[j]             # <<<<<<<<<<<<<<
- *             king_rows[j] = pos[0]
- *             king_cols[j] = pos[1]
+ *             king_rows[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             king_cols[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
 */
-      __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_my_kings_list, __pyx_v_j, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 235, __pyx_L1_error)
+      __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_my_kings_list, __pyx_v_j, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 277, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_7);
       __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_7);
       __pyx_t_7 = 0;
 
-      /* "dama/ai/ml/_fast_score.pyx":236
+      /* "dama/ai/ml/_fast_score.pyx":278
  *         for j in range(num_kings):
  *             pos = my_kings_list[j]
- *             king_rows[j] = pos[0]             # <<<<<<<<<<<<<<
- *             king_cols[j] = pos[1]
- *             row = pos[0]
+ *             king_rows[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))             # <<<<<<<<<<<<<<
+ *             king_cols[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+ *             row = king_rows[j]
 */
-      __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_pos, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 236, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_15 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_15 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 236, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-      (__pyx_v_king_rows[__pyx_v_j]) = __pyx_t_15;
+      __pyx_t_12 = PyTuple_GET_ITEM(__pyx_v_pos, 0);
+      __pyx_t_13 = PyLong_AsLong(((PyObject *)__pyx_t_12)); if (unlikely(__pyx_t_13 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 278, __pyx_L1_error)
+      (__pyx_v_king_rows[__pyx_v_j]) = __pyx_t_13;
 
-      /* "dama/ai/ml/_fast_score.pyx":237
+      /* "dama/ai/ml/_fast_score.pyx":279
  *             pos = my_kings_list[j]
- *             king_rows[j] = pos[0]
- *             king_cols[j] = pos[1]             # <<<<<<<<<<<<<<
- *             row = pos[0]
- *             col = pos[1]
+ *             king_rows[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             king_cols[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))             # <<<<<<<<<<<<<<
+ *             row = king_rows[j]
+ *             col = king_cols[j]
 */
-      __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_pos, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 237, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_15 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_15 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 237, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-      (__pyx_v_king_cols[__pyx_v_j]) = __pyx_t_15;
+      __pyx_t_12 = PyTuple_GET_ITEM(__pyx_v_pos, 1);
+      __pyx_t_13 = PyLong_AsLong(((PyObject *)__pyx_t_12)); if (unlikely(__pyx_t_13 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 279, __pyx_L1_error)
+      (__pyx_v_king_cols[__pyx_v_j]) = __pyx_t_13;
 
-      /* "dama/ai/ml/_fast_score.pyx":238
- *             king_rows[j] = pos[0]
- *             king_cols[j] = pos[1]
- *             row = pos[0]             # <<<<<<<<<<<<<<
- *             col = pos[1]
+      /* "dama/ai/ml/_fast_score.pyx":280
+ *             king_rows[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *             king_cols[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+ *             row = king_rows[j]             # <<<<<<<<<<<<<<
+ *             col = king_cols[j]
  *             if 2 <= row <= 5 and 2 <= col <= 5:
 */
-      __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_pos, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 238, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_15 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_15 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 238, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-      __pyx_v_row = __pyx_t_15;
+      __pyx_v_row = (__pyx_v_king_rows[__pyx_v_j]);
 
-      /* "dama/ai/ml/_fast_score.pyx":239
- *             king_cols[j] = pos[1]
- *             row = pos[0]
- *             col = pos[1]             # <<<<<<<<<<<<<<
+      /* "dama/ai/ml/_fast_score.pyx":281
+ *             king_cols[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+ *             row = king_rows[j]
+ *             col = king_cols[j]             # <<<<<<<<<<<<<<
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS
 */
-      __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_pos, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 239, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_15 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_15 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 239, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-      __pyx_v_col = __pyx_t_15;
+      __pyx_v_col = (__pyx_v_king_cols[__pyx_v_j]);
 
-      /* "dama/ai/ml/_fast_score.pyx":240
- *             row = pos[0]
- *             col = pos[1]
+      /* "dama/ai/ml/_fast_score.pyx":282
+ *             row = king_rows[j]
+ *             col = king_cols[j]
  *             if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *                 pos_score += CENTER_BONUS
  *             if row == start_row:
 */
-      __pyx_t_12 = (2 <= __pyx_v_row);
-      if (__pyx_t_12) {
-        __pyx_t_12 = (__pyx_v_row <= 5);
+      __pyx_t_14 = (2 <= __pyx_v_row);
+      if (__pyx_t_14) {
+        __pyx_t_14 = (__pyx_v_row <= 5);
       }
-      if (__pyx_t_12) {
+      if (__pyx_t_14) {
       } else {
-        __pyx_t_2 = __pyx_t_12;
+        __pyx_t_2 = __pyx_t_14;
         goto __pyx_L18_bool_binop_done;
       }
-      __pyx_t_12 = (2 <= __pyx_v_col);
-      if (__pyx_t_12) {
-        __pyx_t_12 = (__pyx_v_col <= 5);
+      __pyx_t_14 = (2 <= __pyx_v_col);
+      if (__pyx_t_14) {
+        __pyx_t_14 = (__pyx_v_col <= 5);
       }
-      __pyx_t_2 = __pyx_t_12;
+      __pyx_t_2 = __pyx_t_14;
       __pyx_L18_bool_binop_done:;
       if (__pyx_t_2) {
 
-        /* "dama/ai/ml/_fast_score.pyx":241
- *             col = pos[1]
+        /* "dama/ai/ml/_fast_score.pyx":283
+ *             col = king_cols[j]
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS             # <<<<<<<<<<<<<<
  *             if row == start_row:
@@ -4568,16 +4720,16 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
         __pyx_v_pos_score = (__pyx_v_pos_score + __pyx_v_4dama_2ai_2ml_11_fast_score_CENTER_BONUS);
 
-        /* "dama/ai/ml/_fast_score.pyx":240
- *             row = pos[0]
- *             col = pos[1]
+        /* "dama/ai/ml/_fast_score.pyx":282
+ *             row = king_rows[j]
+ *             col = king_cols[j]
  *             if 2 <= row <= 5 and 2 <= col <= 5:             # <<<<<<<<<<<<<<
  *                 pos_score += CENTER_BONUS
  *             if row == start_row:
 */
       }
 
-      /* "dama/ai/ml/_fast_score.pyx":242
+      /* "dama/ai/ml/_fast_score.pyx":284
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS
  *             if row == start_row:             # <<<<<<<<<<<<<<
@@ -4587,7 +4739,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
       __pyx_t_2 = (__pyx_v_row == __pyx_v_start_row);
       if (__pyx_t_2) {
 
-        /* "dama/ai/ml/_fast_score.pyx":243
+        /* "dama/ai/ml/_fast_score.pyx":285
  *                 pos_score += CENTER_BONUS
  *             if row == start_row:
  *                 pos_score += BACK_ROW_BONUS             # <<<<<<<<<<<<<<
@@ -4596,7 +4748,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
         __pyx_v_pos_score = (__pyx_v_pos_score + __pyx_v_4dama_2ai_2ml_11_fast_score_BACK_ROW_BONUS);
 
-        /* "dama/ai/ml/_fast_score.pyx":242
+        /* "dama/ai/ml/_fast_score.pyx":284
  *             if 2 <= row <= 5 and 2 <= col <= 5:
  *                 pos_score += CENTER_BONUS
  *             if row == start_row:             # <<<<<<<<<<<<<<
@@ -4605,7 +4757,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
       }
 
-      /* "dama/ai/ml/_fast_score.pyx":244
+      /* "dama/ai/ml/_fast_score.pyx":286
  *             if row == start_row:
  *                 pos_score += BACK_ROW_BONUS
  *             if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -4616,7 +4768,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
         case 0:
         case 7:
 
-        /* "dama/ai/ml/_fast_score.pyx":245
+        /* "dama/ai/ml/_fast_score.pyx":287
  *                 pos_score += BACK_ROW_BONUS
  *             if col == 0 or col == 7:
  *                 pos_score += EDGE_PENALTY             # <<<<<<<<<<<<<<
@@ -4625,7 +4777,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
         __pyx_v_pos_score = (__pyx_v_pos_score + __pyx_v_4dama_2ai_2ml_11_fast_score_EDGE_PENALTY);
 
-        /* "dama/ai/ml/_fast_score.pyx":244
+        /* "dama/ai/ml/_fast_score.pyx":286
  *             if row == start_row:
  *                 pos_score += BACK_ROW_BONUS
  *             if col == 0 or col == 7:             # <<<<<<<<<<<<<<
@@ -4637,296 +4789,458 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
       }
     }
 
-    /* "dama/ai/ml/_fast_score.pyx":248
- * 
- *         #  Mobility
+    /* "dama/ai/ml/_fast_score.pyx":293
+ *         # per-move king array scan entirely  saves 2 dict lookups + array
+ *         # scan per move for the majority of training data.
  *         mob_score = 0.0             # <<<<<<<<<<<<<<
- *         for m in legal_moves:
- *             captures = m.get('captures', ())
+ *         if num_kings > 0:
+ *             for m in legal_moves:
 */
     __pyx_v_mob_score = 0.0;
 
-    /* "dama/ai/ml/_fast_score.pyx":249
- *         #  Mobility
+    /* "dama/ai/ml/_fast_score.pyx":294
+ *         # scan per move for the majority of training data.
  *         mob_score = 0.0
- *         for m in legal_moves:             # <<<<<<<<<<<<<<
- *             captures = m.get('captures', ())
- *             if captures:
+ *         if num_kings > 0:             # <<<<<<<<<<<<<<
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]
 */
-    if (likely(PyList_CheckExact(__pyx_v_legal_moves)) || PyTuple_CheckExact(__pyx_v_legal_moves)) {
-      __pyx_t_7 = __pyx_v_legal_moves; __Pyx_INCREF(__pyx_t_7);
-      __pyx_t_9 = 0;
-      __pyx_t_10 = NULL;
-    } else {
-      __pyx_t_9 = -1; __pyx_t_7 = PyObject_GetIter(__pyx_v_legal_moves); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 249, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_7);
-      __pyx_t_10 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_7); if (unlikely(!__pyx_t_10)) __PYX_ERR(0, 249, __pyx_L1_error)
-    }
-    for (;;) {
-      if (likely(!__pyx_t_10)) {
-        if (likely(PyList_CheckExact(__pyx_t_7))) {
-          {
-            Py_ssize_t __pyx_temp = __Pyx_PyList_GET_SIZE(__pyx_t_7);
-            #if !CYTHON_ASSUME_SAFE_SIZE
-            if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 249, __pyx_L1_error)
-            #endif
-            if (__pyx_t_9 >= __pyx_temp) break;
-          }
-          __pyx_t_11 = __Pyx_PyList_GetItemRefFast(__pyx_t_7, __pyx_t_9, __Pyx_ReferenceSharing_OwnStrongReference);
-          ++__pyx_t_9;
-        } else {
-          {
-            Py_ssize_t __pyx_temp = __Pyx_PyTuple_GET_SIZE(__pyx_t_7);
-            #if !CYTHON_ASSUME_SAFE_SIZE
-            if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 249, __pyx_L1_error)
-            #endif
-            if (__pyx_t_9 >= __pyx_temp) break;
-          }
-          #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
-          __pyx_t_11 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_7, __pyx_t_9));
-          #else
-          __pyx_t_11 = __Pyx_PySequence_ITEM(__pyx_t_7, __pyx_t_9);
-          #endif
-          ++__pyx_t_9;
-        }
-        if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 249, __pyx_L1_error)
+    __pyx_t_2 = (__pyx_v_num_kings > 0);
+    if (__pyx_t_2) {
+
+      /* "dama/ai/ml/_fast_score.pyx":295
+ *         mob_score = 0.0
+ *         if num_kings > 0:
+ *             for m in legal_moves:             # <<<<<<<<<<<<<<
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:
+*/
+      if (likely(PyList_CheckExact(__pyx_v_legal_moves)) || PyTuple_CheckExact(__pyx_v_legal_moves)) {
+        __pyx_t_7 = __pyx_v_legal_moves; __Pyx_INCREF(__pyx_t_7);
+        __pyx_t_10 = 0;
+        __pyx_t_11 = NULL;
       } else {
-        __pyx_t_11 = __pyx_t_10(__pyx_t_7);
-        if (unlikely(!__pyx_t_11)) {
-          PyObject* exc_type = PyErr_Occurred();
-          if (exc_type) {
-            if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 249, __pyx_L1_error)
-            PyErr_Clear();
+        __pyx_t_10 = -1; __pyx_t_7 = PyObject_GetIter(__pyx_v_legal_moves); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 295, __pyx_L1_error)
+        __Pyx_GOTREF(__pyx_t_7);
+        __pyx_t_11 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_7); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 295, __pyx_L1_error)
+      }
+      for (;;) {
+        if (likely(!__pyx_t_11)) {
+          if (likely(PyList_CheckExact(__pyx_t_7))) {
+            {
+              Py_ssize_t __pyx_temp = __Pyx_PyList_GET_SIZE(__pyx_t_7);
+              #if !CYTHON_ASSUME_SAFE_SIZE
+              if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 295, __pyx_L1_error)
+              #endif
+              if (__pyx_t_10 >= __pyx_temp) break;
+            }
+            __pyx_t_9 = __Pyx_PyList_GetItemRefFast(__pyx_t_7, __pyx_t_10, __Pyx_ReferenceSharing_OwnStrongReference);
+            ++__pyx_t_10;
+          } else {
+            {
+              Py_ssize_t __pyx_temp = __Pyx_PyTuple_GET_SIZE(__pyx_t_7);
+              #if !CYTHON_ASSUME_SAFE_SIZE
+              if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 295, __pyx_L1_error)
+              #endif
+              if (__pyx_t_10 >= __pyx_temp) break;
+            }
+            #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
+            __pyx_t_9 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_7, __pyx_t_10));
+            #else
+            __pyx_t_9 = __Pyx_PySequence_ITEM(__pyx_t_7, __pyx_t_10);
+            #endif
+            ++__pyx_t_10;
           }
-          break;
-        }
-      }
-      __Pyx_GOTREF(__pyx_t_11);
-      if (!(likely(PyDict_CheckExact(__pyx_t_11))||((__pyx_t_11) == Py_None) || __Pyx_RaiseUnexpectedTypeError("dict", __pyx_t_11))) __PYX_ERR(0, 249, __pyx_L1_error)
-      __Pyx_XDECREF_SET(__pyx_v_m, ((PyObject*)__pyx_t_11));
-      __pyx_t_11 = 0;
-
-      /* "dama/ai/ml/_fast_score.pyx":250
- *         mob_score = 0.0
- *         for m in legal_moves:
- *             captures = m.get('captures', ())             # <<<<<<<<<<<<<<
- *             if captures:
- *                 num_captures = len(captures)
-*/
-      if (unlikely(__pyx_v_m == Py_None)) {
-        PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "get");
-        __PYX_ERR(0, 250, __pyx_L1_error)
-      }
-      __pyx_t_11 = __Pyx_PyDict_GetItemDefault(__pyx_v_m, __pyx_mstate_global->__pyx_n_u_captures, __pyx_mstate_global->__pyx_empty_tuple); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 250, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_11);
-      __Pyx_XDECREF_SET(__pyx_v_captures, __pyx_t_11);
-      __pyx_t_11 = 0;
-
-      /* "dama/ai/ml/_fast_score.pyx":251
- *         for m in legal_moves:
- *             captures = m.get('captures', ())
- *             if captures:             # <<<<<<<<<<<<<<
- *                 num_captures = len(captures)
- *                 mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
-*/
-      __pyx_t_2 = __Pyx_PyObject_IsTrue(__pyx_v_captures); if (unlikely((__pyx_t_2 < 0))) __PYX_ERR(0, 251, __pyx_L1_error)
-      if (__pyx_t_2) {
-
-        /* "dama/ai/ml/_fast_score.pyx":252
- *             captures = m.get('captures', ())
- *             if captures:
- *                 num_captures = len(captures)             # <<<<<<<<<<<<<<
- *                 mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
- *             else:
-*/
-        __pyx_t_3 = PyObject_Length(__pyx_v_captures); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 252, __pyx_L1_error)
-        __pyx_v_num_captures = __pyx_t_3;
-
-        /* "dama/ai/ml/_fast_score.pyx":253
- *             if captures:
- *                 num_captures = len(captures)
- *                 mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5             # <<<<<<<<<<<<<<
- *             else:
- *                 mob_score += MOBILITY_WEIGHT
-*/
-        __pyx_v_mob_score = (__pyx_v_mob_score + (__pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_MOVE_BONUS + (((__pyx_v_num_captures - 1) * __pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_MOVE_BONUS) * 0.5)));
-
-        /* "dama/ai/ml/_fast_score.pyx":251
- *         for m in legal_moves:
- *             captures = m.get('captures', ())
- *             if captures:             # <<<<<<<<<<<<<<
- *                 num_captures = len(captures)
- *                 mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
-*/
-        goto __pyx_L23;
-      }
-
-      /* "dama/ai/ml/_fast_score.pyx":255
- *                 mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
- *             else:
- *                 mob_score += MOBILITY_WEIGHT             # <<<<<<<<<<<<<<
- *             # Check if start position is a king (C-array scan, no set/tuple)
- *             path = m['path']
-*/
-      /*else*/ {
-        __pyx_v_mob_score = (__pyx_v_mob_score + __pyx_v_4dama_2ai_2ml_11_fast_score_MOBILITY_WEIGHT);
-      }
-      __pyx_L23:;
-
-      /* "dama/ai/ml/_fast_score.pyx":257
- *                 mob_score += MOBILITY_WEIGHT
- *             # Check if start position is a king (C-array scan, no set/tuple)
- *             path = m['path']             # <<<<<<<<<<<<<<
- *             sr = path[0][0]
- *             sc = path[0][1]
-*/
-      if (unlikely(__pyx_v_m == Py_None)) {
-        PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-        __PYX_ERR(0, 257, __pyx_L1_error)
-      }
-      __pyx_t_11 = __Pyx_PyDict_GetItem(__pyx_v_m, __pyx_mstate_global->__pyx_n_u_path); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 257, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_11);
-      __Pyx_XDECREF_SET(__pyx_v_path, __pyx_t_11);
-      __pyx_t_11 = 0;
-
-      /* "dama/ai/ml/_fast_score.pyx":258
- *             # Check if start position is a king (C-array scan, no set/tuple)
- *             path = m['path']
- *             sr = path[0][0]             # <<<<<<<<<<<<<<
- *             sc = path[0][1]
- *             is_king = False
-*/
-      __pyx_t_11 = __Pyx_GetItemInt(__pyx_v_path, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 258, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_11);
-      __pyx_t_16 = __Pyx_GetItemInt(__pyx_t_11, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_16)) __PYX_ERR(0, 258, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_16);
-      __Pyx_DECREF(__pyx_t_11); __pyx_t_11 = 0;
-      __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_16); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 258, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_16); __pyx_t_16 = 0;
-      __pyx_v_sr = __pyx_t_8;
-
-      /* "dama/ai/ml/_fast_score.pyx":259
- *             path = m['path']
- *             sr = path[0][0]
- *             sc = path[0][1]             # <<<<<<<<<<<<<<
- *             is_king = False
- *             for j in range(num_kings):
-*/
-      __pyx_t_16 = __Pyx_GetItemInt(__pyx_v_path, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_16)) __PYX_ERR(0, 259, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_16);
-      __pyx_t_11 = __Pyx_GetItemInt(__pyx_t_16, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 259, __pyx_L1_error)
-      __Pyx_GOTREF(__pyx_t_11);
-      __Pyx_DECREF(__pyx_t_16); __pyx_t_16 = 0;
-      __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_11); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 259, __pyx_L1_error)
-      __Pyx_DECREF(__pyx_t_11); __pyx_t_11 = 0;
-      __pyx_v_sc = __pyx_t_8;
-
-      /* "dama/ai/ml/_fast_score.pyx":260
- *             sr = path[0][0]
- *             sc = path[0][1]
- *             is_king = False             # <<<<<<<<<<<<<<
- *             for j in range(num_kings):
- *                 if king_rows[j] == sr and king_cols[j] == sc:
-*/
-      __pyx_v_is_king = 0;
-
-      /* "dama/ai/ml/_fast_score.pyx":261
- *             sc = path[0][1]
- *             is_king = False
- *             for j in range(num_kings):             # <<<<<<<<<<<<<<
- *                 if king_rows[j] == sr and king_cols[j] == sc:
- *                     is_king = True
-*/
-      __pyx_t_8 = __pyx_v_num_kings;
-      __pyx_t_13 = __pyx_t_8;
-      for (__pyx_t_14 = 0; __pyx_t_14 < __pyx_t_13; __pyx_t_14+=1) {
-        __pyx_v_j = __pyx_t_14;
-
-        /* "dama/ai/ml/_fast_score.pyx":262
- *             is_king = False
- *             for j in range(num_kings):
- *                 if king_rows[j] == sr and king_cols[j] == sc:             # <<<<<<<<<<<<<<
- *                     is_king = True
- *                     break
-*/
-        __pyx_t_12 = ((__pyx_v_king_rows[__pyx_v_j]) == __pyx_v_sr);
-        if (__pyx_t_12) {
+          if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 295, __pyx_L1_error)
         } else {
-          __pyx_t_2 = __pyx_t_12;
-          goto __pyx_L27_bool_binop_done;
+          __pyx_t_9 = __pyx_t_11(__pyx_t_7);
+          if (unlikely(!__pyx_t_9)) {
+            PyObject* exc_type = PyErr_Occurred();
+            if (exc_type) {
+              if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 295, __pyx_L1_error)
+              PyErr_Clear();
+            }
+            break;
+          }
         }
-        __pyx_t_12 = ((__pyx_v_king_cols[__pyx_v_j]) == __pyx_v_sc);
-        __pyx_t_2 = __pyx_t_12;
-        __pyx_L27_bool_binop_done:;
+        __Pyx_GOTREF(__pyx_t_9);
+        if (!(likely(PyDict_CheckExact(__pyx_t_9))||((__pyx_t_9) == Py_None) || __Pyx_RaiseUnexpectedTypeError("dict", __pyx_t_9))) __PYX_ERR(0, 295, __pyx_L1_error)
+        __Pyx_XDECREF_SET(__pyx_v_m, ((PyObject*)__pyx_t_9));
+        __pyx_t_9 = 0;
+
+        /* "dama/ai/ml/_fast_score.pyx":296
+ *         if num_kings > 0:
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]             # <<<<<<<<<<<<<<
+ *                 if captures:
+ *                     num_captures = len(captures)
+*/
+        if (unlikely(__pyx_v_m == Py_None)) {
+          PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
+          __PYX_ERR(0, 296, __pyx_L1_error)
+        }
+        __pyx_t_9 = __Pyx_PyDict_GetItem(__pyx_v_m, __pyx_v_4dama_2ai_2ml_11_fast_score__K_CAPTURES); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 296, __pyx_L1_error)
+        __Pyx_GOTREF(__pyx_t_9);
+        __Pyx_XDECREF_SET(__pyx_v_captures, __pyx_t_9);
+        __pyx_t_9 = 0;
+
+        /* "dama/ai/ml/_fast_score.pyx":297
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:             # <<<<<<<<<<<<<<
+ *                     num_captures = len(captures)
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+*/
+        __pyx_t_2 = __Pyx_PyObject_IsTrue(__pyx_v_captures); if (unlikely((__pyx_t_2 < 0))) __PYX_ERR(0, 297, __pyx_L1_error)
         if (__pyx_t_2) {
 
-          /* "dama/ai/ml/_fast_score.pyx":263
- *             for j in range(num_kings):
- *                 if king_rows[j] == sr and king_cols[j] == sc:
- *                     is_king = True             # <<<<<<<<<<<<<<
- *                     break
- *             if is_king:
+          /* "dama/ai/ml/_fast_score.pyx":298
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:
+ *                     num_captures = len(captures)             # <<<<<<<<<<<<<<
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+ *                 else:
 */
-          __pyx_v_is_king = 1;
+          __pyx_t_3 = PyObject_Length(__pyx_v_captures); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 298, __pyx_L1_error)
+          __pyx_v_num_captures = __pyx_t_3;
 
-          /* "dama/ai/ml/_fast_score.pyx":264
- *                 if king_rows[j] == sr and king_cols[j] == sc:
- *                     is_king = True
- *                     break             # <<<<<<<<<<<<<<
- *             if is_king:
- *                 mob_score += KING_MOBILITY_WEIGHT
+          /* "dama/ai/ml/_fast_score.pyx":299
+ *                 if captures:
+ *                     num_captures = len(captures)
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5             # <<<<<<<<<<<<<<
+ *                 else:
+ *                     mob_score += MOBILITY_WEIGHT
 */
-          goto __pyx_L25_break;
+          __pyx_v_mob_score = (__pyx_v_mob_score + (__pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_MOVE_BONUS + (((__pyx_v_num_captures - 1) * __pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_MOVE_BONUS) * 0.5)));
 
-          /* "dama/ai/ml/_fast_score.pyx":262
- *             is_king = False
- *             for j in range(num_kings):
- *                 if king_rows[j] == sr and king_cols[j] == sc:             # <<<<<<<<<<<<<<
- *                     is_king = True
- *                     break
+          /* "dama/ai/ml/_fast_score.pyx":297
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:             # <<<<<<<<<<<<<<
+ *                     num_captures = len(captures)
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+*/
+          goto __pyx_L24;
+        }
+
+        /* "dama/ai/ml/_fast_score.pyx":301
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+ *                 else:
+ *                     mob_score += MOBILITY_WEIGHT             # <<<<<<<<<<<<<<
+ *                 # Check if start position is a king (C-array scan, no set/tuple)
+ *                 path = m[_K_PATH]
+*/
+        /*else*/ {
+          __pyx_v_mob_score = (__pyx_v_mob_score + __pyx_v_4dama_2ai_2ml_11_fast_score_MOBILITY_WEIGHT);
+        }
+        __pyx_L24:;
+
+        /* "dama/ai/ml/_fast_score.pyx":303
+ *                     mob_score += MOBILITY_WEIGHT
+ *                 # Check if start position is a king (C-array scan, no set/tuple)
+ *                 path = m[_K_PATH]             # <<<<<<<<<<<<<<
+ *                 pos = path[0]
+ *                 sr = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+*/
+        if (unlikely(__pyx_v_m == Py_None)) {
+          PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
+          __PYX_ERR(0, 303, __pyx_L1_error)
+        }
+        __pyx_t_9 = __Pyx_PyDict_GetItem(__pyx_v_m, __pyx_v_4dama_2ai_2ml_11_fast_score__K_PATH); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 303, __pyx_L1_error)
+        __Pyx_GOTREF(__pyx_t_9);
+        __Pyx_XDECREF_SET(__pyx_v_path, __pyx_t_9);
+        __pyx_t_9 = 0;
+
+        /* "dama/ai/ml/_fast_score.pyx":304
+ *                 # Check if start position is a king (C-array scan, no set/tuple)
+ *                 path = m[_K_PATH]
+ *                 pos = path[0]             # <<<<<<<<<<<<<<
+ *                 sr = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *                 sc = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+*/
+        __pyx_t_9 = __Pyx_GetItemInt(__pyx_v_path, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 304, __pyx_L1_error)
+        __Pyx_GOTREF(__pyx_t_9);
+        __Pyx_XDECREF_SET(__pyx_v_pos, __pyx_t_9);
+        __pyx_t_9 = 0;
+
+        /* "dama/ai/ml/_fast_score.pyx":305
+ *                 path = m[_K_PATH]
+ *                 pos = path[0]
+ *                 sr = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))             # <<<<<<<<<<<<<<
+ *                 sc = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+ *                 is_king = False
+*/
+        __pyx_t_12 = PyTuple_GET_ITEM(__pyx_v_pos, 0);
+        __pyx_t_13 = PyLong_AsLong(((PyObject *)__pyx_t_12)); if (unlikely(__pyx_t_13 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 305, __pyx_L1_error)
+        __pyx_v_sr = __pyx_t_13;
+
+        /* "dama/ai/ml/_fast_score.pyx":306
+ *                 pos = path[0]
+ *                 sr = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *                 sc = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))             # <<<<<<<<<<<<<<
+ *                 is_king = False
+ *                 for j in range(num_kings):
+*/
+        __pyx_t_12 = PyTuple_GET_ITEM(__pyx_v_pos, 1);
+        __pyx_t_13 = PyLong_AsLong(((PyObject *)__pyx_t_12)); if (unlikely(__pyx_t_13 == ((long)-1L) && PyErr_Occurred())) __PYX_ERR(0, 306, __pyx_L1_error)
+        __pyx_v_sc = __pyx_t_13;
+
+        /* "dama/ai/ml/_fast_score.pyx":307
+ *                 sr = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+ *                 sc = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+ *                 is_king = False             # <<<<<<<<<<<<<<
+ *                 for j in range(num_kings):
+ *                     if king_rows[j] == sr and king_cols[j] == sc:
+*/
+        __pyx_v_is_king = 0;
+
+        /* "dama/ai/ml/_fast_score.pyx":308
+ *                 sc = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+ *                 is_king = False
+ *                 for j in range(num_kings):             # <<<<<<<<<<<<<<
+ *                     if king_rows[j] == sr and king_cols[j] == sc:
+ *                         is_king = True
+*/
+        __pyx_t_8 = __pyx_v_num_kings;
+        __pyx_t_15 = __pyx_t_8;
+        for (__pyx_t_16 = 0; __pyx_t_16 < __pyx_t_15; __pyx_t_16+=1) {
+          __pyx_v_j = __pyx_t_16;
+
+          /* "dama/ai/ml/_fast_score.pyx":309
+ *                 is_king = False
+ *                 for j in range(num_kings):
+ *                     if king_rows[j] == sr and king_cols[j] == sc:             # <<<<<<<<<<<<<<
+ *                         is_king = True
+ *                         break
+*/
+          __pyx_t_14 = ((__pyx_v_king_rows[__pyx_v_j]) == __pyx_v_sr);
+          if (__pyx_t_14) {
+          } else {
+            __pyx_t_2 = __pyx_t_14;
+            goto __pyx_L28_bool_binop_done;
+          }
+          __pyx_t_14 = ((__pyx_v_king_cols[__pyx_v_j]) == __pyx_v_sc);
+          __pyx_t_2 = __pyx_t_14;
+          __pyx_L28_bool_binop_done:;
+          if (__pyx_t_2) {
+
+            /* "dama/ai/ml/_fast_score.pyx":310
+ *                 for j in range(num_kings):
+ *                     if king_rows[j] == sr and king_cols[j] == sc:
+ *                         is_king = True             # <<<<<<<<<<<<<<
+ *                         break
+ *                 if is_king:
+*/
+            __pyx_v_is_king = 1;
+
+            /* "dama/ai/ml/_fast_score.pyx":311
+ *                     if king_rows[j] == sr and king_cols[j] == sc:
+ *                         is_king = True
+ *                         break             # <<<<<<<<<<<<<<
+ *                 if is_king:
+ *                     mob_score += KING_MOBILITY_WEIGHT
+*/
+            goto __pyx_L26_break;
+
+            /* "dama/ai/ml/_fast_score.pyx":309
+ *                 is_king = False
+ *                 for j in range(num_kings):
+ *                     if king_rows[j] == sr and king_cols[j] == sc:             # <<<<<<<<<<<<<<
+ *                         is_king = True
+ *                         break
+*/
+          }
+        }
+        __pyx_L26_break:;
+
+        /* "dama/ai/ml/_fast_score.pyx":312
+ *                         is_king = True
+ *                         break
+ *                 if is_king:             # <<<<<<<<<<<<<<
+ *                     mob_score += KING_MOBILITY_WEIGHT
+ *         else:
+*/
+        if (__pyx_v_is_king) {
+
+          /* "dama/ai/ml/_fast_score.pyx":313
+ *                         break
+ *                 if is_king:
+ *                     mob_score += KING_MOBILITY_WEIGHT             # <<<<<<<<<<<<<<
+ *         else:
+ *             for m in legal_moves:
+*/
+          __pyx_v_mob_score = (__pyx_v_mob_score + __pyx_v_4dama_2ai_2ml_11_fast_score_KING_MOBILITY_WEIGHT);
+
+          /* "dama/ai/ml/_fast_score.pyx":312
+ *                         is_king = True
+ *                         break
+ *                 if is_king:             # <<<<<<<<<<<<<<
+ *                     mob_score += KING_MOBILITY_WEIGHT
+ *         else:
 */
         }
-      }
-      __pyx_L25_break:;
 
-      /* "dama/ai/ml/_fast_score.pyx":265
- *                     is_king = True
- *                     break
- *             if is_king:             # <<<<<<<<<<<<<<
- *                 mob_score += KING_MOBILITY_WEIGHT
- * 
+        /* "dama/ai/ml/_fast_score.pyx":295
+ *         mob_score = 0.0
+ *         if num_kings > 0:
+ *             for m in legal_moves:             # <<<<<<<<<<<<<<
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:
 */
-      if (__pyx_v_is_king) {
+      }
+      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
 
-        /* "dama/ai/ml/_fast_score.pyx":266
- *                     break
- *             if is_king:
- *                 mob_score += KING_MOBILITY_WEIGHT             # <<<<<<<<<<<<<<
+      /* "dama/ai/ml/_fast_score.pyx":294
+ *         # scan per move for the majority of training data.
+ *         mob_score = 0.0
+ *         if num_kings > 0:             # <<<<<<<<<<<<<<
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]
+*/
+      goto __pyx_L21;
+    }
+
+    /* "dama/ai/ml/_fast_score.pyx":315
+ *                     mob_score += KING_MOBILITY_WEIGHT
+ *         else:
+ *             for m in legal_moves:             # <<<<<<<<<<<<<<
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:
+*/
+    /*else*/ {
+      if (likely(PyList_CheckExact(__pyx_v_legal_moves)) || PyTuple_CheckExact(__pyx_v_legal_moves)) {
+        __pyx_t_7 = __pyx_v_legal_moves; __Pyx_INCREF(__pyx_t_7);
+        __pyx_t_10 = 0;
+        __pyx_t_11 = NULL;
+      } else {
+        __pyx_t_10 = -1; __pyx_t_7 = PyObject_GetIter(__pyx_v_legal_moves); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 315, __pyx_L1_error)
+        __Pyx_GOTREF(__pyx_t_7);
+        __pyx_t_11 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_7); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 315, __pyx_L1_error)
+      }
+      for (;;) {
+        if (likely(!__pyx_t_11)) {
+          if (likely(PyList_CheckExact(__pyx_t_7))) {
+            {
+              Py_ssize_t __pyx_temp = __Pyx_PyList_GET_SIZE(__pyx_t_7);
+              #if !CYTHON_ASSUME_SAFE_SIZE
+              if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 315, __pyx_L1_error)
+              #endif
+              if (__pyx_t_10 >= __pyx_temp) break;
+            }
+            __pyx_t_9 = __Pyx_PyList_GetItemRefFast(__pyx_t_7, __pyx_t_10, __Pyx_ReferenceSharing_OwnStrongReference);
+            ++__pyx_t_10;
+          } else {
+            {
+              Py_ssize_t __pyx_temp = __Pyx_PyTuple_GET_SIZE(__pyx_t_7);
+              #if !CYTHON_ASSUME_SAFE_SIZE
+              if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 315, __pyx_L1_error)
+              #endif
+              if (__pyx_t_10 >= __pyx_temp) break;
+            }
+            #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
+            __pyx_t_9 = __Pyx_NewRef(PyTuple_GET_ITEM(__pyx_t_7, __pyx_t_10));
+            #else
+            __pyx_t_9 = __Pyx_PySequence_ITEM(__pyx_t_7, __pyx_t_10);
+            #endif
+            ++__pyx_t_10;
+          }
+          if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 315, __pyx_L1_error)
+        } else {
+          __pyx_t_9 = __pyx_t_11(__pyx_t_7);
+          if (unlikely(!__pyx_t_9)) {
+            PyObject* exc_type = PyErr_Occurred();
+            if (exc_type) {
+              if (unlikely(!__Pyx_PyErr_GivenExceptionMatches(exc_type, PyExc_StopIteration))) __PYX_ERR(0, 315, __pyx_L1_error)
+              PyErr_Clear();
+            }
+            break;
+          }
+        }
+        __Pyx_GOTREF(__pyx_t_9);
+        if (!(likely(PyDict_CheckExact(__pyx_t_9))||((__pyx_t_9) == Py_None) || __Pyx_RaiseUnexpectedTypeError("dict", __pyx_t_9))) __PYX_ERR(0, 315, __pyx_L1_error)
+        __Pyx_XDECREF_SET(__pyx_v_m, ((PyObject*)__pyx_t_9));
+        __pyx_t_9 = 0;
+
+        /* "dama/ai/ml/_fast_score.pyx":316
+ *         else:
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]             # <<<<<<<<<<<<<<
+ *                 if captures:
+ *                     num_captures = len(captures)
+*/
+        if (unlikely(__pyx_v_m == Py_None)) {
+          PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
+          __PYX_ERR(0, 316, __pyx_L1_error)
+        }
+        __pyx_t_9 = __Pyx_PyDict_GetItem(__pyx_v_m, __pyx_v_4dama_2ai_2ml_11_fast_score__K_CAPTURES); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 316, __pyx_L1_error)
+        __Pyx_GOTREF(__pyx_t_9);
+        __Pyx_XDECREF_SET(__pyx_v_captures, __pyx_t_9);
+        __pyx_t_9 = 0;
+
+        /* "dama/ai/ml/_fast_score.pyx":317
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:             # <<<<<<<<<<<<<<
+ *                     num_captures = len(captures)
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+*/
+        __pyx_t_2 = __Pyx_PyObject_IsTrue(__pyx_v_captures); if (unlikely((__pyx_t_2 < 0))) __PYX_ERR(0, 317, __pyx_L1_error)
+        if (__pyx_t_2) {
+
+          /* "dama/ai/ml/_fast_score.pyx":318
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:
+ *                     num_captures = len(captures)             # <<<<<<<<<<<<<<
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+ *                 else:
+*/
+          __pyx_t_3 = PyObject_Length(__pyx_v_captures); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 318, __pyx_L1_error)
+          __pyx_v_num_captures = __pyx_t_3;
+
+          /* "dama/ai/ml/_fast_score.pyx":319
+ *                 if captures:
+ *                     num_captures = len(captures)
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5             # <<<<<<<<<<<<<<
+ *                 else:
+ *                     mob_score += MOBILITY_WEIGHT
+*/
+          __pyx_v_mob_score = (__pyx_v_mob_score + (__pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_MOVE_BONUS + (((__pyx_v_num_captures - 1) * __pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_MOVE_BONUS) * 0.5)));
+
+          /* "dama/ai/ml/_fast_score.pyx":317
+ *             for m in legal_moves:
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:             # <<<<<<<<<<<<<<
+ *                     num_captures = len(captures)
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+*/
+          goto __pyx_L34;
+        }
+
+        /* "dama/ai/ml/_fast_score.pyx":321
+ *                     mob_score += CAPTURE_MOVE_BONUS + (num_captures - 1) * CAPTURE_MOVE_BONUS * 0.5
+ *                 else:
+ *                     mob_score += MOBILITY_WEIGHT             # <<<<<<<<<<<<<<
  * 
  *         #  Combine
 */
-        __pyx_v_mob_score = (__pyx_v_mob_score + __pyx_v_4dama_2ai_2ml_11_fast_score_KING_MOBILITY_WEIGHT);
+        /*else*/ {
+          __pyx_v_mob_score = (__pyx_v_mob_score + __pyx_v_4dama_2ai_2ml_11_fast_score_MOBILITY_WEIGHT);
+        }
+        __pyx_L34:;
 
-        /* "dama/ai/ml/_fast_score.pyx":265
- *                     is_king = True
- *                     break
- *             if is_king:             # <<<<<<<<<<<<<<
- *                 mob_score += KING_MOBILITY_WEIGHT
- * 
+        /* "dama/ai/ml/_fast_score.pyx":315
+ *                     mob_score += KING_MOBILITY_WEIGHT
+ *         else:
+ *             for m in legal_moves:             # <<<<<<<<<<<<<<
+ *                 captures = m[_K_CAPTURES]
+ *                 if captures:
 */
       }
-
-      /* "dama/ai/ml/_fast_score.pyx":249
- *         #  Mobility
- *         mob_score = 0.0
- *         for m in legal_moves:             # <<<<<<<<<<<<<<
- *             captures = m.get('captures', ())
- *             if captures:
-*/
+      __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
     }
-    __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
+    __pyx_L21:;
 
-    /* "dama/ai/ml/_fast_score.pyx":269
+    /* "dama/ai/ml/_fast_score.pyx":324
  * 
  *         #  Combine
  *         total_pos = my_mat + material_adv * 0.5 + pos_score + mob_score             # <<<<<<<<<<<<<<
@@ -4935,12 +5249,12 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
 */
     __pyx_v_total_pos = (((__pyx_v_my_mat + (__pyx_v_material_adv * 0.5)) + __pyx_v_pos_score) + __pyx_v_mob_score);
 
-    /* "dama/ai/ml/_fast_score.pyx":272
+    /* "dama/ai/ml/_fast_score.pyx":327
  * 
  *         #  Blend with game outcome
  *         progress = i * inv_total if total_moves > 0 else 0.5             # <<<<<<<<<<<<<<
  *         outcome_weight = 0.3 + 0.7 * progress
- *         ed['score'] = (1.0 - outcome_weight) * total_pos + outcome_weight * game_score
+ *         ed[_K_SCORE] = (1.0 - outcome_weight) * total_pos + outcome_weight * game_score
 */
     __pyx_t_2 = (__pyx_v_total_moves > 0);
     if (__pyx_t_2) {
@@ -4950,30 +5264,30 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
     }
     __pyx_v_progress = __pyx_t_1;
 
-    /* "dama/ai/ml/_fast_score.pyx":273
+    /* "dama/ai/ml/_fast_score.pyx":328
  *         #  Blend with game outcome
  *         progress = i * inv_total if total_moves > 0 else 0.5
  *         outcome_weight = 0.3 + 0.7 * progress             # <<<<<<<<<<<<<<
- *         ed['score'] = (1.0 - outcome_weight) * total_pos + outcome_weight * game_score
+ *         ed[_K_SCORE] = (1.0 - outcome_weight) * total_pos + outcome_weight * game_score
 */
     __pyx_v_outcome_weight = (0.3 + (0.7 * __pyx_v_progress));
 
-    /* "dama/ai/ml/_fast_score.pyx":274
+    /* "dama/ai/ml/_fast_score.pyx":329
  *         progress = i * inv_total if total_moves > 0 else 0.5
  *         outcome_weight = 0.3 + 0.7 * progress
- *         ed['score'] = (1.0 - outcome_weight) * total_pos + outcome_weight * game_score             # <<<<<<<<<<<<<<
+ *         ed[_K_SCORE] = (1.0 - outcome_weight) * total_pos + outcome_weight * game_score             # <<<<<<<<<<<<<<
 */
-    __pyx_t_7 = PyFloat_FromDouble((((1.0 - __pyx_v_outcome_weight) * __pyx_v_total_pos) + (__pyx_v_outcome_weight * __pyx_v_game_score))); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 274, __pyx_L1_error)
+    __pyx_t_7 = PyFloat_FromDouble((((1.0 - __pyx_v_outcome_weight) * __pyx_v_total_pos) + (__pyx_v_outcome_weight * __pyx_v_game_score))); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 329, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
     if (unlikely(__pyx_v_ed == Py_None)) {
       PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-      __PYX_ERR(0, 274, __pyx_L1_error)
+      __PYX_ERR(0, 329, __pyx_L1_error)
     }
-    if (unlikely((PyDict_SetItem(__pyx_v_ed, __pyx_mstate_global->__pyx_n_u_score, __pyx_t_7) < 0))) __PYX_ERR(0, 274, __pyx_L1_error)
+    if (unlikely((PyDict_SetItem(__pyx_v_ed, __pyx_v_4dama_2ai_2ml_11_fast_score__K_SCORE, __pyx_t_7) < 0))) __PYX_ERR(0, 329, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
   }
 
-  /* "dama/ai/ml/_fast_score.pyx":149
+  /* "dama/ai/ml/_fast_score.pyx":188
  * #  Main entry point: score_game_dicts
  * 
  * def score_game_dicts_cy(             # <<<<<<<<<<<<<<
@@ -4986,8 +5300,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_11_fast_score_score_game_dicts_cy(CYTHON
   goto __pyx_L0;
   __pyx_L1_error:;
   __Pyx_XDECREF(__pyx_t_7);
-  __Pyx_XDECREF(__pyx_t_11);
-  __Pyx_XDECREF(__pyx_t_16);
+  __Pyx_XDECREF(__pyx_t_9);
   __Pyx_AddTraceback("dama.ai.ml._fast_score.score_game_dicts_cy", __pyx_clineno, __pyx_lineno, __pyx_filename);
   __pyx_r = NULL;
   __pyx_L0:;
@@ -5029,6 +5342,16 @@ static int __Pyx_modinit_global_init_code(__pyx_mstatetype *__pyx_mstate) {
   CYTHON_UNUSED_VAR(__pyx_mstate);
   __Pyx_RefNannySetupContext("__Pyx_modinit_global_init_code", 0);
   /*--- Global init code ---*/
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_TURN = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_STATE = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_LEGAL_MOVES = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_SCORE = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_CAPTURES = Py_None; Py_INCREF(Py_None);
+  __pyx_v_4dama_2ai_2ml_11_fast_score__K_PATH = Py_None; Py_INCREF(Py_None);
   __Pyx_RefNannyFinishContext();
   return 0;
 }
@@ -5063,10 +5386,30 @@ static int __Pyx_modinit_type_init_code(__pyx_mstatetype *__pyx_mstate) {
 static int __Pyx_modinit_type_import_code(__pyx_mstatetype *__pyx_mstate) {
   __Pyx_RefNannyDeclarations
   CYTHON_UNUSED_VAR(__pyx_mstate);
+  PyObject *__pyx_t_1 = NULL;
+  int __pyx_lineno = 0;
+  const char *__pyx_filename = NULL;
+  int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("__Pyx_modinit_type_import_code", 0);
   /*--- Type import code ---*/
+  __pyx_t_1 = PyImport_ImportModule(__Pyx_BUILTIN_MODULE_NAME); if (unlikely(!__pyx_t_1)) __PYX_ERR(1, 9, __pyx_L1_error)
+  __Pyx_GOTREF(__pyx_t_1);
+  __pyx_mstate->__pyx_ptype_7cpython_4type_type = __Pyx_ImportType_3_2_4(__pyx_t_1, __Pyx_BUILTIN_MODULE_NAME, "type",
+  #if defined(PYPY_VERSION_NUM) && PYPY_VERSION_NUM < 0x050B0000
+  sizeof(PyTypeObject), __PYX_GET_STRUCT_ALIGNMENT_3_2_4(PyTypeObject),
+  #elif CYTHON_COMPILING_IN_LIMITED_API
+  0, 0,
+  #else
+  sizeof(PyHeapTypeObject), __PYX_GET_STRUCT_ALIGNMENT_3_2_4(PyHeapTypeObject),
+  #endif
+  __Pyx_ImportType_CheckSize_Warn_3_2_4); if (!__pyx_mstate->__pyx_ptype_7cpython_4type_type) __PYX_ERR(1, 9, __pyx_L1_error)
+  __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
   __Pyx_RefNannyFinishContext();
   return 0;
+  __pyx_L1_error:;
+  __Pyx_XDECREF(__pyx_t_1);
+  __Pyx_RefNannyFinishContext();
+  return -1;
 }
 
 static int __Pyx_modinit_variable_import_code(__pyx_mstatetype *__pyx_mstate) {
@@ -5350,12 +5693,12 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
   (void)__Pyx_modinit_variable_export_code(__pyx_mstate);
   (void)__Pyx_modinit_function_export_code(__pyx_mstate);
   (void)__Pyx_modinit_type_init_code(__pyx_mstate);
-  (void)__Pyx_modinit_type_import_code(__pyx_mstate);
+  if (unlikely((__Pyx_modinit_type_import_code(__pyx_mstate) < 0))) __PYX_ERR(0, 1, __pyx_L1_error)
   (void)__Pyx_modinit_variable_import_code(__pyx_mstate);
   (void)__Pyx_modinit_function_import_code(__pyx_mstate);
   /*--- Execution code ---*/
 
-  /* "dama/ai/ml/_fast_score.pyx":16
+  /* "dama/ai/ml/_fast_score.pyx":24
  * #  Scoring constants (must match scoring.py)
  * 
  * cdef double MAN_VALUE = 1.0             # <<<<<<<<<<<<<<
@@ -5364,7 +5707,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_MAN_VALUE = 1.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":17
+  /* "dama/ai/ml/_fast_score.pyx":25
  * 
  * cdef double MAN_VALUE = 1.0
  * cdef double KING_VALUE = 1.5             # <<<<<<<<<<<<<<
@@ -5373,7 +5716,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_KING_VALUE = 1.5;
 
-  /* "dama/ai/ml/_fast_score.pyx":18
+  /* "dama/ai/ml/_fast_score.pyx":26
  * cdef double MAN_VALUE = 1.0
  * cdef double KING_VALUE = 1.5
  * cdef double CENTER_BONUS = 0.1             # <<<<<<<<<<<<<<
@@ -5382,7 +5725,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_CENTER_BONUS = 0.1;
 
-  /* "dama/ai/ml/_fast_score.pyx":19
+  /* "dama/ai/ml/_fast_score.pyx":27
  * cdef double KING_VALUE = 1.5
  * cdef double CENTER_BONUS = 0.1
  * cdef double ADVANCE_BONUS_PER_ROW = 0.03             # <<<<<<<<<<<<<<
@@ -5391,7 +5734,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_ADVANCE_BONUS_PER_ROW = 0.03;
 
-  /* "dama/ai/ml/_fast_score.pyx":20
+  /* "dama/ai/ml/_fast_score.pyx":28
  * cdef double CENTER_BONUS = 0.1
  * cdef double ADVANCE_BONUS_PER_ROW = 0.03
  * cdef double BACK_ROW_BONUS = 0.05             # <<<<<<<<<<<<<<
@@ -5400,7 +5743,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_BACK_ROW_BONUS = 0.05;
 
-  /* "dama/ai/ml/_fast_score.pyx":21
+  /* "dama/ai/ml/_fast_score.pyx":29
  * cdef double ADVANCE_BONUS_PER_ROW = 0.03
  * cdef double BACK_ROW_BONUS = 0.05
  * cdef double EDGE_PENALTY = -0.02             # <<<<<<<<<<<<<<
@@ -5409,7 +5752,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_EDGE_PENALTY = -0.02;
 
-  /* "dama/ai/ml/_fast_score.pyx":22
+  /* "dama/ai/ml/_fast_score.pyx":30
  * cdef double BACK_ROW_BONUS = 0.05
  * cdef double EDGE_PENALTY = -0.02
  * cdef double MOBILITY_WEIGHT = 0.02             # <<<<<<<<<<<<<<
@@ -5418,7 +5761,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_MOBILITY_WEIGHT = 0.02;
 
-  /* "dama/ai/ml/_fast_score.pyx":23
+  /* "dama/ai/ml/_fast_score.pyx":31
  * cdef double EDGE_PENALTY = -0.02
  * cdef double MOBILITY_WEIGHT = 0.02
  * cdef double CAPTURE_MOVE_BONUS = 0.05             # <<<<<<<<<<<<<<
@@ -5427,7 +5770,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_MOVE_BONUS = 0.05;
 
-  /* "dama/ai/ml/_fast_score.pyx":24
+  /* "dama/ai/ml/_fast_score.pyx":32
  * cdef double MOBILITY_WEIGHT = 0.02
  * cdef double CAPTURE_MOVE_BONUS = 0.05
  * cdef double KING_MOBILITY_WEIGHT = 0.03             # <<<<<<<<<<<<<<
@@ -5436,7 +5779,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_KING_MOBILITY_WEIGHT = 0.03;
 
-  /* "dama/ai/ml/_fast_score.pyx":25
+  /* "dama/ai/ml/_fast_score.pyx":33
  * cdef double CAPTURE_MOVE_BONUS = 0.05
  * cdef double KING_MOBILITY_WEIGHT = 0.03
  * cdef double WIN_SCORE = 10.0             # <<<<<<<<<<<<<<
@@ -5445,7 +5788,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_WIN_SCORE = 10.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":26
+  /* "dama/ai/ml/_fast_score.pyx":34
  * cdef double KING_MOBILITY_WEIGHT = 0.03
  * cdef double WIN_SCORE = 10.0
  * cdef double LOSS_SCORE = -10.0             # <<<<<<<<<<<<<<
@@ -5454,7 +5797,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_LOSS_SCORE = -10.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":27
+  /* "dama/ai/ml/_fast_score.pyx":35
  * cdef double WIN_SCORE = 10.0
  * cdef double LOSS_SCORE = -10.0
  * cdef double DRAW_SCORE = -3.0             # <<<<<<<<<<<<<<
@@ -5463,7 +5806,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_DRAW_SCORE = -3.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":28
+  /* "dama/ai/ml/_fast_score.pyx":36
  * cdef double LOSS_SCORE = -10.0
  * cdef double DRAW_SCORE = -3.0
  * cdef double QUICK_WIN_BONUS_MAX = 3.0             # <<<<<<<<<<<<<<
@@ -5472,7 +5815,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_QUICK_WIN_BONUS_MAX = 3.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":29
+  /* "dama/ai/ml/_fast_score.pyx":37
  * cdef double DRAW_SCORE = -3.0
  * cdef double QUICK_WIN_BONUS_MAX = 3.0
  * cdef double QUICK_WIN_HALF_MOVES = 60.0             # <<<<<<<<<<<<<<
@@ -5481,7 +5824,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_QUICK_WIN_HALF_MOVES = 60.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":30
+  /* "dama/ai/ml/_fast_score.pyx":38
  * cdef double QUICK_WIN_BONUS_MAX = 3.0
  * cdef double QUICK_WIN_HALF_MOVES = 60.0
  * cdef double DOMINATION_BONUS = 2.0             # <<<<<<<<<<<<<<
@@ -5490,7 +5833,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_DOMINATION_BONUS = 2.0;
 
-  /* "dama/ai/ml/_fast_score.pyx":31
+  /* "dama/ai/ml/_fast_score.pyx":39
  * cdef double QUICK_WIN_HALF_MOVES = 60.0
  * cdef double DOMINATION_BONUS = 2.0
  * cdef double CAPTURE_EFFICIENCY = 0.15             # <<<<<<<<<<<<<<
@@ -5499,54 +5842,174 @@ __Pyx_RefNannySetupContext("PyInit__fast_score", 0);
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_CAPTURE_EFFICIENCY = 0.15;
 
-  /* "dama/ai/ml/_fast_score.pyx":32
+  /* "dama/ai/ml/_fast_score.pyx":40
  * cdef double DOMINATION_BONUS = 2.0
  * cdef double CAPTURE_EFFICIENCY = 0.15
  * cdef double LN2 = 0.6931471805599453  # log(2)             # <<<<<<<<<<<<<<
  * 
- * 
+ * #  Pre-intern dict key strings
 */
   __pyx_v_4dama_2ai_2ml_11_fast_score_LN2 = 0.6931471805599453;
 
-  /* "dama/ai/ml/_fast_score.pyx":155
+  /* "dama/ai/ml/_fast_score.pyx":46
+ * # falling back to string comparison.  Interning once at module load
+ * # makes every dict lookup ~20ns faster (pointer match vs hash+strcmp).
+ * cdef object _K_P1_MEN = 'p1_men'             # <<<<<<<<<<<<<<
+ * cdef object _K_P1_KINGS = 'p1_kings'
+ * cdef object _K_P2_MEN = 'p2_men'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_p1_men);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_MEN, __pyx_mstate_global->__pyx_n_u_p1_men);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_p1_men);
+
+  /* "dama/ai/ml/_fast_score.pyx":47
+ * # makes every dict lookup ~20ns faster (pointer match vs hash+strcmp).
+ * cdef object _K_P1_MEN = 'p1_men'
+ * cdef object _K_P1_KINGS = 'p1_kings'             # <<<<<<<<<<<<<<
+ * cdef object _K_P2_MEN = 'p2_men'
+ * cdef object _K_P2_KINGS = 'p2_kings'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_p1_kings);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P1_KINGS, __pyx_mstate_global->__pyx_n_u_p1_kings);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_p1_kings);
+
+  /* "dama/ai/ml/_fast_score.pyx":48
+ * cdef object _K_P1_MEN = 'p1_men'
+ * cdef object _K_P1_KINGS = 'p1_kings'
+ * cdef object _K_P2_MEN = 'p2_men'             # <<<<<<<<<<<<<<
+ * cdef object _K_P2_KINGS = 'p2_kings'
+ * cdef object _K_TURN = 'turn'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_p2_men);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_MEN, __pyx_mstate_global->__pyx_n_u_p2_men);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_p2_men);
+
+  /* "dama/ai/ml/_fast_score.pyx":49
+ * cdef object _K_P1_KINGS = 'p1_kings'
+ * cdef object _K_P2_MEN = 'p2_men'
+ * cdef object _K_P2_KINGS = 'p2_kings'             # <<<<<<<<<<<<<<
+ * cdef object _K_TURN = 'turn'
+ * cdef object _K_STATE = 'state'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_p2_kings);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_P2_KINGS, __pyx_mstate_global->__pyx_n_u_p2_kings);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_p2_kings);
+
+  /* "dama/ai/ml/_fast_score.pyx":50
+ * cdef object _K_P2_MEN = 'p2_men'
+ * cdef object _K_P2_KINGS = 'p2_kings'
+ * cdef object _K_TURN = 'turn'             # <<<<<<<<<<<<<<
+ * cdef object _K_STATE = 'state'
+ * cdef object _K_LEGAL_MOVES = 'legal_moves'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_turn);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_TURN);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_TURN, __pyx_mstate_global->__pyx_n_u_turn);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_turn);
+
+  /* "dama/ai/ml/_fast_score.pyx":51
+ * cdef object _K_P2_KINGS = 'p2_kings'
+ * cdef object _K_TURN = 'turn'
+ * cdef object _K_STATE = 'state'             # <<<<<<<<<<<<<<
+ * cdef object _K_LEGAL_MOVES = 'legal_moves'
+ * cdef object _K_SCORE = 'score'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_state);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_STATE);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_STATE, __pyx_mstate_global->__pyx_n_u_state);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_state);
+
+  /* "dama/ai/ml/_fast_score.pyx":52
+ * cdef object _K_TURN = 'turn'
+ * cdef object _K_STATE = 'state'
+ * cdef object _K_LEGAL_MOVES = 'legal_moves'             # <<<<<<<<<<<<<<
+ * cdef object _K_SCORE = 'score'
+ * cdef object _K_CAPTURES = 'captures'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_legal_moves);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_LEGAL_MOVES);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_LEGAL_MOVES, __pyx_mstate_global->__pyx_n_u_legal_moves);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_legal_moves);
+
+  /* "dama/ai/ml/_fast_score.pyx":53
+ * cdef object _K_STATE = 'state'
+ * cdef object _K_LEGAL_MOVES = 'legal_moves'
+ * cdef object _K_SCORE = 'score'             # <<<<<<<<<<<<<<
+ * cdef object _K_CAPTURES = 'captures'
+ * cdef object _K_PATH = 'path'
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_score);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_SCORE);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_SCORE, __pyx_mstate_global->__pyx_n_u_score);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_score);
+
+  /* "dama/ai/ml/_fast_score.pyx":54
+ * cdef object _K_LEGAL_MOVES = 'legal_moves'
+ * cdef object _K_SCORE = 'score'
+ * cdef object _K_CAPTURES = 'captures'             # <<<<<<<<<<<<<<
+ * cdef object _K_PATH = 'path'
+ * 
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_captures);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_CAPTURES);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_CAPTURES, __pyx_mstate_global->__pyx_n_u_captures);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_captures);
+
+  /* "dama/ai/ml/_fast_score.pyx":55
+ * cdef object _K_SCORE = 'score'
+ * cdef object _K_CAPTURES = 'captures'
+ * cdef object _K_PATH = 'path'             # <<<<<<<<<<<<<<
+ * 
+ * 
+*/
+  __Pyx_INCREF(__pyx_mstate_global->__pyx_n_u_path);
+  __Pyx_XGOTREF(__pyx_v_4dama_2ai_2ml_11_fast_score__K_PATH);
+  __Pyx_DECREF_SET(__pyx_v_4dama_2ai_2ml_11_fast_score__K_PATH, __pyx_mstate_global->__pyx_n_u_path);
+  __Pyx_GIVEREF(__pyx_mstate_global->__pyx_n_u_path);
+
+  /* "dama/ai/ml/_fast_score.pyx":194
  *     int max_moves,
  *     dict final_state_dict,
  *     int p1_captures=0,             # <<<<<<<<<<<<<<
  *     int p2_captures=0,
  * ):
 */
-  __pyx_t_2 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 155, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 194, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
 
-  /* "dama/ai/ml/_fast_score.pyx":156
+  /* "dama/ai/ml/_fast_score.pyx":195
  *     dict final_state_dict,
  *     int p1_captures=0,
  *     int p2_captures=0,             # <<<<<<<<<<<<<<
  * ):
  *     """Score a list of entry dicts in place (Cython-accelerated).
 */
-  __pyx_t_3 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 156, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 195, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
 
-  /* "dama/ai/ml/_fast_score.pyx":149
+  /* "dama/ai/ml/_fast_score.pyx":188
  * #  Main entry point: score_game_dicts
  * 
  * def score_game_dicts_cy(             # <<<<<<<<<<<<<<
  *     list entry_dicts,
  *     object winner_int,
 */
-  __pyx_t_4 = PyTuple_Pack(2, __pyx_t_2, __pyx_t_3); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 149, __pyx_L1_error)
+  __pyx_t_4 = PyTuple_Pack(2, __pyx_t_2, __pyx_t_3); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 188, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_4);
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
-  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_2ml_11_fast_score_1score_game_dicts_cy, 0, __pyx_mstate_global->__pyx_n_u_score_game_dicts_cy, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_ml__fast_score, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[0])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 149, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_2ml_11_fast_score_1score_game_dicts_cy, 0, __pyx_mstate_global->__pyx_n_u_score_game_dicts_cy, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_ml__fast_score, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[0])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 188, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_3);
   #endif
   __Pyx_CyFunction_SetDefaultsTuple(__pyx_t_3, __pyx_t_4);
   __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_score_game_dicts_cy, __pyx_t_3) < (0)) __PYX_ERR(0, 149, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_score_game_dicts_cy, __pyx_t_3) < (0)) __PYX_ERR(0, 188, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
 
   /* "dama/ai/ml/_fast_score.pyx":1
@@ -5599,8 +6062,6 @@ static int __Pyx_InitCachedBuiltins(__pyx_mstatetype *__pyx_mstate) {
   CYTHON_UNUSED_VAR(__pyx_mstate);
 
   /* Cached unbound methods */
-  __pyx_mstate->__pyx_umethod_PyDict_Type_get.type = (PyObject*)&PyDict_Type;
-  __pyx_mstate->__pyx_umethod_PyDict_Type_get.method_name = &__pyx_mstate->__pyx_n_u_get;
   __pyx_mstate->__pyx_umethod_PyDict_Type_items.type = (PyObject*)&PyDict_Type;
   __pyx_mstate->__pyx_umethod_PyDict_Type_items.method_name = &__pyx_mstate->__pyx_n_u_items;
   __pyx_mstate->__pyx_umethod_PyDict_Type_pop.type = (PyObject*)&PyDict_Type;
@@ -5623,31 +6084,31 @@ static int __Pyx_InitCachedConstants(__pyx_mstatetype *__pyx_mstate) {
 static int __Pyx_InitConstants(__pyx_mstatetype *__pyx_mstate) {
   CYTHON_UNUSED_VAR(__pyx_mstate);
   {
-    const struct { const unsigned int length: 10; } index[] = {{1},{179},{8},{26},{20},{18},{8},{18},{3},{22},{2},{11},{16},{8},{10},{13},{13},{3},{1},{9},{13},{7},{5},{1},{9},{9},{11},{1},{8},{12},{9},{9},{10},{13},{6},{11},{1},{8},{12},{9},{7},{14},{11},{8},{6},{11},{8},{6},{4},{10},{3},{3},{9},{8},{12},{3},{2},{5},{19},{12},{10},{2},{9},{5},{10},{8},{11},{9},{4},{6},{10},{859}};
-    #if (CYTHON_COMPRESS_STRINGS) == 2 /* compression: bz2 (1124 bytes) */
-const char* const cstring = "BZh91AY&SY\215<o\362\000\000\267\177\377\377~\377\377\373\267\374\376\277\275\376\036\277\377\377\372@@@@@@@@@@@@@\000@\000P\003\313f\304R\205``\2252\204!\224\332\236\024~\224\315M\231\022\014\217S\324\321\243\323S\321\250\r\251\26544h\006\010d\3651\251\260\247\204\365\006\204\t\221\240\232e6\223$\364\230\236\243@4\320\000\000\000\000\000\000\032\000\00050\022OS&\2244\330\220hdd\000\000\000\000\001\220\320\000\r\000\320\032\003\200\000\000\000\000\0002\000\000\000\000\000\000\000\003 \001\300\000\000\000\000\000\031\000\000\000\000\000\000\000\001\220\003*\224A\227\002\360\214\274\313\211|\301}\301\266\314g8\230\\\214Ck\021\"\001\222\242\014\310DB%\211\001X\003V@\006\031\021\231Z\260+ \024Af@\315\312Y\212\2053\314\200\305d\244\322\026\312\330\222dD\2345\007\370Yu\303\326\314\005A\303\337<\225:\201\261Q\361T\216e)\222F\030DC\363v\336\245\274\336+\265\033\274\324;M\341l\277\026+K\n\026L\367d\262l\262j\210\213\003\200\346s\224\271u\036\310\206 \275c{&\244\233\262\271&s58q\306\341\337\016\244'\023\204\264\320S}`\334\003\026J\261\024\001\205\026\237W\236\260\375{\246X0&\014\356G\"\004\001\326\020\020L\237\021\331sbb1L;\210\307U\222\255\004\300\230\371\350?\216\024L\001\030\325\000\225\003\220\312I\032^\014\2008\272\365\222\217*\2527\301\323\345M:\310\364\2779\273 E\226X\t\306S\367\3643f\"S\326\356\354R-\310\244E)E\256\240\3732wY\332F(\333$B\320R\301\365`C\213\003O\364s\206P)}M;\314\331\315\023\020\334\372\243HY4\017\276\206\255\300B\353\343T\234\261~\224i\240a\267\0360dG\245\245\251\206\301mR\020\220I^n\022\324Q\342\013\374\262\362\210\004\306\223\00180\271\240\2747\222hP\251\000J\231\242X\035\212{\204\270\362`Ia\003\003\021\376\2579:\351_\2514\330\326\005t\222*\345\276\004\260k\225\305\240\200`LM,\237;\206f\266\021`rLJC\312\231q\262C\0034P\n8\205Wkf\005\030\235\325\233\247\321z\305\271\344X\232*\3276l\214\214\005-U\262dG\020\2578T\t\242\233k\222\014x\200\366\302< @\340k\016R\204\226\303i\010\004\312\360\210[\201L\320\232\371S&mY\3410AH\327\205\231\244\251t\301/\007\256""\242\317c\253Y\0202\220\245\310s\251\342R2\310\247\210\271\002>+x\213\234\327^\024R\005\365\314Z$g\270\t\265\031D\2051\300\205\206*;L\313\023\032\252\030\"T\322\331\206l\320[P\032\224r\275\201\340\314\206\014\354/\0240B\3466B\201\231\234\033:\314\031\213\236\247D$\262\030GV,+\024\275:\212\245E\004\010\200,e8\004W`\354*\300\302q\250\250$\\2\2010i\207\022\251\274\247\200\005\233\267\000\025\327\200U\373x\227.}2\215\014$\036J\026\2416\210(\247\215\242[g\335Y\203\0316[j-\304wBdvB\256l\354\373|\373\212Ri\232\376\375\246\006\271[\340\350\202\340\333a\362\215_bH7\226\226Or8\320\273\340\320\245\204\343\326\224\323i|\373!\375\020U9Z9\250z\266\373J\247\371\020\\>6T\337E\023y\224\323\201\223\247S9\377C\3171\3553Dl\270\371C\210\335\014\364\014\367\326\210\254G\217\345\204\371\356<Z\335\036\316'\030q2k1\361\314\357\315\315S\222\341n\006;\34160\231\214\273w0\322\340%\234:\264\315\241\324\326:\243\245\362]s\360Q\354K\177\034\207\360I\341|\301CL\242\261\350\032K\252u\362\313UH1h\325\214\310\266\017C\246?\021.\016\365[\217\331\254\216V\200\213N|\032\035\3134\3441'\252\240EJ\313\224\020\312FFc\220\304\035A\310\222L\300\246\030\324\325PM\325\234\267\316\314\323 X\177\342\356H\247\n\022\021\247\215\376@";
-    PyObject *data = __Pyx_DecompressString(cstring, 1124, 2);
+    const struct { const unsigned int length: 10; } index[] = {{1},{179},{8},{26},{20},{18},{8},{18},{3},{22},{2},{11},{16},{8},{10},{13},{13},{1},{9},{13},{7},{5},{1},{9},{9},{11},{1},{8},{12},{9},{9},{10},{13},{6},{11},{1},{8},{12},{9},{7},{14},{11},{8},{6},{11},{8},{6},{4},{10},{3},{3},{9},{8},{12},{3},{2},{5},{19},{12},{10},{2},{9},{5},{10},{8},{11},{9},{4},{6},{10},{963}};
+    #if (CYTHON_COMPRESS_STRINGS) == 2 /* compression: bz2 (1209 bytes) */
+const char* const cstring = "BZh91AY&SYWs\245\262\000\000\316\377\377\377~\377\377\177\377\274\377\277\275\366?\377\377\377\356@@@@@@@@@@@@@\000@\000P\004\036\367yv\353\272\322\351Y\340n\022\246\2254\r\032\006\200i\220\332\236\210\r\003M1\032\000\r\000hh\000h\000\323#@z \224\200\246\023i\0314jO(\362\2314\006\206\207\250\000\000\032\001\240\000\000\001\265\007\250\000\032\232d\312i\251\224\361SG\243\023Q\352f\247\251\240\000\001\240\000\006\200\000\000\000\036\241\240\320\r4\220hJyG\247\251\033MM0\000\000\201\200\000\000\001\030\000\00110\000\001*\004jM\032\006@hhz\200\000\006\201\240\000\000\000\000\000\000\033H\004\275\324\001IG\272>$\222\205\241d\2412R\241\366\ns\360\375\023\364\344!\253'?\220Ch\206\222Q\034\021\006\204\216A\001\241\340\003\344 %'\\O\222#\021\034!\001\201\201\277\304\204\366\326\305(\230Z\236\202\222\313O\351\201-\245\201\357\230\230P\177\211\342\204S\271\300\240@(\223d\013 !8&\007\201\001\3263\2040\264\001\t\336*\006\347R^\255,z\030\371\036\355.\n~\r\276\t\246\203\363j\321\275VzFm\335C\262\335\253\004/jB#\255\225\310\"\203L\006\343'\002I\213$\203\030Hy\034\224\345\271\251\231\364g\022A\357s\017\270]\200ROQ\005)\251DA\306\202\330\205\262\301\200\260wWA\2461\005\354\302\000\341k2\214\361(X\323\246\022\300\303Dh\204\326\002\200\231\365X\022\372DHb\215\371\324N&3s\034Dm\202p\371\367V\r\226\272&B\032\222\242\010\301$*U\260\005\204\024\222C\025\364Td\221\274\037\363\220W\263\303e\204\021b+d\243\n\334\355\354&\014\351\257n)B-\260\2234\245$\242!q\022\252MQ<O\242\271\206\254\264\343+\205\252g\017W\351P\035Q\224\266Q-1*\343\264!:\2138\375S\3201\016\203\357G\212\020b\317\221\320\326\021&\324\352T8\227cF\247\n\221b^|U\3355\001C\016$\220\214\253\016\004\306\305k\006\376]q\210\013\302\273!\001Cl\354I]\253\251sKi\221\202\354\204\367\032\3757D\262\335\000GI\007\201y\377\254\205%Lu\304\364\340\364aD\234h\231\353\224p15\345\241@\341x\036\237:J\262V\\\036\271Q\213V\321w\333aA\232L&}\362\325z\227F(\233B\230\342\206\276F\227sQ0<\243\013\346\304\350H[~soG\255\\HU\204\240E\025\345d\315<\"\030-lk8""\231\002\006\0031\356t\306\354\334\3660\"U\006d\220EV\027e\230\250\332\354g\352B\006+\320\007\tX\226l\200\263\202\007%\245#\257\306\342 (\327K\001Rq\022q;\001\304P\317\017\215\t\021C2\265\203\"\2402R\323\260\201\267~\270\210\217,b\021u\005'\rQ\013\n\331\023\263 \247T\005.\256\265\332\212-N\212\360Fe(\300@\tA2\212l\002S\242\031\367^jBI0\275%\302\t\023\3601\377\200X\232B\277\030\214Ti\264\255\325\235\017\023\270\200,\224{\002+L\372J\200.>\310\207\254\357%\014\036w/\265\253zEx\033\023\337x(\207\356\301\036\313:\021\231\371\210F\214)Z>i\030\225\327Q-\330c\252\274\010\371n\3332E\\+\234Zb,r\215=>\271\315Q\306\321a\245\330\354\242i'j\263\213\366\356!Q7\215[\016A{$\204lQ\013UX\234$e\252by\034\310z\257`\233%\2352\361(\203\330_\3448i\304\213&\365b!)V\344LS\261\244;\211c\014*\000\262)\000`A\237\003\304\030<\326]\243\341\260\217\265%~\312U\324\241\214\367\243\321\013\005~*\345\242\334\226\271o\0100m\005\215\317\221\343\326\364\013\2019\313mg\204!\241\t\320\207d\350B\314B3\242\325\327\320\347\204\177\373\313\365\374\256\327\304\376\344$\217\310L\320 \014\335q\272>\010\036N\206\244G2\252\332\251\035\3062\013\310\361\014\005h\t<\333-J\030\304\032s\010\325(\3338\317JH\244\221\331\356k\216\t\244\302\2055lZ\373\224\022\353\320\301\241\247\001\346\006r\020H=X=\214h\314 \260q\271\201 &\201\002\004\030\343^WT\222\241K_b\256\227\270\273\222)\302\204\202\273\235-\220";
+    PyObject *data = __Pyx_DecompressString(cstring, 1209, 2);
     if (unlikely(!data)) __PYX_ERR(0, 1, __pyx_L1_error)
     const char* const bytes = __Pyx_PyBytes_AsString(data);
     #if !CYTHON_ASSUME_SAFE_MACROS
     if (likely(bytes)); else { Py_DECREF(data); __PYX_ERR(0, 1, __pyx_L1_error) }
     #endif
-    #elif (CYTHON_COMPRESS_STRINGS) != 0 /* compression: zlib (1022 bytes) */
-const char* const cstring = "x\332\255S\317O\033G\024\346\207\035\271\315V\305`\207&-\351\032\224\242\242bj\203\3246M\0259@Q\323(\0017\271P\320h\274;\230\t\353\335\365\316\030\330V\221z\334\343\034\3478\307=\356\321G\037s\364q\217\376\023\370\023\372f\355\020\024\365\320J\225\254\331\367\346}\357\233o\2767~\374\334\343\304\344\247\230\233\333!?\365\\\2232\323&\016m\221\000s\342\204&\343\001\2658\t4\3105\367w\367\327\267\276\3372\261k\233\001yM,\316L\326kY\016f\2140\323;1[=\352p\352\232<\364\t\253\232\277\234\230\241\3273]Bl\223{\246\017\270\233\r\374\224\270&#\\\007\346*v]\217cN=\027A;u\333\253\246M\0038\204\236\023\335\3753v\030\251b\333F\200#6\356\340\rL7:\316\006:\301\214#fy\001\251\372\341%B\373\260\354\207;\240\034='\227\274I\000\020\272\026\365\252\200\361z \2200\013\373\274\027\300\327\201\014Q83\300\026ia\353\314\362\034M^\305\264\332q\2527\310\211M\\\036\204\310\006bvB]\354 \006\202I\266\201\320I\317\265\020j\343\016\031\303\337G\310\257\335L\352m\302)u\317\021\207\373:\2102t-\013\3423\2709\345\244\303^\353\010J\016\313\202\300\273`\016\220:\250\343\235\023\326A\250\203A6\2540\037\n\333\330>\357\340\313I\325kMN\203\334\3569\372\033f\324\0149\224qH\240O\257\304\3156\200\310\325\022\221\333\353\240w\336\3508\353\361|_\343A\243\345\001\350\202\320\366)\367k\327@\0103\034|\201\320\257\277/\324'\205zV\300\374\324wpH\0020\234\373\300\3521\370\215\225\372\201\327\206\016\206P\267\207\235\261\030}g+\253\216/\223\271\230\331\217\254\020!x:\023\325\020\3310\345\236\303Y\0003\tx\326\252\207ssB:C\023\3273\233\306!H\000\261\3569vz\204]P\327\035\353\373k\372\312\230\312\337Js\371\253\255\251|yX\372&n\244\205\333\321#\361F\375:\334h\014\212i\256\364\017\273\243\334\234\310\211'\302SG\311|\362]\277\222\346\n\321lT\213\032#\010\362\321+Q\021\265\264\360I\364\273\234\226\305\264P\026M\321\225\323:8\224]\245\203a\371+u\226,${}\000\336\021-\r\274\2725\365\221\021\375(,\3501\356\3115\265\023O\307\367\222Zj|!\237*;\256\304\217\222nj,\n&+\362\241z\031\027\343\265d\267?\017\024\213w\345\202l\310C\305\343Z""\374\254\237\3577\373\335\321\377\301Q(\212\005\321\020\307jY=\215[\311lRK^\014\352\203\203\264\260(.dKMk\321e\001\006\225\304\256\374\\m\253\213\030\217\nF\264\007\016\030\363bE\034\010|#\3704\n\200pO\326\345K5\2576U;>H\347\226\344\201\256\374)Wd\226\351Rm4w\037\370g\324\003\025\304E]\346b\023\030\336\201u\326\222\263rK2U\311v\307J\266\307N\337\216\036j\323S\3433\235\031\321\256(\013\254\363y\261\236\215\300(\203 \"7%\226\335\017\222\377\246\372\337\311j\214E\024\265\365]\231\003\237\217\306\267\352\246s_j\254\252\001z\270\364-X\374\323`f\2602h\016\367\016\207\207G\303\243\343\221\246\031\031\013\242\006\223\200S\212\242\004\262\262'\363ArG\213\235\023y\361\n\246\013\204\013\342\0078\35175\013\232\355\370k\030\336v\302\340\271\226\356K\234\226\312\223\363\257E\352\013\036\307\313\361N2\223\254\365\237\364\261\336.\211:8\371F=\203\315\325>\274\346\273\262$\233\222\253\272\202W\360qT\201?\006\227\365\341\322z\334\214\377\200\227\364\370\355\362\333\306\337*\256\217\206";
-    PyObject *data = __Pyx_DecompressString(cstring, 1022, 1);
+    #elif (CYTHON_COMPRESS_STRINGS) != 0 /* compression: zlib (1060 bytes) */
+const char* const cstring = "x\332\245S\315O\033G\024\307|Dn\342\252\306\330\001\2224Z\223\2464mc\264\006\2514iZ\031BQ\232*\301\250=\364#\231\214w\007\230\260\336]\357\214\201U\213\324\343\036\3478\3079\372\270\307=\372\310\321\307=\372O\340O\350\233\265K8\320\366\020\311\232}\337\357\367~\357\371\273\027\036'\006?\300\334\330\014\371\201\347\032\224\0316qh\213\004\230\023'4\030\017\250\305I\240\203\\cgk\347\341\332\372\232\201]\333\010\310[bqf\260n\313r0c\204\031\336\236\321\352R\207S\327\340\241OX\315x\266g\204^\327p\t\261\r\356\031>\304]N\340\007\3045\030\341Z0\226\261\353z\034s\352\271\010\322\251\273\277l\3304\200&\364\210\350\354\357\261\303H\r\3336\2028b\3436^\301t\245\355\254\240=\3148b\226\027\220\232\037\236 \264\003\317N\370\024\220\243\027\344\204\357\022\010\010]\213z5\210\361\272\000\2200\013\373\274\033\300\327\001\rQ\350\031`\213\264\260uhy\216.^\303\264\326vj\227\212\023\233\270<\010\221\r\205\331\036u\261\203\030\000&\231\001\241\275\256k!\264\217\333d\024\376NB\276yY\251S\352\036!\016\303:\2102t\201\t\344C\030\233r\322fo\265\004.\207eB\340\0353\007*:\250\355\035\021\326F\250\215\0013\274\260\034\nfl\037\265\361\311\330\353\265\306\255@\267\273\216\376\206Yi\206\034\3128(\220\247_\342f\006(\344j|\310\355\266\321?\304h9\313\361|_\307\003F\313\203\240cB\367\017\270o^\004\202\230\305\301\027\n\372\365w\216\372\330Q\317\034\230\037\370\016\016I\000ls\037\252z\014~#\244~\340\355C\006C\250\323\305\316\010\214\236\331\312\274\243a2\n3\356\221\025\"\004w3F\r\222\r+\356:\234\005\260\220\200g\251z3\227\327\24354f=\243i$\002\004\000\353\036a\247K\3301u\335\021\276\277r\347\205\211\231k\351\364\314\371\243\211\231\312\240\374e\257\221\346oD\337\210S\365|\260\322\350\317\246\323\345+\254\303\351\242\230\026\033\302S\277\307\245\370\253\244\232N\347\243\251\310\214\032C\020f\242\237EU\230i\376\303\3507\231\223\263i\276\"vEG\346\264\360\253\354(-\014*\237\252\303x.\336N \360\246h\351\300\363k\023\037\024\242\307\302\202\234\302-\371@\231\352\3078\227\026\356\310g\252\251\234\270\232\026\346""\005\223U\371\265j@\347;\311n\322I\347\027\345\234l\310_\024V\177\306\337\366K}s\370>\271\371Y1'\032\342\225ZR?\364Z\361Tl\306/\373\365~3\315\317\213c\331R9\r\262\"\200\220\262\330\222\267\325\246:\356\341a\276\020m\303\304\205\222x\010\363\345\007\237\255'\271\244\222\340\253,\037E\001\264\330\226u\371\223*\251U\265\337k\246\305\217eS{\376\220\367d\246i\2279,\336\205\216\223\352\276\nz\263\332\315\305\252\300\027\301Zk\311)\271&\231\252f\326\021\266\315\021\3277\242G\232\366\264\260\240\265B\264%*\002k}\004\t\270\251\210\246 \362I/\327[\030\230\260\326\376\375~\347\337\254%\361@\232\262qI\370\2579\376\027haL\342\005\310\242\230\021\220\177[\327\326\024\314\001\235\345{P\026\253NZ\256\016\252k\361f|\332\337\350[g\245\301\363\327\203\327o\006o\360\260\\U\263\303\342\274\036\030n\246xS\330\260a3-V`\201U\265>\370\342qb&[p\306WXnI\300\242\227X\221XB\217y\021\252\234\232\203\215\262\336'=\032w\222\251d\025\026\266\260\004\240\027\026\307\220t\303\367\000;\332\220&\355Uo\251\3674\236\214?O6\022\254\315eQ\007*N\341l'\343\345\004\3765\213\262,w%Wu\005\327w=\252FO\344\264\334\030\334\255\301]^O\226\222\227g\365\263\346\337m\270\273l";
+    PyObject *data = __Pyx_DecompressString(cstring, 1060, 1);
     if (unlikely(!data)) __PYX_ERR(0, 1, __pyx_L1_error)
     const char* const bytes = __Pyx_PyBytes_AsString(data);
     #if !CYTHON_ASSUME_SAFE_MACROS
     if (likely(bytes)); else { Py_DECREF(data); __PYX_ERR(0, 1, __pyx_L1_error) }
     #endif
-    #else /* compression: none (1657 bytes) */
-const char* const bytes = "?Note that Cython is deliberately stricter than PEP-484 and rejects subclasses of builtin types. If you need to pass subclasses then set the 'annotation_typing' directive to False.add_notedama/ai/ml/_fast_score.pyx__Pyx_PyDict_NextRefasyncio.coroutinescapturescline_in_tracebackcoldama.ai.ml._fast_scoreedentry_dictsfinal_state_dict__func__game_scoregame_score_p1game_score_p2getiinv_total_is_coroutineis_kingitemsjking_colsking_rowslegal_movesm__main__material_advmax_movesmob_score__module__my_kings_listmy_matmy_men_listn__name__num_capturesnum_kingsopp_matoutcome_weightp1_capturesp1_kingsp1_menp2_capturesp2_kingsp2_menpathplayer_intpoppospos_scoreprogress__qualname__rowscscorescore_game_dicts_cy__set_name__setdefaultsrstart_rowstatestate_dict__test__total_movestotal_posturnvalueswinner_int\200\001\360\014\000\005\006\330\004\005\3604\000\005\025\320\024,\250A\330\010\013\210<\220}\240K\320/A\300\021\330\004\024\320\024,\250A\330\010\013\210<\220}\240K\320/A\300\021\340\004\020\220\004\220B\220o\240\\\260\022\2607\270!\330\004\010\210\003\2101\210A\340\004\010\210\005\210U\220!\2201\330\010\r\210[\230\001\230\021\330\010\025\220R\220q\230\001\330\010\025\220Z\230q\240\001\330\010\025\320\025&\240k\260\023\260G\2701\330\010\026\220b\230\001\230\021\360\006\000\t\014\210;\220c\230\021\330\014\032\230*\240D\250\001\250\032\2601\330\014\034\230J\240d\250!\250<\260q\330\014\027\220s\230!\230:\240T\250\021\250*\260E\270\022\2701\330\027\031\230\023\230A\230Z\240t\2501\250L\270\005\270R\270q\340\014\032\230*\240D\250\001\250\032\2601\330\014\034\230J\240d\250!\250<\260q\330\014\027\220s\230!\230:\240T\250\021\250*\260E\270\022\2701\330\027\031\230\023\230A\230Z\240t\2501\250L\270\005\270R\270q\340\010\021\220\023\220A\220]\240\"\240J\250b\260\003\2601\260O\3002\300Q\330\010\027\220w\230b\240\001\360\006\000\t\025\220A\330\010\024\220E\230\033\240C\240w\250a\340\010\014\210G\2201\330\014\022\220#\220Q\220a\330\014\022\220#\220Q\220a\330\014\017\210r\220\023\220G\2302\230T\240""\022\2403\240g\250Q\330\020\035\230Q\330\014\017\210{\230#\230Q\330\020\035\230T\240\022\2401\340\020\036\230b\240\002\240%\240r\250\021\330\014\017\210t\2203\220a\330\020\035\230Q\330\014\017\210t\2203\220b\230\003\2304\230s\240!\330\020\035\230Q\360\006\000\t\025\220C\220q\230\001\330\010\013\210:\220R\220q\330\014\030\230\001\330\010\014\210E\220\025\220a\220q\330\014\022\220-\230q\240\001\330\014\025\220Q\220e\2303\230a\230q\330\014\025\220Q\220e\2303\230a\230q\330\014\022\220#\220Q\220a\330\014\022\220#\220Q\220a\330\014\017\210r\220\023\220G\2302\230T\240\022\2403\240g\250Q\330\020\035\230Q\330\014\017\210t\2203\220a\330\020\035\230Q\330\014\017\210t\2203\220b\230\003\2304\230s\240!\330\020\035\230Q\360\006\000\t\025\220A\330\010\014\210E\220\021\330\014\027\220q\230\004\230A\230\\\250\021\330\014\017\210q\330\020\037\230s\240!\2401\330\020\035\320\0350\260\003\260=\300\002\300#\300R\320GZ\320Z\\\320\\]\340\020\035\230Q\340\014\023\2201\220A\220Q\330\014\021\220\024\220Q\220b\230\001\230\021\330\014\021\220\024\220Q\220b\230\001\230\021\330\014\026\220a\330\014\020\220\005\220U\230!\2301\330\020\023\2209\230A\230S\240\003\2403\240d\250)\2601\260C\260s\270!\330\024\036\230a\330\024\025\330\014\017\210q\330\020\035\230Q\360\006\000\t\025\220G\2302\230]\250\"\250D\260\002\260*\270B\270a\360\006\000\t\024\2202\220R\220}\240L\260\002\260'\270\021\330\010\031\230\024\230R\230t\2402\240Q\330\010\n\210!\210<\220t\2302\320\035-\250R\250z\270\022\270?\310\"\310A";
+    #else /* compression: none (1758 bytes) */
+const char* const bytes = "?Note that Cython is deliberately stricter than PEP-484 and rejects subclasses of builtin types. If you need to pass subclasses then set the 'annotation_typing' directive to False.add_notedama/ai/ml/_fast_score.pyx__Pyx_PyDict_NextRefasyncio.coroutinescapturescline_in_tracebackcoldama.ai.ml._fast_scoreedentry_dictsfinal_state_dict__func__game_scoregame_score_p1game_score_p2iinv_total_is_coroutineis_kingitemsjking_colsking_rowslegal_movesm__main__material_advmax_movesmob_score__module__my_kings_listmy_matmy_men_listn__name__num_capturesnum_kingsopp_matoutcome_weightp1_capturesp1_kingsp1_menp2_capturesp2_kingsp2_menpathplayer_intpoppospos_scoreprogress__qualname__rowscscorescore_game_dicts_cy__set_name__setdefaultsrstart_rowstatestate_dict__test__total_movestotal_posturnvalueswinner_int\200\001\360\014\000\005\006\330\004\005\360:\000\005\025\320\024,\250A\330\010\013\210<\220}\240K\320/A\300\021\330\004\024\320\024,\250A\330\010\013\210<\220}\240K\320/A\300\021\340\004\020\220\004\220B\220o\240\\\260\022\2607\270!\330\004\010\210\003\2101\210A\340\004\010\210\005\210U\220!\2201\330\010\r\210[\230\001\230\021\330\010\025\220R\220q\230\001\330\010\025\220Z\230q\240\001\330\010\025\320\025&\240k\260\023\260G\2701\330\010\026\220b\230\001\230\021\360\006\000\t\014\210;\220c\230\021\330\014\032\230)\2401\240L\260\001\330\014\034\230I\240Q\240l\260!\330\014\027\220s\230!\2309\240A\240\\\260\034\270R\270q\330\027\031\230\023\230A\230Y\240a\240|\260>\300\022\3001\340\014\032\230)\2401\240L\260\001\330\014\034\230I\240Q\240l\260!\330\014\027\220s\230!\2309\240A\240\\\260\034\270R\270q\330\027\031\230\023\230A\230Y\240a\240|\260>\300\022\3001\340\010\021\220\023\220A\220]\240\"\240J\250b\260\003\2601\260O\3002\300Q\330\010\027\220w\230b\240\001\360\006\000\t\025\220A\330\010\024\220E\230\033\240C\240w\250a\340\010\014\210G\2201\330\014\022\220-\230q\240\010\320(8\270\001\270\025\270a\330\014\022\220-\230q\240\010\320(8\270\001\270\025\270a\330\014\017\210r\220\023\220G\2302""\230T\240\022\2403\240g\250Q\330\020\035\230Q\330\014\017\210{\230#\230Q\330\020\035\230T\240\022\2401\340\020\036\230b\240\002\240%\240r\250\021\330\014\017\210t\2203\220a\330\020\035\230Q\330\014\017\210t\2203\220b\230\003\2304\230s\240!\330\020\035\230Q\360\006\000\t\025\220C\220q\230\001\330\010\013\210:\220R\220q\330\014\030\230\001\330\010\014\210E\220\025\220a\220q\330\014\022\220-\230q\240\001\330\014\025\220Q\220e\230=\250\001\250\030\3201A\300\021\300%\300q\330\014\025\220Q\220e\230=\250\001\250\030\3201A\300\021\300%\300q\330\014\022\220)\2301\230A\330\014\022\220)\2301\230A\330\014\017\210r\220\023\220G\2302\230T\240\022\2403\240g\250Q\330\020\035\230Q\330\014\017\210t\2203\220a\330\020\035\230Q\330\014\017\210t\2203\220b\230\003\2304\230s\240!\330\020\035\230Q\360\014\000\t\025\220A\330\010\013\210:\220R\220q\330\014\020\220\005\220Q\330\020\033\2301\230A\230Q\330\020\023\2201\330\024#\2403\240a\240q\330\024!\320!4\260C\260}\300B\300c\310\022\320K^\320^`\320`a\340\024!\240\021\340\020\027\220q\230\001\230\021\330\020\026\220d\230!\2301\330\020\025\220]\240!\2408\320+;\2701\270E\300\021\330\020\025\220]\240!\2408\320+;\2701\270E\300\021\330\020\032\230!\330\020\024\220E\230\025\230a\230q\330\024\027\220y\240\001\240\023\240C\240s\250$\250i\260q\270\003\2703\270a\330\030\"\240!\330\030\031\330\020\023\2201\330\024!\240\021\340\014\020\220\005\220Q\330\020\033\2301\230A\230Q\330\020\023\2201\330\024#\2403\240a\240q\330\024!\320!4\260C\260}\300B\300c\310\022\320K^\320^`\320`a\340\024!\240\021\360\006\000\t\025\220G\2302\230]\250\"\250D\260\002\260*\270B\270a\360\006\000\t\024\2202\220R\220}\240L\260\002\260'\270\021\330\010\031\230\024\230R\230t\2402\240Q\330\010\n\210!\210=\230\004\230B\320\036.\250b\260\n\270\"\270O\3102\310Q";
     PyObject *data = NULL;
     CYTHON_UNUSED_VAR(__Pyx_DecompressString);
     #endif
     PyObject **stringtab = __pyx_mstate->__pyx_string_tab;
     Py_ssize_t pos = 0;
-    for (int i = 0; i < 71; i++) {
+    for (int i = 0; i < 70; i++) {
       Py_ssize_t bytes_length = index[i].length;
       PyObject *string = PyUnicode_DecodeUTF8(bytes + pos, bytes_length, NULL);
       if (likely(string) && i >= 4) PyUnicode_InternInPlace(&string);
@@ -5658,7 +6119,7 @@ const char* const bytes = "?Note that Cython is deliberately stricter than PEP-4
       stringtab[i] = string;
       pos += bytes_length;
     }
-    for (int i = 71; i < 72; i++) {
+    for (int i = 70; i < 71; i++) {
       Py_ssize_t bytes_length = index[i].length;
       PyObject *string = PyBytes_FromStringAndSize(bytes + pos, bytes_length);
       stringtab[i] = string;
@@ -5669,14 +6130,14 @@ const char* const bytes = "?Note that Cython is deliberately stricter than PEP-4
       }
     }
     Py_XDECREF(data);
-    for (Py_ssize_t i = 0; i < 72; i++) {
+    for (Py_ssize_t i = 0; i < 71; i++) {
       if (unlikely(PyObject_Hash(stringtab[i]) == -1)) {
         __PYX_ERR(0, 1, __pyx_L1_error)
       }
     }
     #if CYTHON_IMMORTAL_CONSTANTS
     {
-      PyObject **table = stringtab + 71;
+      PyObject **table = stringtab + 70;
       for (Py_ssize_t i=0; i<1; ++i) {
         #if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
         #if PY_VERSION_HEX < 0x030E0000
@@ -5722,9 +6183,9 @@ static int __Pyx_CreateCodeObjects(__pyx_mstatetype *__pyx_mstate) {
   PyObject* tuple_dedup_map = PyDict_New();
   if (unlikely(!tuple_dedup_map)) return -1;
   {
-    const __Pyx_PyCode_New_function_description descr = {7, 0, 0, 42, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 149};
-    PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_entry_dicts, __pyx_mstate->__pyx_n_u_winner_int, __pyx_mstate->__pyx_n_u_total_moves, __pyx_mstate->__pyx_n_u_max_moves, __pyx_mstate->__pyx_n_u_final_state_dict, __pyx_mstate->__pyx_n_u_p1_captures, __pyx_mstate->__pyx_n_u_p2_captures, __pyx_mstate->__pyx_n_u_game_score_p1, __pyx_mstate->__pyx_n_u_game_score_p2, __pyx_mstate->__pyx_n_u_game_score, __pyx_mstate->__pyx_n_u_inv_total, __pyx_mstate->__pyx_n_u_i, __pyx_mstate->__pyx_n_u_n, __pyx_mstate->__pyx_n_u_player_int, __pyx_mstate->__pyx_n_u_start_row, __pyx_mstate->__pyx_n_u_row, __pyx_mstate->__pyx_n_u_col, __pyx_mstate->__pyx_n_u_num_captures, __pyx_mstate->__pyx_n_u_num_kings, __pyx_mstate->__pyx_n_u_my_mat, __pyx_mstate->__pyx_n_u_opp_mat, __pyx_mstate->__pyx_n_u_material_adv, __pyx_mstate->__pyx_n_u_pos_score, __pyx_mstate->__pyx_n_u_mob_score, __pyx_mstate->__pyx_n_u_total_pos, __pyx_mstate->__pyx_n_u_progress, __pyx_mstate->__pyx_n_u_outcome_weight, __pyx_mstate->__pyx_n_u_ed, __pyx_mstate->__pyx_n_u_state_dict, __pyx_mstate->__pyx_n_u_m, __pyx_mstate->__pyx_n_u_my_men_list, __pyx_mstate->__pyx_n_u_my_kings_list, __pyx_mstate->__pyx_n_u_legal_moves, __pyx_mstate->__pyx_n_u_path, __pyx_mstate->__pyx_n_u_captures, __pyx_mstate->__pyx_n_u_king_rows, __pyx_mstate->__pyx_n_u_king_cols, __pyx_mstate->__pyx_n_u_j, __pyx_mstate->__pyx_n_u_sr, __pyx_mstate->__pyx_n_u_sc, __pyx_mstate->__pyx_n_u_is_king, __pyx_mstate->__pyx_n_u_pos};
-    __pyx_mstate_global->__pyx_codeobj_tab[0] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_ml__fast_score_pyx, __pyx_mstate->__pyx_n_u_score_game_dicts_cy, __pyx_mstate->__pyx_kp_b_iso88591_4_A_K_A_A_K_A_Bo_7_1A_U_1_Rq_Zq, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[0])) goto bad;
+    const __Pyx_PyCode_New_function_description descr = {7, 0, 0, 42, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 188};
+    PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_entry_dicts, __pyx_mstate->__pyx_n_u_winner_int, __pyx_mstate->__pyx_n_u_total_moves, __pyx_mstate->__pyx_n_u_max_moves, __pyx_mstate->__pyx_n_u_final_state_dict, __pyx_mstate->__pyx_n_u_p1_captures, __pyx_mstate->__pyx_n_u_p2_captures, __pyx_mstate->__pyx_n_u_game_score_p1, __pyx_mstate->__pyx_n_u_game_score_p2, __pyx_mstate->__pyx_n_u_game_score, __pyx_mstate->__pyx_n_u_inv_total, __pyx_mstate->__pyx_n_u_i, __pyx_mstate->__pyx_n_u_n, __pyx_mstate->__pyx_n_u_player_int, __pyx_mstate->__pyx_n_u_start_row, __pyx_mstate->__pyx_n_u_row, __pyx_mstate->__pyx_n_u_col, __pyx_mstate->__pyx_n_u_num_captures, __pyx_mstate->__pyx_n_u_num_kings, __pyx_mstate->__pyx_n_u_my_mat, __pyx_mstate->__pyx_n_u_opp_mat, __pyx_mstate->__pyx_n_u_material_adv, __pyx_mstate->__pyx_n_u_pos_score, __pyx_mstate->__pyx_n_u_mob_score, __pyx_mstate->__pyx_n_u_total_pos, __pyx_mstate->__pyx_n_u_progress, __pyx_mstate->__pyx_n_u_outcome_weight, __pyx_mstate->__pyx_n_u_ed, __pyx_mstate->__pyx_n_u_state_dict, __pyx_mstate->__pyx_n_u_m, __pyx_mstate->__pyx_n_u_my_men_list, __pyx_mstate->__pyx_n_u_my_kings_list, __pyx_mstate->__pyx_n_u_legal_moves, __pyx_mstate->__pyx_n_u_path, __pyx_mstate->__pyx_n_u_captures, __pyx_mstate->__pyx_n_u_pos, __pyx_mstate->__pyx_n_u_king_rows, __pyx_mstate->__pyx_n_u_king_cols, __pyx_mstate->__pyx_n_u_j, __pyx_mstate->__pyx_n_u_sr, __pyx_mstate->__pyx_n_u_sc, __pyx_mstate->__pyx_n_u_is_king};
+    __pyx_mstate_global->__pyx_codeobj_tab[0] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_ml__fast_score_pyx, __pyx_mstate->__pyx_n_u_score_game_dicts_cy, __pyx_mstate->__pyx_kp_b_iso88591_A_K_A_A_K_A_Bo_7_1A_U_1_Rq_Zq_k, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[0])) goto bad;
   }
   Py_DECREF(tuple_dedup_map);
   return 0;
@@ -5802,464 +6263,6 @@ end:
     return (__Pyx_RefNannyAPIStruct *)r;
 }
 #endif
-
-/* PyObjectCall (used by PyObjectFastCall) */
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject* __Pyx_PyObject_Call(PyObject *func, PyObject *arg, PyObject *kw) {
-    PyObject *result;
-    ternaryfunc call = Py_TYPE(func)->tp_call;
-    if (unlikely(!call))
-        return PyObject_Call(func, arg, kw);
-    if (unlikely(Py_EnterRecursiveCall(" while calling a Python object")))
-        return NULL;
-    result = (*call)(func, arg, kw);
-    Py_LeaveRecursiveCall();
-    if (unlikely(!result) && unlikely(!PyErr_Occurred())) {
-        PyErr_SetString(
-            PyExc_SystemError,
-            "NULL result without error in PyObject_Call");
-    }
-    return result;
-}
-#endif
-
-/* PyObjectCallMethO (used by PyObjectFastCall) */
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject* __Pyx_PyObject_CallMethO(PyObject *func, PyObject *arg) {
-    PyObject *self, *result;
-    PyCFunction cfunc;
-    cfunc = __Pyx_CyOrPyCFunction_GET_FUNCTION(func);
-    self = __Pyx_CyOrPyCFunction_GET_SELF(func);
-    if (unlikely(Py_EnterRecursiveCall(" while calling a Python object")))
-        return NULL;
-    result = cfunc(self, arg);
-    Py_LeaveRecursiveCall();
-    if (unlikely(!result) && unlikely(!PyErr_Occurred())) {
-        PyErr_SetString(
-            PyExc_SystemError,
-            "NULL result without error in PyObject_Call");
-    }
-    return result;
-}
-#endif
-
-/* PyObjectFastCall (used by PyObjectCall2Args) */
-#if PY_VERSION_HEX < 0x03090000 || CYTHON_COMPILING_IN_LIMITED_API
-static PyObject* __Pyx_PyObject_FastCall_fallback(PyObject *func, PyObject * const*args, size_t nargs, PyObject *kwargs) {
-    PyObject *argstuple;
-    PyObject *result = 0;
-    size_t i;
-    argstuple = PyTuple_New((Py_ssize_t)nargs);
-    if (unlikely(!argstuple)) return NULL;
-    for (i = 0; i < nargs; i++) {
-        Py_INCREF(args[i]);
-        if (__Pyx_PyTuple_SET_ITEM(argstuple, (Py_ssize_t)i, args[i]) != (0)) goto bad;
-    }
-    result = __Pyx_PyObject_Call(func, argstuple, kwargs);
-  bad:
-    Py_DECREF(argstuple);
-    return result;
-}
-#endif
-#if CYTHON_VECTORCALL && !CYTHON_COMPILING_IN_LIMITED_API
-  #if PY_VERSION_HEX < 0x03090000
-    #define __Pyx_PyVectorcall_Function(callable) _PyVectorcall_Function(callable)
-  #elif CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE vectorcallfunc __Pyx_PyVectorcall_Function(PyObject *callable) {
-    PyTypeObject *tp = Py_TYPE(callable);
-    #if defined(__Pyx_CyFunction_USED)
-    if (__Pyx_CyFunction_CheckExact(callable)) {
-        return __Pyx_CyFunction_func_vectorcall(callable);
-    }
-    #endif
-    if (!PyType_HasFeature(tp, Py_TPFLAGS_HAVE_VECTORCALL)) {
-        return NULL;
-    }
-    assert(PyCallable_Check(callable));
-    Py_ssize_t offset = tp->tp_vectorcall_offset;
-    assert(offset > 0);
-    vectorcallfunc ptr;
-    memcpy(&ptr, (char *) callable + offset, sizeof(ptr));
-    return ptr;
-}
-  #else
-    #define __Pyx_PyVectorcall_Function(callable) PyVectorcall_Function(callable)
-  #endif
-#endif
-static CYTHON_INLINE PyObject* __Pyx_PyObject_FastCallDict(PyObject *func, PyObject *const *args, size_t _nargs, PyObject *kwargs) {
-    Py_ssize_t nargs = __Pyx_PyVectorcall_NARGS(_nargs);
-#if CYTHON_COMPILING_IN_CPYTHON
-    if (nargs == 0 && kwargs == NULL) {
-        if (__Pyx_CyOrPyCFunction_Check(func) && likely( __Pyx_CyOrPyCFunction_GET_FLAGS(func) & METH_NOARGS))
-            return __Pyx_PyObject_CallMethO(func, NULL);
-    }
-    else if (nargs == 1 && kwargs == NULL) {
-        if (__Pyx_CyOrPyCFunction_Check(func) && likely( __Pyx_CyOrPyCFunction_GET_FLAGS(func) & METH_O))
-            return __Pyx_PyObject_CallMethO(func, args[0]);
-    }
-#endif
-    if (kwargs == NULL) {
-        #if CYTHON_VECTORCALL
-          #if CYTHON_COMPILING_IN_LIMITED_API
-            return PyObject_Vectorcall(func, args, _nargs, NULL);
-          #else
-            vectorcallfunc f = __Pyx_PyVectorcall_Function(func);
-            if (f) {
-                return f(func, args, _nargs, NULL);
-            }
-          #endif
-        #endif
-    }
-    if (nargs == 0) {
-        return __Pyx_PyObject_Call(func, __pyx_mstate_global->__pyx_empty_tuple, kwargs);
-    }
-    #if PY_VERSION_HEX >= 0x03090000 && !CYTHON_COMPILING_IN_LIMITED_API
-    return PyObject_VectorcallDict(func, args, (size_t)nargs, kwargs);
-    #else
-    return __Pyx_PyObject_FastCall_fallback(func, args, (size_t)nargs, kwargs);
-    #endif
-}
-
-/* PyObjectCall2Args (used by CallUnboundCMethod1) */
-static CYTHON_INLINE PyObject* __Pyx_PyObject_Call2Args(PyObject* function, PyObject* arg1, PyObject* arg2) {
-    PyObject *args[3] = {NULL, arg1, arg2};
-    return __Pyx_PyObject_FastCall(function, args+1, 2 | __Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET);
-}
-
-/* PyObjectGetAttrStr (used by UnpackUnboundCMethod) */
-#if CYTHON_USE_TYPE_SLOTS
-static CYTHON_INLINE PyObject* __Pyx_PyObject_GetAttrStr(PyObject* obj, PyObject* attr_name) {
-    PyTypeObject* tp = Py_TYPE(obj);
-    if (likely(tp->tp_getattro))
-        return tp->tp_getattro(obj, attr_name);
-    return PyObject_GetAttr(obj, attr_name);
-}
-#endif
-
-/* UnpackUnboundCMethod (used by CallUnboundCMethod1) */
-#if CYTHON_COMPILING_IN_LIMITED_API && __PYX_LIMITED_VERSION_HEX < 0x030C0000
-static PyObject *__Pyx_SelflessCall(PyObject *method, PyObject *args, PyObject *kwargs) {
-    PyObject *result;
-    PyObject *selfless_args = PyTuple_GetSlice(args, 1, PyTuple_Size(args));
-    if (unlikely(!selfless_args)) return NULL;
-    result = PyObject_Call(method, selfless_args, kwargs);
-    Py_DECREF(selfless_args);
-    return result;
-}
-#elif CYTHON_COMPILING_IN_PYPY && PY_VERSION_HEX < 0x03090000
-static PyObject *__Pyx_SelflessCall(PyObject *method, PyObject **args, Py_ssize_t nargs, PyObject *kwnames) {
-        return _PyObject_Vectorcall
-            (method, args ? args+1 : NULL, nargs ? nargs-1 : 0, kwnames);
-}
-#else
-static PyObject *__Pyx_SelflessCall(PyObject *method, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
-    return
-#if PY_VERSION_HEX < 0x03090000
-    _PyObject_Vectorcall
-#else
-    PyObject_Vectorcall
-#endif
-        (method, args ? args+1 : NULL, nargs ? (size_t) nargs-1 : 0, kwnames);
-}
-#endif
-static PyMethodDef __Pyx_UnboundCMethod_Def = {
-     "CythonUnboundCMethod",
-     __PYX_REINTERPRET_FUNCION(PyCFunction, __Pyx_SelflessCall),
-#if CYTHON_COMPILING_IN_LIMITED_API && __PYX_LIMITED_VERSION_HEX < 0x030C0000
-     METH_VARARGS | METH_KEYWORDS,
-#else
-     METH_FASTCALL | METH_KEYWORDS,
-#endif
-     NULL
-};
-static int __Pyx_TryUnpackUnboundCMethod(__Pyx_CachedCFunction* target) {
-    PyObject *method, *result=NULL;
-    method = __Pyx_PyObject_GetAttrStr(target->type, *target->method_name);
-    if (unlikely(!method))
-        return -1;
-    result = method;
-#if CYTHON_COMPILING_IN_CPYTHON
-    if (likely(__Pyx_TypeCheck(method, &PyMethodDescr_Type)))
-    {
-        PyMethodDescrObject *descr = (PyMethodDescrObject*) method;
-        target->func = descr->d_method->ml_meth;
-        target->flag = descr->d_method->ml_flags & ~(METH_CLASS | METH_STATIC | METH_COEXIST | METH_STACKLESS);
-    } else
-#endif
-#if CYTHON_COMPILING_IN_PYPY
-#else
-    if (PyCFunction_Check(method))
-#endif
-    {
-        PyObject *self;
-        int self_found;
-#if CYTHON_COMPILING_IN_LIMITED_API || CYTHON_COMPILING_IN_PYPY
-        self = PyObject_GetAttrString(method, "__self__");
-        if (!self) {
-            PyErr_Clear();
-        }
-#else
-        self = PyCFunction_GET_SELF(method);
-#endif
-        self_found = (self && self != Py_None);
-#if CYTHON_COMPILING_IN_LIMITED_API || CYTHON_COMPILING_IN_PYPY
-        Py_XDECREF(self);
-#endif
-        if (self_found) {
-            PyObject *unbound_method = PyCFunction_New(&__Pyx_UnboundCMethod_Def, method);
-            if (unlikely(!unbound_method)) return -1;
-            Py_DECREF(method);
-            result = unbound_method;
-        }
-    }
-#if !CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
-    if (unlikely(target->method)) {
-        Py_DECREF(result);
-    } else
-#endif
-    target->method = result;
-    return 0;
-}
-
-/* CallUnboundCMethod1 */
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject* __Pyx_CallUnboundCMethod1(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg) {
-    int was_initialized =  __Pyx_CachedCFunction_GetAndSetInitializing(cfunc);
-    if (likely(was_initialized == 2 && cfunc->func)) {
-        int flag = cfunc->flag;
-        if (flag == METH_O) {
-            return __Pyx_CallCFunction(cfunc, self, arg);
-        } else if (flag == METH_FASTCALL) {
-            return __Pyx_CallCFunctionFast(cfunc, self, &arg, 1);
-        } else if (flag == (METH_FASTCALL | METH_KEYWORDS)) {
-            return __Pyx_CallCFunctionFastWithKeywords(cfunc, self, &arg, 1, NULL);
-        }
-    }
-#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
-    else if (unlikely(was_initialized == 1)) {
-        __Pyx_CachedCFunction tmp_cfunc = {
-#ifndef __cplusplus
-            0
-#endif
-        };
-        tmp_cfunc.type = cfunc->type;
-        tmp_cfunc.method_name = cfunc->method_name;
-        return __Pyx__CallUnboundCMethod1(&tmp_cfunc, self, arg);
-    }
-#endif
-    PyObject* result = __Pyx__CallUnboundCMethod1(cfunc, self, arg);
-    __Pyx_CachedCFunction_SetFinishedInitializing(cfunc);
-    return result;
-}
-#endif
-static PyObject* __Pyx__CallUnboundCMethod1(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg){
-    PyObject *result = NULL;
-    if (unlikely(!cfunc->func && !cfunc->method) && unlikely(__Pyx_TryUnpackUnboundCMethod(cfunc) < 0)) return NULL;
-#if CYTHON_COMPILING_IN_CPYTHON
-    if (cfunc->func && (cfunc->flag & METH_VARARGS)) {
-        PyObject *args = PyTuple_New(1);
-        if (unlikely(!args)) return NULL;
-        Py_INCREF(arg);
-        PyTuple_SET_ITEM(args, 0, arg);
-        if (cfunc->flag & METH_KEYWORDS)
-            result = __Pyx_CallCFunctionWithKeywords(cfunc, self, args, NULL);
-        else
-            result = __Pyx_CallCFunction(cfunc, self, args);
-        Py_DECREF(args);
-    } else
-#endif
-    {
-        result = __Pyx_PyObject_Call2Args(cfunc->method, self, arg);
-    }
-    return result;
-}
-
-/* CallUnboundCMethod2 */
-#if CYTHON_COMPILING_IN_CPYTHON
-static CYTHON_INLINE PyObject *__Pyx_CallUnboundCMethod2(__Pyx_CachedCFunction *cfunc, PyObject *self, PyObject *arg1, PyObject *arg2) {
-    int was_initialized = __Pyx_CachedCFunction_GetAndSetInitializing(cfunc);
-    if (likely(was_initialized == 2 && cfunc->func)) {
-        PyObject *args[2] = {arg1, arg2};
-        if (cfunc->flag == METH_FASTCALL) {
-            return __Pyx_CallCFunctionFast(cfunc, self, args, 2);
-        }
-        if (cfunc->flag == (METH_FASTCALL | METH_KEYWORDS))
-            return __Pyx_CallCFunctionFastWithKeywords(cfunc, self, args, 2, NULL);
-    }
-#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
-    else if (unlikely(was_initialized == 1)) {
-        __Pyx_CachedCFunction tmp_cfunc = {
-#ifndef __cplusplus
-            0
-#endif
-        };
-        tmp_cfunc.type = cfunc->type;
-        tmp_cfunc.method_name = cfunc->method_name;
-        return __Pyx__CallUnboundCMethod2(&tmp_cfunc, self, arg1, arg2);
-    }
-#endif
-    PyObject *result = __Pyx__CallUnboundCMethod2(cfunc, self, arg1, arg2);
-    __Pyx_CachedCFunction_SetFinishedInitializing(cfunc);
-    return result;
-}
-#endif
-static PyObject* __Pyx__CallUnboundCMethod2(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg1, PyObject* arg2){
-    if (unlikely(!cfunc->func && !cfunc->method) && unlikely(__Pyx_TryUnpackUnboundCMethod(cfunc) < 0)) return NULL;
-#if CYTHON_COMPILING_IN_CPYTHON
-    if (cfunc->func && (cfunc->flag & METH_VARARGS)) {
-        PyObject *result = NULL;
-        PyObject *args = PyTuple_New(2);
-        if (unlikely(!args)) return NULL;
-        Py_INCREF(arg1);
-        PyTuple_SET_ITEM(args, 0, arg1);
-        Py_INCREF(arg2);
-        PyTuple_SET_ITEM(args, 1, arg2);
-        if (cfunc->flag & METH_KEYWORDS)
-            result = __Pyx_CallCFunctionWithKeywords(cfunc, self, args, NULL);
-        else
-            result = __Pyx_CallCFunction(cfunc, self, args);
-        Py_DECREF(args);
-        return result;
-    }
-#endif
-    {
-        PyObject *args[4] = {NULL, self, arg1, arg2};
-        return __Pyx_PyObject_FastCall(cfunc->method, args+1, 3 | __Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET);
-    }
-}
-
-/* dict_getitem_default */
-static PyObject* __Pyx_PyDict_GetItemDefault(PyObject* d, PyObject* key, PyObject* default_value) {
-    PyObject* value;
-#if !CYTHON_COMPILING_IN_PYPY || PYPY_VERSION_NUM >= 0x07020000
-    value = PyDict_GetItemWithError(d, key);
-    if (unlikely(!value)) {
-        if (unlikely(PyErr_Occurred()))
-            return NULL;
-        value = default_value;
-    }
-    Py_INCREF(value);
-    if ((1));
-#else
-    if (PyBytes_CheckExact(key) || PyUnicode_CheckExact(key) || PyLong_CheckExact(key)) {
-        value = PyDict_GetItem(d, key);
-        if (unlikely(!value)) {
-            value = default_value;
-        }
-        Py_INCREF(value);
-    }
-#endif
-    else {
-        if (default_value == Py_None)
-            value = __Pyx_CallUnboundCMethod1(&__pyx_mstate_global->__pyx_umethod_PyDict_Type_get, d, key);
-        else
-            value = __Pyx_CallUnboundCMethod2(&__pyx_mstate_global->__pyx_umethod_PyDict_Type_get, d, key, default_value);
-    }
-    return value;
-}
-
-/* GetItemInt */
-static PyObject *__Pyx_GetItemInt_Generic(PyObject *o, PyObject* j) {
-    PyObject *r;
-    if (unlikely(!j)) return NULL;
-    r = PyObject_GetItem(o, j);
-    Py_DECREF(j);
-    return r;
-}
-static CYTHON_INLINE PyObject *__Pyx_GetItemInt_List_Fast(PyObject *o, Py_ssize_t i,
-                                                              int wraparound, int boundscheck, int unsafe_shared) {
-    CYTHON_MAYBE_UNUSED_VAR(unsafe_shared);
-#if CYTHON_ASSUME_SAFE_SIZE
-    Py_ssize_t wrapped_i = i;
-    if (wraparound & unlikely(i < 0)) {
-        wrapped_i += PyList_GET_SIZE(o);
-    }
-    if ((CYTHON_AVOID_BORROWED_REFS || CYTHON_AVOID_THREAD_UNSAFE_BORROWED_REFS || !CYTHON_ASSUME_SAFE_MACROS)) {
-        return __Pyx_PyList_GetItemRefFast(o, wrapped_i, unsafe_shared);
-    } else
-    if ((!boundscheck) || likely(__Pyx_is_valid_index(wrapped_i, PyList_GET_SIZE(o)))) {
-        return __Pyx_NewRef(PyList_GET_ITEM(o, wrapped_i));
-    }
-    return __Pyx_GetItemInt_Generic(o, PyLong_FromSsize_t(i));
-#else
-    (void)wraparound;
-    (void)boundscheck;
-    return PySequence_GetItem(o, i);
-#endif
-}
-static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Tuple_Fast(PyObject *o, Py_ssize_t i,
-                                                              int wraparound, int boundscheck, int unsafe_shared) {
-    CYTHON_MAYBE_UNUSED_VAR(unsafe_shared);
-#if CYTHON_ASSUME_SAFE_SIZE && CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
-    Py_ssize_t wrapped_i = i;
-    if (wraparound & unlikely(i < 0)) {
-        wrapped_i += PyTuple_GET_SIZE(o);
-    }
-    if ((!boundscheck) || likely(__Pyx_is_valid_index(wrapped_i, PyTuple_GET_SIZE(o)))) {
-        return __Pyx_NewRef(PyTuple_GET_ITEM(o, wrapped_i));
-    }
-    return __Pyx_GetItemInt_Generic(o, PyLong_FromSsize_t(i));
-#else
-    (void)wraparound;
-    (void)boundscheck;
-    return PySequence_GetItem(o, i);
-#endif
-}
-static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Fast(PyObject *o, Py_ssize_t i, int is_list,
-                                                     int wraparound, int boundscheck, int unsafe_shared) {
-    CYTHON_MAYBE_UNUSED_VAR(unsafe_shared);
-#if CYTHON_ASSUME_SAFE_MACROS && CYTHON_ASSUME_SAFE_SIZE
-    if (is_list || PyList_CheckExact(o)) {
-        Py_ssize_t n = ((!wraparound) | likely(i >= 0)) ? i : i + PyList_GET_SIZE(o);
-        if ((CYTHON_AVOID_BORROWED_REFS || CYTHON_AVOID_THREAD_UNSAFE_BORROWED_REFS)) {
-            return __Pyx_PyList_GetItemRefFast(o, n, unsafe_shared);
-        } else if ((!boundscheck) || (likely(__Pyx_is_valid_index(n, PyList_GET_SIZE(o))))) {
-            return __Pyx_NewRef(PyList_GET_ITEM(o, n));
-        }
-    } else
-    #if !CYTHON_AVOID_BORROWED_REFS
-    if (PyTuple_CheckExact(o)) {
-        Py_ssize_t n = ((!wraparound) | likely(i >= 0)) ? i : i + PyTuple_GET_SIZE(o);
-        if ((!boundscheck) || likely(__Pyx_is_valid_index(n, PyTuple_GET_SIZE(o)))) {
-            return __Pyx_NewRef(PyTuple_GET_ITEM(o, n));
-        }
-    } else
-    #endif
-#endif
-#if CYTHON_USE_TYPE_SLOTS && !CYTHON_COMPILING_IN_PYPY
-    {
-        PyMappingMethods *mm = Py_TYPE(o)->tp_as_mapping;
-        PySequenceMethods *sm = Py_TYPE(o)->tp_as_sequence;
-        if (!is_list && mm && mm->mp_subscript) {
-            PyObject *r, *key = PyLong_FromSsize_t(i);
-            if (unlikely(!key)) return NULL;
-            r = mm->mp_subscript(o, key);
-            Py_DECREF(key);
-            return r;
-        }
-        if (is_list || likely(sm && sm->sq_item)) {
-            if (wraparound && unlikely(i < 0) && likely(sm->sq_length)) {
-                Py_ssize_t l = sm->sq_length(o);
-                if (likely(l >= 0)) {
-                    i += l;
-                } else {
-                    if (!PyErr_ExceptionMatches(PyExc_OverflowError))
-                        return NULL;
-                    PyErr_Clear();
-                }
-            }
-            return sm->sq_item(o, i);
-        }
-    }
-#else
-    if (is_list || !PyMapping_Check(o)) {
-        return PySequence_GetItem(o, i);
-    }
-#endif
-    (void)wraparound;
-    (void)boundscheck;
-    return __Pyx_GetItemInt_Generic(o, PyLong_FromSsize_t(i));
-}
 
 /* TupleAndListFromArray (used by fastcall) */
 #if !CYTHON_COMPILING_IN_CPYTHON && CYTHON_METH_FASTCALL
@@ -6500,10 +6503,222 @@ bad:
 #endif
 #endif
 
+/* PyObjectCall (used by PyObjectFastCall) */
+#if CYTHON_COMPILING_IN_CPYTHON
+static CYTHON_INLINE PyObject* __Pyx_PyObject_Call(PyObject *func, PyObject *arg, PyObject *kw) {
+    PyObject *result;
+    ternaryfunc call = Py_TYPE(func)->tp_call;
+    if (unlikely(!call))
+        return PyObject_Call(func, arg, kw);
+    if (unlikely(Py_EnterRecursiveCall(" while calling a Python object")))
+        return NULL;
+    result = (*call)(func, arg, kw);
+    Py_LeaveRecursiveCall();
+    if (unlikely(!result) && unlikely(!PyErr_Occurred())) {
+        PyErr_SetString(
+            PyExc_SystemError,
+            "NULL result without error in PyObject_Call");
+    }
+    return result;
+}
+#endif
+
+/* PyObjectCallMethO (used by PyObjectFastCall) */
+#if CYTHON_COMPILING_IN_CPYTHON
+static CYTHON_INLINE PyObject* __Pyx_PyObject_CallMethO(PyObject *func, PyObject *arg) {
+    PyObject *self, *result;
+    PyCFunction cfunc;
+    cfunc = __Pyx_CyOrPyCFunction_GET_FUNCTION(func);
+    self = __Pyx_CyOrPyCFunction_GET_SELF(func);
+    if (unlikely(Py_EnterRecursiveCall(" while calling a Python object")))
+        return NULL;
+    result = cfunc(self, arg);
+    Py_LeaveRecursiveCall();
+    if (unlikely(!result) && unlikely(!PyErr_Occurred())) {
+        PyErr_SetString(
+            PyExc_SystemError,
+            "NULL result without error in PyObject_Call");
+    }
+    return result;
+}
+#endif
+
+/* PyObjectFastCall (used by PyObjectCallOneArg) */
+#if PY_VERSION_HEX < 0x03090000 || CYTHON_COMPILING_IN_LIMITED_API
+static PyObject* __Pyx_PyObject_FastCall_fallback(PyObject *func, PyObject * const*args, size_t nargs, PyObject *kwargs) {
+    PyObject *argstuple;
+    PyObject *result = 0;
+    size_t i;
+    argstuple = PyTuple_New((Py_ssize_t)nargs);
+    if (unlikely(!argstuple)) return NULL;
+    for (i = 0; i < nargs; i++) {
+        Py_INCREF(args[i]);
+        if (__Pyx_PyTuple_SET_ITEM(argstuple, (Py_ssize_t)i, args[i]) != (0)) goto bad;
+    }
+    result = __Pyx_PyObject_Call(func, argstuple, kwargs);
+  bad:
+    Py_DECREF(argstuple);
+    return result;
+}
+#endif
+#if CYTHON_VECTORCALL && !CYTHON_COMPILING_IN_LIMITED_API
+  #if PY_VERSION_HEX < 0x03090000
+    #define __Pyx_PyVectorcall_Function(callable) _PyVectorcall_Function(callable)
+  #elif CYTHON_COMPILING_IN_CPYTHON
+static CYTHON_INLINE vectorcallfunc __Pyx_PyVectorcall_Function(PyObject *callable) {
+    PyTypeObject *tp = Py_TYPE(callable);
+    #if defined(__Pyx_CyFunction_USED)
+    if (__Pyx_CyFunction_CheckExact(callable)) {
+        return __Pyx_CyFunction_func_vectorcall(callable);
+    }
+    #endif
+    if (!PyType_HasFeature(tp, Py_TPFLAGS_HAVE_VECTORCALL)) {
+        return NULL;
+    }
+    assert(PyCallable_Check(callable));
+    Py_ssize_t offset = tp->tp_vectorcall_offset;
+    assert(offset > 0);
+    vectorcallfunc ptr;
+    memcpy(&ptr, (char *) callable + offset, sizeof(ptr));
+    return ptr;
+}
+  #else
+    #define __Pyx_PyVectorcall_Function(callable) PyVectorcall_Function(callable)
+  #endif
+#endif
+static CYTHON_INLINE PyObject* __Pyx_PyObject_FastCallDict(PyObject *func, PyObject *const *args, size_t _nargs, PyObject *kwargs) {
+    Py_ssize_t nargs = __Pyx_PyVectorcall_NARGS(_nargs);
+#if CYTHON_COMPILING_IN_CPYTHON
+    if (nargs == 0 && kwargs == NULL) {
+        if (__Pyx_CyOrPyCFunction_Check(func) && likely( __Pyx_CyOrPyCFunction_GET_FLAGS(func) & METH_NOARGS))
+            return __Pyx_PyObject_CallMethO(func, NULL);
+    }
+    else if (nargs == 1 && kwargs == NULL) {
+        if (__Pyx_CyOrPyCFunction_Check(func) && likely( __Pyx_CyOrPyCFunction_GET_FLAGS(func) & METH_O))
+            return __Pyx_PyObject_CallMethO(func, args[0]);
+    }
+#endif
+    if (kwargs == NULL) {
+        #if CYTHON_VECTORCALL
+          #if CYTHON_COMPILING_IN_LIMITED_API
+            return PyObject_Vectorcall(func, args, _nargs, NULL);
+          #else
+            vectorcallfunc f = __Pyx_PyVectorcall_Function(func);
+            if (f) {
+                return f(func, args, _nargs, NULL);
+            }
+          #endif
+        #endif
+    }
+    if (nargs == 0) {
+        return __Pyx_PyObject_Call(func, __pyx_mstate_global->__pyx_empty_tuple, kwargs);
+    }
+    #if PY_VERSION_HEX >= 0x03090000 && !CYTHON_COMPILING_IN_LIMITED_API
+    return PyObject_VectorcallDict(func, args, (size_t)nargs, kwargs);
+    #else
+    return __Pyx_PyObject_FastCall_fallback(func, args, (size_t)nargs, kwargs);
+    #endif
+}
+
 /* PyObjectCallOneArg (used by CallUnboundCMethod0) */
 static CYTHON_INLINE PyObject* __Pyx_PyObject_CallOneArg(PyObject *func, PyObject *arg) {
     PyObject *args[2] = {NULL, arg};
     return __Pyx_PyObject_FastCall(func, args+1, 1 | __Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET);
+}
+
+/* PyObjectGetAttrStr (used by UnpackUnboundCMethod) */
+#if CYTHON_USE_TYPE_SLOTS
+static CYTHON_INLINE PyObject* __Pyx_PyObject_GetAttrStr(PyObject* obj, PyObject* attr_name) {
+    PyTypeObject* tp = Py_TYPE(obj);
+    if (likely(tp->tp_getattro))
+        return tp->tp_getattro(obj, attr_name);
+    return PyObject_GetAttr(obj, attr_name);
+}
+#endif
+
+/* UnpackUnboundCMethod (used by CallUnboundCMethod0) */
+#if CYTHON_COMPILING_IN_LIMITED_API && __PYX_LIMITED_VERSION_HEX < 0x030C0000
+static PyObject *__Pyx_SelflessCall(PyObject *method, PyObject *args, PyObject *kwargs) {
+    PyObject *result;
+    PyObject *selfless_args = PyTuple_GetSlice(args, 1, PyTuple_Size(args));
+    if (unlikely(!selfless_args)) return NULL;
+    result = PyObject_Call(method, selfless_args, kwargs);
+    Py_DECREF(selfless_args);
+    return result;
+}
+#elif CYTHON_COMPILING_IN_PYPY && PY_VERSION_HEX < 0x03090000
+static PyObject *__Pyx_SelflessCall(PyObject *method, PyObject **args, Py_ssize_t nargs, PyObject *kwnames) {
+        return _PyObject_Vectorcall
+            (method, args ? args+1 : NULL, nargs ? nargs-1 : 0, kwnames);
+}
+#else
+static PyObject *__Pyx_SelflessCall(PyObject *method, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
+    return
+#if PY_VERSION_HEX < 0x03090000
+    _PyObject_Vectorcall
+#else
+    PyObject_Vectorcall
+#endif
+        (method, args ? args+1 : NULL, nargs ? (size_t) nargs-1 : 0, kwnames);
+}
+#endif
+static PyMethodDef __Pyx_UnboundCMethod_Def = {
+     "CythonUnboundCMethod",
+     __PYX_REINTERPRET_FUNCION(PyCFunction, __Pyx_SelflessCall),
+#if CYTHON_COMPILING_IN_LIMITED_API && __PYX_LIMITED_VERSION_HEX < 0x030C0000
+     METH_VARARGS | METH_KEYWORDS,
+#else
+     METH_FASTCALL | METH_KEYWORDS,
+#endif
+     NULL
+};
+static int __Pyx_TryUnpackUnboundCMethod(__Pyx_CachedCFunction* target) {
+    PyObject *method, *result=NULL;
+    method = __Pyx_PyObject_GetAttrStr(target->type, *target->method_name);
+    if (unlikely(!method))
+        return -1;
+    result = method;
+#if CYTHON_COMPILING_IN_CPYTHON
+    if (likely(__Pyx_TypeCheck(method, &PyMethodDescr_Type)))
+    {
+        PyMethodDescrObject *descr = (PyMethodDescrObject*) method;
+        target->func = descr->d_method->ml_meth;
+        target->flag = descr->d_method->ml_flags & ~(METH_CLASS | METH_STATIC | METH_COEXIST | METH_STACKLESS);
+    } else
+#endif
+#if CYTHON_COMPILING_IN_PYPY
+#else
+    if (PyCFunction_Check(method))
+#endif
+    {
+        PyObject *self;
+        int self_found;
+#if CYTHON_COMPILING_IN_LIMITED_API || CYTHON_COMPILING_IN_PYPY
+        self = PyObject_GetAttrString(method, "__self__");
+        if (!self) {
+            PyErr_Clear();
+        }
+#else
+        self = PyCFunction_GET_SELF(method);
+#endif
+        self_found = (self && self != Py_None);
+#if CYTHON_COMPILING_IN_LIMITED_API || CYTHON_COMPILING_IN_PYPY
+        Py_XDECREF(self);
+#endif
+        if (self_found) {
+            PyObject *unbound_method = PyCFunction_New(&__Pyx_UnboundCMethod_Def, method);
+            if (unlikely(!unbound_method)) return -1;
+            Py_DECREF(method);
+            result = unbound_method;
+        }
+    }
+#if !CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
+    if (unlikely(target->method)) {
+        Py_DECREF(result);
+    } else
+#endif
+    target->method = result;
+    return 0;
 }
 
 /* CallUnboundCMethod0 */
@@ -6619,6 +6834,60 @@ static void __Pyx_RaiseDoubleKeywordsError(
 {
     PyErr_Format(PyExc_TypeError,
         "%s() got multiple values for keyword argument '%U'", func_name, kw_name);
+}
+
+/* CallUnboundCMethod2 */
+#if CYTHON_COMPILING_IN_CPYTHON
+static CYTHON_INLINE PyObject *__Pyx_CallUnboundCMethod2(__Pyx_CachedCFunction *cfunc, PyObject *self, PyObject *arg1, PyObject *arg2) {
+    int was_initialized = __Pyx_CachedCFunction_GetAndSetInitializing(cfunc);
+    if (likely(was_initialized == 2 && cfunc->func)) {
+        PyObject *args[2] = {arg1, arg2};
+        if (cfunc->flag == METH_FASTCALL) {
+            return __Pyx_CallCFunctionFast(cfunc, self, args, 2);
+        }
+        if (cfunc->flag == (METH_FASTCALL | METH_KEYWORDS))
+            return __Pyx_CallCFunctionFastWithKeywords(cfunc, self, args, 2, NULL);
+    }
+#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
+    else if (unlikely(was_initialized == 1)) {
+        __Pyx_CachedCFunction tmp_cfunc = {
+#ifndef __cplusplus
+            0
+#endif
+        };
+        tmp_cfunc.type = cfunc->type;
+        tmp_cfunc.method_name = cfunc->method_name;
+        return __Pyx__CallUnboundCMethod2(&tmp_cfunc, self, arg1, arg2);
+    }
+#endif
+    PyObject *result = __Pyx__CallUnboundCMethod2(cfunc, self, arg1, arg2);
+    __Pyx_CachedCFunction_SetFinishedInitializing(cfunc);
+    return result;
+}
+#endif
+static PyObject* __Pyx__CallUnboundCMethod2(__Pyx_CachedCFunction* cfunc, PyObject* self, PyObject* arg1, PyObject* arg2){
+    if (unlikely(!cfunc->func && !cfunc->method) && unlikely(__Pyx_TryUnpackUnboundCMethod(cfunc) < 0)) return NULL;
+#if CYTHON_COMPILING_IN_CPYTHON
+    if (cfunc->func && (cfunc->flag & METH_VARARGS)) {
+        PyObject *result = NULL;
+        PyObject *args = PyTuple_New(2);
+        if (unlikely(!args)) return NULL;
+        Py_INCREF(arg1);
+        PyTuple_SET_ITEM(args, 0, arg1);
+        Py_INCREF(arg2);
+        PyTuple_SET_ITEM(args, 1, arg2);
+        if (cfunc->flag & METH_KEYWORDS)
+            result = __Pyx_CallCFunctionWithKeywords(cfunc, self, args, NULL);
+        else
+            result = __Pyx_CallCFunction(cfunc, self, args);
+        Py_DECREF(args);
+        return result;
+    }
+#endif
+    {
+        PyObject *args[4] = {NULL, self, arg1, arg2};
+        return __Pyx_PyObject_FastCall(cfunc->method, args+1, 3 | __Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET);
+    }
 }
 
 /* ParseKeywordsImpl (used by ParseKeywords) */
@@ -7109,6 +7378,192 @@ static PyObject *__Pyx_PyDict_GetItem(PyObject *d, PyObject* key) {
         }
     }
     return value;
+}
+#endif
+
+/* GetItemInt */
+static PyObject *__Pyx_GetItemInt_Generic(PyObject *o, PyObject* j) {
+    PyObject *r;
+    if (unlikely(!j)) return NULL;
+    r = PyObject_GetItem(o, j);
+    Py_DECREF(j);
+    return r;
+}
+static CYTHON_INLINE PyObject *__Pyx_GetItemInt_List_Fast(PyObject *o, Py_ssize_t i,
+                                                              int wraparound, int boundscheck, int unsafe_shared) {
+    CYTHON_MAYBE_UNUSED_VAR(unsafe_shared);
+#if CYTHON_ASSUME_SAFE_SIZE
+    Py_ssize_t wrapped_i = i;
+    if (wraparound & unlikely(i < 0)) {
+        wrapped_i += PyList_GET_SIZE(o);
+    }
+    if ((CYTHON_AVOID_BORROWED_REFS || CYTHON_AVOID_THREAD_UNSAFE_BORROWED_REFS || !CYTHON_ASSUME_SAFE_MACROS)) {
+        return __Pyx_PyList_GetItemRefFast(o, wrapped_i, unsafe_shared);
+    } else
+    if ((!boundscheck) || likely(__Pyx_is_valid_index(wrapped_i, PyList_GET_SIZE(o)))) {
+        return __Pyx_NewRef(PyList_GET_ITEM(o, wrapped_i));
+    }
+    return __Pyx_GetItemInt_Generic(o, PyLong_FromSsize_t(i));
+#else
+    (void)wraparound;
+    (void)boundscheck;
+    return PySequence_GetItem(o, i);
+#endif
+}
+static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Tuple_Fast(PyObject *o, Py_ssize_t i,
+                                                              int wraparound, int boundscheck, int unsafe_shared) {
+    CYTHON_MAYBE_UNUSED_VAR(unsafe_shared);
+#if CYTHON_ASSUME_SAFE_SIZE && CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
+    Py_ssize_t wrapped_i = i;
+    if (wraparound & unlikely(i < 0)) {
+        wrapped_i += PyTuple_GET_SIZE(o);
+    }
+    if ((!boundscheck) || likely(__Pyx_is_valid_index(wrapped_i, PyTuple_GET_SIZE(o)))) {
+        return __Pyx_NewRef(PyTuple_GET_ITEM(o, wrapped_i));
+    }
+    return __Pyx_GetItemInt_Generic(o, PyLong_FromSsize_t(i));
+#else
+    (void)wraparound;
+    (void)boundscheck;
+    return PySequence_GetItem(o, i);
+#endif
+}
+static CYTHON_INLINE PyObject *__Pyx_GetItemInt_Fast(PyObject *o, Py_ssize_t i, int is_list,
+                                                     int wraparound, int boundscheck, int unsafe_shared) {
+    CYTHON_MAYBE_UNUSED_VAR(unsafe_shared);
+#if CYTHON_ASSUME_SAFE_MACROS && CYTHON_ASSUME_SAFE_SIZE
+    if (is_list || PyList_CheckExact(o)) {
+        Py_ssize_t n = ((!wraparound) | likely(i >= 0)) ? i : i + PyList_GET_SIZE(o);
+        if ((CYTHON_AVOID_BORROWED_REFS || CYTHON_AVOID_THREAD_UNSAFE_BORROWED_REFS)) {
+            return __Pyx_PyList_GetItemRefFast(o, n, unsafe_shared);
+        } else if ((!boundscheck) || (likely(__Pyx_is_valid_index(n, PyList_GET_SIZE(o))))) {
+            return __Pyx_NewRef(PyList_GET_ITEM(o, n));
+        }
+    } else
+    #if !CYTHON_AVOID_BORROWED_REFS
+    if (PyTuple_CheckExact(o)) {
+        Py_ssize_t n = ((!wraparound) | likely(i >= 0)) ? i : i + PyTuple_GET_SIZE(o);
+        if ((!boundscheck) || likely(__Pyx_is_valid_index(n, PyTuple_GET_SIZE(o)))) {
+            return __Pyx_NewRef(PyTuple_GET_ITEM(o, n));
+        }
+    } else
+    #endif
+#endif
+#if CYTHON_USE_TYPE_SLOTS && !CYTHON_COMPILING_IN_PYPY
+    {
+        PyMappingMethods *mm = Py_TYPE(o)->tp_as_mapping;
+        PySequenceMethods *sm = Py_TYPE(o)->tp_as_sequence;
+        if (!is_list && mm && mm->mp_subscript) {
+            PyObject *r, *key = PyLong_FromSsize_t(i);
+            if (unlikely(!key)) return NULL;
+            r = mm->mp_subscript(o, key);
+            Py_DECREF(key);
+            return r;
+        }
+        if (is_list || likely(sm && sm->sq_item)) {
+            if (wraparound && unlikely(i < 0) && likely(sm->sq_length)) {
+                Py_ssize_t l = sm->sq_length(o);
+                if (likely(l >= 0)) {
+                    i += l;
+                } else {
+                    if (!PyErr_ExceptionMatches(PyExc_OverflowError))
+                        return NULL;
+                    PyErr_Clear();
+                }
+            }
+            return sm->sq_item(o, i);
+        }
+    }
+#else
+    if (is_list || !PyMapping_Check(o)) {
+        return PySequence_GetItem(o, i);
+    }
+#endif
+    (void)wraparound;
+    (void)boundscheck;
+    return __Pyx_GetItemInt_Generic(o, PyLong_FromSsize_t(i));
+}
+
+/* TypeImport */
+#ifndef __PYX_HAVE_RT_ImportType_3_2_4
+#define __PYX_HAVE_RT_ImportType_3_2_4
+static PyTypeObject *__Pyx_ImportType_3_2_4(PyObject *module, const char *module_name, const char *class_name,
+    size_t size, size_t alignment, enum __Pyx_ImportType_CheckSize_3_2_4 check_size)
+{
+    PyObject *result = 0;
+    Py_ssize_t basicsize;
+    Py_ssize_t itemsize;
+#if defined(Py_LIMITED_API) || (defined(CYTHON_COMPILING_IN_LIMITED_API) && CYTHON_COMPILING_IN_LIMITED_API)
+    PyObject *py_basicsize;
+    PyObject *py_itemsize;
+#endif
+    result = PyObject_GetAttrString(module, class_name);
+    if (!result)
+        goto bad;
+    if (!PyType_Check(result)) {
+        PyErr_Format(PyExc_TypeError,
+            "%.200s.%.200s is not a type object",
+            module_name, class_name);
+        goto bad;
+    }
+#if !( defined(Py_LIMITED_API) || (defined(CYTHON_COMPILING_IN_LIMITED_API) && CYTHON_COMPILING_IN_LIMITED_API) )
+    basicsize = ((PyTypeObject *)result)->tp_basicsize;
+    itemsize = ((PyTypeObject *)result)->tp_itemsize;
+#else
+    if (size == 0) {
+        return (PyTypeObject *)result;
+    }
+    py_basicsize = PyObject_GetAttrString(result, "__basicsize__");
+    if (!py_basicsize)
+        goto bad;
+    basicsize = PyLong_AsSsize_t(py_basicsize);
+    Py_DECREF(py_basicsize);
+    py_basicsize = 0;
+    if (basicsize == (Py_ssize_t)-1 && PyErr_Occurred())
+        goto bad;
+    py_itemsize = PyObject_GetAttrString(result, "__itemsize__");
+    if (!py_itemsize)
+        goto bad;
+    itemsize = PyLong_AsSsize_t(py_itemsize);
+    Py_DECREF(py_itemsize);
+    py_itemsize = 0;
+    if (itemsize == (Py_ssize_t)-1 && PyErr_Occurred())
+        goto bad;
+#endif
+    if (itemsize) {
+        if (size % alignment) {
+            alignment = size % alignment;
+        }
+        if (itemsize < (Py_ssize_t)alignment)
+            itemsize = (Py_ssize_t)alignment;
+    }
+    if ((size_t)(basicsize + itemsize) < size) {
+        PyErr_Format(PyExc_ValueError,
+            "%.200s.%.200s size changed, may indicate binary incompatibility. "
+            "Expected %zd from C header, got %zd from PyObject",
+            module_name, class_name, size, basicsize+itemsize);
+        goto bad;
+    }
+    if (check_size == __Pyx_ImportType_CheckSize_Error_3_2_4 &&
+            ((size_t)basicsize > size || (size_t)(basicsize + itemsize) < size)) {
+        PyErr_Format(PyExc_ValueError,
+            "%.200s.%.200s size changed, may indicate binary incompatibility. "
+            "Expected %zd from C header, got %zd-%zd from PyObject",
+            module_name, class_name, size, basicsize, basicsize+itemsize);
+        goto bad;
+    }
+    else if (check_size == __Pyx_ImportType_CheckSize_Warn_3_2_4 && (size_t)basicsize > size) {
+        if (PyErr_WarnFormat(NULL, 0,
+                "%.200s.%.200s size changed, may indicate binary incompatibility. "
+                "Expected %zd from C header, got %zd from PyObject",
+                module_name, class_name, size, basicsize) < 0) {
+            goto bad;
+        }
+    }
+    return (PyTypeObject *)result;
+bad:
+    Py_XDECREF(result);
+    return NULL;
 }
 #endif
 
