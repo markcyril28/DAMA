@@ -89,15 +89,15 @@ selfplay:
                                         # of epochs while waiting for next self-play batch.
 
   algo_vs_algo:
-    enabled: true
-    games_per_epoch: 900                # [Part 2] Reduced from 3600. Was 94.7% of training data.
-                                        # 900 algo + 200 ML = ~82% algo. Better balance.
-                                        # ~48K algo entries + ~8.4K ML entries = ~57K per cycle.
-                                        # Cython fast path: ~3ms/easy, ~378ms/hard. Total ~60s.
-    difficulties:                     # Exclude super_hard — matches selfplay decision.
-      - "easy"                        # super_hard ~1s/move even with Cython TT,
-      - "medium"                      # causes 60% longer cycles (pass 8 analysis).
-      - "hard"
+    enabled: false                      # [Pass 61] Disabled — algo-vs-algo has 99.7% P1 win
+                                        # rate, creating extreme bias in reward weighting.
+                                        # Re-enable once model reaches >30% WR and can benefit
+                                        # from diverse training data.
+    games_per_epoch: 200                # [Pass 61] Reduced from 900. Synced with retrain config.
+    difficulties:
+      - "easy"
+      - "medium"
+      # - "hard"                        # [Pass 61] Removed — model at 0% WR
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
@@ -134,8 +134,8 @@ training:
     eta_min: 5.0e-5                     # Higher floor — don't let LR drop below useful range
     warmup_steps: 200
 
-  reward_mode: "cycle"                  # Alternate scoring/uniform epochs — adds regularization
-                                        # diversity without the instability of a LR scheduler
+  reward_mode: "scoring"                # [Pass 61] Changed from "cycle". Consistent reward signal.
+                                        # "cycle" amplifies P1 bias on scoring epochs (pass 56).
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
@@ -146,7 +146,8 @@ dataloader:
   prefetch_factor: 4                   # Unused — FastBatchIterator bypasses DataLoader
   replay_max_entries: 1000000            # 1M entries x ~1.2KB (fp16 on GPU) = ~1.2GB VRAM.
                                         # Float16 GPU storage halves VRAM; was 400K at ~0.7GB.
-  clear_replay_after_load: false        # Accumulate data across self-play cycles for diversity
+  clear_replay_after_load: true         # [Pass 61] Changed from false. Prevents stale/degenerate
+                                        # data from accumulating. Synced with retrain config.
   max_moves_per_sample: 32              # Max legal moves in Dama is ~20; 32 saves 50% vs old default of 64
 
   ram_cache:
