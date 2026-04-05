@@ -425,10 +425,17 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 'result': 0,
                 'score': 0.0,
             })
-            captures = chosen_md.get('captures', ())
-            if captures:
-                game['captures'][game['state'].current_player] += len(captures)
-            game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
+            if _use_compact:
+                prev_pl = game['pl']
+                game['bb'], game['pl'], ncaps = _apply_move_board(
+                    game['bb'], game['pl'], chosen_md)
+                if ncaps > 0:
+                    game['captures'][Player(prev_pl)] += ncaps
+            else:
+                captures = chosen_md.get('captures', ())
+                if captures:
+                    game['captures'][game['state'].current_player] += len(captures)
+                game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
             game['move_count'] += 1
 
         # Batched ML inference — encode using partition-step dicts
@@ -470,15 +477,28 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                     'result': 0,
                     'score': 0.0,
                 })
-                captures = chosen_md.get('captures', ())
-                if captures:
-                    game['captures'][game['state'].current_player] += len(captures)
-                game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
+                if _use_compact:
+                    prev_pl = game['pl']
+                    game['bb'], game['pl'], ncaps = _apply_move_board(
+                        game['bb'], game['pl'], chosen_md)
+                    if ncaps > 0:
+                        game['captures'][Player(prev_pl)] += ncaps
+                else:
+                    captures = chosen_md.get('captures', ())
+                    if captures:
+                        game['captures'][game['state'].current_player] += len(captures)
+                    game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
                 game['move_count'] += 1
 
         # Sequential algo moves — match by path start/end positions
         for game_idx, sd, md in algo_requests:
-            move = get_best_move(games[game_idx]['state'], games[game_idx]['difficulty'],
+            # Compact path: reconstruct GameState from compact dict for algo search.
+            # Cost is ~50μs — negligible vs 200ms-2.5s search.
+            if _use_compact:
+                _algo_state = GameState.from_compact(sd)
+            else:
+                _algo_state = games[game_idx]['state']
+            move = get_best_move(_algo_state, games[game_idx]['difficulty'],
                                  use_parallel=False)
             if move is None:
                 idx = random.randrange(len(md))
@@ -507,10 +527,17 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 'result': 0,
                 'score': 0.0,
             })
-            captures = chosen_md.get('captures', ())
-            if captures:
-                game['captures'][game['state'].current_player] += len(captures)
-            game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
+            if _use_compact:
+                prev_pl = game['pl']
+                game['bb'], game['pl'], ncaps = _apply_move_board(
+                    game['bb'], game['pl'], chosen_md)
+                if ncaps > 0:
+                    game['captures'][Player(prev_pl)] += ncaps
+            else:
+                captures = chosen_md.get('captures', ())
+                if captures:
+                    game['captures'][game['state'].current_player] += len(captures)
+                game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
             game['move_count'] += 1
 
     # Score all games' entries
