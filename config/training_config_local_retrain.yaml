@@ -42,7 +42,10 @@ device:
   type: "cuda"
   amp:
     enabled: true
-    dtype: "float16"                    # float16 + GradScaler for RTX 5050
+    dtype: "bfloat16"                   # [Pass 74] bfloat16 on Blackwell (CC 12.0):
+                                        # - No GradScaler needed (same exponent range as fp32)
+                                        # - Enables fused AdamW (single kernel per step)
+                                        # - Eliminates per-step CUDA sync from GradScaler NaN check
   compile:
     enabled: false                      # [Pass 20] Always fails on RTX 5050 with
                                         # "CUDA driver error: device kernel image is invalid".
@@ -68,11 +71,11 @@ model:
 # losing patterns. algo_vs_algo provides high-quality baseline data.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 12                        # All 12 cores. GPU training uses torch.set_num_threads(1)
-                                        # and bg coordinator is I/O-bound. Matches main local profile.
-  games_per_epoch: 500                  # [Pass 57] Increased from 200. More ML-vs-algo data.
-                                        # 500 games x ~40 moves = ~20K entries/cycle.
-                                        # 250 as P1 + 250 as P2 (focus_side: "both").
+  cpu_workers: 10                        # 10 of 12 cores. Leaves 2 for GPU training thread
+                                        # + bg coordinator. Matches main local profile.
+  games_per_epoch: 200                  # ML-vs-algo games per cycle.
+                                        # 200 games × ~42 moves = ~8.4K entries/cycle.
+                                        # 100 as P1 + 100 as P2 (focus_side: "both").
   difficulties:
     - "easy"                            # Learnable signal for a weak model.
     - "medium"                          # Adds challenge without being impossibly hard.
@@ -83,37 +86,29 @@ selfplay:
   noise_prob: 0.15                      # [Pass 20] Reduced from 0.18. Model has 2K steps
                                         # of learning — slightly less exploration appropriate.
   max_moves_per_game: 150               # Allow endgame play (avg game ~42 moves)
-  pipeline_mode: "simultaneous"      # [Pass 63] Fixed: was "alternate" (value never updated).
-                                        # With alternate mode,
-                                        # 500 games × 42 moves = 20K entries ÷ batch_size 8192 =
-                                        # only 2.5 batches per epoch (~1.6% GPU utilization).
-                                        # Simultaneous: GPU trains on accumulating buffer while
-                                        # CPU generates. Buffer fills to 600K = 73 batches/epoch.
+  pipeline_mode: "simultaneous"         # [Pass 63] CPU self-play overlaps GPU training.
+                                        # GPU trains continuously on accumulating buffer while
+                                        # CPU generates fresh data. Buffer fills to 1M entries
+                                        # = 61 batches/epoch at batch=16384.
   max_stale_epochs: 0                   # [Pass 47] Explicit (was relying on trainer default).
                                         # 0 = unlimited GPU training while CPU generates.
                                         # Thermal protection handles GPU temperature.
 
   algo_vs_algo:
-    enabled: false
-    games_per_epoch: 200                # [Pass 56] Reduced from 900. Algo-vs-algo had 99.7%
-                                        # P1 win rate, creating extreme bias in training data.
-                                        # Currently disabled — all data from ML-vs-algo games.
-                                        # If re-enabled: 200 algo + 500 ML = 28.6% algo.
+    enabled: true
+    games_per_epoch: 4000                # [Pass 73] 4000 hard games via Cython.
+                                        # 4000 × ~42 moves = ~168K entries/cycle from algo.
     difficulties:
-      - "easy"                          # [Pass 56] Removed "hard" — model at 0% WR cannot
-      - "medium"                        # learn from hard demonstrations. Keeps matchups simpler.
+      - "hard"                          # Hard-only provides highest-quality demonstrations.
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 16384                      # [Pass 68] Doubled from 8192. At 16384: ~2.4GB activations.
-                                        # VRAM budget: model 72MB + dataset 0.93GB + pre-shuffle 0.93GB
-                                        # + activations 2.4GB = ~4.3GB of 8GB (54%). Better GPU warp
-                                        # occupancy; 800K entries / 16384 = 48 batches/epoch.
-  learning_rate: 2.8e-4                 # [Pass 68] Sqrt-scaled from 2.0e-4 for 2x batch:
-                                        #   lr_new = 2.0e-4 × sqrt(2) ≈ 2.83e-4, rounded to 2.8e-4.
-                                        # Still below 3.9e-4 crash threshold (fixed LR, no scheduler).
+  batch_size: 16384                      # [Pass 68] ~2.4GB activations of 8GB VRAM.
+                                        # 1M entries / 16384 = 61 batches/epoch.
+  learning_rate: 2.8e-4                 # [Pass 68] Sqrt-scaled from 2.0e-4 for 2x batch
+                                        # (8192→16384). Below 3.9e-4 crash threshold.
   weight_decay: 1.0e-5                  # [Pass 20] Reduced from 1e-4. Original clamp bug
                                         # is fixed — lower regularization lets the model
                                         # learn more freely.
@@ -163,10 +158,9 @@ value_head:
 dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
-  replay_max_entries: 800000              # [Pass 68] Reduced from 1M for batch_size=16384 VRAM budget.
-                                        # 800K × 1168 bytes (fp16 on GPU) = ~0.93GB VRAM. With model
-                                        # (72MB), activations (~2.4GB), pre-shuffle (~0.93GB), total
-                                        # ~4.3GB of 8GB (54%). 48 batches/epoch at batch=16384.
+  replay_max_entries: 1000000             # 1M × 1168 bytes (fp16 storage on GPU) = ~1.17GB VRAM.
+                                        # With model (72MB), activations (~2.4GB at batch=16384),
+                                        # total ~3.7GB of 8GB VRAM. 61 batches/epoch.
   max_moves_per_sample: 32              # Max legal moves in Dama is ~20; saves 50% memory
   clear_replay_after_load: true          # [Pass 56] Clear replay files after loading into buffer.
                                         # Prevents disk from filling with stale data. Buffer holds

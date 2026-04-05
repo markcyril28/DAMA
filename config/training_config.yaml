@@ -240,7 +240,7 @@ profiles:
       type: "cuda"
       amp:
         enabled: true
-        dtype: "float16"
+        dtype: "bfloat16"              # [Pass 74] Blackwell CC 12.0: no GradScaler, fused AdamW
       compile:
         enabled: false                  # [Pass 20]: Always fails on RTX 5050
     selfplay:
