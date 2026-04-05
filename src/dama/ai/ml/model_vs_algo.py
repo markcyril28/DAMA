@@ -378,11 +378,14 @@ def _play_test_games_batch(args: Tuple[str, str, List[int], int]) -> List[Dict[s
                     counts[j] = _encode_moves_fast(sd, md, all_mf[j])
 
             with torch.inference_mode():
-                scores = model.forward_padded(
-                    torch.from_numpy(boards),
-                    torch.from_numpy(all_mf),
-                    torch.from_numpy(counts),
-                )
+                _bt = torch.from_numpy(boards)
+                _mft = torch.from_numpy(all_mf)
+                _mct = torch.from_numpy(counts)
+                # [Pass 68] JIT-traced models use __call__; eager uses forward_padded.
+                if isinstance(model, torch.jit.ScriptModule):
+                    scores = model(_bt, _mft, _mct)
+                else:
+                    scores = model.forward_padded(_bt, _mft, _mct)
 
             for j, (game_idx, legal_moves) in enumerate(ml_requests):
                 best_idx = scores[j, :len(legal_moves)].argmax().item()
