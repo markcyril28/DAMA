@@ -320,6 +320,13 @@ def _play_test_games_batch(args: Tuple[str, str, List[int], int]) -> List[Dict[s
 
     active = list(range(n))
 
+    # [Pass 68] Pre-allocate numpy buffers for ML inference (same pattern as
+    # selfplay.py).  Avoids np.zeros() allocation+zeroing per round.
+    _MAX_M = 32  # matches config max_moves_per_sample
+    _boards_buf = np.zeros((n, 5, 8, 8), dtype=np.float32)
+    _mf_buf = np.zeros((n, _MAX_M, 8), dtype=np.float32)
+    _counts_buf = np.zeros(n, dtype=np.int32)
+
     while active:
         ml_requests = []      # (game_idx, legal_moves)
         algo_requests = []    # (game_idx, legal_moves)
@@ -361,11 +368,11 @@ def _play_test_games_batch(args: Tuple[str, str, List[int], int]) -> List[Dict[s
         # Batched ML inference
         if ml_requests:
             batch_sz = len(ml_requests)
-            max_m = max(len(lm) for _, lm in ml_requests)
 
-            boards = np.zeros((batch_sz, 5, 8, 8), dtype=np.float32)
-            all_mf = np.zeros((batch_sz, max_m, 8), dtype=np.float32)
-            counts = np.zeros(batch_sz, dtype=np.int32)
+            # [Pass 68] Reuse pre-allocated buffers instead of np.zeros() per round.
+            boards = _boards_buf[:batch_sz]
+            all_mf = _mf_buf[:batch_sz]
+            counts = _counts_buf[:batch_sz]
 
             for j, (game_idx, legal_moves) in enumerate(ml_requests):
                 sd = games[game_idx]['state'].to_compact()
@@ -378,17 +385,17 @@ def _play_test_games_batch(args: Tuple[str, str, List[int], int]) -> List[Dict[s
                     counts[j] = _encode_moves_fast(sd, md, all_mf[j])
 
             with torch.inference_mode():
-                _bt = torch.from_numpy(boards)
-                _mft = torch.from_numpy(all_mf)
-                _mct = torch.from_numpy(counts)
-                # [Pass 68] JIT-traced models use __call__; eager uses forward_padded.
-                if isinstance(model, torch.jit.ScriptModule):
-                    scores = model(_bt, _mft, _mct)
-                else:
-                    scores = model.forward_padded(_bt, _mft, _mct)
+                scores = model.forward_padded(
+                    torch.from_numpy(boards),
+                    torch.from_numpy(all_mf),
+                    torch.from_numpy(counts),
+                )
+
+            # [Pass 68] Batch argmax + tolist() avoids per-game .item() dispatch.
+            best_indices_list = scores.argmax(dim=1).tolist()
 
             for j, (game_idx, legal_moves) in enumerate(ml_requests):
-                best_idx = scores[j, :len(legal_moves)].argmax().item()
+                best_idx = best_indices_list[j]
                 g = games[game_idx]
                 g['ml_moves'] += 1
                 g['state'] = g['state'].apply_move(legal_moves[best_idx])
