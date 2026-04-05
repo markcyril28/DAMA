@@ -1227,7 +1227,10 @@ class FastBatchIterator:
             b = mf = mc = tgt = rw = vt = None
             try:
                 perm = torch.randperm(self.n, device=_dev)
-                b = self._boards[perm]
+                # Fancy indexing may not preserve channels_last memory format.
+                # Explicit conversion here (1× per epoch) avoids the model's
+                # forward pass converting every batch (61× per epoch).
+                b = self._boards[perm].contiguous(memory_format=torch.channels_last)
                 mf = self._move_features[perm]
                 mc = self._move_counts[perm]
                 tgt = self._targets[perm]
@@ -1248,25 +1251,38 @@ class FastBatchIterator:
                 del b, mf, mc, tgt, rw, vt
             return
 
-        # Fallback: per-batch fancy-indexing (CPU data, non-shuffle, or low VRAM)
+        # Fallback: CPU data, non-shuffle, or low VRAM
         if self.shuffle:
+            # Shuffle requires fancy indexing (gather kernel per batch)
             indices = torch.randperm(self.n, device=_dev)
+            for start in range(0, self.n, self.batch_size):
+                end = min(start + self.batch_size, self.n)
+                if self.drop_last and (end - start) < self.batch_size:
+                    break
+                idx = indices[start:end]
+                yield (
+                    self._boards[idx].contiguous(memory_format=torch.channels_last),
+                    self._move_features[idx],
+                    self._move_counts[idx],
+                    self._targets[idx],
+                    self._reward_weights[idx],
+                    self._value_targets[idx],
+                )
         else:
-            indices = torch.arange(self.n, device=_dev)
-
-        for start in range(0, self.n, self.batch_size):
-            end = min(start + self.batch_size, self.n)
-            if self.drop_last and (end - start) < self.batch_size:
-                break
-            idx = indices[start:end]
-            yield (
-                self._boards[idx],
-                self._move_features[idx],
-                self._move_counts[idx],
-                self._targets[idx],
-                self._reward_weights[idx],
-                self._value_targets[idx],
-            )
+            # Non-shuffle: direct slicing produces views (zero-copy, no kernel launch).
+            # Avoids torch.arange allocation + per-batch gather that the old path used.
+            for start in range(0, self.n, self.batch_size):
+                end = min(start + self.batch_size, self.n)
+                if self.drop_last and (end - start) < self.batch_size:
+                    break
+                yield (
+                    self._boards[start:end].contiguous(memory_format=torch.channels_last),
+                    self._move_features[start:end],
+                    self._move_counts[start:end],
+                    self._targets[start:end],
+                    self._reward_weights[start:end],
+                    self._value_targets[start:end],
+                )
 
     def update_data(
         self,
