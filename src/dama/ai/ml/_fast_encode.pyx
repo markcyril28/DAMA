@@ -62,17 +62,28 @@ def encode_moves_fast_cy(
     """
     cdef int turn = state_dict['turn']
     cdef str king_key
-    cdef set king_set
     cdef int n, i
     cdef dict m
-    cdef list path, captures
+    cdef object path, captures  # tuple or list from Move.to_dict()
     cdef bint promotion, is_king, flip
     cdef int start_r, start_c, end_r, end_c
     cdef int num_captures
     cdef float cap_ratio
 
+    # C-array king lookup (avoids Python set + tuple construction)
+    cdef int king_rows[12]
+    cdef int king_cols[12]
+    cdef int num_kings, k
+    cdef object kings_list
+
     king_key = 'p1_kings' if turn == 1 else 'p2_kings'
-    king_set = {(pos[0], pos[1]) for pos in state_dict.get(king_key, ())}
+    kings_list = state_dict.get(king_key, ())
+    num_kings = len(kings_list)
+    if num_kings > 12:
+        num_kings = 12
+    for k in range(num_kings):
+        king_rows[k] = kings_list[k][0]
+        king_cols[k] = kings_list[k][1]
     flip = (turn == 2)
 
     n = len(legal_moves)
@@ -88,7 +99,13 @@ def encode_moves_fast_cy(
         start_c = path[0][1]
         end_r = path[len(path) - 1][0]
         end_c = path[len(path) - 1][1]
-        is_king = (start_r, start_c) in king_set
+
+        # C-array scan for king check (no Python set/tuple overhead)
+        is_king = False
+        for k in range(num_kings):
+            if king_rows[k] == start_r and king_cols[k] == start_c:
+                is_king = True
+                break
 
         if flip:
             start_r = 7 - start_r
@@ -130,12 +147,18 @@ def preprocess_chunk_cy(
     cdef int row, col, start_r, start_c, end_r, end_c, num_captures
     cdef int path_len
     cdef dict state_dict, m_dict
-    cdef list path, legal_moves_list, mapping
-    cdef object positions, captures  # can be list or tuple from .get() defaults
+    cdef object path, captures  # tuple or list from Move.to_dict()
+    cdef list legal_moves_list, mapping
+    cdef object positions  # can be list or tuple from .get() defaults
     cdef str key, king_key
     cdef bint promotion, is_king, flip
-    cdef set king_set
     cdef float cap_ratio
+
+    # C-array king lookup (avoids Python set + tuple per entry)
+    cdef int king_rows[12]
+    cdef int king_cols[12]
+    cdef int num_kings, k
+    cdef object kings_list
 
     for i in range(n):
         entry = entries[start_idx + i]
@@ -162,9 +185,15 @@ def preprocess_chunk_cy(
                 boards[i, plane_idx, row, col] = 1.0
         boards[i, 4, :, :] = 1.0
 
-        # ── Encode moves ──
+        # ── Encode moves ── (C-array king lookup)
         king_key = 'p1_kings' if turn == 1 else 'p2_kings'
-        king_set = {(pos[0], pos[1]) for pos in state_dict.get(king_key, ())}
+        kings_list = state_dict.get(king_key, ())
+        num_kings = len(kings_list)
+        if num_kings > 12:
+            num_kings = 12
+        for k in range(num_kings):
+            king_rows[k] = kings_list[k][0]
+            king_cols[k] = kings_list[k][1]
 
         legal_moves_list = entry.legal_moves
         num_moves = len(legal_moves_list)
@@ -181,7 +210,11 @@ def preprocess_chunk_cy(
             path_len = len(path)
             end_r = path[path_len - 1][0]
             end_c = path[path_len - 1][1]
-            is_king = (start_r, start_c) in king_set
+            is_king = False
+            for k in range(num_kings):
+                if king_rows[k] == start_r and king_cols[k] == start_c:
+                    is_king = True
+                    break
 
             if flip:
                 start_r = 7 - start_r
@@ -239,8 +272,13 @@ def preprocess_dicts_chunk_cy(
     cdef object positions, captures  # can be list or tuple from .get() defaults
     cdef str key, king_key
     cdef bint promotion, is_king, flip
-    cdef set king_set
     cdef float cap_ratio
+
+    # C-array king lookup (avoids Python set + tuple per entry)
+    cdef int king_rows[12]
+    cdef int king_cols[12]
+    cdef int num_kings, k
+    cdef object kings_list
 
     for i in range(n):
         ed = entry_dicts[start_idx + i]
@@ -266,9 +304,15 @@ def preprocess_dicts_chunk_cy(
                 boards[i, plane_idx, row, col] = 1.0
         boards[i, 4, :, :] = 1.0
 
-        # ── Encode moves ──
+        # ── Encode moves ── (C-array king lookup)
         king_key = 'p1_kings' if turn == 1 else 'p2_kings'
-        king_set = {(pos[0], pos[1]) for pos in state_dict.get(king_key, ())}
+        kings_list = state_dict.get(king_key, ())
+        num_kings = len(kings_list)
+        if num_kings > 12:
+            num_kings = 12
+        for k in range(num_kings):
+            king_rows[k] = kings_list[k][0]
+            king_cols[k] = kings_list[k][1]
 
         legal_moves_list = ed['legal_moves']
         num_moves = len(legal_moves_list)
@@ -285,7 +329,11 @@ def preprocess_dicts_chunk_cy(
             path_len = len(path)
             end_r = path[path_len - 1][0]
             end_c = path[path_len - 1][1]
-            is_king = (start_r, start_c) in king_set
+            is_king = False
+            for k in range(num_kings):
+                if king_rows[k] == start_r and king_cols[k] == start_c:
+                    is_king = True
+                    break
 
             if flip:
                 start_r = 7 - start_r
