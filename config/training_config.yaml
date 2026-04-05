@@ -244,8 +244,10 @@ profiles:
       compile:
         enabled: false                  # [Pass 20]: Always fails on RTX 5050
     selfplay:
-      cpu_workers: 11
+      cpu_workers: 12
       games_per_epoch: 200
+      max_moves_per_game: 150             # [Pass 70] Override base 100; matches local configs
+      max_stale_epochs: 0                 # [Pass 70] Explicit unlimited; thermal handles GPU temp
       difficulties:
         - "easy"
         - "medium"
@@ -258,14 +260,14 @@ profiles:
           - "medium"
           # - "hard"                        # Re-enable when model is competitive
     training:
-      batch_size: 8192
-      learning_rate: 2.0e-4
+      batch_size: 16384                   # [Pass 68] 2x for better GPU warp occupancy (4.3GB/8GB VRAM)
+      learning_rate: 2.8e-4               # [Pass 68] Sqrt-scaled from 2.0e-4 for 2x batch
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: false                  # LR scheduler caused catastrophic regression.
     dataloader:
       num_workers: 0
-      replay_max_entries: 1000000        # Synced with training_config_local.yaml
+      replay_max_entries: 800000          # [Pass 68] Reduced from 1M for batch=16384 VRAM budget
       ram_cache:
         enabled: true
         threshold_gb: 16.0

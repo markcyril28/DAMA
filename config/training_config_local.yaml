@@ -1,7 +1,7 @@
 # =============================================================================
 # Local Training Configuration (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
 # =============================================================================
-# Updated 2026-04-05 based on training analysis pass 59.
+# Updated 2026-04-05 based on optimization pass 66.
 #
 # Current state: model at step 2000, 0% WR vs medium/easy. All prior high-WR
 # checkpoints (step 50K, 43% WR) were lost. Use auto-detect (checkpoint_path=null)
@@ -64,7 +64,10 @@ value_head:
 # Re-enable ML self-play (opponent_focus: "both") once WR exceeds 30%.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 11                       # 11 of 12 cores — 1 for GPU thread + system
+  cpu_workers: 12                       # All 12 cores. GPU training uses torch.set_num_threads(1)
+                                        # and the bg self-play coordinator is I/O-bound (waiting on
+                                        # futures). OS scheduling handles the minimal time-slicing
+                                        # needed for the training thread's rare CPU ops.
   games_per_epoch: 200                  # [Part 2] Doubled from 100. More ML-vs-algo data per cycle.
                                         # 200 games x ~42 moves = ~8.4K entries/cycle from ML games.
                                         # With algo-vs-algo, total ~57K entries/cycle.
@@ -103,15 +106,12 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 8192                      # Doubled from 4096. At 4096: ~0.6GB VRAM activations.
-                                        # At 8192: ~1.2GB — only 15% of 8GB VRAM. Leaves ~6.8GB
-                                        # for model (~18MB) + GPU-resident data (~1.2GB for 1M
-                                        # entries fp16) + overhead. Better GPU warp occupancy.
-                                        # At 1M entries: ~122 batches/epoch — still plenty of
-                                        # gradient updates per data pass.
-  learning_rate: 2.0e-4                 # Sqrt-scaled from 1.5e-4 for 2x batch:
-                                        #   lr_new = 1.5e-4 × sqrt(8192/4096) = 2.12e-4
-                                        #   rounded to 2.0e-4.
+  batch_size: 16384                     # [Pass 68] Doubled from 8192. At 16384: ~2.4GB activations.
+                                        # VRAM budget: model 72MB + dataset 0.93GB + pre-shuffle 0.93GB
+                                        # + activations 2.4GB = ~4.3GB of 8GB (54%). Better GPU warp
+                                        # occupancy. At 800K entries: 48 batches/epoch.
+  learning_rate: 2.8e-4                 # [Pass 68] Sqrt-scaled from 2.0e-4 for 2x batch:
+                                        #   lr_new = 2.0e-4 × sqrt(16384/8192) ≈ 2.83e-4, rounded 2.8e-4.
                                         # Still well below the 3.9e-4 that caused the crash.
   weight_decay: 1.0e-5                  # Model is underfitting — keep regularization minimal
   grad_clip_norm: 1.0                   # Standard clipping — stable with algo-only data
@@ -144,10 +144,11 @@ dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
   prefetch_factor: 4                   # Unused — FastBatchIterator bypasses DataLoader
-  replay_max_entries: 1000000            # 1M entries x ~1.2KB (fp16 on GPU) = ~1.2GB VRAM.
-                                        # Float16 GPU storage halves VRAM; was 400K at ~0.7GB.
-  clear_replay_after_load: true         # [Pass 61] Changed from false. Prevents stale/degenerate
-                                        # data from accumulating. Synced with retrain config.
+  replay_max_entries: 800000             # [Pass 68] Reduced from 1M for batch=16384 VRAM budget.
+                                        # 800K × 1168 bytes (fp16) = ~0.93GB VRAM. Total with
+                                        # activations (2.4GB) + pre-shuffle (0.93GB) = 4.3GB of 8GB.
+  clear_replay_after_load: true          # [Pass 61] Prevents stale/degenerate data from
+                                        # accumulating. Synced with retrain config.
   max_moves_per_sample: 32              # Max legal moves in Dama is ~20; 32 saves 50% vs old default of 64
 
   ram_cache:
@@ -258,8 +259,8 @@ profiles:
       cpu_workers: 11                   # Matches top-level
       games_per_epoch: 200              # [Part 3] Fixed: now matches top-level
     training:
-      batch_size: 8192                  # Matches top-level
-      learning_rate: 2.0e-4             # Matches top-level
+      batch_size: 16384                 # [Pass 68] Matches top-level
+      learning_rate: 2.8e-4             # [Pass 68] Matches top-level
 
   cpu:
     device:
