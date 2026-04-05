@@ -96,7 +96,7 @@ export TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE=1
 # =============================================================================
 # Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
 # The training thread uses GPU for all compute; these libraries would otherwise
-# spawn threads that compete with the 52 self-play worker processes.
+# spawn threads that compete with the 96 self-play worker processes.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
