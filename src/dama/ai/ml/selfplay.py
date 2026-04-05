@@ -298,24 +298,45 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
 
     n = len(batch_args)
 
+    # [Pass 75] Compact-state path: maintain board as raw bytes (int8[64])
+    # instead of GameState objects. Eliminates Move.from_dict + Board.__init__
+    # + GameState.__init__ per position (~100-200μs saved per move).
+    _use_compact = _HAS_COMPACT_STATE
+
     # Initialize all games
     games = []
-    for difficulty, max_moves, noise_prob, start_player, p1_pol, p2_pol, _mp, _dev in batch_args:
-        games.append({
-            'state': GameState(
-                board=Board.initial(),
-                current_player=Player(start_player),
-                move_count=0,
-            ),
-            'entries': [],
-            'p1_policy': p1_pol,
-            'p2_policy': p2_pol,
-            'difficulty': difficulty,
-            'noise_prob': noise_prob,
-            'max_moves': max_moves,
-            'move_count': 0,
-            'captures': {Player.ONE: 0, Player.TWO: 0},
-        })
+    if _use_compact:
+        _init_bb = _init_board_bytes()
+        for difficulty, max_moves, noise_prob, start_player, p1_pol, p2_pol, _mp, _dev in batch_args:
+            games.append({
+                'bb': _init_bb,  # raw board bytes (64 int8)
+                'pl': int(start_player),  # current player (1 or 2)
+                'entries': [],
+                'p1_policy': p1_pol,
+                'p2_policy': p2_pol,
+                'difficulty': difficulty,
+                'noise_prob': noise_prob,
+                'max_moves': max_moves,
+                'move_count': 0,
+                'captures': {Player.ONE: 0, Player.TWO: 0},
+            })
+    else:
+        for difficulty, max_moves, noise_prob, start_player, p1_pol, p2_pol, _mp, _dev in batch_args:
+            games.append({
+                'state': GameState(
+                    board=Board.initial(),
+                    current_player=Player(start_player),
+                    move_count=0,
+                ),
+                'entries': [],
+                'p1_policy': p1_pol,
+                'p2_policy': p2_pol,
+                'difficulty': difficulty,
+                'noise_prob': noise_prob,
+                'max_moves': max_moves,
+                'move_count': 0,
+                'captures': {Player.ONE: 0, Player.TWO: 0},
+            })
 
     active = list(range(n))
 
