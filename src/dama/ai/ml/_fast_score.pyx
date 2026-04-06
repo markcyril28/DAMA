@@ -13,8 +13,16 @@ in the hot scoring loop.  ~30-40% faster than .get() + pos[0]/pos[1].
 from libc.math cimport exp, log
 from cpython.dict cimport PyDict_GetItem
 from cpython.tuple cimport PyTuple_GET_ITEM
+from cpython.list cimport PyList_GET_ITEM
 from cpython.long cimport PyLong_AsLong
 from cpython.ref cimport PyObject
+
+
+# [Pass 83] Safe element accessor for tuples AND lists — see _fast_encode.pyx.
+cdef inline object _pos_item(object pos, Py_ssize_t i):
+    if type(pos) is tuple:
+        return <object>PyTuple_GET_ITEM(pos, i)
+    return <object>PyList_GET_ITEM(pos, i)
 
 cimport cython
 
@@ -156,8 +164,8 @@ cdef double _positional_compact(dict state_dict, int player_int):
 
     for pos in men_list:
         # C-level tuple element access: no bounds check, no __getitem__
-        row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-        col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+        row = PyLong_AsLong(_pos_item(pos, 0))
+        col = PyLong_AsLong(_pos_item(pos, 1))
         if 2 <= row <= 5 and 2 <= col <= 5:
             score += CENTER_BONUS
         if player_int == 1:
@@ -171,8 +179,8 @@ cdef double _positional_compact(dict state_dict, int player_int):
             score += EDGE_PENALTY
 
     for pos in kings_list:
-        row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-        col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+        row = PyLong_AsLong(_pos_item(pos, 0))
+        col = PyLong_AsLong(_pos_item(pos, 1))
         if 2 <= row <= 5 and 2 <= col <= 5:
             score += CENTER_BONUS
         if row == start_row:
@@ -256,8 +264,8 @@ def score_game_dicts_cy(
         start_row = 0 if player_int == 1 else 7
 
         for pos in my_men_list:
-            row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            row = PyLong_AsLong(_pos_item(pos, 0))
+            col = PyLong_AsLong(_pos_item(pos, 1))
             if 2 <= row <= 5 and 2 <= col <= 5:
                 pos_score += CENTER_BONUS
             if player_int == 1:
@@ -275,8 +283,8 @@ def score_game_dicts_cy(
             num_kings = 12
         for j in range(num_kings):
             pos = my_kings_list[j]
-            king_rows[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            king_cols[j] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            king_rows[j] = PyLong_AsLong(_pos_item(pos, 0))
+            king_cols[j] = PyLong_AsLong(_pos_item(pos, 1))
             row = king_rows[j]
             col = king_cols[j]
             if 2 <= row <= 5 and 2 <= col <= 5:
@@ -302,8 +310,8 @@ def score_game_dicts_cy(
                 # Check if start position is a king (C-array scan, no set/tuple)
                 path = m[_K_PATH]
                 pos = path[0]
-                sr = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-                sc = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+                sr = PyLong_AsLong(_pos_item(pos, 0))
+                sc = PyLong_AsLong(_pos_item(pos, 1))
                 is_king = False
                 for j in range(num_kings):
                     if king_rows[j] == sr and king_cols[j] == sc:
