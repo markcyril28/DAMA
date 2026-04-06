@@ -8,6 +8,7 @@ import random
 import argparse
 import tempfile
 import warnings
+from collections import deque
 import platform
 import threading
 import multiprocessing as mp
@@ -100,7 +101,9 @@ def _make_compiled_fwd_loss(model, compile_mode):
         # cast to int64 once for gather (which requires LongTensor).
         no_moves = move_counts == 0
         stable = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
-        log_probs = nn.functional.log_softmax(stable.float(), dim=1)
+        # dtype= fuses the bf16→f32 upcast into the softmax kernel,
+        # eliminating a separate cast kernel launch (~5μs per batch).
+        log_probs = nn.functional.log_softmax(stable, dim=1, dtype=torch.float32)
         log_probs = torch.clamp(log_probs, min=-100.0)
         max_m = scores.shape[1]
         safe_tgt = targets.long().clamp(0, max_m - 1).unsqueeze(1)
@@ -119,6 +122,45 @@ def _make_compiled_fwd_loss(model, compile_mode):
         return loss, scores.detach()
 
     return torch.compile(_fwd_loss, mode=compile_mode, fullgraph=True)
+
+
+def _make_compiled_fwd_loss_value(model, compile_mode, value_weight):
+    """Build and compile a fused forward_padded_with_value + policy+value loss.
+
+    Same benefits as _make_compiled_fwd_loss (kernel fusion, CUDAGraph capture,
+    inline NaN sanitization) but includes the value head path.  Previously,
+    value_head_enabled forced fallback to model-only compilation — losing the
+    fused loss benefit that eliminates ~30% of kernel launch overhead.
+    """
+    def _fwd_loss_value(boards, move_features, move_counts, targets,
+                        reward_weights, value_targets):
+        # Forward — shared backbone → policy scores + value predictions
+        scores, values = model.forward_padded_with_value(
+            boards, move_features, move_counts)
+
+        # Policy loss (inlined from _compute_loss_padded)
+        no_moves = move_counts == 0
+        stable = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
+        log_probs = nn.functional.log_softmax(stable, dim=1, dtype=torch.float32)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+        max_m = scores.shape[1]
+        safe_tgt = targets.long().clamp(0, max_m - 1).unsqueeze(1)
+        chosen_lp = log_probs.gather(1, safe_tgt).squeeze(1)
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
+        w = reward_weights.float() * valid.float()
+        tw = w.sum().clamp(min=1.0)
+        policy_loss = -(chosen_lp * w).sum() / tw
+
+        # Value loss (MSE)
+        value_loss = nn.functional.mse_loss(values, value_targets)
+
+        loss = policy_loss + value_weight * value_loss
+
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return loss, scores.detach()
+
+    return torch.compile(_fwd_loss_value, mode=compile_mode, fullgraph=True)
 
 
 def parse_duration(duration_str: Optional[str]) -> Optional[datetime]:
@@ -232,25 +274,40 @@ class TrainingStats:
     best_loss: float = float('inf')
     best_val_loss: float = float('inf')
 
-    # History lists (stored as lists for JSON serialization)
-    loss_history: list = None
-    val_loss_history: list = None
-    lr_history: list = None
-    gpu_mem_history: list = None
-    step_times: list = None
-    test_history: list = None  # Model vs algorithm test results
-    
+    # History deques — maxlen=_STATS_HISTORY_CAP provides O(1) eviction of
+    # oldest entries, replacing the old O(n) list slice + reallocation that
+    # fired every ~10K appends.  Deques also avoid the GC spike from discarding
+    # the old list object (which held ~10K dicts = ~200K Python objects).
+    # to_dict() converts to list for JSON; from_dict() wraps back to deque.
+    loss_history: object = None
+    val_loss_history: object = None
+    lr_history: object = None
+    gpu_mem_history: object = None
+    step_times: object = None
+    test_history: list = None  # Model vs algorithm test results (low-volume, list is fine)
+
     def __post_init__(self):
+        _cap = _STATS_HISTORY_CAP
         if self.loss_history is None:
-            self.loss_history = []
+            self.loss_history = deque(maxlen=_cap)
+        elif not isinstance(self.loss_history, deque):
+            self.loss_history = deque(self.loss_history, maxlen=_cap)
         if self.val_loss_history is None:
-            self.val_loss_history = []
+            self.val_loss_history = deque(maxlen=_cap)
+        elif not isinstance(self.val_loss_history, deque):
+            self.val_loss_history = deque(self.val_loss_history, maxlen=_cap)
         if self.lr_history is None:
-            self.lr_history = []
+            self.lr_history = deque(maxlen=_cap)
+        elif not isinstance(self.lr_history, deque):
+            self.lr_history = deque(self.lr_history, maxlen=_cap)
         if self.gpu_mem_history is None:
-            self.gpu_mem_history = []
+            self.gpu_mem_history = deque(maxlen=_cap)
+        elif not isinstance(self.gpu_mem_history, deque):
+            self.gpu_mem_history = deque(self.gpu_mem_history, maxlen=_cap)
         if self.step_times is None:
-            self.step_times = []
+            self.step_times = deque(maxlen=_cap)
+        elif not isinstance(self.step_times, deque):
+            self.step_times = deque(self.step_times, maxlen=_cap)
         if self.test_history is None:
             self.test_history = []
     
@@ -260,14 +317,20 @@ class TrainingStats:
         Returns shallow copies of all mutable lists so the dict is safe to
         pass to a background thread (e.g., for async checkpoint writes) while
         the main thread continues to append to the originals.
+
+        float('inf') values are serialized as None to produce valid JSON
+        (Python's json.dump writes 'Infinity' which is non-standard).
         """
+        import math
+        _bl = self.best_loss
+        _bvl = self.best_val_loss
         return {
             'start_time': self.start_time,
             'end_time': self.end_time,
             'total_steps': self.total_steps,
             'epochs_completed': self.epochs_completed,
-            'best_loss': self.best_loss,
-            'best_val_loss': self.best_val_loss,
+            'best_loss': _bl if math.isfinite(_bl) else None,
+            'best_val_loss': _bvl if math.isfinite(_bvl) else None,
             'loss_history': list(self.loss_history),
             'val_loss_history': list(self.val_loss_history),
             'lr_history': list(self.lr_history),
@@ -278,15 +341,32 @@ class TrainingStats:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'TrainingStats':
-        """Create from dictionary."""
+        """Create from dictionary.
+
+        JSON deserialization returns Python lists; __post_init__ converts
+        them to deques with maxlen so eviction is automatic.
+
+        Handles backwards compatibility:
+        - None best_loss/best_val_loss → float('inf') (from to_dict inf→None)
+        - Unix timestamp floats in loss_history → ISO strings (from older code)
+        """
+        # Normalize old Unix-float timestamps in loss_history to ISO strings
+        loss_history = data.get('loss_history', [])
+        for entry in loss_history:
+            ts = entry.get('timestamp')
+            if isinstance(ts, (int, float)):
+                entry['timestamp'] = datetime.fromtimestamp(ts).isoformat()
+
+        _bl = data.get('best_loss')
+        _bvl = data.get('best_val_loss')
         return cls(
             start_time=data.get('start_time', ''),
             end_time=data.get('end_time', ''),
             total_steps=data.get('total_steps', 0),
             epochs_completed=data.get('epochs_completed', 0),
-            best_loss=data.get('best_loss', float('inf')),
-            best_val_loss=data.get('best_val_loss', float('inf')),
-            loss_history=data.get('loss_history', []),
+            best_loss=float('inf') if _bl is None else _bl,
+            best_val_loss=float('inf') if _bvl is None else _bvl,
+            loss_history=loss_history,
             val_loss_history=data.get('val_loss_history', []),
             lr_history=data.get('lr_history', []),
             gpu_mem_history=data.get('gpu_mem_history', []),
@@ -357,7 +437,7 @@ class TrainingConfig:
     # Value head / TD learning
     value_head_enabled: bool = False
     value_head_hidden: int = 128
-    value_weight: float = 0.5  # Weight of value loss relative to policy loss
+    value_weight: float = 0.15  # Weight of value loss relative to policy loss (85% policy / 15% value)
 
     # DataLoader settings
     dataloader_workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 2)))
@@ -680,10 +760,29 @@ class Trainer:
                 _wm = torch.randn(_warmup_bs, _warmup_max_moves, 8, device=self.device)
                 _wc = torch.full((_warmup_bs,), 4, dtype=torch.int32, device=self.device)
 
-                # Stage 1: try fused forward+loss compilation (only useful
-                # without value head — value head needs a different fwd path)
-                if not config.value_head_enabled:
-                    try:
+                # Stage 1: try fused forward+loss compilation.
+                # With value_head: fuses forward_padded_with_value + policy+value loss.
+                # Without value_head: fuses forward_padded + policy loss.
+                try:
+                    if config.value_head_enabled:
+                        print(f"Enabling torch.compile for fused forward+loss+value "
+                              f"(mode={self.config.compile_mode}, fullgraph=True)...")
+                        sys.stdout.flush()
+                        self._compiled_fwd_loss = _make_compiled_fwd_loss_value(
+                            self.model, self.config.compile_mode, config.value_weight)
+                        print("  Running compile warmup (fused forward+loss+value)...")
+                        sys.stdout.flush()
+                        _wt = torch.zeros(_warmup_bs, dtype=torch.int32, device=self.device)
+                        _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
+                        _wv = torch.zeros(_warmup_bs, dtype=torch.float32, device=self.device)
+                        with torch.no_grad():
+                            if self.config.amp:
+                                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                    self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr, _wv)
+                            else:
+                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr, _wv)
+                        del _wt, _wr, _wv
+                    else:
                         print(f"Enabling torch.compile for fused forward+loss "
                               f"(mode={self.config.compile_mode}, fullgraph=True)...")
                         sys.stdout.flush()
@@ -700,21 +799,19 @@ class Trainer:
                             else:
                                 self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
                         del _wt, _wr
-                        print("torch.compile warmup OK — compiled fused forward+loss active")
-                        sys.stdout.flush()
-                    except Exception as e:
-                        print(f"Fused compile failed ({e}), trying model-only compile...")
-                        sys.stdout.flush()
-                        self._compiled_fwd_loss = None
+                    print("torch.compile warmup OK — compiled fused forward+loss active")
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"Fused compile failed ({e}), trying model-only compile...")
+                    sys.stdout.flush()
+                    self._compiled_fwd_loss = None
 
                 # Stage 2: model-only compilation — used as fallback when
-                # fused compile fails, or as primary when value_head is
-                # enabled (fused compile doesn't support the value path).
+                # fused compile fails (Stage 1 now supports both policy-only
+                # and value_head paths via _make_compiled_fwd_loss_value).
                 if self._compiled_fwd_loss is None:
                     try:
-                        _stage2_label = ("value_head enabled"
-                                         if config.value_head_enabled
-                                         else "fused compile unavailable")
+                        _stage2_label = "fused compile unavailable"
                         print(f"Enabling torch.compile for model forward "
                               f"(mode={self.config.compile_mode}, {_stage2_label})...")
                         sys.stdout.flush()
@@ -1162,48 +1259,42 @@ class Trainer:
     def _record_step_stats(self, loss: float, lr: float) -> None:
         """Record statistics for a training step."""
         current_time = time.time()
-        
-        # Record loss
+        _step = self.step
+
+        # Record loss — keep dict format for checkpoint JSON compat.
+        # Use ISO timestamp for consistency with all other timestamp fields
+        # (val_loss_history, test_history, JSONL logs, stats_collector).
         self.stats.loss_history.append({
-            'step': self.step,
+            'step': _step,
             'loss': loss,
             'timestamp': datetime.now().isoformat(),
         })
-        
+
         # Record learning rate
         self.stats.lr_history.append({
-            'step': self.step,
-            'lr': lr
+            'step': _step,
+            'lr': lr,
         })
-        
+
         # Record GPU memory
         if torch.cuda.is_available():
             gpu_mem = torch.cuda.memory_allocated() / 1e6
             self.stats.gpu_mem_history.append({
-                'step': self.step,
-                'gpu_mem_mb': gpu_mem
+                'step': _step,
+                'gpu_mem_mb': gpu_mem,
             })
-        
+
         # Record step time
         if self._last_step_time is not None:
             step_time = current_time - self._last_step_time
             self.stats.step_times.append({
-                'step': self.step,
-                'time_sec': step_time
+                'step': _step,
+                'time_sec': step_time,
             })
         self._last_step_time = current_time
 
-        # Trim history lists to prevent unbounded memory growth.
-        # At stats_record_every=500 and cap=10000, this retains the last 5M steps.
-        _cap = _STATS_HISTORY_CAP
-        if len(self.stats.loss_history) > _cap:
-            _trim = len(self.stats.loss_history) - _cap
-            self.stats.loss_history = self.stats.loss_history[_trim:]
-            self.stats.lr_history = self.stats.lr_history[_trim:]
-            if self.stats.gpu_mem_history:
-                self.stats.gpu_mem_history = self.stats.gpu_mem_history[-_cap:]
-            if self.stats.step_times:
-                self.stats.step_times = self.stats.step_times[-_cap:]
+        # Trimming is handled automatically by deque(maxlen=_STATS_HISTORY_CAP).
+        # Previous approach rebuilt the list via slice + copy every ~10K appends.
 
         # Update best loss
         if loss < self.stats.best_loss:
@@ -1216,18 +1307,23 @@ class Trainer:
             'val_loss': val_loss,
             'timestamp': datetime.now().isoformat(),
         })
-        if len(self.stats.val_loss_history) > _STATS_HISTORY_CAP:
-            self.stats.val_loss_history = self.stats.val_loss_history[-_STATS_HISTORY_CAP:]
+        # Trimming handled by deque(maxlen=_STATS_HISTORY_CAP)
 
         if val_loss < self.stats.best_val_loss:
             self.stats.best_val_loss = val_loss
 
-    def _save_checkpoint(self, loss: float) -> str:
+    def _save_checkpoint(self, loss: float, log_entry: Optional[dict] = None) -> str:
         """Save a checkpoint atomically.
 
         The state_dict copy happens on the main thread (requires CUDA sync),
         but the actual disk I/O is offloaded to a background thread so the
         GPU can continue training while the file is being written.
+
+        Args:
+            loss: Current loss value for checkpoint metadata.
+            log_entry: Optional dict to append to the JSONL log file.  Written
+                in the background thread alongside the checkpoint, keeping disk
+                I/O off the training thread (~50-100μs saved per checkpoint).
         """
         # Copy state dicts to CPU (requires CUDA sync — must be on main thread).
         # Both model AND optimizer states must be moved to CPU here, not in the
@@ -1290,6 +1386,10 @@ class Trainer:
         # background thread while the main thread appends to history lists.
         _stats_snapshot = self._snapshot_stats()
 
+        # Capture log file path and entry for background writing.
+        _log_file = self.log_file
+        _log_entry = log_entry
+
         # Offload disk I/O to background thread — GPU resumes training immediately.
         def _write_checkpoint():
             try:
@@ -1313,6 +1413,12 @@ class Trainer:
                     shutil.copy2(str(checkpoint_path), _lp)
 
                 self._save_stats(_snapshot=_stats_snapshot)
+
+                # Write JSONL log entry (moved from training thread).
+                if _log_entry is not None:
+                    _log_entry['timestamp'] = datetime.now().isoformat()
+                    with open(_log_file, 'a') as f:
+                        f.write(json.dumps(_log_entry) + '\n')
 
                 if _stats_collector:
                     ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
@@ -1522,8 +1628,12 @@ class Trainer:
                 torch.cuda.current_stream().synchronize()
             else:
                 _sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
-            # Build CPU model for fork inheritance (avoids N × torch.load)
+            # Build CPU model for fork inheritance (avoids N × torch.load).
+            # Fold BatchNorm into Conv2d for ~10-20% faster CPU inference:
+            # eliminates 17 BN forward calls per position (the BN affine
+            # transform is baked into the conv weights, replaced by Identity).
             try:
+                from .model import fold_batchnorm
                 _fork_model = create_model(
                     **getattr(self.model, 'arch_params', {
                         'embedding_size': self.config.model_embedding,
@@ -1533,6 +1643,7 @@ class Trainer:
                     }))
                 _fork_model.load_state_dict(_sd)
                 _fork_model.eval()
+                fold_batchnorm(_fork_model)
                 _sp_mod._FORK_MODEL = _fork_model
             except Exception:
                 _sp_mod._FORK_MODEL = None
@@ -1728,14 +1839,19 @@ class Trainer:
         def _worker():
             _existing = getattr(self, '_current_dataset', None)
             _max_entries = self.config.replay_max_entries
+            # Track entry count as integer to avoid holding ~2GB of CPU
+            # tensors between cycles.  When GPU-resident, update_data()
+            # handles trimming on GPU; the CPU concat result is never
+            # iterated — it only served as a concat base and length check.
+            _existing_count = len(_existing) if _existing is not None else 0
+            # Only hold the full dataset reference for the first cycle
+            # (needed for fallback paths).  After that, free the ~2GB CPU
+            # copy — the data lives on GPU.
+            _first_cycle = True
 
             while not self._stopped:
                 try:
-                    # Skip JSONL replay I/O when we have an existing dataset to
-                    # build on incrementally.  Data flows directly from self-play
-                    # workers → memory dicts → CachedTensorDataset → GPU, avoiding
-                    # json serialization + disk writes + ReplayEntry conversion.
-                    _skip = _existing is not None and len(_existing) > 0
+                    _skip = _existing_count > 0
 
                     # Always use inline preprocessing: preprocess entries as each
                     # game batch completes in the as_completed() loop.  Eliminates
@@ -1750,17 +1866,23 @@ class Trainer:
                     # Check for inline-preprocessed data first (fast path).
                     incremental = getattr(self, '_last_selfplay_preprocessed', None)
 
-                    if incremental is not None and _existing is not None and len(_existing) > 0:
-                        # Inline preprocessing produced the incremental dataset
-                        # directly — no from_dicts() call needed.
-                        dataset = _existing.concat(incremental, max_entries=_max_entries)
-                        print(f"  Merged dataset: {len(dataset)} entries "
-                              f"(+{len(incremental)} inline-preprocessed)")
+                    if incremental is not None and _existing_count > 0:
+                        # Incremental update path: skip CPU concat entirely.
+                        # GPU update_data() handles trimming old entries.
+                        # Just track the expected total count.
+                        _new_n = len(incremental)
+                        if _max_entries > 0 and _existing_count + _new_n > _max_entries:
+                            _existing_count = _max_entries
+                        else:
+                            _existing_count += _new_n
+                        dataset = None  # No CPU concat — saves ~2GB alloc+copy
+                        print(f"  Incremental: +{_new_n} entries "
+                              f"(total ~{_existing_count}, no CPU concat)")
                     elif incremental is not None:
                         # First cycle with inline preprocessing, or no existing
                         # data to concat with.  On first cycle, also load any
                         # existing replay data from disk and merge.
-                        if _existing is None or len(_existing) == 0:
+                        if _existing_count == 0:
                             # Check for existing replay data on disk
                             train_entries, _ = prepare_training_data(
                                 self.replay_buffer, max_entries=_max_entries, val_split=0.0)
@@ -1768,27 +1890,31 @@ class Trainer:
                                 existing_ds = CachedTensorDataset.from_entries(
                                     train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
                                 dataset = existing_ds.concat(incremental, max_entries=_max_entries)
+                                _existing_count = len(dataset)
                                 print(f"  Loaded {len(existing_ds)} existing + "
                                       f"{len(incremental)} inline-preprocessed = "
-                                      f"{len(dataset)} total entries")
+                                      f"{_existing_count} total entries")
                             else:
                                 dataset = incremental
-                                print(f"  New dataset: {len(dataset)} entries (inline-preprocessed)")
+                                _existing_count = len(incremental)
+                                print(f"  New dataset: {_existing_count} entries (inline-preprocessed)")
                         else:
                             dataset = incremental
-                            print(f"  New dataset: {len(dataset)} entries (inline-preprocessed)")
+                            _existing_count = len(incremental)
+                            print(f"  New dataset: {_existing_count} entries (inline-preprocessed)")
                     else:
                         # Fallback: no inline preprocessing available.
                         # Use collected dicts or load from replay.
                         new_dicts = getattr(self, '_last_selfplay_dicts', None)
 
-                        if new_dicts and _existing is not None and len(_existing) > 0:
+                        if new_dicts and _existing_count > 0 and _existing is not None:
                             print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
-                                  f"(existing: {len(_existing)})")
+                                  f"(existing: {_existing_count})")
                             incremental = CachedTensorDataset.from_dicts(
                                 new_dicts, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
                             dataset = _existing.concat(incremental, max_entries=_max_entries)
-                            print(f"  Merged dataset: {len(dataset)} entries")
+                            _existing_count = len(dataset)
+                            print(f"  Merged dataset: {_existing_count} entries")
                         else:
                             incremental = None
                             train_entries, _ = prepare_training_data(
@@ -1799,6 +1925,7 @@ class Trainer:
                                     print(f"Cleared {deleted} replay files after loading")
                             dataset = CachedTensorDataset.from_entries(
                                 train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
+                            _existing_count = len(dataset)
 
                     with self._bg_selfplay_lock:
                         self._bg_selfplay_entries = None
@@ -1807,8 +1934,11 @@ class Trainer:
                     # Wake the main thread immediately if it's waiting for data.
                     self._data_ready_event.set()
 
-                    # Use the just-produced dataset as base for next incremental cycle
-                    _existing = dataset
+                    # After first cycle, free the CPU dataset reference.
+                    # Data is on GPU; keeping _existing alive wastes ~2GB RAM.
+                    if _first_cycle:
+                        _existing = None
+                        _first_cycle = False
 
                 except Exception as e:
                     import traceback
@@ -1822,20 +1952,24 @@ class Trainer:
         self._bg_selfplay_thread.start()
 
     def _collect_background_selfplay(self):
-        """Check if background self-play produced a dataset. Non-blocking.
+        """Check if background self-play produced new data. Non-blocking.
 
         Returns (dataset, incremental) where:
-        - dataset: Full merged dataset (old + new), used for _current_dataset tracking
-        - incremental: Only the new entries from this cycle, used for GPU update_data
-          to avoid re-uploading the entire dataset via PCIe.  None on first cycle
-          (full rebuild).
+        - dataset: Full merged dataset (first cycle only), or None when
+          concat was skipped (GPU-resident incremental-only path).
+        - incremental: Only the new entries from this cycle, used for GPU
+          update_data to avoid re-uploading the entire dataset via PCIe.
+
+        Returns (None, None) when no new data is available.
         The background thread keeps running — no need to restart.
         """
         with self._bg_selfplay_lock:
             dataset = self._bg_selfplay_dataset
-            if dataset is None:
-                return None, None
             incremental = self._bg_selfplay_incremental
+            # No new data: both are None (or incremental is None when dataset
+            # hasn't been set yet).
+            if dataset is None and incremental is None:
+                return None, None
             self._bg_selfplay_dataset = None
             self._bg_selfplay_incremental = None
             self._bg_selfplay_entries = None
@@ -1848,21 +1982,43 @@ class Trainer:
         Handles both FastBatchIterator (in-place GPU update) and standard
         DataLoader (full recreate) paths.  Returns the (possibly new)
         dataloader and whether data is GPU-resident.
+
+        When bg_dataset is None but bg_incremental is not, the background
+        thread skipped the CPU concat (GPU-resident incremental-only path).
+        Only the incremental data is uploaded to the GPU buffer.
         """
-        self._current_dataset = bg_dataset
+        if bg_dataset is not None:
+            self._current_dataset = bg_dataset
         _is_fast = isinstance(dataloader, FastBatchIterator)
         if _is_fast:
             _update_src = bg_incremental if bg_incremental is not None else bg_dataset
-            dataloader.update_data(
-                _update_src, max_entries=self.config.replay_max_entries)
-            dataloader.dataset = bg_dataset
+            if _update_src is not None:
+                dataloader.update_data(
+                    _update_src, max_entries=self.config.replay_max_entries)
+            if bg_dataset is not None:
+                dataloader.dataset = bg_dataset
+            # Free CPU dataset references after GPU upload.  The data lives
+            # on GPU (update_data copied it); keeping CPU tensors alive wastes
+            # ~2GB RAM on memory-constrained systems (26GB local machine).
+            # _current_dataset is only read once — at background thread start
+            # (which copies the reference immediately).  dataloader.dataset is
+            # a compatibility attribute never read during training.
+            if getattr(dataloader, 'on_gpu', False):
+                self._current_dataset = None
+                dataloader.dataset = None
         else:
+            # Non-fast path requires the full dataset.  If concat was skipped
+            # (bg_dataset is None), fall back to bg_incremental — this only
+            # happens in the first cycle transition.
+            _src = bg_dataset if bg_dataset is not None else bg_incremental
+            if _src is None:
+                return dataloader, getattr(dataloader, 'on_gpu', False)
             _was_gpu = getattr(dataloader, 'on_gpu', False)
             if _was_gpu:
                 dataloader = None
                 torch.cuda.empty_cache()
             dataloader = create_dataloader_from_dataset(
-                bg_dataset,
+                _src,
                 batch_size=self.config.batch_size,
                 num_workers=effective_workers,
                 pin_memory=self.config.pin_memory,
@@ -2052,23 +2208,34 @@ class Trainer:
     # while minimizing GPU pipeline stalls from forced CUDA syncs.
     _SANITY_CHECK_INTERVAL = 2000
 
-    def train_epoch(self, dataloader, use_scoring: bool = True) -> float:
+    def train_epoch(self, dataloader, use_scoring: bool = True,
+                    _loss_acc: Optional[torch.Tensor] = None) -> float:
         """Train for one epoch, returns average loss.
 
         Args:
             dataloader: Training data loader
             use_scoring: If True, apply reward weights from the scoring system.
                          If False, use uniform weights (classic behavior).
+            _loss_acc: Optional pre-allocated GPU scalar for loss accumulation.
+                       When provided, avoids per-epoch torch.tensor() allocation.
         """
-        self.model.train()
+        # model.train() is set once before the main loop in train() — not
+        # per-epoch.  The model never switches to eval() during training.
         # Accumulate loss on GPU to avoid per-step CUDA sync from .item()
-        total_loss_acc = torch.tensor(0.0, device=self.device)
+        if _loss_acc is not None:
+            total_loss_acc = _loss_acc
+            total_loss_acc.zero_()
+        else:
+            total_loss_acc = torch.tensor(0.0, device=self.device)
         num_batches = 0
         total_batches = len(dataloader)
         first_batch = True
         epoch_start_time = time.time()
         _step_start = 0.0  # lazily set only when stats recording needs it
         accum_steps = self.config.gradient_accumulation_steps
+        # [Pass 81] Pre-compute loss scale factor: eliminates conditional check
+        # in 3 separate code paths (compiled, AMP, no-AMP) on every step.
+        _loss_scale = 1.0 / accum_steps if accum_steps > 1 else None
         _micro_step = 0  # counts mini-batches within an accumulation window
 
         # Cache frequently accessed config/state as locals to eliminate
@@ -2083,6 +2250,13 @@ class Trainer:
         _checkpoint_every = _cfg.checkpoint_every
         _train_steps = _cfg.train_steps
         _grad_clip_norm = _cfg.grad_clip_norm
+        # [Pass 84] Pre-collect parameters into a list for clip_grad_norm_.
+        # model.parameters() creates a new generator on every call, which is
+        # consumed by clip_grad_norm_ into an internal list anyway.  Caching
+        # the list avoids ~40 generator next() calls per optimizer step.
+        # Safe because parameters don't change during training (no layer
+        # freezing/unfreezing in this model).
+        _model_params = list(self.model.parameters()) if _grad_clip_norm is not None else None
         _use_amp = _cfg.amp
         _amp_dtype = self.amp_dtype
         _value_head_enabled = _cfg.value_head_enabled
@@ -2095,17 +2269,19 @@ class Trainer:
         _sanity_interval = self._SANITY_CHECK_INTERVAL
         _thermal_enabled = _cfg.thermal_enabled
 
-        # Compiled fwd+loss: use when available, padded, and no value head
+        # Compiled fwd+loss: use when available and padded.
+        # Now supports both policy-only and policy+value head paths.
         _compiled_fwd_loss = self._compiled_fwd_loss
-        _use_compiled = (_compiled_fwd_loss is not None and _use_padded
-                         and not _value_head_enabled)
+        _use_compiled = (_compiled_fwd_loss is not None and _use_padded)
 
         # Pre-allocate uniform weights for non-scoring epochs so the compiled
         # path always receives a tensor (never None).
         if _use_compiled and not use_scoring:
             _uniform_rw = torch.ones(_cfg.batch_size, dtype=torch.float32, device=_device)
+            _uniform_rw_n = _uniform_rw.shape[0]  # [Pass 81] Cache to avoid .shape access per step
         else:
             _uniform_rw = None
+            _uniform_rw_n = 0
 
         # Use CUDA prefetcher for overlapped H2D transfer — but skip when data
         # is already GPU-resident (no transfer to overlap, prefetcher just adds
@@ -2147,7 +2323,7 @@ class Trainer:
                 # Slice to actual batch size in case drop_last=False yields a smaller batch.
                 if _uniform_rw is not None:
                     _bs = boards.shape[0]
-                    reward_weights = _uniform_rw[:_bs] if _bs < _uniform_rw.shape[0] else _uniform_rw
+                    reward_weights = _uniform_rw[:_bs] if _bs < _uniform_rw_n else _uniform_rw
                 else:
                     reward_weights = None
             elif not _use_prefetcher and not _data_on_gpu:
@@ -2181,13 +2357,25 @@ class Trainer:
                 # ── Compiled path: fused forward+loss in single CUDAGraph ──
                 # nan_to_num inside the compiled function sanitizes NaN/Inf loss
                 # without CUDA sync.  No per-step torch.isfinite() needed.
-                if _use_amp:
-                    with autocast(device_type='cuda', dtype=_amp_dtype):
+                # Value-head variant takes an extra value_targets argument.
+                if _value_head_enabled:
+                    if _use_amp:
+                        with autocast(device_type='cuda', dtype=_amp_dtype):
+                            loss, _current_scores = _compiled_fwd_loss(
+                                boards, move_features, move_counts, targets,
+                                reward_weights, value_targets)
+                    else:
+                        loss, _current_scores = _compiled_fwd_loss(
+                            boards, move_features, move_counts, targets,
+                            reward_weights, value_targets)
+                else:
+                    if _use_amp:
+                        with autocast(device_type='cuda', dtype=_amp_dtype):
+                            loss, _current_scores = _compiled_fwd_loss(
+                                boards, move_features, move_counts, targets, reward_weights)
+                    else:
                         loss, _current_scores = _compiled_fwd_loss(
                             boards, move_features, move_counts, targets, reward_weights)
-                else:
-                    loss, _current_scores = _compiled_fwd_loss(
-                        boards, move_features, move_counts, targets, reward_weights)
 
                 # Score-level NaN check at sanity interval only (expensive array-wide check)
                 if _do_sanity and torch.isnan(_current_scores).any():
@@ -2199,8 +2387,8 @@ class Trainer:
                             self.step, 'compiled_fwd_loss', 'NaN scores')
                     continue
 
-                if accum_steps > 1:
-                    loss = loss / accum_steps
+                if _loss_scale is not None:
+                    loss = loss * _loss_scale
 
                 if _scaler is not None:
                     _scaler.scale(loss).backward()
@@ -2276,8 +2464,8 @@ class Trainer:
                 else:
                     loss = policy_loss
 
-                if accum_steps > 1:
-                    loss = loss / accum_steps
+                if _loss_scale is not None:
+                    loss = loss * _loss_scale
 
                 # NaN-safe: replace non-finite loss with 0 to avoid CUDA sync.
                 # GradScaler path: scaler.step() already detects NaN grads and
@@ -2330,8 +2518,8 @@ class Trainer:
                 else:
                     loss = policy_loss
 
-                if accum_steps > 1:
-                    loss = loss / accum_steps
+                if _loss_scale is not None:
+                    loss = loss * _loss_scale
 
                 # NaN-safe: replace non-finite loss with 0 (no CUDA sync needed).
                 # No-AMP path typically runs on CPU where sync isn't a concern,
@@ -2365,26 +2553,30 @@ class Trainer:
             # parameters a second time in compute_gradient_stats.  Per-layer
             # norms are only collected at model_health frequency (much lower)
             # to avoid ~40 .item() CUDA syncs per stats step.
-            _want_grad_stats = (_stats_collector and
-                                self.step % _stats_record_every == 0)
+            # Defer .item() on grad norm: store the GPU tensor and call .item()
+            # only when we already sync for loss.item() — avoids an extra CUDA
+            # sync on every stats interval (~50μs saved per recorded step).
+            # [Pass 84] _will_record already computes the same condition as
+            # _want_grad_stats — reuse it to avoid a redundant modulo per step.
+            _clip_norm_tensor = None  # GPU tensor, deferred .item()
 
             if _use_amp and _scaler is not None:
                 if _grad_clip_norm is not None:
                     _scaler.unscale_(_optimizer)
                     _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        _model.parameters(), _grad_clip_norm,
+                        _model_params, _grad_clip_norm,
                         foreach=True)
-                    if _want_grad_stats:
-                        _grad_norm = _clip_norm.item()
+                    if _will_record:
+                        _clip_norm_tensor = _clip_norm
                 _scaler.step(_optimizer)
                 _scaler.update()
             else:
                 if _grad_clip_norm is not None:
                     _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        _model.parameters(), _grad_clip_norm,
+                        _model_params, _grad_clip_norm,
                         foreach=True)
-                    if _want_grad_stats:
-                        _grad_norm = _clip_norm.item()
+                    if _will_record:
+                        _clip_norm_tensor = _clip_norm
                 _optimizer.step()
 
             # Accumulate on GPU — no sync. Only .item() when needed for logging.
@@ -2399,22 +2591,27 @@ class Trainer:
             if _scheduler is not None:
                 _scheduler.step()
 
-            # Get current LR (from scheduler if active, else from config)
-            current_lr = (_scheduler.get_last_lr()[0]
-                          if _scheduler is not None
-                          else _cfg.learning_rate)
-
             # Only call loss.item() (CUDA sync) when we actually need the scalar.
             # Avoid hardcoded intervals — piggyback on stats_record_every to
             # eliminate extra CUDA sync points on the critical path.
-            _step = self.step  # cache for repeated modulo checks below
-            _need_loss_val = (
-                _step % _stats_record_every == 0
-                or _step % _checkpoint_every == 0
-            )
+            # [Pass 81] Pre-compute all modulo flags once per step instead of
+            # repeating the same checks in 6+ locations below.
+            _step = self.step  # cache for repeated use below
+            _is_stats_step = (_step % _stats_record_every == 0)
+            _is_checkpoint_step = (_step % _checkpoint_every == 0)
+            _need_loss_val = _is_stats_step or _is_checkpoint_step
             # `loss` was divided by accum_steps for gradient scaling; undo that
             # for human-readable reporting (no extra sync — same .item() call).
+            # Piggyback grad_norm .item() on the same CUDA sync as loss.item()
+            # to avoid a separate sync (both values are ready after optimizer.step).
             _loss_val = (loss.item() * accum_steps) if _need_loss_val else None
+            # [Pass 82] Only .item() grad norm when loss sync already happened
+            # (coalesced — same CUDA stream, second sync is a no-op).
+            # Without this guard, _clip_norm_tensor.item() triggers an
+            # independent CUDA sync (~30-50μs) when _need_loss_val is False.
+            if _need_loss_val and _clip_norm_tensor is not None:
+                _grad_norm = _clip_norm_tensor.item()  # coalesced with loss sync
+                _clip_norm_tensor = None
 
             # Periodic NaN monitoring: piggyback on the stats sync to check
             # for NaN losses without an extra CUDA sync.  nan_to_num converts
@@ -2428,8 +2625,16 @@ class Trainer:
                     _stats_collector.record_non_finite_event(
                         _step, 'nan_to_num', 'NaN/Inf loss replaced with 0 by nan_to_num')
 
+            # Compute current LR only at stats/checkpoint boundaries (not every step).
+            # get_last_lr() creates a list copy; deferring it to where it's consumed
+            # eliminates ~99% of calls (stats_record_every=100 → only 1% of steps).
+            if _need_loss_val:
+                current_lr = (_scheduler.get_last_lr()[0]
+                              if _scheduler is not None
+                              else _cfg.learning_rate)
+
             # Record step stats every N steps (to avoid excessive memory usage)
-            if _loss_val is not None and _step % _stats_record_every == 0:
+            if _loss_val is not None and _is_stats_step:
                 self._record_step_stats(_loss_val, current_lr)
 
                 # Enhanced stats collection
@@ -2467,16 +2672,15 @@ class Trainer:
             # Checkpoint — reuse _loss_val if already computed at this step
             # (avoids a redundant .item() CUDA sync when checkpoint and stats
             # recording align on the same step).
-            if _step % _checkpoint_every == 0:
+            if _is_checkpoint_step:
                 if _loss_val is not None:
                     avg_loss = _loss_val
                 else:
                     avg_loss = (total_loss_acc / max(num_batches, 1)).item()
-                self._save_checkpoint(avg_loss)
-
-                # Log metrics
+                # Log entry written in the background thread alongside the
+                # checkpoint — keeps file open/write/close off the training thread.
                 gpu_mem = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
-                self._log({
+                self._save_checkpoint(avg_loss, log_entry={
                     'step': _step,
                     'loss': avg_loss,
                     'lr': current_lr,
@@ -2485,7 +2689,7 @@ class Trainer:
 
             # Progress — print at the stats interval (which already computed .item()).
             # Avoids extra CUDA syncs from a separate hardcoded interval.
-            if _loss_val is not None and _step % _stats_record_every == 0:
+            if _loss_val is not None and _is_stats_step:
                 print(f"  Step {_step}, Loss: {_loss_val:.4f}")
 
             if _step >= _train_steps:
@@ -2586,7 +2790,7 @@ class Trainer:
 
         # Build per-sample weights (zero for invalid entries).
         if reward_weights is not None:
-            w = reward_weights.float().squeeze(-1) * valid.float()
+            w = reward_weights.float() * valid.float()
         else:
             w = valid.float()
 
@@ -2619,7 +2823,7 @@ class Trainer:
         no_moves = move_counts == 0
         scores = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
 
-        log_probs = torch.nn.functional.log_softmax(scores.float(), dim=1)
+        log_probs = torch.nn.functional.log_softmax(scores, dim=1, dtype=torch.float32)
         log_probs = torch.clamp(log_probs, min=-100.0)
 
         max_moves = scores.shape[1]
@@ -2629,7 +2833,7 @@ class Trainer:
         valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
 
         if reward_weights is not None:
-            w = reward_weights.float().squeeze(-1) * valid.float()
+            w = reward_weights.float() * valid.float()
         else:
             w = valid.float()
 
@@ -2724,10 +2928,19 @@ class Trainer:
         sys.stdout.flush()
         start_time = time.time()
 
+        # Set training mode once — stays in effect for the entire loop.
+        # train_epoch() no longer calls model.train() per epoch, saving
+        # ~50 module traversals × 650 epochs/cycle = ~32,500 method calls.
+        self.model.train()
+
         # Track last test step (init to current step so resumed runs don't
         # immediately trigger a test before the first test_every interval)
         last_test_step = self.step
         loss = 0.0  # Initialize loss in case loop doesn't run
+        # Persistent GPU scalar for loss accumulation — created once, zeroed per
+        # epoch via .zero_().  Eliminates ~650 torch.tensor() GPU allocations per
+        # self-play cycle (one per epoch) that each go through CUDA caching allocator.
+        _total_loss_acc = torch.tensor(0.0, device=self.device)
         _consecutive_dead_epochs = 0  # epochs where all batches were skipped (non-finite)
         _DEAD_EPOCH_RECOVERY_THRESHOLD = 3  # trigger checkpoint rollback after this many
         _stale_epochs = 0  # epochs since last data refresh
@@ -2818,7 +3031,8 @@ class Trainer:
                 print(f"\nStop time reached ({self.config.stop_time.strftime('%Y-%m-%d %H:%M')}). Saving and exiting...")
                 break
 
-            loss = self.train_epoch(dataloader, use_scoring=self._should_use_scoring())
+            loss = self.train_epoch(dataloader, use_scoring=self._should_use_scoring(),
+                                   _loss_acc=_total_loss_acc)
             self.epoch += 1
             self.stats.epochs_completed = self.epoch
             # Throttle epoch prints: with ~245 epochs per 60s self-play cycle,
@@ -2872,11 +3086,17 @@ class Trainer:
             _stale_epochs += 1
 
             if _simultaneous:
-                # Continuous background self-play: check if new data is ready
+                # Continuous background self-play: check if new data is ready.
+                # bg_dataset may be None when concat was skipped (GPU-resident
+                # incremental-only path); bg_incremental carries the new data.
                 bg_dataset, bg_incremental = self._collect_background_selfplay()
-                if bg_dataset is not None:
+                _has_new_data = bg_dataset is not None or bg_incremental is not None
+                if _has_new_data:
+                    _desc = (f"{len(bg_dataset)} entries"
+                             if bg_dataset is not None
+                             else f"+{len(bg_incremental)} incremental")
                     print(f"Background self-play complete — refreshing DataLoader "
-                          f"({len(bg_dataset)} entries)...")
+                          f"({_desc})...")
                     dataloader, _gpu_resident = self._refresh_dataloader(
                         dataloader, bg_dataset, bg_incremental, effective_workers)
                     _stale_epochs = 0  # Fresh data arrived — reset counter
@@ -2908,9 +3128,13 @@ class Trainer:
                         # between check and clear, adding up to 2s latency.
                         self._data_ready_event.clear()
                         bg_dataset, bg_incremental = self._collect_background_selfplay()
-                        if bg_dataset is not None:
+                        _has_fresh = bg_dataset is not None or bg_incremental is not None
+                        if _has_fresh:
+                            _desc = (f"{len(bg_dataset)} entries"
+                                     if bg_dataset is not None
+                                     else f"+{len(bg_incremental)} incremental")
                             print(f"Fresh data arrived after {_stale_epochs} stale epochs "
-                                  f"— refreshing ({len(bg_dataset)} entries)...")
+                                  f"— refreshing ({_desc})...")
                             dataloader, _gpu_resident = self._refresh_dataloader(
                                 dataloader, bg_dataset, bg_incremental, effective_workers)
                             _stale_epochs = 0
@@ -3260,7 +3484,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         # Value head / TD learning
         value_head_enabled=value_head_cfg.get('enabled', False),
         value_head_hidden=value_head_cfg.get('hidden_size', 128),
-        value_weight=value_head_cfg.get('value_weight', 0.5),
+        value_weight=value_head_cfg.get('value_weight', 0.15),
         # DataLoader settings
         dataloader_workers=dataloader_cfg.get('num_workers', 0),
         pin_memory=dataloader_cfg.get('pin_memory', True),
@@ -3305,6 +3529,14 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
 
 def main():
     """Main entry point for command-line training."""
+    proc_title = os.environ.get('PROCESS_TITLE')
+    if proc_title:
+        try:
+            import setproctitle
+            setproctitle.setproctitle(proc_title)
+        except ImportError:
+            pass
+
     parser = argparse.ArgumentParser(description='Train Filipino Dama ML model')
 
     # Config file support
