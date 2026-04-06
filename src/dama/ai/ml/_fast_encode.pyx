@@ -14,8 +14,21 @@ cimport numpy as np
 cimport cython
 from cpython.dict cimport PyDict_GetItem
 from cpython.tuple cimport PyTuple_GET_ITEM
+from cpython.list cimport PyList_GET_ITEM
 from cpython.long cimport PyLong_AsLong
 from cpython.ref cimport PyObject
+
+
+# [Pass 83] Safe element accessor for tuples AND lists.
+# board_to_compact_dict (Cython) creates tuples, but JSON deserialization
+# (replay buffer loading) creates lists.  PyTuple_GET_ITEM on a list
+# segfaults (reads list's ob_item pointer as an element — wrong struct layout).
+# This helper adds one type check (~1ns) to avoid the crash while keeping
+# C-level access (~3ns) instead of Python __getitem__ protocol (~20ns).
+cdef inline object _pos_item(object pos, Py_ssize_t i):
+    if type(pos) is tuple:
+        return <object>PyTuple_GET_ITEM(pos, i)
+    return <object>PyList_GET_ITEM(pos, i)
 
 np.import_array()
 
@@ -86,10 +99,10 @@ cdef inline void _encode_positions(
     cdef int row, col
     cdef object pos
     for pos in positions:
-        row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+        row = PyLong_AsLong(_pos_item(pos, 0))
         if flip:
             row = 7 - row
-        col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+        col = PyLong_AsLong(_pos_item(pos, 1))
         planes[plane_idx, row, col] = 1.0
 
 
@@ -106,10 +119,10 @@ cdef inline void _encode_positions_4d(
     cdef int row, col
     cdef object pos
     for pos in positions:
-        row = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
+        row = PyLong_AsLong(_pos_item(pos, 0))
         if flip:
             row = 7 - row
-        col = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+        col = PyLong_AsLong(_pos_item(pos, 1))
         boards[i, plane_idx, row, col] = 1.0
 
 
@@ -180,8 +193,8 @@ def encode_moves_fast_cy(
         num_kings = 12
     for k in range(num_kings):
         pos = kings_list[k]
-        king_rows[k] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-        king_cols[k] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+        king_rows[k] = PyLong_AsLong(_pos_item(pos, 0))
+        king_cols[k] = PyLong_AsLong(_pos_item(pos, 1))
     flip = (turn == 2)
 
     n = len(legal_moves)
@@ -195,12 +208,12 @@ def encode_moves_fast_cy(
         promotion = _dict_get_false(m, _K_PROMOTION)
 
         pos = path[0]
-        start_r = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-        start_c = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+        start_r = PyLong_AsLong(_pos_item(pos, 0))
+        start_c = PyLong_AsLong(_pos_item(pos, 1))
         path_len = len(path)
         pos = path[path_len - 1]
-        end_r = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-        end_c = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+        end_r = PyLong_AsLong(_pos_item(pos, 0))
+        end_c = PyLong_AsLong(_pos_item(pos, 1))
 
         # C-array scan for king check (no Python set/tuple overhead)
         is_king = False
@@ -262,6 +275,12 @@ def preprocess_chunk_cy(
     cdef int num_kings, k
     cdef object kings_list
 
+    # [Pass 72] Bulk board init — single numpy memset + fill for the entire
+    # chunk instead of n individual Python-level slice assignments per entry.
+    # boards[:n] zeros all 5 planes; then plane 4 gets bias fill.
+    boards[:n, :, :, :] = 0.0
+    boards[:n, 4, :, :] = 1.0
+
     for i in range(n):
         entry = entries[start_idx + i]
         state_dict = entry.state
@@ -269,8 +288,6 @@ def preprocess_chunk_cy(
         flip = (turn == 2)
 
         # ── Encode board (unrolled — no mapping list allocation) ──
-        boards[i, :, :, :] = 0.0
-
         if turn == 1:
             _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 0, flip)
             _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 1, flip)
@@ -282,8 +299,6 @@ def preprocess_chunk_cy(
             _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 2, flip)
             _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 3, flip)
 
-        boards[i, 4, :, :] = 1.0
-
         # ── Encode moves ── (C-array king lookup)
         if turn == 1:
             kings_list = _dict_get(state_dict, _K_P1_KINGS)
@@ -294,8 +309,8 @@ def preprocess_chunk_cy(
             num_kings = 12
         for k in range(num_kings):
             pos = kings_list[k]
-            king_rows[k] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            king_cols[k] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            king_rows[k] = PyLong_AsLong(_pos_item(pos, 0))
+            king_cols[k] = PyLong_AsLong(_pos_item(pos, 1))
 
         legal_moves_list = entry.legal_moves
         num_moves = len(legal_moves_list)
@@ -309,12 +324,12 @@ def preprocess_chunk_cy(
             promotion = _dict_get_false(m_dict, _K_PROMOTION)
 
             pos = path[0]
-            start_r = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            start_c = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            start_r = PyLong_AsLong(_pos_item(pos, 0))
+            start_c = PyLong_AsLong(_pos_item(pos, 1))
             path_len = len(path)
             pos = path[path_len - 1]
-            end_r = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            end_c = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            end_r = PyLong_AsLong(_pos_item(pos, 0))
+            end_c = PyLong_AsLong(_pos_item(pos, 1))
             is_king = False
             for k in range(num_kings):
                 if king_rows[k] == start_r and king_cols[k] == start_c:
@@ -383,6 +398,11 @@ def preprocess_dicts_chunk_cy(
     cdef int num_kings, k
     cdef object kings_list
 
+    # [Pass 72] Bulk board init — single numpy memset + fill for the entire
+    # chunk instead of n individual Python-level slice assignments per entry.
+    boards[:n, :, :, :] = 0.0
+    boards[:n, 4, :, :] = 1.0
+
     for i in range(n):
         ed = entry_dicts[start_idx + i]
         state_dict = ed[_K_STATE]
@@ -390,8 +410,6 @@ def preprocess_dicts_chunk_cy(
         flip = (turn == 2)
 
         # ── Encode board (unrolled — no mapping list allocation) ──
-        boards[i, :, :, :] = 0.0
-
         if turn == 1:
             _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 0, flip)
             _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 1, flip)
@@ -403,8 +421,6 @@ def preprocess_dicts_chunk_cy(
             _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 2, flip)
             _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 3, flip)
 
-        boards[i, 4, :, :] = 1.0
-
         # ── Encode moves ── (C-array king lookup)
         if turn == 1:
             kings_list = _dict_get(state_dict, _K_P1_KINGS)
@@ -415,8 +431,8 @@ def preprocess_dicts_chunk_cy(
             num_kings = 12
         for k in range(num_kings):
             pos = kings_list[k]
-            king_rows[k] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            king_cols[k] = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            king_rows[k] = PyLong_AsLong(_pos_item(pos, 0))
+            king_cols[k] = PyLong_AsLong(_pos_item(pos, 1))
 
         legal_moves_list = ed[_K_LEGAL_MOVES]
         num_moves = len(legal_moves_list)
@@ -430,12 +446,12 @@ def preprocess_dicts_chunk_cy(
             promotion = _dict_get_false(m_dict, _K_PROMOTION)
 
             pos = path[0]
-            start_r = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            start_c = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            start_r = PyLong_AsLong(_pos_item(pos, 0))
+            start_c = PyLong_AsLong(_pos_item(pos, 1))
             path_len = len(path)
             pos = path[path_len - 1]
-            end_r = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 0))
-            end_c = PyLong_AsLong(<object>PyTuple_GET_ITEM(pos, 1))
+            end_r = PyLong_AsLong(_pos_item(pos, 0))
+            end_c = PyLong_AsLong(_pos_item(pos, 1))
             is_king = False
             for k in range(num_kings):
                 if king_rows[k] == start_r and king_cols[k] == start_c:
