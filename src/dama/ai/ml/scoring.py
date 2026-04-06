@@ -400,20 +400,32 @@ def _mobility_score_from_moves(legal_moves: list, state_dict: dict, player_int: 
     re-running the expensive legal_moves() computation.
     """
     king_key = 'p1_kings' if player_int == 1 else 'p2_kings'
-    king_set = {(p[0], p[1]) for p in state_dict.get(king_key, ())}
+    king_positions = state_dict.get(king_key, ())
 
     score = 0.0
-    for m in legal_moves:
-        captures = m.get('captures', ())
-        if captures:
-            n_cap = len(captures)
-            score += CAPTURE_MOVE_BONUS
-            score += (n_cap - 1) * CAPTURE_MOVE_BONUS * 0.5
-        else:
-            score += MOBILITY_WEIGHT
-        start = m['path'][0]
-        if (start[0], start[1]) in king_set:
-            score += KING_MOBILITY_WEIGHT
+    if king_positions:
+        king_set = {(p[0], p[1]) for p in king_positions}
+        for m in legal_moves:
+            captures = m['captures']
+            if captures:
+                n_cap = len(captures)
+                score += CAPTURE_MOVE_BONUS
+                score += (n_cap - 1) * CAPTURE_MOVE_BONUS * 0.5
+            else:
+                score += MOBILITY_WEIGHT
+            start = m['path'][0]
+            if (start[0], start[1]) in king_set:
+                score += KING_MOBILITY_WEIGHT
+    else:
+        # No kings — skip king_set construction and lookup
+        for m in legal_moves:
+            captures = m['captures']
+            if captures:
+                n_cap = len(captures)
+                score += CAPTURE_MOVE_BONUS
+                score += (n_cap - 1) * CAPTURE_MOVE_BONUS * 0.5
+            else:
+                score += MOBILITY_WEIGHT
 
     return score
 
@@ -625,28 +637,46 @@ def score_game_dicts(
             if col == 0 or col == 7:
                 pos_score += _EDGE_PEN
 
-        king_set = set(my_kings_list)
-        for pos in my_kings_list:
-            row = pos[0]; col = pos[1]
-            if 2 <= row <= 5 and 2 <= col <= 5:
-                pos_score += _CENTER_BONUS
-            if row == start_row:
-                pos_score += _BACK_ROW
-            if col == 0 or col == 7:
-                pos_score += _EDGE_PEN
+        # Only build king_set when kings exist (avoids set() alloc + hashing
+        # in early-game positions where kings are rare).
+        _n_kings = len(my_kings_list)
+        if _n_kings:
+            king_set = set(my_kings_list)
+            for pos in my_kings_list:
+                row = pos[0]; col = pos[1]
+                if 2 <= row <= 5 and 2 <= col <= 5:
+                    pos_score += _CENTER_BONUS
+                if row == start_row:
+                    pos_score += _BACK_ROW
+                if col == 0 or col == 7:
+                    pos_score += _EDGE_PEN
+        else:
+            king_set = None
 
         # ── Inline mobility ──
+        # [Pass 81] Direct m['captures'] instead of m.get('captures', ()):
+        # 'captures' key always present in dicts from cmove_to_dict/Move.to_dict.
         mob_score = 0.0
-        for m in legal_moves:
-            captures = m.get('captures', ())
-            if captures:
-                n_cap = len(captures)
-                mob_score += _CAP_BONUS + (n_cap - 1) * _CAP_BONUS * 0.5
-            else:
-                mob_score += _MOB_W
-            start = m['path'][0]
-            if start in king_set:
-                mob_score += _KING_MOB
+        if king_set is not None:
+            for m in legal_moves:
+                captures = m['captures']
+                if captures:
+                    n_cap = len(captures)
+                    mob_score += _CAP_BONUS + (n_cap - 1) * _CAP_BONUS * 0.5
+                else:
+                    mob_score += _MOB_W
+                start = m['path'][0]
+                if start in king_set:
+                    mob_score += _KING_MOB
+        else:
+            # No kings — skip king_set lookup per move
+            for m in legal_moves:
+                captures = m['captures']
+                if captures:
+                    n_cap = len(captures)
+                    mob_score += _CAP_BONUS + (n_cap - 1) * _CAP_BONUS * 0.5
+                else:
+                    mob_score += _MOB_W
 
         # ── Combine position total ──
         total_pos = my_mat + material_adv * 0.5 + pos_score + mob_score
