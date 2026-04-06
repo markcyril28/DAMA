@@ -16,6 +16,8 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # SESSION SETTINGS — Edit these per-run
 # -----------------------------------------------------------------------------
+SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
+PROCESS_TITLE="micro-trainer"            # Process name shown in htop (requires 'setproctitle' package)
 RESUME_LATEST=false              # Set true to resume from latest checkpoint in models/checkpoints/
                                  # NOTE: Set to false for fresh retrain — old checkpoints may be
                                  # degenerate. See config/training_config_local_retrain.yaml.
@@ -37,6 +39,7 @@ export PYTHONPATH="${PROJECT_DIR}/src:${PYTHONPATH:-}"
 # Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
 # The training thread uses GPU for all compute; these libraries would otherwise
 # spawn threads that compete with the 6 self-play worker processes.
+if [ "$SET_PROCESS_TITLE" = true ]; then export PROCESS_TITLE; fi
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1

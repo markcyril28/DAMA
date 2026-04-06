@@ -11,7 +11,7 @@ set -euo pipefail
 #   Architecture: gfx90a (CDNA2)
 #   Driver: amdgpu
 #   Compute Platform: ROCm 6.x
-#   CPU Threads: 128
+#   CPU Threads: 64
 #===============================================================================
 
 # =============================================================================
@@ -36,6 +36,8 @@ CONFIG_PROFILE=""
 # -----------------------------------------------------------------------------
 # Resume Settings (can override config file)
 # -----------------------------------------------------------------------------
+SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
+PROCESS_TITLE="micro"            # Process name shown in htop (requires 'setproctitle' package)
 RESUME=""                        # Path to checkpoint to resume from
 RESUME_LATEST=false              # Set true to resume from latest checkpoint in models/checkpoints/
                                  # NOTE: Set to false for fresh retrain — old checkpoints are
@@ -97,6 +99,7 @@ export TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE=1
 # Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
 # The training thread uses GPU for all compute; these libraries would otherwise
 # spawn threads that compete with the 96 self-play worker processes.
+if [ "$SET_PROCESS_TITLE" = true ]; then export PROCESS_TITLE; fi
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
