@@ -63,6 +63,12 @@ except ImportError:
 
 from .dataset import _encode_board_fast, _encode_moves_fast
 
+# [Pass 81] Module-level function references avoid attribute lookup on
+# random.random (~50ns) and random.randrange (~50ns) per call.
+# With ~3000-10K noise moves per self-play cycle, saves ~300-1000μs.
+_random = random.random
+_randrange = random.randrange
+
 # [Pass 70] Fork-inherited model for self-play workers.
 # On Linux (fork start method), parent sets this global before creating the
 # ProcessPoolExecutor. Workers inherit the model via copy-on-write — zero
@@ -120,12 +126,12 @@ def play_single_game(
     )
     entries = []
     move_count = 0
-    player_captures = {Player.ONE: 0, Player.TWO: 0}
+    player_captures = {1: 0, 2: 0}
 
     def _select_move(policy: str, legal_moves: List[Move], player_diff: str):
         """Select a move. Returns (move, index) tuple."""
-        if random.random() < noise_prob and len(legal_moves) > 1:
-            idx = random.randrange(len(legal_moves))
+        if _random() < noise_prob and len(legal_moves) > 1:
+            idx = _randrange(len(legal_moves))
             return legal_moves[idx], idx
         if policy == 'ml' and get_ml_move_idx is not None:
             try:
@@ -137,7 +143,7 @@ def play_single_game(
                     return legal_moves[idx], idx
             except Exception as e:
                 print(f"  Warning: ML inference failed, using random move: {e}")
-            idx = random.randrange(len(legal_moves))
+            idx = _randrange(len(legal_moves))
             return legal_moves[idx], idx
         # use_parallel=False: self-play already parallelizes at the game level
         # via ProcessPoolExecutor. Creating threads per move per worker causes
@@ -146,7 +152,7 @@ def play_single_game(
         # but the flag prevents thread storms if falling back to Python search.
         chosen = get_best_move(state, player_diff, use_parallel=False)
         if chosen is None:
-            idx = random.randrange(len(legal_moves))
+            idx = _randrange(len(legal_moves))
             return legal_moves[idx], idx
         # Find index for algorithmic move
         try:
@@ -172,7 +178,7 @@ def play_single_game(
 
         # Track captures per player
         if chosen_move.is_capture:
-            player_captures[state.current_player] += chosen_move.num_captures
+            player_captures[int(state.current_player)] += chosen_move.num_captures
 
         # Record the position — build dicts directly when return_dicts=True
         # to skip ReplayEntry construction + to_dict() roundtrip
@@ -218,8 +224,8 @@ def play_single_game(
             total_moves=move_count,
             max_moves=max_moves,
             final_state_dict=state.to_compact(),
-            p1_captures=player_captures[Player.ONE],
-            p2_captures=player_captures[Player.TWO],
+            p1_captures=player_captures[1],
+            p2_captures=player_captures[2],
         )
         return entries  # Return list of dicts directly
     else:
@@ -304,6 +310,10 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
     _use_compact = _HAS_COMPACT_STATE
 
     # Initialize all games
+    # [Pass 80] Use int keys {1: 0, 2: 0} for captures dict instead of
+    # {Player.ONE: 0, Player.TWO: 0}.  Eliminates ~10K Player() IntEnum
+    # constructor calls per self-play cycle (~2μs each = ~20ms per cycle).
+    # score_game_dicts expects int keys (p1_captures, p2_captures).
     games = []
     if _use_compact:
         _init_bb = _init_board_bytes()
@@ -318,7 +328,7 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 'noise_prob': noise_prob,
                 'max_moves': max_moves,
                 'move_count': 0,
-                'captures': {Player.ONE: 0, Player.TWO: 0},
+                'captures': {1: 0, 2: 0},
             })
     else:
         for difficulty, max_moves, noise_prob, start_player, p1_pol, p2_pol, _mp, _dev in batch_args:
@@ -335,7 +345,7 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 'noise_prob': noise_prob,
                 'max_moves': max_moves,
                 'move_count': 0,
-                'captures': {Player.ONE: 0, Player.TWO: 0},
+                'captures': {1: 0, 2: 0},
             })
 
     active = list(range(n))
@@ -348,6 +358,14 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
     _boards_buf = np.zeros((n, 5, 8, 8), dtype=np.float32)
     _mf_buf = np.zeros((n, _MAX_M, 8), dtype=np.float32)
     _counts_buf = np.zeros(n, dtype=np.int32)
+
+    # [Pass 84] Pre-create torch tensor views of the numpy buffers.
+    # torch.from_numpy shares memory (zero copy), so encoding writes to
+    # numpy are visible through these tensors.  Avoids ~3 × torch.from_numpy
+    # Python object creations per ML inference round (~150 rounds/batch).
+    _boards_t = torch.from_numpy(_boards_buf)
+    _mf_t = torch.from_numpy(_mf_buf)
+    _counts_t = torch.from_numpy(_counts_buf)
 
     # [Pass 70] Use Cython movegen when available — generates move dicts
     # directly in C, ~50-100x faster than Python legal_moves() + to_dict().
@@ -403,8 +421,8 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 policy = g['p1_policy'] if g['state'].current_player == Player.ONE else g['p2_policy']
 
             # Exploration noise
-            if random.random() < g['noise_prob']:
-                immediate.append((i, random.randrange(len(md)), sd, md))
+            if _random() < g['noise_prob']:
+                immediate.append((i, _randrange(len(md)), sd, md))
             elif policy == 'ml':
                 ml_requests.append((i, sd, md))
             else:
@@ -430,11 +448,11 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 game['bb'], game['pl'], ncaps = _apply_move_board(
                     game['bb'], game['pl'], chosen_md)
                 if ncaps > 0:
-                    game['captures'][Player(prev_pl)] += ncaps
+                    game['captures'][prev_pl] += ncaps
             else:
                 captures = chosen_md.get('captures', ())
                 if captures:
-                    game['captures'][game['state'].current_player] += len(captures)
+                    game['captures'][int(game['state'].current_player)] += len(captures)
                 game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
             game['move_count'] += 1
 
@@ -458,9 +476,9 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
 
             with torch.inference_mode():
                 scores = model.forward_padded(
-                    torch.from_numpy(boards),
-                    torch.from_numpy(all_mf),
-                    torch.from_numpy(counts),
+                    _boards_t[:batch_sz],
+                    _mf_t[:batch_sz],
+                    _counts_t[:batch_sz],
                 )
 
             # [Pass 71] Batch argmax: single torch op for all positions.
@@ -482,11 +500,11 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                     game['bb'], game['pl'], ncaps = _apply_move_board(
                         game['bb'], game['pl'], chosen_md)
                     if ncaps > 0:
-                        game['captures'][Player(prev_pl)] += ncaps
+                        game['captures'][prev_pl] += ncaps
                 else:
                     captures = chosen_md.get('captures', ())
                     if captures:
-                        game['captures'][game['state'].current_player] += len(captures)
+                        game['captures'][int(game['state'].current_player)] += len(captures)
                     game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
                 game['move_count'] += 1
 
@@ -501,21 +519,23 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             move = get_best_move(_algo_state, games[game_idx]['difficulty'],
                                  use_parallel=False)
             if move is None:
-                idx = random.randrange(len(md))
+                idx = _randrange(len(md))
             else:
                 # Match algo Move to dict by path start+end positions.
                 # Cython fast_search and fast_generate_moves use the same C
                 # move generator, so paths are identical. Start+end match is
                 # sufficient; full-path fallback handles rare multi-capture
                 # ambiguities.
+                # [Pass 81] Tuple comparison (dp[0] == mp_start) is faster than
+                # 4 element-by-element int comparisons — CPython tuple __eq__
+                # short-circuits on first mismatch with C-level comparison.
                 mp = move.path
-                mp_s0, mp_s1 = mp[0][0], mp[0][1]
-                mp_e0, mp_e1 = mp[-1][0], mp[-1][1]
+                mp_start = mp[0]
+                mp_end = mp[-1]
                 idx = 0
                 for k, m_dict in enumerate(md):
                     dp = m_dict['path']
-                    if (dp[0][0] == mp_s0 and dp[0][1] == mp_s1 and
-                            dp[-1][0] == mp_e0 and dp[-1][1] == mp_e1):
+                    if dp[0] == mp_start and dp[-1] == mp_end:
                         idx = k
                         break
             game = games[game_idx]
@@ -532,11 +552,11 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 game['bb'], game['pl'], ncaps = _apply_move_board(
                     game['bb'], game['pl'], chosen_md)
                 if ncaps > 0:
-                    game['captures'][Player(prev_pl)] += ncaps
+                    game['captures'][prev_pl] += ncaps
             else:
                 captures = chosen_md.get('captures', ())
                 if captures:
-                    game['captures'][game['state'].current_player] += len(captures)
+                    game['captures'][int(game['state'].current_player)] += len(captures)
                 game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
             game['move_count'] += 1
 
@@ -571,14 +591,11 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             winner_int = int(winner) if winner is not None else None
             final_state_dict = state.to_compact()
 
-        for entry in entries:
-            turn = entry['state']['turn']
-            if winner_int is None:
-                entry['result'] = 0
-            elif turn == winner_int:
-                entry['result'] = 1
-            else:
-                entry['result'] = -1
+        # Entries are initialized with result=0 (draw) during the game loop.
+        # Only update for decisive games — skips the loop entirely for draws.
+        if winner_int is not None:
+            for entry in entries:
+                entry['result'] = 1 if entry['state']['turn'] == winner_int else -1
 
         score_game_dicts(
             entry_dicts=entries,
@@ -586,8 +603,8 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             total_moves=g['move_count'],
             max_moves=g['max_moves'],
             final_state_dict=final_state_dict,
-            p1_captures=g['captures'][Player.ONE],
-            p2_captures=g['captures'][Player.TWO],
+            p1_captures=g['captures'][1],
+            p2_captures=g['captures'][2],
         )
         all_entries.extend(entries)
 
