@@ -213,12 +213,12 @@ profiles:
       compile:
         mode: "max-autotune"          # MI210 benefits from max-autotune (large VRAM)
     selfplay:
-      cpu_workers: 96                 # Synced with server configs (was 52)
-      games_per_epoch: 512            # Synced with training_config_server.yaml
+      cpu_workers: 96                 # Synced with server configs
+      games_per_epoch: 900            # [Pass 83] Synced with server_retrain.yaml (was 512)
       pipeline_mode: "simultaneous"
     training:
       batch_size: 65536               # 64GB VRAM — ~19.4GB activations with BF16
-      learning_rate: 2.8e-4           # Synced with training_config_server.yaml
+      learning_rate: 4.2e-4           # [Pass 83] Synced with server_retrain.yaml (was 2.8e-4)
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: false                # LR scheduler disabled per v5 post-mortem
@@ -254,20 +254,21 @@ profiles:
         # - "hard"                          # Re-enable when model beats medium >40% WR
       pipeline_mode: "simultaneous"
       algo_vs_algo:
-        games_per_epoch: 200              # Synced with training_config_local_retrain.yaml
+        enabled: false                    # [Pass 83] Disabled — 99.7% P1 bias. Synced with local_retrain.
+        games_per_epoch: 1000
         difficulties:
           - "easy"
           - "medium"
-          # - "hard"                        # Re-enable when model is competitive
+          - "hard"
     training:
-      batch_size: 16384                   # [Pass 68] 2x for better GPU warp occupancy (4.3GB/8GB VRAM)
-      learning_rate: 2.8e-4               # [Pass 68] Sqrt-scaled from 2.0e-4 for 2x batch
+      batch_size: 8192                    # [Pass 83] Synced with local_retrain.yaml (was 16384)
+      learning_rate: 2.0e-4               # [Pass 83] Synced with local_retrain.yaml (was 2.8e-4)
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: false                  # LR scheduler caused catastrophic regression.
     dataloader:
       num_workers: 0
-      replay_max_entries: 800000          # [Pass 68] Reduced from 1M for batch=16384 VRAM budget
+      replay_max_entries: 500000          # [Pass 83] Synced with local_retrain.yaml
       ram_cache:
         enabled: true
         threshold_gb: 16.0

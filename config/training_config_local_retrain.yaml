@@ -1,33 +1,26 @@
 # =============================================================================
 # Local Retrain Configuration (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
 # =============================================================================
-# Updated 2026-04-05 — Pass 67 optimization.
+# Updated 2026-04-05 — Training Analysis Pass 83.
 #
-# Status: No valid checkpoint exists (model_step_002000.pt deleted). Auto-detect
-# finds no model_step_*.pt → starts fresh. temp_selfplay_model.pt in checkpoints/
-# is a self-play snapshot only (no optimizer state, not auto-detected).
+# Status: Fresh training from random weights. Prior run (step 3000, loss=1.70,
+# 0% WR) diverged due to:
+#   a) LR 2.8e-4 was too high (fixed to 2.0e-4 in pass 82)
+#   b) algo_vs_algo (4000 hard games) created 95:5 data ratio with 99.7% P1
+#      win bias — model learned biased P1 patterns instead of balanced play
+#   c) GPU overfitted on stale buffer while waiting for slow CPU cycles
 #
-# Previous run (step 2000, loss=1.43, 0% WR) used wrong config (trainer defaults:
-# LR=3e-4, batch_size=256). The corrected configs below have NOT been tested yet.
-# data/replay/ is already empty — old degenerate data was purged.
-#
-# Pass 63 changes:
-#   - pipeline_mode "alternate" → "simultaneous" (GPU utilization fix:
-#     alternate gave only 2.5 batches/epoch = ~1.6% GPU utilization)
-#   - Header updated: checkpoint status, removed stale purge instructions
-#
-# Key fixes from passes 20-62:
-#   1. GradScaler save/restore fixed — old checkpoints get scale=1024.
-#   2. BatchNorm NaN repair — corrupted running stats auto-reset.
-#   3. torch.compile disabled — always fails on RTX 5050.
-#   4. LR scheduler disabled — caused catastrophic 43%→0% WR crash.
-#   5. LR 2.0e-4 — sqrt-scaled from 1.5e-4 for 2x batch size.
-#   6. gradient_accumulation_steps=1 — avoids NaN interaction.
-#   7. Testing vs easy — 0% WR vs medium gives no signal.
-#   8. algo_vs_algo disabled — 99.7% P1 bias in algo data.
-#   9. value_head disabled — no checkpoint has value head params.
-#   10. clear_replay_after_load=true — prevent stale data accumulation.
-#   11. reward_mode="scoring" — no cycle P1 bias amplification.
+# Key changes this pass (analysis-driven):
+#   1. algo_vs_algo DISABLED — 99.7% P1 bias in algo-vs-algo (hard)
+#      overwhelmed the 5% ML-vs-algo data. Removing it forces all training
+#      signal through balanced ML-vs-algo games (50% P1, 50% P2).
+#   2. games_per_epoch 200 → 400 — compensates for lost algo data volume.
+#      400 × 42 moves = ~16.8K entries/cycle (was ~8.4K ML + ~168K algo).
+#   3. noise_prob 0.15 → 0.20 — fresh model needs broader exploration.
+#   4. max_stale_epochs 0 → 100 — prevents extreme overfitting while the
+#      buffer is small (early cycles have <50K entries).
+#   5. record_every 1000 → 200 — capture grad norms now that off-by-one
+#      bug is fixed (pass 82). Critical for diagnosing next divergence.
 #
 # Board encoding correctly flips for P2 (move_encoder.py:30-35).
 #
@@ -68,47 +61,67 @@ model:
 # Self-Play Settings
 # -----------------------------------------------------------------------------
 # At 0% WR, 100% algorithmic teachers. ML self-play at this stage produces
-# losing patterns. algo_vs_algo provides high-quality baseline data.
+# losing patterns. ML-vs-algo games provide balanced teacher signal from both
+# P1 and P2 perspectives (algo wins as both sides).
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                        # 10 of 12 cores. Leaves 2 for GPU training thread
-                                        # + bg coordinator. Matches main local profile.
-  games_per_epoch: 200                  # ML-vs-algo games per cycle.
-                                        # 200 games × ~42 moves = ~8.4K entries/cycle.
-                                        # 100 as P1 + 100 as P2 (focus_side: "both").
+  cpu_workers: 10                        # [Pass 82] 10 of 12 cores for self-play. GPU training
+                                        # runs on GPU (not CPU), so only 2 cores needed for
+                                        # trainer thread + OS. 2.5× more self-play data/cycle.
+  games_per_epoch: 500*4                  # [Pass 83] Doubled from 200 to compensate for algo_vs_algo
+                                        # removal. 400 × ~42 moves = ~16.8K entries/cycle.
+                                        # 200 as P1 + 200 as P2 (focus_side: "both").
+                                        # Algo teacher moves get high reward weights (~2.0),
+                                        # providing imitation learning signal from both sides.
   difficulties:
     - "easy"                            # Learnable signal for a weak model.
     - "medium"                          # Adds challenge without being impossibly hard.
+    - "hard"
   focus_side: "both"                    # Equal P1/P2 exposure. Board encoding flips
-                                        # for P2 (move_encoder.py:30-35) — both sides
+                                        # for P2 (move_encoder.py:30-35) ��� both sides
                                         # need equal training for the model to generalize.
   opponent_focus: "algorithm"           # 100% algorithmic teachers at 0% WR.
-  noise_prob: 0.15                      # [Pass 20] Reduced from 0.18. Model has 2K steps
-                                        # of learning — slightly less exploration appropriate.
+  noise_prob: 0.20                      # [Pass 83] Increased from 0.15. Fresh model needs
+                                        # broader exploration of the move space. At 0% WR,
+                                        # the model's own policy is near-random anyway —
+                                        # higher noise doesn't degrade quality much but
+                                        # discovers more diverse game states.
   max_moves_per_game: 150               # Allow endgame play (avg game ~42 moves)
   pipeline_mode: "simultaneous"         # [Pass 63] CPU self-play overlaps GPU training.
                                         # GPU trains continuously on accumulating buffer while
                                         # CPU generates fresh data. Buffer fills to 1M entries
-                                        # = 61 batches/epoch at batch=16384.
-  max_stale_epochs: 0                   # [Pass 47] Explicit (was relying on trainer default).
-                                        # 0 = unlimited GPU training while CPU generates.
-                                        # Thermal protection handles GPU temperature.
+                                        # = 122 batches/epoch at batch=8192.
+  max_stale_epochs: 100                 # [Pass 83] Changed from 0 (unlimited). Prevents extreme
+                                        # overfitting when buffer is small in early training.
+                                        # With ~16.8K entries and batch=8192, each epoch ≈2
+                                        # batches. 100 epochs = 200 steps of training, then
+                                        # yields to wait for fresh data. As the buffer grows
+                                        # (1M entries → 122 batches/epoch), the cap is rarely
+                                        # hit. Thermal protection still active as secondary guard.
 
+  # ALGO-VS-ALGO: DISABLED
+  # [Pass 83] Re-disabled after analysis found 95:5 data ratio (168K algo vs 8.4K ML)
+  # with 99.7% P1 win bias in hard-only games. This overwhelmed the balanced ML-vs-algo
+  # signal and taught the model P1-biased patterns. Prior pass 20 disabled it for the
+  # same reason; pass 73 re-enabled it prematurely. Keep disabled until model reaches
+  # >30% WR, at which point the P1 bias in algo data is offset by the model's own
+  # competitive play generating balanced wins.
   algo_vs_algo:
-    enabled: true
-    games_per_epoch: 4000                # [Pass 73] 4000 hard games via Cython.
-                                        # 4000 × ~42 moves = ~168K entries/cycle from algo.
+    enabled: false
+    games_per_epoch: 1000*2                # (Inactive — kept for re-enable reference)
     difficulties:
-      - "hard"                          # Hard-only provides highest-quality demonstrations.
+      #- "easy"
+      #- "medium"
+      - "hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 16384                      # [Pass 68] ~2.4GB activations of 8GB VRAM.
-                                        # 1M entries / 16384 = 61 batches/epoch.
-  learning_rate: 2.8e-4                 # [Pass 68] Sqrt-scaled from 2.0e-4 for 2x batch
-                                        # (8192→16384). Below 3.9e-4 crash threshold.
+  batch_size: 8192*2                         # [Pass 68] ~1.2GB activations of 8GB VRAM.
+                                        # 1M entries / 8192 = 122 batches/epoch.
+  learning_rate: 2.0e-4                 # [Pass 82] Reverted from 2.8e-4 — batch_size is
+                                        # 8192 (not 16384). 2.0e-4 is the correct base LR.
   weight_decay: 1.0e-5                  # [Pass 20] Reduced from 1e-4. Original clamp bug
                                         # is fixed — lower regularization lets the model
                                         # learn more freely.
@@ -158,9 +171,11 @@ value_head:
 dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
-  replay_max_entries: 1000000             # 1M × 1168 bytes (fp16 storage on GPU) = ~1.17GB VRAM.
-                                        # With model (72MB), activations (~2.4GB at batch=16384),
-                                        # total ~3.7GB of 8GB VRAM. 61 batches/epoch.
+  replay_max_entries: 500000              # [Pass 83] Reduced from 1M. With algo_vs_algo disabled,
+                                        # each cycle adds ~16.8K entries. 500K ≈ 30 cycles of data.
+                                        # 500K × 1168 bytes = ~585MB VRAM. With model (72MB),
+                                        # activations (~1.2GB at batch=8192), total ~1.9GB of 8GB.
+                                        # 500K / 8192 = 61 batches/epoch.
   max_moves_per_sample: 32              # Max legal moves in Dama is ~20; saves 50% memory
   clear_replay_after_load: true          # [Pass 56] Clear replay files after loading into buffer.
                                         # Prevents disk from filling with stale data. Buffer holds
@@ -168,7 +183,7 @@ dataloader:
 
   ram_cache:
     enabled: true
-    threshold_gb: 8.0                  # 8GB cache limit on 32GB system — leaves 24GB for
+    threshold_gb: 16.0                  # 8GB cache limit on 32GB system — leaves 24GB for
                                         # OS, self-play workers, and GPU driver overhead.
     cache_file: null
 
@@ -198,8 +213,10 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 1000                    # [Pass 70] Synced with training_config_local.yaml. Each
-                                        # triggers .item() CUDA sync (~30-50µs). 1000 halves syncs.
+  record_every: 200                      # [Pass 83] Reduced from 1000. Grad norm off-by-one bug
+                                        # was fixed in pass 82 — norms are now actually recorded.
+                                        # Need fine-grained data to diagnose next divergence.
+                                        # 200 still only adds 5 CUDA syncs/1000 steps (~250µs).
   system_every: 5000
   model_health_every: 5000              # 1000 was excessive — each records ~40 .item() syncs.
                                         # 5000 matches local config.

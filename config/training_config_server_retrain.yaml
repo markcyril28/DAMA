@@ -60,18 +60,20 @@ model:
 # via Cython fast path.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 96                         # 96 of 128 cores for self-play processes.
+  cpu_workers: 96                          # 96 of 128 cores for self-play processes.
                                           # ProcessPoolExecutor uses separate processes
                                           # (not threads), so GIL is not a factor.
                                           # Training uses 1 CPU thread (GPU mode), leaving
                                           # 127 cores available. 96 uses 75%, leaving 32
-                                          # for preprocessing + OS. With 14400 algo games
-                                          # / 25 per batch = 576 batches, 96 workers
-                                          # complete in ~6 waves vs ~11 with 52 (~45% faster).
-  games_per_epoch: 600                    # Increased from 200. More ML-vs-algo data to
-                                          # balance the algo_vs_algo P1 bias.
-                                          # 600 games x ~40 moves = ~24K entries/cycle.
-                                          # 300 as P1 + 300 as P2 (focus_side="both").
+                                          # for preprocessing + OS. Each Cython worker
+                                          # uses ~128MB TT: 96 × 128MB = 12.3GB (trivial
+                                          # on 1TB). 50% more workers = ~33% faster
+                                          # algo-vs-algo cycles.
+  games_per_epoch: 900                    # Increased from 600. With 96 workers (was 64),
+                                          # 900 ML games run in parallel with algo games.
+                                          # 900 × ~40 moves = ~36K entries/cycle.
+                                          # 450 as P1 + 450 as P2 (focus_side="both").
+                                          # ML ratio: 900/(900+5400) = 14.3% (was 14.3%).
   difficulties:
     - "easy"                              # Start with easy — learnable signal for
     - "medium"                            # a random model. Medium adds challenge.
@@ -85,18 +87,32 @@ selfplay:
   pipeline_mode: "simultaneous"           # Overlaps CPU self-play with GPU training.
                                           # Trainer auto-generates initial data if
                                           # replay buffer has < batch_size*10 entries.
+  max_stale_epochs: 500                   # During early training (~600K entries), each
+                                          # epoch ≈9 batches ≈ 0.1s. Self-play takes ~3 min.
+                                          # 500 epochs = ~4500 steps = ~50s of training,
+                                          # keeping the GPU busy for ~28% of the cycle.
+                                          # (was 150 = ~15s = 8% GPU utilization early on.)
+                                          # As the dataset grows to 5M entries, each epoch
+                                          # takes ~4.6s (76 batches), so the GPU can only
+                                          # complete ~39 epochs/cycle — never hitting the cap.
+                                          # The cap only matters in the early phase.
+                                          # MI210 has enterprise cooling; thermal not a concern.
 
+  # ALGO-VS-ALGO: WARNING — 85.7% algo data with hard-only = P1 bias risk.
+  # [Pass 84] Hard games have 99.7% P1 win rate. reward_mode=scoring
+  # AMPLIFIES this (winning moves get 2x weight → P1 moves dominate).
+  # Local training with 95% algo ratio diverged for this exact reason.
+  # Server ratio (85.7%) is better but still risky. Monitor P1/P2 win rates
+  # closely. If P2 WR stays 0% after step 2000, disable algo_vs_algo.
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 3600                 # Reduced from 14400. At 14400: 98.6% algo data
-                                          # (14400/(14400+200)). Algo-vs-algo has 99.7% P1
-                                          # win rate — extreme P1 bias in reward weighting.
-                                          # At 3600: 85.7% algo (3600/(3600+200+600)), still
-                                          # plenty of data from 96 Cython workers.
-    difficulties:                         # Exclude super_hard — per pass 8 analysis,
-      - "easy"                            # super_hard matchups cause 60% longer cycles
-      - "medium"                          # (~39min -> ~15min). Cython TT helps but
-      - "hard"                            # super_hard still ~1s/move, not worth it.
+    games_per_epoch: 5400                 # With 96 workers, 5400 games ≈ same wall time as
+                                          # 3600 with 64 workers (56 games/worker).
+                                          # Algo ratio: 5400/(5400+900) = 85.7%.
+    difficulties:                         # Hard-only: 99.7% P1 win rate — see warning above.
+      #- "easy"                            # Enabling easy/medium would reduce P1 bias.
+      #- "medium"                          # Consider switching to easy+medium if P2 WR = 0%.
+      - "hard"
       # - "super_hard"                    # Excluded: ~1s/move, 60% longer cycles
 
 # -----------------------------------------------------------------------------
