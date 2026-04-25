@@ -1,4 +1,4 @@
-name: micro
+name: train
 channels:
   - defaults
   - conda-forge
@@ -10,4 +10,5 @@ dependencies:
     - pyyaml
     - psutil  # For RAM detection in dataset caching
     - pytest  # For running tests
+    - setproctitle  # Renames the trainer process for htop/btop visibility (PROCESS_TITLE env)
     # PyTorch with ROCm is installed separately via setup_conda_server.sh

@@ -3534,8 +3534,13 @@ def main():
         try:
             import setproctitle
             setproctitle.setproctitle(proc_title)
+            print(f"Process title set to '{proc_title}' (visible in htop/btop).")
         except ImportError:
-            pass
+            print(
+                f"[warn] PROCESS_TITLE='{proc_title}' set but 'setproctitle' is not installed; "
+                "process will show as 'python3' in htop. Install with: pip install setproctitle",
+                flush=True,
+            )
 
     parser = argparse.ArgumentParser(description='Train Filipino Dama ML model')
 

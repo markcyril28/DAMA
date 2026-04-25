@@ -37,7 +37,7 @@ CONFIG_PROFILE=""
 # Resume Settings (can override config file)
 # -----------------------------------------------------------------------------
 SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
-PROCESS_TITLE="micro"            # Process name shown in htop (requires 'setproctitle' package)
+PROCESS_TITLE="micro"            # Process name shown in htop or btop (requires 'setproctitle' package)
 RESUME=""                        # Path to checkpoint to resume from
 RESUME_LATEST=false              # Set true to resume from latest checkpoint in models/checkpoints/
                                  # NOTE: Set to false for fresh retrain — old checkpoints are
@@ -95,10 +95,19 @@ export TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE=1
 # =============================================================================
 # CPU/Memory Optimizations
 # =============================================================================
-# Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
+# Minimize CPU threads for numpy/MKL/OpenMP - self-play workers need the cores.
 # The training thread uses GPU for all compute; these libraries would otherwise
 # spawn threads that compete with the configured self-play worker processes.
-if [ "$SET_PROCESS_TITLE" = true ]; then export PROCESS_TITLE; fi
+if [ "$SET_PROCESS_TITLE" = true ]; then
+    export PROCESS_TITLE
+    # Self-heal: ensure 'setproctitle' is installed in the active env, otherwise
+    # the trainer's rename is a silent no-op and htop shows 'python3'.
+    if ! python3 -c "import setproctitle" >/dev/null 2>&1; then
+        echo "Installing 'setproctitle' (required for PROCESS_TITLE='${PROCESS_TITLE}')..."
+        python3 -m pip install --quiet setproctitle || \
+            echo "[warn] Failed to install 'setproctitle'; process will show as 'python3' in htop."
+    fi
+fi
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
