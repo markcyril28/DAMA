@@ -50,6 +50,29 @@ fi
 echo "=== Filipino Dama ==="
 echo "Python: $(python --version)"
 python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+
+# Model discovery
+MODEL_PATH="${PROJECT_DIR}/models/latest.pt"
+if [[ -f "$MODEL_PATH" ]]; then
+    MODEL_SIZE=$(du -h "$MODEL_PATH" | cut -f1)
+    MODEL_DATE=$(date -r "$MODEL_PATH" +"%Y-%m-%d %H:%M")
+    echo "ML model:      ${MODEL_PATH} (${MODEL_SIZE}, ${MODEL_DATE})"
+    MODEL_PATH="$MODEL_PATH" python - <<'PYEOF' 2>/dev/null || echo "  Checkpoint:   (could not read metadata)"
+import os, torch
+cp = torch.load(os.environ["MODEL_PATH"], map_location="cpu", weights_only=False)
+step = cp.get("step", "?")
+loss = cp.get("loss")
+arch = cp.get("arch_params", {})
+parts = [f"step {step}"]
+if loss is not None:
+    parts.append(f"loss {loss:.4f}")
+if arch:
+    parts.append(f'{arch.get("channels", "?")}-ch {arch.get("num_blocks", "?")}-blk')
+print("  Checkpoint:  ", ", ".join(parts))
+PYEOF
+else
+    echo "ML model:      not found (game will use algorithmic AI only)"
+fi
 echo ""
 
 exec python -m dama
