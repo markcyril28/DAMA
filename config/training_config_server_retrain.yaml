@@ -37,9 +37,12 @@ device:
                                           # exponent range as FP32. No GradScaler needed.
   compile:
     enabled: true
-    mode: "max-autotune"                  # MI210 has VRAM headroom for autotuning.
-                                          # Slower to compile (~5 min), faster execution.
-                                          # Board is always 8x8, so autotuning pays off.
+    mode: "reduce-overhead"                # Was "max-autotune". Per-shape Triton autotune was
+                                          # firing mid-run on policy/value backward matmuls
+                                          # (one event burned 181s), starving training. CUDAGraph
+                                          # capture without per-shape benchmarking is the right
+                                          # tradeoff once shapes are stable (board 8x8, batch
+                                          # 65536, drop_last=True).
   matmul_precision: "medium"              # TF32-equivalent for float32 matmuls
 
 # -----------------------------------------------------------------------------
@@ -219,7 +222,13 @@ statistics:
   score_dist_every: 500                   # Was 50. Score stats do array-wide ops on GPU tensors.
                                           # 500 still gives granular distribution tracking.
   buffer_size: 100000                     # Large ring buffer — 1TB RAM is abundant
-  flush_every: 2000                       # Was 1000. Disk I/O on training thread — reduce 2x.
+  flush_every: 50                         # Was 2000. With record_every=100 and simultaneous-mode
+                                          # epochs taking many cycles to accumulate steps, 2000
+                                          # records meant ~200K training steps before any disk
+                                          # write — partial runs lost everything. 50 records ≈
+                                          # one flush per ~5K training steps. Stats collector now
+                                          # also force-flushes on a wall-clock interval as a
+                                          # safety net.
   output_dir: "logs/server/stats"
 
 # -----------------------------------------------------------------------------

@@ -236,6 +236,11 @@ class StatsCollector:
         self._loss_plateau_steps = 0
         self._loss_plateau_threshold = 1e-4
         self._step_since_last_flush = 0
+        # Wall-clock fallback: force flush every N seconds even if record-count
+        # threshold isn't reached. Prevents partial-run data loss when training
+        # advances slowly (simultaneous mode) or the run exits before flush_every.
+        self._last_flush_time = time.time()
+        self._flush_max_seconds = 60.0
 
         # --- Configuration snapshot (set by caller) ---
         self.config_snapshot: Dict[str, Any] = {}
@@ -325,11 +330,19 @@ class StatsCollector:
                 else:
                     self._loss_plateau_steps = 0
 
-        # Auto-flush
+        # Auto-flush: fire on either record-count threshold OR wall-clock interval.
         self._step_since_last_flush += 1
-        if self._step_since_last_flush >= self.flush_every:
+        self._maybe_flush()
+
+    def _maybe_flush(self) -> None:
+        """Flush incrementally if either the record-count or wall-clock
+        threshold has been reached. Safe to call from any record_* method."""
+        _now = time.time()
+        if (self._step_since_last_flush >= self.flush_every
+                or (_now - self._last_flush_time) >= self._flush_max_seconds):
             self.flush_incremental()
             self._step_since_last_flush = 0
+            self._last_flush_time = _now
 
     def record_non_finite_event(self, step: int, location: str, details: str = "") -> None:
         """Record a NaN/Inf event for stability analysis."""
@@ -754,6 +767,7 @@ class StatsCollector:
             record['avg_legal_moves_per_position'] = avg_moves_per_position
 
         self.selfplay_records.append(record)
+        self._maybe_flush()
 
     # ===================================================================
     # Replay buffer recording

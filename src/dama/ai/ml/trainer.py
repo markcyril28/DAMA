@@ -2712,6 +2712,15 @@ class Trainer:
                 epoch_time_sec=epoch_time,
             )
 
+        # Per-epoch heartbeat: prints regardless of stats_record_every so the
+        # console isn't silent when steps accumulate slowly (simultaneous mode
+        # with small per-cycle batch counts). Reads LR from scheduler if present.
+        _hb_lr = (_scheduler.get_last_lr()[0]
+                  if _scheduler is not None else _cfg.learning_rate)
+        print(f"  [epoch end] step={self.step} loss={_avg_loss:.4f} "
+              f"lr={_hb_lr:.2e} batches={num_batches} time={epoch_time:.1f}s")
+        sys.stdout.flush()
+
         return _avg_loss
 
     def _compute_loss(
