@@ -170,8 +170,8 @@ paths:
   checkpoint_dir: "models/checkpoints"
   latest_model: "models/latest.pt"
   replay_dir: "data/replay"
-  log_dir: "logs"
-  stats_file: "models/training_stats.json"
+  log_dir: "logs/local"
+  stats_file: "models/training_stats_local.json"
 
 # -----------------------------------------------------------------------------
 # Statistics Collection
@@ -184,7 +184,7 @@ statistics:
   score_dist_every: 1000
   buffer_size: 50000
   flush_every: 500                      # [Pass 17 fix]: 5000 loses stats on short runs
-  output_dir: "logs/stats"
+  output_dir: "logs/local/stats"
 
 # -----------------------------------------------------------------------------
 # Thermal Protection

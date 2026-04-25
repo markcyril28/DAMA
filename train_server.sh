@@ -113,7 +113,7 @@ CONFIG_TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
 cp "$CONFIG_FILE" "${CONFIG_ARCHIVE_DIR}/$(basename "${CONFIG_FILE}" .yaml)_${CONFIG_TIMESTAMP}.yaml"
 
 # Console logging
-LOG_DIR="${PROJECT_DIR}/logs/console"
+LOG_DIR="${PROJECT_DIR}/logs/server/console"
 mkdir -p "$LOG_DIR"
 LOG_TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
 LOG_FILE="${LOG_DIR}/console_${LOG_TIMESTAMP}.txt"

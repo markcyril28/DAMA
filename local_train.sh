@@ -45,7 +45,7 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
 
 # Console logging
-LOG_DIR="${PROJECT_DIR}/logs/console"
+LOG_DIR="${PROJECT_DIR}/logs/local/console"
 mkdir -p "$LOG_DIR"
 LOG_TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
 LOG_FILE="${LOG_DIR}/console_${LOG_TIMESTAMP}.txt"
