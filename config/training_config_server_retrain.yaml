@@ -1,5 +1,8 @@
 # =============================================================================
-# Retrain from Scratch — Server (MI210, 64GB HBM2e, 128 threads, 1TB RAM)
+# Retrain from Scratch - Server (MI210, 64GB HBM2e, 32-thread budget, 1TB RAM)
+# =============================================================================
+# Sized for a 32-thread budget: 32 self-play workers + 1 trainer thread.
+# (Box has 128 cores; this config only uses ~25% of them by design.)
 # =============================================================================
 # Created 2026-04-05 after discovering all prior checkpoints were degenerate.
 #
@@ -60,22 +63,18 @@ model:
 # via Cython fast path.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 32                          # 96 of 128 cores for self-play processes.
-                                          # ProcessPoolExecutor uses separate processes
-                                          # (not threads), so GIL is not a factor.
-                                          # Training uses 1 CPU thread (GPU mode), leaving
-                                          # 127 cores available. 96 uses 75%, leaving 32
-                                          # for preprocessing + OS. Each Cython worker
-                                          # uses ~128MB TT: 96 × 128MB = 12.3GB (trivial
-                                          # on 1TB). 50% more workers = ~33% faster
-                                          # algo-vs-algo cycles.
-  games_per_epoch: 900                    # Increased from 600. With 96 workers (was 64),
-                                          # 900 ML games run in parallel with algo games.
-                                          # 900 × ~40 moves = ~36K entries/cycle.
-                                          # 450 as P1 + 450 as P2 (focus_side="both").
-                                          # ML ratio: 900/(900+5400) = 14.3%, same as the
-                                          # prior 600/(600+3600) — the workload scaled
-                                          # proportionally with the worker count.
+  cpu_workers: 32                         # 32-thread budget. ProcessPoolExecutor uses
+                                          # separate processes (no GIL). Training uses 1
+                                          # CPU thread (GPU mode), so total ~33 threads.
+                                          # Each Cython worker ~128MB TT: 32 x 128MB =
+                                          # ~4GB (trivial on 1TB).
+  games_per_epoch: 300                    # Sized for 32 workers at ~9-10 games/worker
+                                          # per cycle (same per-worker workload that the
+                                          # 96-worker / 900-game config targeted, which
+                                          # gave ~3 min cycles).
+                                          # 300 x ~40 moves = ~12K entries/cycle.
+                                          # 150 as P1 + 150 as P2 (focus_side="both").
+                                          # ML ratio: 300/(300+1800) = 14.3% (unchanged).
   difficulties:
     - "easy"                              # Start with easy — learnable signal for
     - "medium"                            # a random model. Medium adds challenge.
@@ -89,29 +88,23 @@ selfplay:
   pipeline_mode: "simultaneous"           # Overlaps CPU self-play with GPU training.
                                           # Trainer auto-generates initial data if
                                           # replay buffer has < batch_size*10 entries.
-  max_stale_epochs: 500                   # During early training (~600K entries), each
-                                          # epoch ≈9 batches ≈ 0.1s. Self-play takes ~3 min.
-                                          # 500 epochs = ~4500 steps = ~50s of training,
-                                          # keeping the GPU busy for ~22% of the cycle
-                                          # (50s / (180s + 50s)).
-                                          # (was 150 = ~15s = 8% GPU utilization early on.)
-                                          # As the dataset grows to 5M entries, each epoch
-                                          # takes ~4.6s (76 batches), so the GPU can only
-                                          # complete ~39 epochs/cycle — never hitting the cap.
-                                          # The cap only matters in the early phase.
+  max_stale_epochs: 500                   # Sized so the GPU keeps training while CPU
+                                          # self-play runs (~3 min/cycle on 32 workers).
+                                          # Cap mainly bites during the early phase
+                                          # before the replay buffer fills.
                                           # MI210 has enterprise cooling; thermal not a concern.
 
-  # ALGO-VS-ALGO: WARNING — 85.7% algo data with hard-only = P1 bias risk.
+  # ALGO-VS-ALGO: WARNING - 85.7% algo data with hard-only = P1 bias risk.
   # [Pass 84] Hard games have 99.7% P1 win rate. reward_mode=scoring
-  # AMPLIFIES this (winning moves get 2x weight → P1 moves dominate).
+  # AMPLIFIES this (winning moves get 2x weight -> P1 moves dominate).
   # Local training with 95% algo ratio diverged for this exact reason.
   # Server ratio (85.7%) is better but still risky. Monitor P1/P2 win rates
   # closely. If P2 WR stays 0% after step 2000, disable algo_vs_algo.
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 5400                 # With 96 workers, 5400 games ≈ same wall time as
-                                          # 3600 with 64 workers (56 games/worker).
-                                          # Algo ratio: 5400/(5400+900) = 85.7%.
+    games_per_epoch: 1800                 # 32 workers x ~56 games/worker (same per-worker
+                                          # load as the prior 64w/3600 and 96w/5400 sizings).
+                                          # Algo ratio: 1800/(1800+300) = 85.7% (unchanged).
     difficulties:                         # Hard-only: 99.7% P1 win rate — see warning above.
       #- "easy"                            # Enabling easy/medium would reduce P1 bias.
       #- "medium"                          # Consider switching to easy+medium if P2 WR = 0%.
