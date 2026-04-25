@@ -128,7 +128,7 @@ model:
 #   Total cycle: ~212 min. 6h session ≈ 1.7 cycles ≈ 945 training steps.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 96                     # 96 of 128 cores — maximize game generation.
+  cpu_workers: 32                     # 96 of 128 cores — maximize game generation.
                                       # ProcessPoolExecutor creates separate processes (no GIL).
                                       # Training uses only 1 CPU thread (torch.set_num_threads(1)
                                       # when device=cuda), leaving 127 cores available.
@@ -154,7 +154,7 @@ selfplay:
                                       # Slight increase from 10% for broader positional variety.
                                       # WR is improving; marginal exploration helps further.
                                       # 88% of moves still come from the algorithmic teacher.
-  max_moves_per_game: 80              # Increased from 40 (was cutting games too short).
+  max_moves_per_game: 80              # Empirically avg_game_length ≈ 41, so 80 is not constraining.
   pipeline_mode: "simultaneous"       # "simultaneous" = overlap CPU self-play with GPU training
                                       # "alternate"     = generate all data first, then train
                                       # Allow endgame patterns: king promotion, piece
@@ -284,7 +284,8 @@ dataloader:
 testing:
   enabled: true
   every_n_steps: 750                  # Test every 750 steps. At 20s/step → ~4.2h between tests.
-  num_games: 100                      # 
+  num_games: 400                      # 400 games gives ±5% CI. 200-game tests produced an inflated
+                                      # 21.5% reading vs the true 16.75% (±7% CI was too noisy).
   difficulty: "medium"                # Benchmark against medium — the target to beat
 
 # -----------------------------------------------------------------------------

@@ -77,7 +77,6 @@ export ROCBLAS_LAYER=0
 # torch.compile optimization - cache compiled models for faster subsequent runs
 # =============================================================================
 export TORCHINDUCTOR_CACHE_DIR="${PROJECT_DIR}/.torch_cache"
-export TORCH_COMPILE_CACHE_DIR="${PROJECT_DIR}/.torch_cache"
 export TRITON_CACHE_DIR="${PROJECT_DIR}/.triton_cache"
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
@@ -98,7 +97,7 @@ export TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE=1
 # =============================================================================
 # Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
 # The training thread uses GPU for all compute; these libraries would otherwise
-# spawn threads that compete with the 96 self-play worker processes.
+# spawn threads that compete with the configured self-play worker processes.
 if [ "$SET_PROCESS_TITLE" = true ]; then export PROCESS_TITLE; fi
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -165,7 +164,7 @@ for ckpt in checkpoints:
         if is_valid:
             print(str(ckpt))
             sys.exit(0)
-    except:
+    except Exception:
         continue
 PYEOF
 )
