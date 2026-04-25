@@ -63,7 +63,7 @@ model:
 # via Cython fast path.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 32                         # 32-thread budget. ProcessPoolExecutor uses
+  cpu_workers: 64                         # 32-thread budget. ProcessPoolExecutor uses
                                           # separate processes (no GIL). Training uses 1
                                           # CPU thread (GPU mode), so total ~33 threads.
                                           # Each Cython worker ~128MB TT: 32 x 128MB =

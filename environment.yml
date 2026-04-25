@@ -6,6 +6,7 @@ dependencies:
   - python=3.11
   - pip
   - numpy
+  - btop  # System monitor (conda-forge) — for inspecting the renamed trainer process
   - pip:
     - pyyaml
     - psutil  # For RAM detection in dataset caching

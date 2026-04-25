@@ -37,7 +37,7 @@ CONFIG_PROFILE=""
 # Resume Settings (can override config file)
 # -----------------------------------------------------------------------------
 SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
-PROCESS_TITLE="micro"            # Process name shown in htop or btop (requires 'setproctitle' package)
+PROCESS_TITLE="micro_trainer"            # Process name shown in htop or btop (requires 'setproctitle' package)
 RESUME=""                        # Path to checkpoint to resume from
 RESUME_LATEST=false              # Set true to resume from latest checkpoint in models/checkpoints/
                                  # NOTE: Set to false for fresh retrain — old checkpoints are
@@ -100,12 +100,23 @@ export TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE=1
 # spawn threads that compete with the configured self-play worker processes.
 if [ "$SET_PROCESS_TITLE" = true ]; then
     export PROCESS_TITLE
-    # Self-heal: ensure 'setproctitle' is installed in the active env, otherwise
-    # the trainer's rename is a silent no-op and htop shows 'python3'.
+    # Self-heal #1: ensure the Python 'setproctitle' package is installed, otherwise
+    # the trainer's rename is a silent no-op and htop/btop show 'python3'.
     if ! python3 -c "import setproctitle" >/dev/null 2>&1; then
         echo "Installing 'setproctitle' (required for PROCESS_TITLE='${PROCESS_TITLE}')..."
         python3 -m pip install --quiet setproctitle || \
-            echo "[warn] Failed to install 'setproctitle'; process will show as 'python3' in htop."
+            echo "[warn] Failed to install 'setproctitle'; process will show as 'python3' in htop/btop."
+    fi
+    # Self-heal #2: ensure 'btop' itself is on PATH — without it there's nowhere to
+    # actually see the renamed process. Best-effort via conda-forge; non-fatal.
+    if ! command -v btop >/dev/null 2>&1; then
+        if command -v conda >/dev/null 2>&1; then
+            echo "Installing 'btop' (system monitor, conda-forge)..."
+            conda install -y -c conda-forge btop >/dev/null 2>&1 || \
+                echo "[warn] Failed to install 'btop' via conda. Run manually: conda install -c conda-forge btop"
+        else
+            echo "[note] 'btop' not on PATH and 'conda' is not available. Install with: conda install -c conda-forge btop"
+        fi
     fi
 fi
 export OMP_NUM_THREADS=1
