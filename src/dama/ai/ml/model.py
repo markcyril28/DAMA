@@ -147,12 +147,15 @@ class MoveScorerNet(nn.Module):
         self.board_encoder = BoardEncoder(embedding_size, num_blocks, channels)
         self.move_scorer = MoveScorer(embedding_size, hidden_size)
 
-        # Lazily-allocated arange buffer for forward_padded mask.
-        # Avoids creating a new tensor every forward call.  Registered as
-        # a non-persistent buffer so it moves with .to(device) but is NOT
-        # saved in checkpoints (it's reconstructed from max_moves at runtime).
-        self.register_buffer('_mask_arange', None, persistent=False)
-        self._mask_arange_n: int = 0  # [Pass 81] Cached size avoids .shape[0] per forward
+        # Pre-allocated arange buffer for forward_padded mask.
+        # Sized to MASK_ARANGE_CAP (>= dataloader.max_moves_per_sample). Pre-allocated
+        # because under torch.compile + cudagraphs, allocating inside the captured graph
+        # and assigning to a Module attribute aliases cudagraph-pool memory and trips
+        # "accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run."
+        # Non-persistent: moves with .to(device) but not saved in checkpoints.
+        MASK_ARANGE_CAP = 64  # 2x dataloader.max_moves_per_sample (32); Dama legal moves ~20 max
+        self._mask_arange_cap = MASK_ARANGE_CAP
+        self.register_buffer('_mask_arange', torch.arange(MASK_ARANGE_CAP), persistent=False)
 
         # Optional value head for TD/value learning
         self.value_head_enabled = value_head_enabled
@@ -301,11 +304,12 @@ class MoveScorerNet(nn.Module):
         scores = x.squeeze(-1)  # (batch, max_moves)
 
         # Mask invalid (padding) slots to -inf.
-        # Reuse cached arange buffer (allocated once, moves with .to(device)).
-        if max_moves > self._mask_arange_n:
-            self._mask_arange = torch.arange(max_moves, device=board.device)
-            self._mask_arange_n = max_moves
-        arange = self._mask_arange[:max_moves]
+        # Slice the pre-allocated buffer (cudagraph-safe). Cold-path fallback for
+        # max_moves above cap allocates locally and is not cached on self.
+        if max_moves <= self._mask_arange_cap:
+            arange = self._mask_arange[:max_moves]
+        else:
+            arange = torch.arange(max_moves, device=board.device)
         valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
         scores = scores.masked_fill(~valid_mask, float('-inf'))
 
@@ -339,10 +343,10 @@ class MoveScorerNet(nn.Module):
         x = self.move_scorer.fc3(x)
         scores = x.squeeze(-1)
 
-        if max_moves > self._mask_arange_n:
-            self._mask_arange = torch.arange(max_moves, device=board.device)
-            self._mask_arange_n = max_moves
-        arange = self._mask_arange[:max_moves]
+        if max_moves <= self._mask_arange_cap:
+            arange = self._mask_arange[:max_moves]
+        else:
+            arange = torch.arange(max_moves, device=board.device)
         valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
         scores = scores.masked_fill(~valid_mask, float('-inf'))
 
