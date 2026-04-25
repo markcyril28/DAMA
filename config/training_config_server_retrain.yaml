@@ -1,8 +1,9 @@
 # =============================================================================
-# Retrain from Scratch - Server (MI210, 64GB HBM2e, 32-thread budget, 1TB RAM)
+# Retrain from Scratch - Server (MI210, 64GB HBM2e, 64-thread budget, 1TB RAM)
 # =============================================================================
-# Sized for a 32-thread budget: 32 self-play workers + 1 trainer thread.
-# (Box has 128 cores; this config only uses ~25% of them by design.)
+# Sized for a 64-thread budget: 64 self-play workers + 1 trainer thread.
+# (Box has 128 cores; this config uses ~50% of them, leaving headroom for
+# OS, MIOpen kernel compilation, and torch.compile autotune subprocesses.)
 # =============================================================================
 # Created 2026-04-05 after discovering all prior checkpoints were degenerate.
 #
@@ -57,24 +58,28 @@ model:
 # -----------------------------------------------------------------------------
 # Self-Play Settings
 # -----------------------------------------------------------------------------
-# Fresh model knows nothing — 100% algorithmic teachers, generous exploration.
-# algo_vs_algo provides high-quality baseline data from day one.
-# With 128 CPU threads, algo_vs_algo can generate large volumes of data
-# via Cython fast path.
+# Fresh model knows nothing - 100% algorithmic teachers, generous exploration.
+# algo_vs_algo provides high-quality baseline data from day one. With 64
+# Cython workers the algo data path is the dominant CPU consumer.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 64                         # 32-thread budget. ProcessPoolExecutor uses
+  cpu_workers: 64                         # 64-thread budget. ProcessPoolExecutor uses
                                           # separate processes (no GIL). Training uses 1
-                                          # CPU thread (GPU mode), so total ~33 threads.
-                                          # Each Cython worker ~128MB TT: 32 x 128MB =
-                                          # ~4GB (trivial on 1TB).
-  games_per_epoch: 300                    # Sized for 32 workers at ~9-10 games/worker
-                                          # per cycle (same per-worker workload that the
-                                          # 96-worker / 900-game config targeted, which
-                                          # gave ~3 min cycles).
-                                          # 300 x ~40 moves = ~12K entries/cycle.
-                                          # 150 as P1 + 150 as P2 (focus_side="both").
-                                          # ML ratio: 300/(300+1800) = 14.3% (unchanged).
+                                          # CPU thread (GPU mode), so total ~65 threads.
+                                          # Each Cython worker ~128MB TT: 64 x 128MB =
+                                          # ~8GB (trivial on 1TB).
+                                          # Empirical: prior 32-worker run measured
+                                          # ~21 games/worker/min; 64 workers should
+                                          # roughly double cycle throughput at the same
+                                          # per-worker rate.
+  games_per_epoch: 600                    # Doubled from 300 to keep per-worker load
+                                          # constant when worker count doubled (32 -> 64).
+                                          # ~9-10 games/worker/cycle, targeting ~3 min
+                                          # cycles (matches the 32w/300g and 96w/900g
+                                          # baselines).
+                                          # 600 x ~40 moves = ~24K entries/cycle.
+                                          # 300 as P1 + 300 as P2 (focus_side="both").
+                                          # ML ratio: 600/(600+3600) = 14.3% (unchanged).
   difficulties:
     - "easy"                              # Start with easy — learnable signal for
     - "medium"                            # a random model. Medium adds challenge.
@@ -89,7 +94,9 @@ selfplay:
                                           # Trainer auto-generates initial data if
                                           # replay buffer has < batch_size*10 entries.
   max_stale_epochs: 500                   # Sized so the GPU keeps training while CPU
-                                          # self-play runs (~3 min/cycle on 32 workers).
+                                          # self-play runs (~3 min/cycle on 64 workers
+                                          # with 4200 games/cycle - per-worker load
+                                          # matches the 32w/2100g baseline).
                                           # Cap mainly bites during the early phase
                                           # before the replay buffer fills.
                                           # MI210 has enterprise cooling; thermal not a concern.
@@ -102,9 +109,9 @@ selfplay:
   # closely. If P2 WR stays 0% after step 2000, disable algo_vs_algo.
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 1800                 # 32 workers x ~56 games/worker (same per-worker
-                                          # load as the prior 64w/3600 and 96w/5400 sizings).
-                                          # Algo ratio: 1800/(1800+300) = 85.7% (unchanged).
+    games_per_epoch: 3600                 # 64 workers x ~56 games/worker (same per-worker
+                                          # load as the prior 32w/1800 and 96w/5400 sizings).
+                                          # Algo ratio: 3600/(3600+600) = 85.7% (unchanged).
     difficulties:                         # Hard-only: 99.7% P1 win rate — see warning above.
       #- "easy"                            # Enabling easy/medium would reduce P1 bias.
       #- "medium"                          # Consider switching to easy+medium if P2 WR = 0%.
