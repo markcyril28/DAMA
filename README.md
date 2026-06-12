@@ -2,7 +2,13 @@
 
 This is a computer version of **Filipino Dama**, a traditional Filipino board game similar to checkers (draughts). You can play it on your computer with a friend, or against the computer itself.
 
-The game comes with **two different computer opponents**: the **Calculating Opponent**, which thinks ahead before every move, and the **Learning Opponent**, an artificial intelligence that taught itself to play. More about them below.
+At its heart, this project is a **combination of three things**:
+
+- A **GUI game**: a game window where you point, click, and play
+- A classic **algorithm**: precise, step-by-step calculation that thinks ahead
+- **Reinforcement learning**: an AI that improves through trial and error, learning from its own wins and losses
+
+The last two power the game's **two different computer opponents**: the **Calculating Opponent**, which thinks ahead before every move, and the **Learning Opponent**, an artificial intelligence that taught itself to play. More about them below.
 
 ## What is Filipino Dama?
 
@@ -25,7 +31,7 @@ This opponent thinks ahead several moves before choosing the best one, like a ca
 
 ### 2. The Learning Opponent
 
-This one is an artificial intelligence that taught itself how to play. Nobody programmed its strategy. Instead, it learned by playing thousands and thousands of games against itself, gradually noticing which moves lead to winning and which lead to losing. The more it trains, the stronger it gets.
+This one is an artificial intelligence that taught itself how to play. Nobody programmed its strategy. Instead, it learned by playing thousands and thousands of games against itself, gradually noticing which moves lead to winning and which lead to losing. This trial-and-error style of teaching is known as **reinforcement learning**. The more it trains, the stronger it gets.
 
 At a glance:
 
@@ -33,7 +39,7 @@ At a glance:
 |---|---|---|
 | How it plays | Works out moves ahead, every turn | Uses what it learned from self-practice |
 | Strength | Four fixed difficulty levels | Grows the more it is trained |
-| Where it comes from | Built-in rules and logic | Trained by the included practice system |
+| Where it comes from | Built-in rules and logic (a classic algorithm) | Trained by the included practice system (reinforcement learning) |
 
 ## How does the Learning Opponent improve?
 
