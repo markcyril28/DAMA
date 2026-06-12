@@ -55,12 +55,3 @@ bash run_game.sh
 ```
 
 A window opens with the board. You click a piece to select it, then click the square you want to move it to. From the menus you can choose who plays: you, a friend, the Calculating Opponent, or the Learning Opponent, and adjust settings like difficulty and appearance.
-
-## What is in this project folder?
-
-- The game itself (board, rules, and the window you play in)
-- The two computer opponents
-- The training system that teaches the Learning Opponent
-- Saved AI "brains" from earlier training, settings files, and logs
-
-For developers: the source code lives in the `src` folder, the training settings in the `config` folder, and helper scripts at the project root and in `scripts`.
