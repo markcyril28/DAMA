@@ -59,10 +59,13 @@ value_head:
 # Re-enable ML self-play (opponent_focus: "both") once WR exceeds 30%.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 12                       # All 12 cores. GPU training uses torch.set_num_threads(1)
-                                        # and the bg self-play coordinator is I/O-bound (waiting on
-                                        # futures). OS scheduling handles the minimal time-slicing
-                                        # needed for the training thread's rare CPU ops.
+  cpu_workers: 8                        # [Pass 85] Reduced from 12. The i5-13420H has 8 physical
+                                        # cores (12 are SMT threads) sharing a heatpipe with the GPU.
+                                        # Sustained all-core self-play load heats the GPU sensor to
+                                        # 87-92C, activating SW Thermal Slowdown (GPU pinned at
+                                        # 277MHz of 3090MHz) and tripping the trainer's 90C pause.
+                                        # Pair with Windows "Maximum processor state" 80% on AC.
+                                        # Self-play over-produces data 50-100x, so this costs nothing.
   games_per_epoch: 200                  # [Part 2] Doubled from 100. More ML-vs-algo data per cycle.
                                         # 200 games x ~42 moves = ~8.4K entries/cycle from ML games.
                                         # With algo-vs-algo, total ~57K entries/cycle.
@@ -249,7 +252,7 @@ profiles:
       compile:
         mode: "reduce-overhead"
     selfplay:
-      cpu_workers: 12                   # [Pass 84] Matches top-level (was 11)
+      cpu_workers: 8                    # [Pass 85] Matches top-level (thermal budget, see above)
       games_per_epoch: 200              # Matches top-level
     training:
       batch_size: 8192                  # [Pass 84] Synced with top-level (was 16384)

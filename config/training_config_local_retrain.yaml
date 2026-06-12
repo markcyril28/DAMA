@@ -65,9 +65,14 @@ model:
 # P1 and P2 perspectives (algo wins as both sides).
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10                        # [Pass 82] 10 of 12 cores for self-play. GPU training
-                                        # runs on GPU (not CPU), so only 2 cores needed for
-                                        # trainer thread + OS. 2.5× more self-play data/cycle.
+  cpu_workers: 8                        # [Pass 85] Reduced from 10. Measured on 2026-06-12: 10 workers
+                                        # push the shared laptop heatpipe to 87-89C, which activates
+                                        # GPU "SW Thermal Slowdown" and pins the GPU at 277MHz of
+                                        # 3090MHz max (29W of 75W limit), ~11x slower batches.
+                                        # Self-play over-produces data 50-100x relative to GPU
+                                        # consumption (104K entries/40s vs max_stale 100 epochs),
+                                        # so trading 2 workers for GPU clock headroom is a large
+                                        # net throughput win. Trainer thread + OS use the rest.
   games_per_epoch: 500*4                  # [Pass 83] Doubled from 200 to compensate for algo_vs_algo
                                         # removal. 400 × ~42 moves = ~16.8K entries/cycle.
                                         # 200 as P1 + 200 as P2 (focus_side: "both").
@@ -118,8 +123,13 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 8192*2                         # [Pass 68] ~1.2GB activations of 8GB VRAM.
-                                        # 1M entries / 8192 = 122 batches/epoch.
+  batch_size: 8192                      # [Pass 85] Reverted from 8192*2 (16384). At batch 16384 the
+                                        # activations overflow 8GB VRAM and the Windows driver pages
+                                        # GPU memory over PCIe (sysmem fallback). Measured on 2026-06-12:
+                                        # 7.6GB/8.1GB used, "100%" util at only 23W power draw, and
+                                        # 23-27s per batch (6 steps in 163.6s). At 8192 everything fits
+                                        # in VRAM and batches return to sub-second. LR 2.0e-4 is also
+                                        # tuned for 8192 (passes 82-84).
   learning_rate: 2.0e-4                 # [Pass 82] Reverted from 2.8e-4 — batch_size is
                                         # 8192 (not 16384). 2.0e-4 is the correct base LR.
   weight_decay: 1.0e-5                  # [Pass 20] Reduced from 1e-4. Original clamp bug
