@@ -14,7 +14,7 @@ passed as ints through the C call tree — zero per-node Python overhead.
 
 from libc.string cimport memcpy, memset
 from libc.math cimport fabs, sqrt
-from libc.time cimport clock, CLOCKS_PER_SEC
+from posix.time cimport clock_gettime, timespec, CLOCK_MONOTONIC
 from libc.stdlib cimport malloc, free, calloc
 
 # ── Board cell values ──
@@ -31,7 +31,12 @@ DEF PLAYER_TWO = 2
 # ── Move limits ──
 DEF MAX_PATH = 8
 DEF MAX_CAPTURES = 7
-DEF MAX_MOVES = 64
+# 128: multi-king positions with forced_capture off can exceed 64 combined
+# capture+simple moves; 64 would silently truncate legal moves. sizeof(CMove)
+# is 140 bytes, so CMoveList is ~18KB; worst-case recursion (max_depth 12
+# plus nested IID plus quiescence, ~30 frames at one CMoveList each) stays
+# under 1MB, well within the 8MB default Linux thread stack.
+DEF MAX_MOVES = 128
 DEF MAX_PLY = 32
 DEF NUM_KILLERS = 2
 
@@ -655,7 +660,7 @@ cdef void generate_all_moves_c(
     """
     cdef CMoveList simple_moves
     cdef CMoveList capture_moves
-    cdef int r, c, piece, i, sq
+    cdef int r, c, piece, i, sq, n_simple
 
     capture_moves.count = 0
 
@@ -683,10 +688,16 @@ cdef void generate_all_moves_c(
             continue
         generate_simple_moves(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, &simple_moves)
 
-    out.count = simple_moves.count + capture_moves.count
+    # Merge: captures first, then as many simple moves as fit. Each source
+    # list is independently capped at MAX_MOVES, so the combined count must
+    # be clamped or the copy below writes past out.moves (boundscheck off).
+    n_simple = simple_moves.count
+    if n_simple > MAX_MOVES - capture_moves.count:
+        n_simple = MAX_MOVES - capture_moves.count
+    out.count = capture_moves.count + n_simple
     for i in range(capture_moves.count):
         out.moves[i] = capture_moves.moves[i]
-    for i in range(simple_moves.count):
+    for i in range(n_simple):
         out.moves[capture_moves.count + i] = simple_moves.moves[i]
 
 
@@ -1028,6 +1039,11 @@ cdef void _order_moves_full(
     cdef int cap_sq, cap_value
     cdef CMove temp
 
+    # Defensive clamp: scores[] holds MAX_MOVES entries, so a corrupt or
+    # oversized count would read/write out of bounds (boundscheck off).
+    if moves.count > MAX_MOVES:
+        moves.count = MAX_MOVES
+
     for i in range(moves.count):
         from_sq = moves.moves[i].from_sq
         to_sq = moves.moves[i].to_sq
@@ -1283,9 +1299,22 @@ cdef float alphabeta(
     return best
 
 
+cdef inline double _wall_now() noexcept nogil:
+    """Monotonic wall-clock seconds, callable inside nogil sections.
+
+    libc clock() measures process CPU time, which advances slower than wall
+    time when many self-play workers contend for cores, so searches would
+    run far past their time budgets. CLOCK_MONOTONIC tracks real elapsed
+    time regardless of CPU contention. The .so targets Linux/WSL2 only, so
+    the POSIX API is used unconditionally.
+    """
+    cdef timespec ts
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    return <double>ts.tv_sec + <double>ts.tv_nsec * 1e-9
+
+
 cdef bint _check_deadline(SearchState *ss) noexcept nogil:
-    cdef double now = <double>clock() / <double>CLOCKS_PER_SEC
-    if now >= ss.deadline:
+    if _wall_now() >= ss.deadline:
         ss.timeout = True
         return True
     return False
@@ -1478,14 +1507,16 @@ def fast_search(
     best_depth = 0
 
     # Release the GIL for the entire compute-intensive section.
-    # All operations below are pure C — no Python objects touched.
-    # This enables true multi-threading when fast_search is called from
-    # concurrent threads (e.g. ThreadPoolExecutor in self-play workers).
-    # The transposition table (_tt_table) uses lockless sharing — concurrent
-    # reads/writes may occasionally corrupt entries, but this is a well-
-    # established technique in parallel game-tree search (cf. Stockfish).
-    # Corrupted TT entries only reduce search efficiency, never correctness
-    # (move generation is deterministic, TT probes have hash verification).
+    # All operations below are pure C: no Python objects touched.
+    # Releasing the GIL keeps other Python threads (e.g. the GUI) responsive
+    # during a search. Self-play parallelism uses separate processes
+    # (ProcessPoolExecutor), so no current code path calls fast_search from
+    # concurrent threads within one process. If that ever changes, the
+    # transposition table (_tt_table) uses lockless sharing: concurrent
+    # reads/writes may occasionally corrupt entries, a well-established
+    # technique in parallel game-tree search (cf. Stockfish). Corrupted TT
+    # entries only reduce search efficiency, never correctness (move
+    # generation is deterministic, TT probes have hash verification).
     with nogil:
         # Compute initial Zobrist hash and initialize killer/history tables
         h = compute_hash(board, player)
@@ -1497,7 +1528,7 @@ def fast_search(
             tt_probe(h, 0, &_d_score, &_d_alpha, &_d_beta, &_tt_from, &_tt_to)
         _order_moves_full(&moves, 0, &ss, _tt_from, _tt_to, board, -1, -1)
 
-        deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
+        deadline = _wall_now() + time_budget
         ss.deadline = deadline
         ss.nodes = 0
         ss.timeout = False
@@ -1837,7 +1868,7 @@ def play_full_game_cy(
             # good after ~50 moves. Halving preserves relative ordering while
             # letting recent cutoffs dominate older ones.
             _age_history(&ss)
-            ss.deadline = <double>clock() / <double>CLOCKS_PER_SEC + time_budget
+            ss.deadline = _wall_now() + time_budget
             ss.nodes = 0
             ss.timeout = False
 
