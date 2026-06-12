@@ -115,18 +115,15 @@ if [[ -f "$PROJECT_DIR/src/setup_cython.py" ]]; then
     ARCH="$(uname -m)"
     SUFFIX="cpython-${PYVER}-${ARCH}-linux-gnu.so"
     built_any=false
-    for so_src in \
-        "$BUILD_LIB/dama/ai/ml/_fast_encode.${SUFFIX}" \
-        "$BUILD_LIB/dama/ai/algorithmic/_fast_search.${SUFFIX}"; do
-        if [[ -f "$so_src" ]]; then
-            # Derive destination from relative path within build dir
-            rel="${so_src#$BUILD_LIB/}"
-            dest="$PROJECT_DIR/src/$rel"
-            mkdir -p "$(dirname "$dest")"
-            cp "$so_src" "$dest"
-            built_any=true
-        fi
-    done
+    # Copy every built extension (_fast_encode, _fast_score, _fast_search, ...)
+    while IFS= read -r -d '' so_src; do
+        # Derive destination from relative path within build dir
+        rel="${so_src#$BUILD_LIB/}"
+        dest="$PROJECT_DIR/src/$rel"
+        mkdir -p "$(dirname "$dest")"
+        cp "$so_src" "$dest"
+        built_any=true
+    done < <(find "$BUILD_LIB" -name "*.${SUFFIX}" -print0 2>/dev/null)
     if [[ "$built_any" = true ]]; then
         echo "Cython extensions built and installed."
     else
