@@ -27,7 +27,7 @@ SAMPLE_RATE_TARGET = 500         # Target number of loss points to display
 # END OF CONFIGURATION
 # =============================================================================
 
-def load_stats(stats_path: str = "models/training_stats.json"):
+def load_stats(stats_path: str = "models/training_stats_legacy.json"):
     """Load training statistics from JSON file."""
     with open(stats_path, 'r') as f:
         return json.load(f)
@@ -257,6 +257,13 @@ def main():
     project_dir = script_dir if (script_dir / "models").exists() else script_dir.parent
 
     stats_path = Path(args.stats) if args.stats else project_dir / "models" / "training_stats.json"
+    
+    # Fallback to legacy stats file if primary doesn't exist
+    if not stats_path.exists() and not args.stats:
+        legacy_path = project_dir / "models" / "training_stats_legacy.json"
+        if legacy_path.exists():
+            stats_path = legacy_path
+    
     logs_dir = Path(args.logs) if args.logs else project_dir / "logs"
     output_path = Path(args.output) if args.output else project_dir / "models" / "training_progress.png"
 
