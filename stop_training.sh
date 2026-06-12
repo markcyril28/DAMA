@@ -41,15 +41,18 @@ kill_training_only() {
         rm -f "$CHILD_PID_FILE"
     fi
 
-    if pkill -SIGTERM -f "dama\.ai\.ml\.trainer" 2>/dev/null; then
+    # Match both the module path and the setproctitle name set by the
+    # launcher scripts (PROCESS_TITLE in local_train.sh / train_server.sh),
+    # which replaces the python cmdline and hides it from the module pattern.
+    if pkill -SIGTERM -f "dama\.ai\.ml\.trainer|micro-trainer" 2>/dev/null; then
         killed=true
     fi
 
     if $killed; then
         echo "Waiting for trainer to exit..."
         sleep 3
-        if pgrep -f "dama\.ai\.ml\.trainer" >/dev/null 2>&1; then
-            pkill -SIGKILL -f "dama\.ai\.ml\.trainer" 2>/dev/null
+        if pgrep -f "dama\.ai\.ml\.trainer|micro-trainer" >/dev/null 2>&1; then
+            pkill -SIGKILL -f "dama\.ai\.ml\.trainer|micro-trainer" 2>/dev/null
         fi
         echo "Training session stopped. Daemon still running."
     else
@@ -90,15 +93,15 @@ kill_session() {
     fi
 
     # 4) Catch any remaining related processes via pattern match
-    if pkill -SIGTERM -f "dama\.ai\.ml\.trainer|script\.sh|train_server\.sh" 2>/dev/null; then
+    if pkill -SIGTERM -f "dama\.ai\.ml\.trainer|micro-trainer|script\.sh|train_server\.sh" 2>/dev/null; then
         killed=true
         sleep 2
     fi
 
     # 5) Force-kill anything still alive
-    if pgrep -f "dama\.ai\.ml\.trainer" >/dev/null 2>&1; then
+    if pgrep -f "dama\.ai\.ml\.trainer|micro-trainer" >/dev/null 2>&1; then
         echo "Force-killing remaining trainer processes..."
-        pkill -SIGKILL -f "dama\.ai\.ml\.trainer" 2>/dev/null
+        pkill -SIGKILL -f "dama\.ai\.ml\.trainer|micro-trainer" 2>/dev/null
         killed=true
     fi
 
