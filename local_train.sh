@@ -18,7 +18,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
 PROCESS_TITLE="micro-trainer"            # Process name shown in htop (requires 'setproctitle' package)
-RESUME_LATEST=false              # Set true to resume from latest checkpoint in models/checkpoints/
+RESUME_LATEST=true              # Set true to resume from latest checkpoint in models/checkpoints/
                                  # NOTE: Set to false for fresh retrain — old checkpoints may be
                                  # degenerate. See config/training_config_local_retrain.yaml.
 RESUME=""                        # Or set a specific checkpoint path
