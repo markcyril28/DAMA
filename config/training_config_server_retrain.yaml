@@ -1,5 +1,5 @@
 # =============================================================================
-# Retrain from Scratch - Server (MI210, 64GB HBM2e, 64-thread budget, 1TB RAM)
+# Retrain from Scratch - Server (64GB VRAM, 64-thread budget, 1TB RAM)
 # =============================================================================
 # Sized for a 64-thread budget: 64 self-play workers + 1 trainer thread.
 # (Box has 128 cores; this config uses ~50% of them, leaving headroom for
@@ -30,10 +30,10 @@
 # Device Settings
 # -----------------------------------------------------------------------------
 device:
-  type: "cuda"                            # "cuda" maps to ROCm/HIP on AMD
+  type: "cuda"                            # "cuda" maps to the server GPU backend (ROCm/HIP)
   amp:
     enabled: true
-    dtype: "bfloat16"                     # bfloat16 — native on MI210 CDNA2, same
+    dtype: "bfloat16"                     # bfloat16, native on the server GPU, same
                                           # exponent range as FP32. No GradScaler needed.
   compile:
     enabled: true
@@ -102,7 +102,7 @@ selfplay:
                                           # matches the 32w/2100g baseline).
                                           # Cap mainly bites during the early phase
                                           # before the replay buffer fills.
-                                          # MI210 has enterprise cooling; thermal not a concern.
+                                          # Server GPU has enterprise cooling; thermal not a concern.
 
   # ALGO-VS-ALGO: WARNING - 85.7% algo data with hard-only = P1 bias risk.
   # [Pass 84] Hard games have 99.7% P1 win rate. reward_mode=scoring
@@ -125,7 +125,7 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 65536                       # Doubled from 32768. MI210 has 64GB HBM2e.
+  batch_size: 65536                       # Doubled from 32768. Server GPU has 64GB VRAM.
                                           # VRAM at 65536 BF16: ~19.4GB (30% of 64GB).
                                           # Still leaves ~38GB for GPU-resident data +
                                           # torch.compile workspace. Better CU occupancy.
@@ -140,7 +140,7 @@ training:
   checkpoint_every: 1000                  # Frequent saves for fresh training —
                                           # lets eval_checkpoints.sh track progress
                                           # at fine granularity.
-  gradient_accumulation_steps: 1          # Not needed — MI210 64GB can fit batch=65536
+  gradient_accumulation_steps: 1          # Not needed: server GPU 64GB can fit batch=65536
                                           # in a single forward pass (~19.4GB VRAM).
                                           # Effective batch equals batch_size (65536).
 
@@ -235,7 +235,7 @@ statistics:
 # Thermal Protection
 # -----------------------------------------------------------------------------
 thermal_protection:
-  enabled: false                          # MI210 has enterprise active cooling
+  enabled: false                          # Server GPU has enterprise active cooling
   temp_limit_c: 90
   rest_duration: "5m"
   check_every: 30
