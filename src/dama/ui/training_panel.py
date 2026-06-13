@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
     QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QBrush
 
 from ..config import get_config
@@ -48,9 +48,6 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
 
     Communicates with the GUI via queues.
     """
-    import sys
-    import time
-
     try:
         # Import here to avoid loading torch in main process
         from ..ai.ml.trainer import Trainer, TrainingConfig
@@ -79,49 +76,18 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
 
         trainer = Trainer(config)
 
-        # Training loop with IPC handling
-        while trainer.step < config.train_steps:
-            # Check for control messages
-            try:
-                while True:
-                    msg = control_queue.get_nowait()
-                    msg_type = msg.get('type')
-
-                    if msg_type == MSG_PAUSE:
-                        trainer.pause()
-                        status_queue.put({'type': MSG_STATUS_REPLY, **trainer.get_status()})
-
-                    elif msg_type == MSG_RESUME:
-                        trainer.resume()
-                        status_queue.put({'type': MSG_STATUS_REPLY, **trainer.get_status()})
-
-                    elif msg_type == MSG_STOP:
-                        trainer.stop()
-                        status_queue.put({'type': MSG_STATUS_REPLY, 'stopped': True})
-                        return
-
-                    elif msg_type == MSG_STATUS:
-                        status_queue.put({'type': MSG_STATUS_REPLY, **trainer.get_status()})
-
-            except Empty:
-                pass
-
-            # Run training step
-            if not trainer.is_paused:
-                try:
-                    trainer.train()
-                    break  # Training complete
-                except Exception as e:
-                    status_queue.put({'type': MSG_ERROR, 'message': str(e)})
-                    return
-            else:
-                time.sleep(0.1)
+        # train() services control_queue internally (PAUSE/RESUME/STOP/
+        # STATUS) and pushes STATUS_REPLY heartbeats plus CHECKPOINT
+        # notifications onto status_queue while it runs.
+        trainer.set_control_queues(control_queue, status_queue)
+        trainer.train()
 
         # Send final status
         status_queue.put({
             'type': MSG_STATUS_REPLY,
             'step': trainer.step,
             'complete': True,
+            'stopped': trainer.is_stopped,
         })
 
     except Exception as e:
@@ -134,35 +100,48 @@ class TrainingWorker(QThread):
     """
 
     status_update = pyqtSignal(dict)
-    training_complete = pyqtSignal()
+    training_complete = pyqtSignal(bool)  # True when stopped by the user
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, status_queue: mp.Queue):
+    def __init__(self, status_queue: mp.Queue, process: Optional[mp.Process] = None):
         super().__init__()
         self.status_queue = status_queue
+        self._process = process
         self._running = True
 
     def run(self):
         while self._running:
             try:
                 msg = self.status_queue.get(timeout=0.5)
-                msg_type = msg.get('type')
-
-                if msg_type == MSG_STATUS_REPLY:
-                    self.status_update.emit(msg)
-                    if msg.get('complete') or msg.get('stopped'):
-                        self.training_complete.emit()
+            except Empty:
+                # Detect a trainer that died without a final message
+                # (OOM kill, segfault, CUDA abort).  Allow a short grace
+                # period for a last in-flight message before reporting.
+                if self._process is not None and not self._process.is_alive():
+                    try:
+                        msg = self.status_queue.get(timeout=1.0)
+                    except Empty:
+                        self.error_occurred.emit(
+                            "Training process exited unexpectedly "
+                            f"(exit code {self._process.exitcode})")
                         break
+                else:
+                    continue
 
-                elif msg_type == MSG_ERROR:
-                    self.error_occurred.emit(msg.get('message', 'Unknown error'))
+            msg_type = msg.get('type')
+
+            if msg_type == MSG_STATUS_REPLY:
+                self.status_update.emit(msg)
+                if msg.get('complete') or msg.get('stopped'):
+                    self.training_complete.emit(bool(msg.get('stopped')))
                     break
 
-                elif msg_type == MSG_CHECKPOINT:
-                    self.status_update.emit(msg)
+            elif msg_type == MSG_ERROR:
+                self.error_occurred.emit(msg.get('message', 'Unknown error'))
+                break
 
-            except Empty:
-                pass
+            elif msg_type == MSG_CHECKPOINT:
+                self.status_update.emit(msg)
 
     def stop(self):
         self._running = False
@@ -235,32 +214,43 @@ class TestWorker(QThread):
     progress_update = pyqtSignal(dict)
     test_complete = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
-    
-    def __init__(self, status_queue: mp.Queue):
+
+    def __init__(self, status_queue: mp.Queue, process: Optional[mp.Process] = None):
         super().__init__()
         self.status_queue = status_queue
+        self._process = process
         self._running = True
-    
+
     def run(self):
         while self._running:
             try:
                 msg = self.status_queue.get(timeout=0.5)
-                msg_type = msg.get('type')
-                
-                if msg_type == MSG_TEST_PROGRESS:
-                    self.progress_update.emit(msg)
-                
-                elif msg_type == MSG_TEST_COMPLETE:
-                    self.test_complete.emit(msg.get('stats', {}))
-                    break
-                
-                elif msg_type == MSG_TEST_ERROR:
-                    self.error_occurred.emit(msg.get('message', 'Unknown error'))
-                    break
-            
             except Empty:
-                pass
-    
+                # Detect a tester that died without a final message.
+                if self._process is not None and not self._process.is_alive():
+                    try:
+                        msg = self.status_queue.get(timeout=1.0)
+                    except Empty:
+                        self.error_occurred.emit(
+                            "Test process exited unexpectedly "
+                            f"(exit code {self._process.exitcode})")
+                        break
+                else:
+                    continue
+
+            msg_type = msg.get('type')
+
+            if msg_type == MSG_TEST_PROGRESS:
+                self.progress_update.emit(msg)
+
+            elif msg_type == MSG_TEST_COMPLETE:
+                self.test_complete.emit(msg.get('stats', {}))
+                break
+
+            elif msg_type == MSG_TEST_ERROR:
+                self.error_occurred.emit(msg.get('message', 'Unknown error'))
+                break
+
     def stop(self):
         self._running = False
 
@@ -926,7 +916,7 @@ class TestPanel(QWidget):
         self._test_process.start()
         
         # Start worker
-        self._test_worker = TestWorker(self._test_status_queue)
+        self._test_worker = TestWorker(self._test_status_queue, self._test_process)
         self._test_worker.progress_update.connect(self._on_test_progress)
         self._test_worker.test_complete.connect(self._on_test_complete)
         self._test_worker.error_occurred.connect(self._on_test_error)
@@ -1015,6 +1005,9 @@ class TestPanel(QWidget):
         if self._test_process and self._test_process.is_alive():
             self._test_process.terminate()
             self._test_process.join(timeout=5)
+            if self._test_process.is_alive():
+                self._test_process.kill()
+                self._test_process.join(timeout=2)
 
         self._test_process = None
         self._test_control_queue = None
@@ -1139,13 +1132,10 @@ class TrainingPanel(QWidget):
         self._control_queue: Optional[mp.Queue] = None
         self._status_queue: Optional[mp.Queue] = None
         self._worker: Optional[TrainingWorker] = None
-        
+        self._stop_requested = False
+
         # Live chart data
         self._live_loss_data: List[float] = []
-
-        # Status timer
-        self._status_timer = QTimer()
-        self._status_timer.timeout.connect(self._request_status)
 
         self._init_ui()
         self._refresh_checkpoints()
@@ -1378,6 +1368,7 @@ class TrainingPanel(QWidget):
         
         # Clear live loss data
         self._live_loss_data = []
+        self._stop_requested = False
 
         # Create queues
         self._control_queue = mp.Queue()
@@ -1391,14 +1382,11 @@ class TrainingPanel(QWidget):
         self._process.start()
 
         # Start worker thread to monitor status
-        self._worker = TrainingWorker(self._status_queue)
+        self._worker = TrainingWorker(self._status_queue, self._process)
         self._worker.status_update.connect(self._on_status_update)
         self._worker.training_complete.connect(self._on_training_complete)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.start()
-
-        # Start status polling
-        self._status_timer.start(2000)
 
         # Update UI
         self._set_training_state(True)
@@ -1409,39 +1397,57 @@ class TrainingPanel(QWidget):
         """Pause training."""
         if self._control_queue:
             self._control_queue.put({'type': MSG_PAUSE})
-            self.state_label.setText("State: Paused")
+            # Transitional label; flips to "Paused" when the trainer's
+            # STATUS_REPLY confirms in _on_status_update.
+            self.state_label.setText("State: Pausing...")
             self.pause_btn.setEnabled(False)
             self.resume_btn.setEnabled(True)
-            self._log("Training paused")
+            self._log("Pause requested")
 
     def _resume_training(self):
         """Resume training."""
         if self._control_queue:
             self._control_queue.put({'type': MSG_RESUME})
-            self.state_label.setText("State: Running")
+            self.state_label.setText("State: Resuming...")
             self.pause_btn.setEnabled(True)
             self.resume_btn.setEnabled(False)
-            self._log("Training resumed")
+            self._log("Resume requested")
 
     def _stop_training(self):
         """Stop training."""
         if self._control_queue:
             self._control_queue.put({'type': MSG_STOP})
-            self._log("Stopping training...")
-
-    def _request_status(self):
-        """Request status update from trainer."""
-        if self._control_queue:
-            self._control_queue.put({'type': MSG_STATUS})
+            self._stop_requested = True
+            self.state_label.setText("State: Stopping...")
+            # Pause/Resume make no sense once a stop is in flight
+            self.pause_btn.setEnabled(False)
+            self.resume_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self._log("Stopping training (will save a final checkpoint)...")
 
     def _on_status_update(self, status: dict):
         """Handle status update from trainer."""
+        # Checkpoint notifications carry only step + path; handle them
+        # separately so they don't clobber the richer heartbeat label.
+        if status.get('type') == MSG_CHECKPOINT:
+            path = status.get('checkpoint_path')
+            if path:
+                self._log(f"Checkpoint saved: {path}")
+                # Refresh stats panel when checkpoint is saved
+                self.stats_panel.load_stats()
+            return
+
         step = status.get('step', 0)
         gpu_mem = status.get('gpu_mem_mb', 0)
         epoch = status.get('epoch', 0)
         recent_loss = status.get('recent_loss')
-        best_loss = status.get('best_loss')
         paused = status.get('paused', False)
+
+        # Reflect the trainer's actual pause state (the buttons set the
+        # label optimistically; this confirms once the trainer reacts).
+        if ('paused' in status and not self._stop_requested
+                and not status.get('complete') and not status.get('stopped')):
+            self.state_label.setText("State: Paused" if paused else "State: Running")
 
         # Update step label with more info
         step_text = f"Step: {step}"
@@ -1450,30 +1456,31 @@ class TrainingPanel(QWidget):
         if recent_loss is not None:
             step_text += f" | Loss: {recent_loss:.4f}"
         self.step_label.setText(step_text)
-        
+
         self.progress_bar.setValue(step)
 
         if gpu_mem > 0:
             self.gpu_label.setText(f"GPU: {gpu_mem:.0f} MB")
 
-        if status.get('checkpoint_path'):
-            self._log(f"Checkpoint saved: {status['checkpoint_path']}")
-            # Refresh stats panel when checkpoint is saved
-            self.stats_panel.load_stats()
-
-    def _on_training_complete(self):
-        """Handle training completion."""
-        self._log("Training complete!")
+    def _on_training_complete(self, stopped: bool = False):
+        """Handle training completion (natural or user-stopped)."""
+        self._log("Training stopped." if stopped else "Training complete!")
         self._cleanup()
-        self.state_label.setText("State: Complete")
+        self.state_label.setText("State: Stopped" if stopped else "State: Complete")
         # Refresh stats
         self.stats_panel.load_stats()
         # Refresh checkpoints
         self._refresh_checkpoints()
-        QMessageBox.information(self, "Training Complete",
-                               "ML model training has completed successfully.\n\n"
-                               "The trained model is saved at models/latest.pt\n"
-                               "View the Statistics tab for training metrics.")
+        if stopped:
+            QMessageBox.information(self, "Training Stopped",
+                                   "Training was stopped.\n\n"
+                                   "A final checkpoint was saved at models/latest.pt\n"
+                                   "View the Statistics tab for training metrics.")
+        else:
+            QMessageBox.information(self, "Training Complete",
+                                   "ML model training has completed successfully.\n\n"
+                                   "The trained model is saved at models/latest.pt\n"
+                                   "View the Statistics tab for training metrics.")
 
     def _on_error(self, message: str):
         """Handle training error."""
@@ -1499,8 +1506,6 @@ class TrainingPanel(QWidget):
 
     def _cleanup(self):
         """Clean up after training stops."""
-        self._status_timer.stop()
-
         if self._worker:
             self._worker.stop()
             self._worker.wait()
@@ -1509,12 +1514,22 @@ class TrainingPanel(QWidget):
         if self._process and self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=5)
+            if self._process.is_alive():
+                # terminate() (SIGTERM) did not work; force-kill so the
+                # trainer cannot outlive the GUI.
+                self._process.kill()
+                self._process.join(timeout=2)
 
         self._process = None
         self._control_queue = None
         self._status_queue = None
 
         self._set_training_state(False)
+
+    def shutdown(self):
+        """Stop all child processes and worker threads (called on app close)."""
+        self._cleanup()
+        self.test_panel._cleanup_test()
 
     def _reload_model(self):
         """Reload the ML model for inference."""
@@ -1530,5 +1545,5 @@ class TrainingPanel(QWidget):
 
     def closeEvent(self, event):
         """Handle panel close."""
-        self._cleanup()
+        self.shutdown()
         event.accept()
