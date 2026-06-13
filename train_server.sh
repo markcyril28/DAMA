@@ -4,18 +4,16 @@ set -euo pipefail
 # =============================================================================
 # SETUP CONFIGURATION
 # =============================================================================
-# SERVER SPECS (Dell Server with AMD ROCm):
-#   GPU: AMD Instinct MI210 (Aldebaran/MI200)
-#   VRAM: 64GB HBM2e
+# SERVER SPECS:
+#   GPU: server GPU
+#   VRAM: 64GB
 #   RAM: 1TB DDR4
-#   Architecture: gfx90a (CDNA2)
-#   Driver: amdgpu
 #   Compute Platform: ROCm 6.x
 #   CPU Threads: 64
 #===============================================================================
 
 # =============================================================================
-# TRAINING PARAMETERS - Optimized for MI210 64GB + 128 CPU threads + 1TB RAM
+# TRAINING PARAMETERS - Optimized for server GPU 64GB + 128 CPU threads + 1TB RAM
 # =============================================================================
 # All training parameters are now defined in the YAML config file.
 # Edit the config file to change training settings.
@@ -67,7 +65,7 @@ export PYTHONPATH="${PROJECT_DIR}/src:${PYTHONPATH:-}"
 # =============================================================================
 # GPU Vendor Settings
 # =============================================================================
-# Suppress logging for AMD ROCm (harmless no-ops on NVIDIA/CPU)
+# Suppress logging for the server GPU (ROCm; harmless no-ops on NVIDIA/CPU)
 export MIOPEN_ENABLE_LOGGING=0
 export MIOPEN_ENABLE_LOGGING_CMD=0
 export AMD_LOG_LEVEL=0
@@ -149,7 +147,7 @@ python3 -c "import torch; assert torch.cuda.is_available(), 'GPU not available. 
     echo ""
     echo "Troubleshooting:"
     echo "  NVIDIA: run 'nvidia-smi', install CUDA toolkit, pip install torch --index-url https://download.pytorch.org/whl/cu121"
-    echo "  AMD:    run 'rocm-smi', install ROCm 6.x, pip install torch --index-url https://download.pytorch.org/whl/rocm6.2"
+    echo "  Server: run 'rocm-smi', install ROCm 6.x, pip install torch --index-url https://download.pytorch.org/whl/rocm6.2"
     exit 1
 }
 

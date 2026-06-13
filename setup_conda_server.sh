@@ -4,21 +4,16 @@ set -euo pipefail
 # =============================================================================
 # SETUP CONFIGURATION
 # =============================================================================
-# SERVER SPECS (Dell Server with AMD ROCm):
-#   GPU: AMD Instinct MI210 (Aldebaran/MI200)
-#   VRAM: 64GB HBM2e
-#   Architecture: gfx90a (CDNA2)
-#   Driver: amdgpu
+# SERVER SPECS:
+#   GPU: server GPU
+#   VRAM: 64GB
 #   Compute Platform: ROCm 6.x
 #   CPU Threads: 32
 #===============================================================================
 
 : << 'SERVER_SPECS'
 =================================== Product Info ======================================
-GPU[0]          : Card Model:           0x740f
-GPU[0]          : Card Vendor:          Advanced Micro Devices, Inc. [AMD/ATI]
-GPU[0]          : Card SKU:             D67301V
-GPU[0]          : GFX Version:          gfx90a
+GPU[0]          : Card Vendor:          server GPU
 ================================== Memory Info ========================================
 GPU[0]          : VRAM Total Memory (B): 68702699520 (~64GB)
 GPU[0]          : Temperature (Sensor junction) (C): 35.0
@@ -30,7 +25,7 @@ SERVER_SPECS
 ENV_NAME="train"                  # Name of the conda environment
 PYTHON_VERSION="3.11"            # Python version (must match environment.yml)
 
-# PyTorch settings for AMD ROCm
+# PyTorch settings for the server GPU (ROCm)
 ROCM_VERSION="rocm6.2"           # ROCm version for PyTorch (matches ROCm 6.x platform)
 
 # Optional components
@@ -88,8 +83,8 @@ fi
 echo "Active environment: ${CONDA_PREFIX:-unknown}"
 
 echo ""
-echo "Installing PyTorch with AMD ROCm support..."
-echo "Target GPU: AMD Instinct MI210 (gfx90a/CDNA2)"
+echo "Installing PyTorch with ROCm support..."
+echo "Target: server GPU"
 
 # Verify ROCm is available
 if command -v rocm-smi &> /dev/null; then
@@ -152,9 +147,8 @@ python -c "import torch; print('ROCm version:', torch.version.hip if hasattr(tor
 
 # ROCm environment hints
 echo ""
-echo "=== AMD ROCm Environment ==="
-echo "GPU: AMD Instinct MI210 (64GB HBM2e)"
-echo "Architecture: gfx90a (CDNA2)"
+echo "=== Server GPU Environment ==="
+echo "GPU: server GPU (64GB VRAM)"
 echo "ROCm Platform: 6.x"
 echo ""
 echo "Useful ROCm commands:"
