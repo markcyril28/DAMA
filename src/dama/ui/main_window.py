@@ -60,6 +60,9 @@ class MainWindow(QMainWindow):
 
         # AI worker
         self.ai_worker: Optional[AIWorker] = None
+        # True while an AI worker is thinking; covers the gap between the
+        # worker's completion signal and isRunning() turning false
+        self._ai_thinking = False
         
         # Self-play control
         self.self_play_paused = False
@@ -334,6 +337,7 @@ class MainWindow(QMainWindow):
         if self.ai_worker and self.ai_worker.isRunning():
             self.ai_worker.terminate()
             self.ai_worker.wait()
+        self._ai_thinking = False
 
         # Reset pause state
         self.self_play_paused = False
@@ -402,6 +406,11 @@ class MainWindow(QMainWindow):
 
     def _on_move_request(self, player: Player, player_type: PlayerType) -> None:
         """Handle AI move request."""
+        # Don't spawn a second worker while one is still thinking
+        # (e.g. _refresh_current_turn firing during an in-flight think)
+        if self._ai_thinking or (self.ai_worker is not None and self.ai_worker.isRunning()):
+            return
+
         color_name = "White" if player == Player.ONE else "Black"
         # Check if paused
         if self.self_play_paused:
@@ -414,6 +423,7 @@ class MainWindow(QMainWindow):
         self._update_pause_button()
 
         # Start AI worker thread
+        self._ai_thinking = True
         self.ai_worker = AIWorker(self.engine, player_type)
         self.ai_worker.move_ready.connect(self._on_ai_move_ready)
         self.ai_worker.error.connect(self._on_ai_error)
@@ -428,6 +438,7 @@ class MainWindow(QMainWindow):
 
     def _on_ai_move_ready(self, move: Move) -> None:
         """Handle move from AI."""
+        self._ai_thinking = False
         # Check if both players are AI (self-play mode)
         p1_type = self.engine.get_player_type(Player.ONE)
         p2_type = self.engine.get_player_type(Player.TWO)
@@ -448,6 +459,7 @@ class MainWindow(QMainWindow):
 
     def _on_ai_error(self, error: str) -> None:
         """Handle AI error."""
+        self._ai_thinking = False
         self.status_bar.showMessage(f"AI error: {error}")
         QMessageBox.warning(self, "AI Error", error)
 
@@ -558,6 +570,13 @@ class MainWindow(QMainWindow):
         if self.ai_worker and self.ai_worker.isRunning():
             self.ai_worker.terminate()
             self.ai_worker.wait()
+        self._ai_thinking = False
+
+        # Shut down training/testing subprocesses and their monitor threads.
+        # Docked panels never receive closeEvent themselves, so without this
+        # the trainer process would be orphaned and keep running.
+        for panel in self.findChildren(TrainingPanel):
+            panel.shutdown()
 
         # Save config
         save_config()
