@@ -1,6 +1,8 @@
 """Self-play for generating training data."""
 
+import os
 import random
+import time
 from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
 from ...types import Move, Player
@@ -68,6 +70,18 @@ from .dataset import _encode_board_fast, _encode_moves_fast
 # With ~3000-10K noise moves per self-play cycle, saves ~300-1000μs.
 _random = random.random
 _randrange = random.randrange
+
+
+def _selfplay_worker_init():
+    """Per-worker initializer for self-play ProcessPoolExecutor pools.
+
+    With the fork start method, every worker inherits the parent's global
+    random state byte-for-byte, so without reseeding all workers draw
+    identical exploration noise. Reseeding the global random module also
+    affects the _random/_randrange bindings above (bound methods of the
+    same global Random singleton).
+    """
+    random.seed((os.getpid() ^ (time.time_ns() & 0xFFFFFFFF)) & 0xFFFFFFFF)
 
 # [Pass 70] Fork-inherited model for self-play workers.
 # On Linux (fork start method), parent sets this global before creating the
