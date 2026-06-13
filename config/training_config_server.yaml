@@ -1,8 +1,8 @@
 # =============================================================================
 # Micro Training Configuration - SERVER (v5)
 # =============================================================================
-# Hardware: AMD Instinct MI210 (64GB HBM2e) + 128 CPU threads + 1TB DDR4 RAM
-# Platform: ROCm 6.x, gfx90a (CDNA2)
+# Hardware: server GPU (64GB VRAM) + 128 CPU threads + 1TB DDR4 RAM
+# Platform: ROCm 6.x
 #
 # Thread Allocation (128 total — auto-configured by trainer):
 #   - Self-play workers:   96 (75%)   ← game generation via ProcessPoolExecutor
@@ -87,11 +87,11 @@ time_limit:
 # Device Settings
 # -----------------------------------------------------------------------------
 device:
-  type: "cuda"                        # "cuda" maps to ROCm/HIP on AMD
+  type: "cuda"                        # "cuda" maps to the server GPU backend (ROCm/HIP)
   amp:
-    enabled: true                     # ENABLED: MI210 CDNA2 has native bfloat16 ALUs
+    enabled: true                     # ENABLED: server GPU has native bfloat16 ALUs
                                       # No GradScaler needed with bfloat16. ~2x throughput.
-    dtype: "bfloat16"                 # bfloat16 — native on MI210, same exponent range as FP32
+    dtype: "bfloat16"                 # bfloat16, native on the server GPU, same exponent range as FP32
   compile:
     enabled: true                     # torch.compile for kernel fusion
     mode: "max-autotune"              # "max-autotune" = maximum GPU optimization.
@@ -247,14 +247,14 @@ value_head:
 # DataLoader Settings
 # -----------------------------------------------------------------------------
 # FastBatchIterator bypasses DataLoader entirely — zero workers needed.
-# pin_memory=true enables async HBM2e transfers via CUDAPrefetcher
+# pin_memory=true enables async host-to-VRAM transfers via CUDAPrefetcher
 # (avoids synchronous pageable→staging copy for unpinned tensors).
 # Dataset preprocessing is parallelized via ProcessPoolExecutor (auto-scaled
 # to min(cores/2, 16) workers for datasets >5K entries).
 # -----------------------------------------------------------------------------
 dataloader:
   num_workers: 0                      # FastBatchIterator bypasses DataLoader — workers unused.
-  pin_memory: true                    # Pinned memory for async HBM2e transfers via CUDAPrefetcher
+  pin_memory: true                    # Pinned memory for async host-to-VRAM transfers via CUDAPrefetcher
   prefetch_factor: 2                  # Unused — FastBatchIterator bypasses DataLoader
   replay_max_entries: 5000000          # 5M entries. Float16 GPU storage: ~5.9GB of 64GB VRAM.
                                       # With batch=65536 activations ~19.4GB +
@@ -324,7 +324,7 @@ statistics:
 # Pauses training when GPU or CPU temperature exceeds the threshold.
 # After resting for the configured duration, training resumes automatically.
 thermal_protection:
-  enabled: false                       # Disabled: MI210 has enterprise active cooling
+  enabled: false                       # Disabled: server GPU has enterprise active cooling
   temp_limit_c: 90                     # Temperature threshold in Celsius
   rest_duration: "5m"                  # Rest duration when limit is hit
   check_every: 30                      # Check temperature every N seconds
