@@ -1,5 +1,6 @@
 """ML model inference for move selection."""
 
+import time
 import warnings
 import threading
 from typing import Optional, List, Tuple
@@ -42,9 +43,19 @@ def _resolve_model_path(model_path: str) -> Path:
     return _PROJECT_ROOT / path
 
 
+def _stat_signature(path: Path) -> Tuple[int, int]:
+    """Return (st_mtime_ns, st_size) identifying the file's current contents."""
+    st = path.stat()
+    return (st.st_mtime_ns, st.st_size)
+
+
 def get_model(model_path: str, device: Optional[torch.device] = None) -> MoveScorerNet:
     """
     Get a model, loading from cache if available.
+
+    The cache is keyed on (model_path, device) and stores the file's
+    mtime/size signature, so a checkpoint overwritten at the same path
+    (e.g. models/latest.pt during training) is reloaded automatically.
 
     Args:
         model_path: Path to the model checkpoint
@@ -68,32 +79,63 @@ def get_model(model_path: str, device: Optional[torch.device] = None) -> MoveSco
             device = torch.device('cpu')
 
     cache_key = (model_path, str(device))
+    path = _resolve_model_path(model_path)
 
-    if cache_key not in _model_cache:
+    try:
+        signature = _stat_signature(path)
+    except FileNotFoundError:
+        # Checkpoints are written to a temp file then os.rename()'d into
+        # place, so the file can be briefly missing. Serve the cached model
+        # if one exists; otherwise retry the stat briefly before giving up.
         with _model_cache_lock:
-            if cache_key not in _model_cache:
-                path = _resolve_model_path(model_path)
-                if not path.exists():
-                    raise FileNotFoundError(f"Model not found: {path}")
+            entry = _model_cache.get(cache_key)
+        if entry is not None:
+            return entry[0]
+        signature = None
+        for _ in range(5):
+            time.sleep(0.05)
+            try:
+                signature = _stat_signature(path)
+                break
+            except FileNotFoundError:
+                pass
+        if signature is None:
+            raise FileNotFoundError(f"Model not found: {path}")
 
-                model = load_model(str(path), device)
-                # Fold BatchNorm into Conv2d on CPU for ~10-20% faster
-                # inference.  GPU inference benefits less (cuDNN already
-                # fuses BN+Conv internally), so only fold on CPU.
-                if device.type == 'cpu':
-                    try:
-                        fold_batchnorm(model)
-                    except Exception:
-                        pass  # Folding is optional; fall back to unfused
-                _model_cache[cache_key] = model
+    with _model_cache_lock:
+        entry = _model_cache.get(cache_key)
+    if entry is not None and entry[1] == signature:
+        return entry[0]
 
-    return _model_cache[cache_key]
+    # Cache miss or stale checkpoint: load outside the lock so other
+    # threads are not blocked behind torch.load.
+    model = load_model(str(path), device)
+    # Fold BatchNorm into Conv2d on CPU for ~10-20% faster
+    # inference.  GPU inference benefits less (cuDNN already
+    # fuses BN+Conv internally), so only fold on CPU.
+    if device.type == 'cpu':
+        try:
+            fold_batchnorm(model)
+        except Exception:
+            pass  # Folding is optional; fall back to unfused
+
+    with _model_cache_lock:
+        entry = _model_cache.get(cache_key)
+        if entry is not None and entry[1] == signature:
+            # Another thread loaded the same checkpoint first; reuse it.
+            return entry[0]
+        # Replace any existing entry for this (path, device) pair in
+        # place so the cache holds at most one model per key.
+        _model_cache[cache_key] = (model, signature)
+
+    return model
 
 
 def clear_model_cache() -> None:
     """Clear the model cache."""
     global _model_cache
-    _model_cache.clear()
+    with _model_cache_lock:
+        _model_cache.clear()
 
 
 def get_ml_move(
