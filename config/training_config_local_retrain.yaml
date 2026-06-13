@@ -65,14 +65,40 @@ model:
 # P1 and P2 perspectives (algo wins as both sides).
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 8                        # [Pass 85] Reduced from 10. Measured on 2026-06-12: 10 workers
-                                        # push the shared laptop heatpipe to 87-89C, which activates
-                                        # GPU "SW Thermal Slowdown" and pins the GPU at 277MHz of
-                                        # 3090MHz max (29W of 75W limit), ~11x slower batches.
-                                        # Self-play over-produces data 50-100x relative to GPU
-                                        # consumption (104K entries/40s vs max_stale 100 epochs),
-                                        # so trading 2 workers for GPU clock headroom is a large
-                                        # net throughput win. Trainer thread + OS use the rest.
+  cpu_workers: 6                        # [Pass 86] Reduced from 8. Measured on the 2026-06-13 6h run
+                                        # (logs/local/stats/epochs_20260613_120944.csv): 8 workers
+                                        # still thermally throttle 3.8% of epochs (11/292 epochs
+                                        # >120s; epoch 292 = 360s for 61 batches = 6x slowdown), and
+                                        # those throttle events drag mean batches/sec from ~0.95
+                                        # (un-throttled) down to 0.872. On the shared heatpipe, CPU
+                                        # load directly steals GPU clock, so the throttle IS the
+                                        # dominant throughput loss (GPU is otherwise 100% util,
+                                        # 1.3GB/8GB allocated — compute-bound, not VRAM-bound).
+                                        # No starvation risk: at 6 workers self-play still produces
+                                        # ~101K entries/~46s, refreshing the buffer every ~1-2 epochs
+                                        # while max_stale_epochs=100 only requires fresh data every
+                                        # ~100 epochs (≈50x safety margin). Self-play over-produces
+                                        # 20-100x vs GPU consumption regardless.
+                                        # MECHANISM (measured 2026-06-13): the heat is CPU-dominated,
+                                        # conducted through the shared heatpipe. Proof: GPU at 0% util
+                                        # / 11W still read 77C, and under training load it pinned at
+                                        # 277MHz (SW Thermal Slowdown) at 87-90C while drawing only
+                                        # 30-40W — a GPU shedding 30W can't self-heat to 90C, so the
+                                        # GPU temp sensor is effectively a proxy for CPU heat. This is
+                                        # why a marginal worker cut (8->6) helps little: at 100% self-
+                                        # play duty cycle the heatpipe stays saturated regardless.
+                                        # NEXT PASS (the real lever): throttle the background self-play
+                                        # *duty cycle* (sleep between cycles) — it periodically drops
+                                        # CPU self-play to ~0 and lets the heatpipe actually cool,
+                                        # without cutting parallelism. Data is over-produced 20-100x so
+                                        # freshness is unaffected. Verify in ~2 min (no 6h run needed):
+                                        # sample GPU temp with self-play running vs paused, ~60s each;
+                                        # the delta is the CPU-heatpipe contribution. Deferred here: it
+                                        # touches the bg hot loop and must preserve pause/stop
+                                        # responsiveness, so keep it isolated.
+                                        # [Pass 85] Reduced 10->8: 10 workers push the heatpipe to
+                                        # 87-89C, activating GPU "SW Thermal Slowdown" pinning the GPU
+                                        # at 277MHz of 3090MHz (29W of 75W), ~11x slower batches.
   games_per_epoch: 500*4                  # [Pass 83] Doubled from 200 to compensate for algo_vs_algo
                                         # removal. 400 × ~42 moves = ~16.8K entries/cycle.
                                         # 200 as P1 + 200 as P2 (focus_side: "both").
