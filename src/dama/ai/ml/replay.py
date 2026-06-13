@@ -24,6 +24,11 @@ except ImportError:
     _json_loads = _json_mod.loads
     _json_dumps = _json_mod.dumps
 
+# Errors raised when parsing a corrupt/truncated JSONL line: JSONDecodeError
+# (stdlib and orjson) subclasses ValueError; KeyError/TypeError cover entry
+# dicts with missing fields or malformed structures in ReplayEntry.from_dict.
+_PARSE_ERRORS = (ValueError, KeyError, TypeError)
+
 
 @dataclass
 class ReplayEntry:
@@ -258,11 +263,19 @@ class ReplayBuffer:
             random.shuffle(files)
 
         for filepath in files:
+            skipped = 0
             with open(filepath, 'r') as f:
                 for line in f:
                     if line.strip():
-                        data = _json_loads(line)
-                        yield ReplayEntry.from_dict(data)
+                        try:
+                            data = _json_loads(line)
+                            entry = ReplayEntry.from_dict(data)
+                        except _PARSE_ERRORS:
+                            skipped += 1
+                            continue
+                        yield entry
+            if skipped:
+                print(f"  Warning: skipped {skipped} corrupt line(s) in replay file {filepath}")
 
     def _load_file_cached(self, path: Path) -> List[ReplayEntry]:
         """Load entries from a single file, using mtime cache to skip unchanged files."""
@@ -277,11 +290,17 @@ class ReplayBuffer:
 
         # Cache miss — parse from disk.
         entries = []
+        skipped = 0
         with open(path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    entries.append(ReplayEntry.from_dict(_json_loads(line)))
+                    try:
+                        entries.append(ReplayEntry.from_dict(_json_loads(line)))
+                    except _PARSE_ERRORS:
+                        skipped += 1
+        if skipped:
+            print(f"  Warning: skipped {skipped} corrupt line(s) in replay file {path}")
         self._file_cache[path] = (mtime, entries)
         return entries
 
@@ -398,11 +417,19 @@ class ReplayBuffer:
             if not indices_set:
                 return []
             loaded = []
+            skipped = 0
             with open(path, 'r') as f:
+                # Enumerate every physical line (blank or corrupt included) so
+                # indices stay aligned with _count_file's line counts.
                 for i, line in enumerate(f):
                     if i in indices_set and line.strip():
-                        data = _json_loads(line)
-                        loaded.append(ReplayEntry.from_dict(data))
+                        try:
+                            data = _json_loads(line)
+                            loaded.append(ReplayEntry.from_dict(data))
+                        except _PARSE_ERRORS:
+                            skipped += 1
+            if skipped:
+                print(f"  Warning: skipped {skipped} corrupt line(s) in replay file {path}")
             return loaded
 
         # Iterate in original file order (sorted by mtime from get_replay_files)
