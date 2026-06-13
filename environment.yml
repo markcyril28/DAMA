@@ -12,4 +12,4 @@ dependencies:
     - psutil  # For RAM detection in dataset caching
     - pytest  # For running tests
     - setproctitle  # Renames the trainer process for htop/btop visibility (PROCESS_TITLE env)
-    # PyTorch with ROCm is installed separately via setup_conda_server.sh
+    # PyTorch for the server GPU is installed separately via setup_conda_server.sh
