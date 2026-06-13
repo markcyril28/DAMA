@@ -27,7 +27,7 @@ SAMPLE_RATE_TARGET = 500         # Target number of loss points to display
 # END OF CONFIGURATION
 # =============================================================================
 
-def load_stats(stats_path: str = "models/training_stats_legacy.json"):
+def load_stats(stats_path: str = "models/training_stats.json"):
     """Load training statistics from JSON file."""
     with open(stats_path, 'r') as f:
         return json.load(f)
@@ -77,8 +77,12 @@ def merge_test_history(stats: dict, log_entries: list[dict]) -> list[dict]:
     Returns:
         Combined and deduplicated test history, sorted by step
     """
-    # Start with test_history from stats
-    combined = {entry['step']: entry for entry in stats.get('test_history', [])}
+    # Start with test_history from stats (skip malformed entries with no step)
+    combined = {
+        entry['step']: entry
+        for entry in stats.get('test_history', [])
+        if entry.get('step') is not None
+    }
     
     # Add entries from log files (will overwrite duplicates)
     for entry in log_entries:
@@ -88,6 +92,7 @@ def merge_test_history(stats: dict, log_entries: list[dict]) -> list[dict]:
     
     # Sort by step and return as list
     return [combined[step] for step in sorted(combined.keys())]
+
 
 def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "models/training_progress.png", dpi: int = DEFAULT_DPI, show: bool = True):
     """Plot ML model win rate against algorithm over training steps.
@@ -206,10 +211,10 @@ def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "mod
     Epochs Completed:         {epochs_str}
     Best Loss:                {best_loss_str}
     
-    Model vs Algorithm Tests
-    ========================
+    Model vs Algorithm Tests (cumulative)
+    =====================================
     
-    Total Test Games:         {total_games:,}
+    Cumulative Test Games:    {total_games:,}
     ML Wins:                  {total_ml_wins:,} ({overall_win_rate:.1f}%)
     Algorithm Wins:           {total_algo_wins:,} ({algo_win_rate:.1f}%)
     Draws:                    {total_draws:,}
@@ -237,6 +242,37 @@ def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "mod
     else:
         plt.close(fig)
 
+
+def resolve_stats_path(project_dir: Path, explicit: str | None) -> Path:
+    """Choose which training-stats JSON to plot.
+
+    With --stats, honor the given path verbatim. Otherwise pick the most
+    recently modified non-legacy stats file (training_stats.json,
+    training_stats_local.json, training_stats_server.json) so the no-arg
+    command tracks whichever run last wrote stats. Fall back to
+    training_stats_legacy.json only when none of those exist, then to the
+    conventional default path so the caller reports a consistent message.
+    """
+    if explicit:
+        return Path(explicit)
+
+    models_dir = project_dir / "models"
+    candidates = [
+        models_dir / "training_stats.json",
+        models_dir / "training_stats_local.json",
+        models_dir / "training_stats_server.json",
+    ]
+    existing = [p for p in candidates if p.exists()]
+    if existing:
+        return max(existing, key=lambda p: p.stat().st_mtime)
+
+    legacy = models_dir / "training_stats_legacy.json"
+    if legacy.exists():
+        return legacy
+
+    return models_dir / "training_stats.json"
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description='Plot Filipino Micro training progress')
@@ -256,14 +292,8 @@ def main():
     script_dir = Path(__file__).resolve().parent
     project_dir = script_dir if (script_dir / "models").exists() else script_dir.parent
 
-    stats_path = Path(args.stats) if args.stats else project_dir / "models" / "training_stats.json"
-    
-    # Fallback to legacy stats file if primary doesn't exist
-    if not stats_path.exists() and not args.stats:
-        legacy_path = project_dir / "models" / "training_stats_legacy.json"
-        if legacy_path.exists():
-            stats_path = legacy_path
-    
+    stats_path = resolve_stats_path(project_dir, args.stats)
+
     logs_dir = Path(args.logs) if args.logs else project_dir / "logs"
     output_path = Path(args.output) if args.output else project_dir / "models" / "training_progress.png"
 
@@ -284,7 +314,7 @@ def main():
     # Merge test history
     test_history = merge_test_history(stats, log_entries)
     stats_count = len(stats.get('test_history', []))
-    print(f"  Combined: {stats_count} from stats + {len(log_entries)} from logs = {len(test_history)} unique entries")
+    print(f"  Combined {stats_count} from stats and {len(log_entries)} from logs -> {len(test_history)} unique entries (deduplicated by step)")
 
     print("Generating training progress plot...")
     plot_win_rate(stats, test_history, str(output_path), dpi=args.dpi, show=not args.no_show)
