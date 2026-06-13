@@ -18,7 +18,7 @@ device:
   type: "cuda"                        # "cuda" (ROCm/HIP or CUDA) or "cpu"
   amp:
     enabled: true                     # Enable automatic mixed precision
-    dtype: "bfloat16"                 # "bfloat16" (recommended for MI210) or "float16"
+    dtype: "bfloat16"                 # "bfloat16" (recommended for the server GPU) or "float16"
   compile:
     enabled: true                     # Enable torch.compile for faster training
     mode: "reduce-overhead"           # "default", "reduce-overhead", "max-autotune"
@@ -196,7 +196,7 @@ time_limit:
 # =============================================================================
 
 profiles:
-  # AMD MI210 Server (64GB VRAM, 128 CPU threads, 1TB RAM)
+  # Server GPU (64GB VRAM, 128 CPU threads, 1TB RAM)
   # NOTE: Use training_config_server.yaml or training_config_server_retrain.yaml
   # directly for server training. This profile is for reference only.
   server:
@@ -211,7 +211,7 @@ profiles:
         enabled: true
         dtype: "bfloat16"
       compile:
-        mode: "max-autotune"          # MI210 benefits from max-autotune (large VRAM)
+        mode: "max-autotune"          # Server GPU benefits from max-autotune (large VRAM)
     selfplay:
       cpu_workers: 96                 # Synced with server configs
       games_per_epoch: 900            # [Pass 83] Synced with server_retrain.yaml (was 512)
