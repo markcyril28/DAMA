@@ -574,7 +574,18 @@ class ModelVsAlgoTester:
 
         except Exception as e:
             print(f"Parallel testing failed ({e}), falling back to sequential")
-            # Sequential fallback — use batched function directly
+            # The parallel loop may have already ingested some games before
+            # failing; the fallback replays every batch, so reset all
+            # accumulators to avoid double-counting those games.
+            stats = TestStatistics(
+                model_path=self.model_path,
+                algo_difficulty=self.algo_difficulty,
+                start_time=stats.start_time,
+            )
+            total_moves = 0
+            total_time_ms = 0.0
+            self._games_completed = 0
+            # Sequential fallback - use batched function directly
             for batch in batches:
                 if not self._running:
                     break
