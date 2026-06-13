@@ -12,6 +12,7 @@ from collections import deque
 import platform
 import threading
 import multiprocessing as mp
+from queue import Empty
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -73,6 +74,7 @@ from .replay import ReplayBuffer
 from .selfplay import (
     _play_game_worker_algo_vs_algo,
     _play_games_batch_worker_algo, _play_games_batch_worker_full,
+    _selfplay_worker_init,
 )
 from .dataset import (
     create_dataloader, create_dataloader_from_dataset, prepare_training_data,
@@ -381,7 +383,7 @@ class TrainingConfig:
     # Device settings
     device: str = 'cuda'
     amp: bool = True
-    amp_dtype: str = 'float16'  # 'float16' or 'bfloat16' (bfloat16 recommended for AMD MI210)
+    amp_dtype: str = 'float16'  # 'float16' or 'bfloat16' (bfloat16 recommended for the server GPU)
     compile_model: bool = True
     compile_mode: str = 'reduce-overhead'
     matmul_precision: str = 'medium'  # 'highest', 'high', 'medium' — medium enables TF32
@@ -485,6 +487,18 @@ class TrainingConfig:
 
     # Time-based stopping
     stop_time: Optional[datetime] = None  # Calculated from train_duration
+
+
+# IPC message types for GUI <-> trainer communication.  These mirror the
+# protocol constants in ui/training_panel.py, which cannot be imported here:
+# the GUI process loads that module without torch installed in scope, and
+# this module must stay importable headless.
+MSG_PAUSE = 'PAUSE'
+MSG_RESUME = 'RESUME'
+MSG_STOP = 'STOP'
+MSG_STATUS = 'STATUS'
+MSG_STATUS_REPLY = 'STATUS_REPLY'
+MSG_CHECKPOINT = 'CHECKPOINT'
 
 
 class Trainer:
@@ -598,39 +612,7 @@ class Trainer:
             print("Using fused AdamW optimizer for faster training")
 
         # Learning rate scheduler with optional warmup
-        self.scheduler = None
-        if config.lr_scheduler_enabled:
-            main_scheduler = None
-            if config.lr_scheduler_type == 'cosine_warm_restarts':
-                main_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                    self.optimizer,
-                    T_0=config.lr_scheduler_T0,
-                    T_mult=config.lr_scheduler_T_mult,
-                    eta_min=config.lr_scheduler_eta_min,
-                )
-                sched_desc = (f"CosineAnnealingWarmRestarts "
-                              f"(T_0={config.lr_scheduler_T0}, T_mult={config.lr_scheduler_T_mult}, "
-                              f"eta_min={config.lr_scheduler_eta_min})")
-            else:
-                print(f"Warning: Unknown LR scheduler type '{config.lr_scheduler_type}'")
-
-            if main_scheduler is not None:
-                if config.lr_warmup_steps > 0:
-                    warmup_scheduler = optim.lr_scheduler.LinearLR(
-                        self.optimizer,
-                        start_factor=1e-3,  # start at 0.1% of base LR
-                        end_factor=1.0,
-                        total_iters=config.lr_warmup_steps,
-                    )
-                    self.scheduler = optim.lr_scheduler.SequentialLR(
-                        self.optimizer,
-                        schedulers=[warmup_scheduler, main_scheduler],
-                        milestones=[config.lr_warmup_steps],
-                    )
-                    print(f"LR Scheduler: {config.lr_warmup_steps}-step warmup → {sched_desc}")
-                else:
-                    self.scheduler = main_scheduler
-                    print(f"LR Scheduler: {sched_desc}")
+        self._build_scheduler()
 
         self.replay_buffer = ReplayBuffer(config.replay_dir)
 
@@ -642,6 +624,15 @@ class Trainer:
         # Control flags for IPC
         self._paused = False
         self._stopped = False
+
+        # GUI IPC queues (attached via set_control_queues when run from the
+        # GUI).  When attached, train() drains control messages and pushes
+        # status/checkpoint updates while it runs.
+        self._control_queue = None
+        self._status_queue = None
+        self._next_control_poll = 0.0
+        self._next_status_push = 0.0
+        self._control_lock = threading.Lock()
 
         # Background self-play state
         self._bg_selfplay_thread: Optional[threading.Thread] = None
@@ -742,7 +733,7 @@ class Trainer:
             # when reduce-overhead/max-autotune modes trigger CUDAGraph recording.
             # Fall back to 'default' mode which still provides inductor operator
             # fusion without CUDAGraphs — significant speedup vs eager mode.
-            _MIN_SM_COUNT = 64  # safe threshold; MI210=104, A100=108, RTX 4090=128
+            _MIN_SM_COUNT = 64  # safe threshold; server GPU=104, A100=108, RTX 4090=128
             if self.device.type == 'cuda':
                 _props = torch.cuda.get_device_properties(self.device)
                 _sm_count = _props.multi_processor_count
@@ -895,7 +886,7 @@ class Trainer:
                 return float(result.stdout.strip().split('\n')[0])
         except Exception:
             pass
-        # AMD ROCm
+        # Server GPU (ROCm)
         try:
             result = subprocess.run(
                 ['rocm-smi', '--showtemp', '--json'],
@@ -1042,6 +1033,48 @@ class Trainer:
                     repaired = True
         return repaired
 
+    def _build_scheduler(self) -> None:
+        """Create self.scheduler around the current self.optimizer.
+
+        Called from __init__ and again from _reset_model_state: a scheduler
+        wraps a specific optimizer instance, so it must be rebuilt whenever
+        the optimizer is replaced.
+        """
+        config = self.config
+        self.scheduler = None
+        if config.lr_scheduler_enabled:
+            main_scheduler = None
+            if config.lr_scheduler_type == 'cosine_warm_restarts':
+                main_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self.optimizer,
+                    T_0=config.lr_scheduler_T0,
+                    T_mult=config.lr_scheduler_T_mult,
+                    eta_min=config.lr_scheduler_eta_min,
+                )
+                sched_desc = (f"CosineAnnealingWarmRestarts "
+                              f"(T_0={config.lr_scheduler_T0}, T_mult={config.lr_scheduler_T_mult}, "
+                              f"eta_min={config.lr_scheduler_eta_min})")
+            else:
+                print(f"Warning: Unknown LR scheduler type '{config.lr_scheduler_type}'")
+
+            if main_scheduler is not None:
+                if config.lr_warmup_steps > 0:
+                    warmup_scheduler = optim.lr_scheduler.LinearLR(
+                        self.optimizer,
+                        start_factor=1e-3,  # start at 0.1% of base LR
+                        end_factor=1.0,
+                        total_iters=config.lr_warmup_steps,
+                    )
+                    self.scheduler = optim.lr_scheduler.SequentialLR(
+                        self.optimizer,
+                        schedulers=[warmup_scheduler, main_scheduler],
+                        milestones=[config.lr_warmup_steps],
+                    )
+                    print(f"LR Scheduler: {config.lr_warmup_steps}-step warmup → {sched_desc}")
+                else:
+                    self.scheduler = main_scheduler
+                    print(f"LR Scheduler: {sched_desc}")
+
     def _reset_model_state(self, reason: str) -> None:
         """Reset model/optimizer if checkpoint is corrupt."""
         print(f"WARNING: {reason}. Resetting model and optimizer state.")
@@ -1069,6 +1102,11 @@ class Trainer:
         self.step = 0
         self.epoch = 0
         self.best_loss = float('inf')
+        # Rebuild the scheduler around the new optimizer; the old scheduler
+        # would keep stepping the discarded one, freezing the live LR.
+        # Scheduler progress (warmup/cosine position) restarts from zero,
+        # which is expected after a full model reset.
+        self._build_scheduler()
 
     def _load_checkpoint(self, path: str) -> None:
         """Load training state from checkpoint."""
@@ -1403,11 +1441,16 @@ class Trainer:
                 # torch.save serialization + disk write of ~55MB).  Falls back
                 # to shutil.copy2 if hardlink fails (cross-device, permissions).
                 latest_path.parent.mkdir(parents=True, exist_ok=True)
+                _lp = str(latest_path)
                 try:
-                    _lp = str(latest_path)
-                    if os.path.exists(_lp):
-                        os.unlink(_lp)
-                    os.link(str(checkpoint_path), _lp)
+                    # Hardlink to a temp name, then atomically replace.
+                    # Avoids the unlink-then-link window where latest.pt
+                    # does not exist if the process is killed mid-update.
+                    _lp_tmp = _lp + '.tmp'
+                    if os.path.exists(_lp_tmp):
+                        os.unlink(_lp_tmp)
+                    os.link(str(checkpoint_path), _lp_tmp)
+                    os.replace(_lp_tmp, _lp)
                 except OSError:
                     import shutil
                     shutil.copy2(str(checkpoint_path), _lp)
@@ -1427,6 +1470,13 @@ class Trainer:
                         file_size_mb=ckpt_size,
                     )
                 print(f"Checkpoint saved: {checkpoint_path}")
+                # Notify the GUI so the panel can log the checkpoint and
+                # refresh its stats view (no-op when training headless).
+                self._put_status({
+                    'type': MSG_CHECKPOINT,
+                    'step': _step,
+                    'checkpoint_path': str(checkpoint_path),
+                })
             except Exception as e:
                 print(f"Checkpoint save error: {e}")
 
@@ -1549,6 +1599,7 @@ class Trainer:
 
         from itertools import combinations_with_replacement
         from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed
+        from concurrent.futures.process import BrokenProcessPool
 
         _max_moves = self.config.selfplay_max_moves
         _noise_prob = self.config.selfplay_noise_prob
@@ -1697,44 +1748,105 @@ class Trainer:
             self.replay_buffer.start_new_file()
 
         # --- Submit ALL to one ProcessPoolExecutor ---
+        # initializer reseeds each worker's RNG: forked workers otherwise
+        # inherit identical random state, correlating exploration noise.
+
+        # Consume one batch's results into the replay buffer / preprocessing
+        # pipeline.  Shared by the pool loop and the sequential fallbacks so
+        # all three paths stay in sync.
+        def _consume_batch(entries_data, batch_game_count):
+            nonlocal entries, completed_total
+            if not skip_replay:
+                self.replay_buffer.add_entry_dicts(entries_data)
+            entries += len(entries_data)
+            if _collected is not None:
+                _collected.extend(entries_data)
+            # Inline preprocessing: convert dicts to tensors now, while the
+            # thread is otherwise idle waiting for the next game batch.
+            # Cython processes ~1000 entries in <2ms — negligible vs the
+            # seconds between batches.
+            if _preprocess_chunks is not None and entries_data:
+                _preprocess_chunks.append(
+                    _pp_chunk((entries_data, _pp_max_moves)))
+            completed_total += batch_game_count
+            if callback:
+                callback(completed_total, grand_total)
+            if completed_total % 100 == 0 or completed_total == grand_total:
+                print(f"  Games: {completed_total}/{grand_total}")
+
+        # Worker fn per task type, for re-running a batch in-process. ML
+        # batches reuse the fork-inherited _FORK_MODEL (set above), so they
+        # run correctly in the main process too.
+        _batch_fn = {
+            'ml': _play_games_batch_worker_full,
+            'algo': _play_games_batch_worker_algo,
+        }
+        # Batches still owed when the pool breaks, so we can finish them
+        # sequentially instead of silently dropping their game data.
+        unfinished = {}  # future → (task_type, batch_game_count, batch)
+
         try:
-            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                # future → (task_type, num_games_in_batch)
+            with ProcessPoolExecutor(max_workers=effective_workers,
+                                     initializer=_selfplay_worker_init) as executor:
+                # future → (task_type, num_games_in_batch, batch)
                 future_meta = {}
                 for batch in ml_batches:
                     f = executor.submit(_play_games_batch_worker_full, batch)
-                    future_meta[f] = ('ml', len(batch))
+                    future_meta[f] = ('ml', len(batch), batch)
                 for batch in algo_batches:
                     f = executor.submit(_play_games_batch_worker_algo, batch)
-                    future_meta[f] = ('algo', len(batch))
+                    future_meta[f] = ('algo', len(batch), batch)
+                unfinished = dict(future_meta)
 
                 for future in _as_completed(future_meta):
-                    task_type, batch_game_count = future_meta[future]
+                    self._service_control_queue()
+                    if self._stopped:
+                        # Stop requested: drop queued game batches and return
+                        # with whatever already finished.  Running batches
+                        # still complete (the exit of the with-block waits
+                        # for them), bounding stop latency to one batch.
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        unfinished.clear()
+                        break
+                    task_type, batch_game_count, batch = future_meta[future]
                     try:
                         entries_data = future.result(timeout=600)
-                        if not skip_replay:
-                            self.replay_buffer.add_entry_dicts(entries_data)
-                        entries += len(entries_data)
-                        if _collected is not None:
-                            _collected.extend(entries_data)
-                        # Inline preprocessing: convert dicts to tensors now,
-                        # while the thread is otherwise idle waiting for the
-                        # next game batch.  Cython processes ~1000 entries in
-                        # <2ms — negligible vs the seconds between batches.
-                        if _preprocess_chunks is not None and entries_data:
-                            _preprocess_chunks.append(
-                                _pp_chunk((entries_data, _pp_max_moves)))
-                        completed_total += batch_game_count
-                        if callback:
-                            callback(completed_total, grand_total)
-                        if completed_total % 100 == 0 or completed_total == grand_total:
-                            print(f"  Games: {completed_total}/{grand_total}")
+                        unfinished.pop(future, None)
+                        _consume_batch(entries_data, batch_game_count)
+                    except BrokenProcessPool:
+                        # A worker died abruptly (OOM, native crash, external
+                        # kill).  The pool is now poisoned — every remaining
+                        # future will also raise BrokenProcessPool.  Stop
+                        # draining it and finish the owed batches sequentially
+                        # below so this cycle's data isn't silently lost.
+                        print(f"Self-play worker died abruptly (broken pool); "
+                              f"finishing {len(unfinished)} remaining batch(es) "
+                              f"sequentially")
+                        break
                     except Exception as e:
+                        unfinished.pop(future, None)
                         print(f"Self-play error ({task_type}): {e}")
+
+            # Pool torn down. Re-run any batches the broken pool never
+            # delivered, in-process (single process = less memory pressure
+            # than the worker pool that just died).
+            if unfinished and not self._stopped:
+                for task_type, batch_game_count, batch in list(unfinished.values()):
+                    self._service_control_queue()
+                    if self._stopped:
+                        break
+                    try:
+                        entries_data = _batch_fn[task_type](batch)
+                        _consume_batch(entries_data, batch_game_count)
+                    except Exception as e:
+                        print(f"Self-play sequential re-run error ({task_type}): {e}")
         except Exception as e:
             print(f"Unified pool failed ({e}), falling back to sequential")
             # Sequential fallback for algo-vs-algo only (ML fallback is rarely needed)
             for task_a in all_algo_tasks:
+                self._service_control_queue()
+                if self._stopped:
+                    break
                 try:
                     entries_data = _play_game_worker_algo_vs_algo(task_a)
                     if not skip_replay:
@@ -1851,6 +1963,13 @@ class Trainer:
 
             while not self._stopped:
                 try:
+                    # Respect Pause: do not start a new self-play cycle while
+                    # paused (games already in flight still finish).
+                    while self._paused and not self._stopped:
+                        time.sleep(0.5)
+                    if self._stopped:
+                        break
+
                     _skip = _existing_count > 0
 
                     # Always use inline preprocessing: preprocess entries as each
@@ -2026,6 +2145,12 @@ class Trainer:
                 amp_enabled=self.config.amp,
             )
         self._use_padded = True
+        # [Pass 86] Flag that fresh self-play data was applied. train_epoch reads
+        # and resets this so the next epoch's stats record data_refresh=True.
+        # Previously record_epoch always defaulted data_refresh=False, making the
+        # epochs CSV show False for every epoch even though refreshes happen each
+        # epoch — actively misleading throughput analysis.
+        self._data_refreshed_pending = True
         _gpu_resident = getattr(dataloader, 'on_gpu', False)
         return dataloader, _gpu_resident
 
@@ -2268,6 +2393,11 @@ class Trainer:
         _use_padded = self._use_padded
         _sanity_interval = self._SANITY_CHECK_INTERVAL
         _thermal_enabled = _cfg.thermal_enabled
+        # GUI control servicing: None when training headless (CLI), so the
+        # hot loop pays only a None check per batch.  The method itself is
+        # time-throttled (_CONTROL_POLL_INTERVAL) when a queue is attached.
+        _service_control = (self._service_control_queue
+                            if self._control_queue is not None else None)
 
         # Compiled fwd+loss: use when available and padded.
         # Now supports both policy-only and policy+value head paths.
@@ -2298,10 +2428,15 @@ class Trainer:
                 print(f"  First batch loaded. Processing {total_batches} batches...")
                 sys.stdout.flush()
 
+            if _service_control is not None:
+                _service_control()
+
             if self._stopped:
                 break
 
             while self._paused:
+                if _service_control is not None:
+                    _service_control()
                 time.sleep(0.1)
                 if self._stopped:
                     break
@@ -2704,12 +2839,18 @@ class Trainer:
         # stats recording and return value.
         _avg_loss = (total_loss_acc / max(num_batches, 1)).item()
         if _stats_collector:
+            # [Pass 86] Report whether this epoch ran on freshly-refreshed data.
+            # The outer train() loop refreshes the dataloader at the end of the
+            # previous iteration and sets _data_refreshed_pending; consume it here.
+            _data_refreshed = getattr(self, '_data_refreshed_pending', False)
+            self._data_refreshed_pending = False
             _stats_collector.record_epoch(
                 epoch=self.epoch + 1,  # will be incremented by caller
                 step=self.step,
                 avg_loss=_avg_loss,
                 num_batches=num_batches,
                 epoch_time_sec=epoch_time,
+                data_refresh=_data_refreshed,
             )
 
         # Per-epoch heartbeat: prints regardless of stats_record_every so the
@@ -2886,6 +3027,11 @@ class Trainer:
             print(f"\nInsufficient training data ({entry_count} entries)")
             self.run_selfplay(self.config.selfplay_games)
 
+        self._service_control_queue()
+        if self._stopped:
+            print("Stop requested during startup; exiting before training")
+            return
+
         # Prepare data
         print("\nPreparing training data...")
         train_entries, _ = prepare_training_data(
@@ -2930,6 +3076,11 @@ class Trainer:
         _path_label = " (GPU-resident)" if _gpu_resident else (" (fast tensor indexing)" if _is_fast else (" (padded training path)" if self._use_padded else ""))
         print(f"DataLoader ready with {len(dataloader)} batches{_path_label}.")
         sys.stdout.flush()
+
+        self._service_control_queue()
+        if self._stopped:
+            print("Stop requested during startup; exiting before training")
+            return
 
         # Training loop
         print(f"\nStarting training from step {self.step}...")
@@ -3032,6 +3183,7 @@ class Trainer:
             self._start_background_selfplay(self.config.selfplay_games)
 
         while self.step < self.config.train_steps:
+            self._service_control_queue()
             if self._stopped:
                 break
 
@@ -3044,6 +3196,10 @@ class Trainer:
                                    _loss_acc=_total_loss_acc)
             self.epoch += 1
             self.stats.epochs_completed = self.epoch
+            # Skip dataloader refresh / async-test startup when stopping:
+            # they only add wind-down latency after a Stop request.
+            if self._stopped:
+                break
             # Throttle epoch prints: with ~245 epochs per 60s self-play cycle,
             # per-epoch prints add ~735ms of terminal I/O overhead on WSL2
             # (~3ms per print call with stdout flush).  Print every 50 epochs
@@ -3117,8 +3273,10 @@ class Trainer:
                     # Use _data_ready_event for zero-latency wakeup instead of
                     # time.sleep(0.5) polling (saves up to 500ms per data arrival).
                     while not self._stopped:
+                        self._service_control_queue()
                         # Respect pause commands while waiting
                         while self._paused and not self._stopped:
+                            self._service_control_queue()
                             time.sleep(0.1)
                         if self._stopped:
                             break
@@ -3212,8 +3370,10 @@ class Trainer:
         # Final checkpoint
         self._save_checkpoint(loss)
 
-        # Final test vs algorithm (synchronous — training is done)
-        if self.config.test_vs_algo:
+        # Final test vs algorithm (synchronous — training is done).
+        # Skipped when training was explicitly stopped: a Stop request from
+        # the GUI should not block on a 100-game evaluation.
+        if self.config.test_vs_algo and not self._stopped:
             try:
                 print("\nRunning final model evaluation...")
                 self.run_test_vs_algo(num_games=self.config.test_games * 2)
@@ -3243,6 +3403,14 @@ class Trainer:
             except Exception as e:
                 print(f"  Warning: Failed to export statistics: {e}")
 
+        # Ensure the final checkpoint write (background daemon thread) is
+        # fully on disk before returning: the GUI wrapper reports completion
+        # as soon as train() returns and may then terminate this process,
+        # which would kill the daemon writer mid-write.
+        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
+            print("Waiting for final checkpoint write...")
+            self._checkpoint_thread.join(timeout=60)
+
     def pause(self) -> None:
         """Pause training."""
         self._paused = True
@@ -3259,6 +3427,84 @@ class Trainer:
     @property
     def is_paused(self) -> bool:
         return self._paused
+
+    @property
+    def is_stopped(self) -> bool:
+        return self._stopped
+
+    # Control-queue servicing intervals (seconds).  Polling is time-throttled
+    # so the per-batch cost in train_epoch stays negligible.
+    _CONTROL_POLL_INTERVAL = 0.25
+    _STATUS_PUSH_INTERVAL = 2.0
+
+    def set_control_queues(self, control_queue, status_queue) -> None:
+        """Attach the GUI IPC queues (protocol in ui/training_panel.py).
+
+        Once attached, train() drains PAUSE/RESUME/STOP/STATUS requests from
+        control_queue while running, and pushes STATUS_REPLY heartbeats plus
+        CHECKPOINT notifications onto status_queue.
+        """
+        self._control_queue = control_queue
+        self._status_queue = status_queue
+
+    def _put_status(self, payload: Dict[str, Any]) -> None:
+        """Push a message onto the GUI status queue. Never blocks or raises."""
+        if self._status_queue is None:
+            return
+        try:
+            self._status_queue.put_nowait(payload)
+        except Exception:
+            pass
+
+    def _push_status_reply(self) -> None:
+        self._next_status_push = time.monotonic() + self._STATUS_PUSH_INTERVAL
+        self._put_status({'type': MSG_STATUS_REPLY, **self.get_status()})
+
+    def _service_control_queue(self) -> None:
+        """Drain pending GUI control messages and heartbeat a status update.
+
+        No-op when no control queue is attached (CLI training).  Called from
+        the train()/train_epoch() loops, the pause busy-waits, and the
+        self-play loop; safe to call from any thread (handlers only set
+        flags and put onto a process-safe queue).
+        """
+        q = self._control_queue
+        if q is None:
+            return
+        now = time.monotonic()
+        if now < self._next_control_poll:
+            return
+        # Serialize draining: the main training thread and the background
+        # self-play thread can both call this; a single drainer at a time
+        # guarantees messages are applied in the order they were sent.
+        if not self._control_lock.acquire(blocking=False):
+            return
+        try:
+            self._next_control_poll = now + self._CONTROL_POLL_INTERVAL
+            replied = False
+            while True:
+                try:
+                    msg = q.get_nowait()
+                except Empty:
+                    break
+                except (EOFError, OSError):
+                    # The GUI end of the queue is gone; stop servicing.
+                    self._control_queue = None
+                    return
+                msg_type = msg.get('type') if isinstance(msg, dict) else None
+                if msg_type == MSG_PAUSE:
+                    self.pause()
+                elif msg_type == MSG_RESUME:
+                    self.resume()
+                elif msg_type == MSG_STOP:
+                    self.stop()
+                if msg_type in (MSG_PAUSE, MSG_RESUME, MSG_STOP, MSG_STATUS):
+                    self._push_status_reply()
+                    replied = True
+            if not replied and now >= self._next_status_push:
+                self._push_status_reply()
+        finally:
+            self._control_lock.release()
 
     def get_status(self) -> Dict[str, Any]:
         """Get current training status."""
@@ -3566,7 +3812,7 @@ def main():
                        help='Disable mixed precision training')
     parser.add_argument('--amp-dtype', type=str, default='float16',
                        choices=['float16', 'bfloat16'],
-                       help='AMP dtype: float16 (default) or bfloat16 (recommended for AMD MI210)')
+                       help='AMP dtype: float16 (default) or bfloat16 (recommended for the server GPU)')
     parser.add_argument('--compile-model', action='store_true',
                        help='Use torch.compile for faster training')
     parser.add_argument('--compile-mode', type=str, default='reduce-overhead', 
