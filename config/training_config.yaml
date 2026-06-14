@@ -73,9 +73,9 @@ selfplay:
     enabled: true                     # Include algo-vs-algo games in training data
     games_per_epoch: 200              # Additional games per self-play epoch
     difficulties:                     # Difficulties to combine into matchup pairs
-      - "easy"                        # Exclude super_hard: ~60% longer cycles per
-      - "medium"                      # pass 8 analysis (39min → 15min on local hw).
-      - "hard"                        # Re-enable for server only when needed.
+      - "easy"                        # Exclude super_hard: ~60% longer cycles. See Journal Pass 8.
+      - "medium"
+      - "hard"
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
@@ -211,14 +211,14 @@ profiles:
         enabled: true
         dtype: "bfloat16"
       compile:
-        mode: "max-autotune"          # Server GPU benefits from max-autotune (large VRAM)
+        mode: "reduce-overhead"       # max-autotune reverted (per-shape autotune stalls). See Journal Pass 90 + Landmines.
     selfplay:
-      cpu_workers: 96                 # Synced with server configs
-      games_per_epoch: 900            # [Pass 83] Synced with server_retrain.yaml (was 512)
+      cpu_workers: 96                 # Reference-only profile; server trains from server_retrain.yaml (value differs). See Journal config-audit.
+      games_per_epoch: 900            # Reference-only profile; server trains from server_retrain.yaml (value differs). See Journal config-audit.
       pipeline_mode: "simultaneous"
     training:
       batch_size: 65536               # 64GB VRAM — ~19.4GB activations with BF16
-      learning_rate: 4.2e-4           # [Pass 83] Synced with server_retrain.yaml (was 2.8e-4)
+      learning_rate: 4.2e-4           # Synced with server_retrain.yaml. See Journal Pass 83.
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: false                # LR scheduler disabled per v5 post-mortem
@@ -240,35 +240,35 @@ profiles:
       type: "cuda"
       amp:
         enabled: true
-        dtype: "bfloat16"              # [Pass 74] Blackwell CC 12.0: no GradScaler, fused AdamW
+        dtype: "bfloat16"              # Blackwell CC 12.0: no GradScaler, fused AdamW. See Journal Pass 74.
       compile:
-        enabled: false                  # [Pass 20]: Always fails on RTX 5050
+        enabled: false                  # Always fails on RTX 5050. See Journal Pass 20, 92.
     selfplay:
       cpu_workers: 12
       games_per_epoch: 200
-      max_moves_per_game: 150             # [Pass 70] Override base 100; matches local configs
-      max_stale_epochs: 0                 # [Pass 70] Explicit unlimited; thermal handles GPU temp
+      max_moves_per_game: 150             # Override base 100; matches local configs. See Journal Pass 70.
+      max_stale_epochs: 0                 # Explicit unlimited; thermal handles GPU temp. See Journal Pass 70.
       difficulties:
         - "easy"
         - "medium"
         # - "hard"                          # Re-enable when model beats medium >40% WR
       pipeline_mode: "simultaneous"
       algo_vs_algo:
-        enabled: false                    # [Pass 83] Disabled — 99.7% P1 bias. Synced with local_retrain.
+        enabled: false                    # Disabled: 99.7% P1 bias. See Journal Pass 83 + Landmines.
         games_per_epoch: 1000
         difficulties:
           - "easy"
           - "medium"
           - "hard"
     training:
-      batch_size: 8192                    # [Pass 83] Synced with local_retrain.yaml (was 16384)
-      learning_rate: 2.0e-4               # [Pass 83] Synced with local_retrain.yaml (was 2.8e-4)
+      batch_size: 8192                    # Synced with local_retrain.yaml. See Journal Pass 83.
+      learning_rate: 2.0e-4               # Synced with local_retrain.yaml. See Journal Pass 83.
       gradient_accumulation_steps: 1
       lr_scheduler:
         enabled: false                  # LR scheduler caused catastrophic regression.
     dataloader:
       num_workers: 0
-      replay_max_entries: 500000          # [Pass 83] Synced with local_retrain.yaml
+      replay_max_entries: 500000          # Synced with local_retrain.yaml. See Journal Pass 83.
       ram_cache:
         enabled: true
         threshold_gb: 16.0
