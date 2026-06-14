@@ -1,31 +1,13 @@
 # =============================================================================
-# Local Retrain Configuration (RTX 5050, 8GB VRAM, 12 cores, 32GB RAM)
+# Local Retrain Configuration (RTX 5050, 8GB VRAM, 12 threads, 32GB RAM)
 # =============================================================================
-# Updated 2026-04-05 — Training Analysis Pass 83.
+# Fresh training from random weights. The full pass-by-pass history, rationale,
+# and measurements live in config/Journal.md; this file keeps only one-line
+# pointers ("See Journal Pass N"). Current blocker is CONVERGENCE (0% WR), not
+# speed (see Journal "Open questions"). Board encoding flips for P2
+# (move_encoder.py:30-35).
 #
-# Status: Fresh training from random weights. Prior run (step 3000, loss=1.70,
-# 0% WR) diverged due to:
-#   a) LR 2.8e-4 was too high (fixed to 2.0e-4 in pass 82)
-#   b) algo_vs_algo (4000 hard games) created 95:5 data ratio with 99.7% P1
-#      win bias — model learned biased P1 patterns instead of balanced play
-#   c) GPU overfitted on stale buffer while waiting for slow CPU cycles
-#
-# Key changes this pass (analysis-driven):
-#   1. algo_vs_algo DISABLED — 99.7% P1 bias in algo-vs-algo (hard)
-#      overwhelmed the 5% ML-vs-algo data. Removing it forces all training
-#      signal through balanced ML-vs-algo games (50% P1, 50% P2).
-#   2. games_per_epoch 200 → 400 — compensates for lost algo data volume.
-#      400 × 42 moves = ~16.8K entries/cycle (was ~8.4K ML + ~168K algo).
-#   3. noise_prob 0.15 → 0.20 — fresh model needs broader exploration.
-#   4. max_stale_epochs 0 → 100 — prevents extreme overfitting while the
-#      buffer is small (early cycles have <50K entries).
-#   5. record_every 1000 → 200 — capture grad norms now that off-by-one
-#      bug is fixed (pass 82). Critical for diagnosing next divergence.
-#
-# Board encoding correctly flips for P2 (move_encoder.py:30-35).
-#
-# Usage:
-#   bash local_train.sh
+# Usage: bash local_train.sh
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -35,21 +17,13 @@ device:
   type: "cuda"
   amp:
     enabled: true
-    dtype: "bfloat16"                   # [Pass 74] bfloat16 on Blackwell (CC 12.0):
-                                        # - No GradScaler needed (same exponent range as fp32)
-                                        # - Enables fused AdamW (single kernel per step)
-                                        # - Eliminates per-step CUDA sync from GradScaler NaN check
+    dtype: "bfloat16"                   # Blackwell CC 12.0: no GradScaler, fused AdamW. See Journal Pass 74.
   compile:
-    enabled: false                      # [Pass 20] Always fails on RTX 5050 with
-                                        # "CUDA driver error: device kernel image is invalid".
-                                        # Disabling avoids 5s warmup overhead each run.
+    enabled: false                      # Always fails on RTX 5050 (inductor/Triton sm_120 codegen). See Journal Pass 20, 92.
   matmul_precision: "medium"            # TF32 enabled
 
 # -----------------------------------------------------------------------------
-# Model Architecture
-# -----------------------------------------------------------------------------
-# Architecture: 128/8/256/128. Must match any checkpoint being resumed.
-# Starting fresh → no compatibility concern, but keep consistent across configs.
+# Model Architecture (128/8/256/128 - must match any resumed checkpoint)
 # -----------------------------------------------------------------------------
 model:
   channels: 128                         # CNN channels in ResidualBlocks
@@ -60,86 +34,27 @@ model:
 # -----------------------------------------------------------------------------
 # Self-Play Settings
 # -----------------------------------------------------------------------------
-# At 0% WR, 100% algorithmic teachers. ML self-play at this stage produces
-# losing patterns. ML-vs-algo games provide balanced teacher signal from both
-# P1 and P2 perspectives (algo wins as both sides).
+# 100% algorithmic teachers at 0% WR (ML self-play teaches losing patterns).
+# ML-vs-algo gives balanced P1/P2 teacher signal. See Journal "Reference".
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 6                        # [Pass 86] Reduced from 8. Measured on the 2026-06-13 6h run
-                                        # (logs/local/stats/epochs_20260613_120944.csv): 8 workers
-                                        # still thermally throttle 3.8% of epochs (11/292 epochs
-                                        # >120s; epoch 292 = 360s for 61 batches = 6x slowdown), and
-                                        # those throttle events drag mean batches/sec from ~0.95
-                                        # (un-throttled) down to 0.872. On the shared heatpipe, CPU
-                                        # load directly steals GPU clock, so the throttle IS the
-                                        # dominant throughput loss (GPU is otherwise 100% util,
-                                        # 1.3GB/8GB allocated — compute-bound, not VRAM-bound).
-                                        # No starvation risk: at 6 workers self-play still produces
-                                        # ~101K entries/~46s, refreshing the buffer every ~1-2 epochs
-                                        # while max_stale_epochs=100 only requires fresh data every
-                                        # ~100 epochs (≈50x safety margin). Self-play over-produces
-                                        # 20-100x vs GPU consumption regardless.
-                                        # MECHANISM (measured 2026-06-13): the heat is CPU-dominated,
-                                        # conducted through the shared heatpipe. Proof: GPU at 0% util
-                                        # / 11W still read 77C, and under training load it pinned at
-                                        # 277MHz (SW Thermal Slowdown) at 87-90C while drawing only
-                                        # 30-40W — a GPU shedding 30W can't self-heat to 90C, so the
-                                        # GPU temp sensor is effectively a proxy for CPU heat. This is
-                                        # why a marginal worker cut (8->6) helps little: at 100% self-
-                                        # play duty cycle the heatpipe stays saturated regardless.
-                                        # NEXT PASS (the real lever): throttle the background self-play
-                                        # *duty cycle* (sleep between cycles) — it periodically drops
-                                        # CPU self-play to ~0 and lets the heatpipe actually cool,
-                                        # without cutting parallelism. Data is over-produced 20-100x so
-                                        # freshness is unaffected. Verify in ~2 min (no 6h run needed):
-                                        # sample GPU temp with self-play running vs paused, ~60s each;
-                                        # the delta is the CPU-heatpipe contribution. Deferred here: it
-                                        # touches the bg hot loop and must preserve pause/stop
-                                        # responsiveness, so keep it isolated.
-                                        # [Pass 85] Reduced 10->8: 10 workers push the heatpipe to
-                                        # 87-89C, activating GPU "SW Thermal Slowdown" pinning the GPU
-                                        # at 277MHz of 3090MHz (29W of 75W), ~11x slower batches.
-  games_per_epoch: 500*4                  # [Pass 83] Doubled from 200 to compensate for algo_vs_algo
-                                        # removal. 400 × ~42 moves = ~16.8K entries/cycle.
-                                        # 200 as P1 + 200 as P2 (focus_side: "both").
-                                        # Algo teacher moves get high reward weights (~2.0),
-                                        # providing imitation learning signal from both sides.
+  cpu_workers: 6                        # 8->6; GPU is power/thermal-capped, self-play-heat thesis refuted. See Journal Pass 85-89.
+  games_per_epoch: 500*4                # =2000 (eval'd by _eval_expr); compensates algo_vs_algo removal. See Journal Pass 86.
   difficulties:
     - "easy"                            # Learnable signal for a weak model.
     - "medium"                          # Adds challenge without being impossibly hard.
     - "hard"
-  focus_side: "both"                    # Equal P1/P2 exposure. Board encoding flips
-                                        # for P2 (move_encoder.py:30-35) ��� both sides
-                                        # need equal training for the model to generalize.
-  opponent_focus: "algorithm"           # 100% algorithmic teachers at 0% WR.
-  noise_prob: 0.20                      # [Pass 83] Increased from 0.15. Fresh model needs
-                                        # broader exploration of the move space. At 0% WR,
-                                        # the model's own policy is near-random anyway —
-                                        # higher noise doesn't degrade quality much but
-                                        # discovers more diverse game states.
-  max_moves_per_game: 150               # Allow endgame play (avg game ~42 moves)
-  pipeline_mode: "simultaneous"         # [Pass 63] CPU self-play overlaps GPU training.
-                                        # GPU trains continuously on accumulating buffer while
-                                        # CPU generates fresh data. Buffer fills to 1M entries
-                                        # = 122 batches/epoch at batch=8192.
-  max_stale_epochs: 100                 # [Pass 83] Changed from 0 (unlimited). Prevents extreme
-                                        # overfitting when buffer is small in early training.
-                                        # With ~16.8K entries and batch=8192, each epoch ≈2
-                                        # batches. 100 epochs = 200 steps of training, then
-                                        # yields to wait for fresh data. As the buffer grows
-                                        # (1M entries → 122 batches/epoch), the cap is rarely
-                                        # hit. Thermal protection still active as secondary guard.
+  focus_side: "both"                    # Equal P1/P2 exposure (encoding flips for P2). See Journal Pass 38.
+  opponent_focus: "algorithm"           # 100% algorithmic teachers at low WR.
+  noise_prob: 0.20                      # Fresh-model exploration. See Journal Pass 83.
+  max_moves_per_game: 150               # Allow endgame play (avg game ~42 moves).
+  pipeline_mode: "simultaneous"         # CPU self-play overlaps GPU training. See Journal Pass 63.
+  max_stale_epochs: 100                 # Limits overfitting while buffer is small. See Journal Pass 83.
 
-  # ALGO-VS-ALGO: DISABLED
-  # [Pass 83] Re-disabled after analysis found 95:5 data ratio (168K algo vs 8.4K ML)
-  # with 99.7% P1 win bias in hard-only games. This overwhelmed the balanced ML-vs-algo
-  # signal and taught the model P1-biased patterns. Prior pass 20 disabled it for the
-  # same reason; pass 73 re-enabled it prematurely. Keep disabled until model reaches
-  # >30% WR, at which point the P1 bias in algo data is offset by the model's own
-  # competitive play generating balanced wins.
+  # ALGO-VS-ALGO: DISABLED - 99.7% P1 bias; re-enable only above >30% WR. See Journal Pass 83 + Landmines.
   algo_vs_algo:
     enabled: false
-    games_per_epoch: 1000*2                # (Inactive — kept for re-enable reference)
+    games_per_epoch: 1000*2             # (Inactive - kept for re-enable reference)
     difficulties:
       #- "easy"
       #- "medium"
@@ -149,57 +64,32 @@ selfplay:
 # Training Hyperparameters
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 8192                      # [Pass 85] Reverted from 8192*2 (16384). At batch 16384 the
-                                        # activations overflow 8GB VRAM and the Windows driver pages
-                                        # GPU memory over PCIe (sysmem fallback). Measured on 2026-06-12:
-                                        # 7.6GB/8.1GB used, "100%" util at only 23W power draw, and
-                                        # 23-27s per batch (6 steps in 163.6s). At 8192 everything fits
-                                        # in VRAM and batches return to sub-second. LR 2.0e-4 is also
-                                        # tuned for 8192 (passes 82-84).
-  learning_rate: 2.0e-4                 # [Pass 82] Reverted from 2.8e-4 — batch_size is
-                                        # 8192 (not 16384). 2.0e-4 is the correct base LR.
-  weight_decay: 1.0e-5                  # [Pass 20] Reduced from 1e-4. Original clamp bug
-                                        # is fixed — lower regularization lets the model
-                                        # learn more freely.
+  batch_size: 8192                      # Max for 8GB VRAM; 16384 -> sysmem fallback. See Journal Pass 85 + Landmines.
+  learning_rate: 2.0e-4                 # Correct base LR for batch 8192. See Journal Pass 82.
+  weight_decay: 1.0e-5                  # Lower regularization after clamp-bug fix. See Journal Pass 20.
   grad_clip_norm: 1.0                   # Standard gradient clipping
-  train_steps: 100000000000             # Unlimited — time_limit controls stopping
+  train_steps: 100000000000             # Unlimited - time_limit controls stopping
   checkpoint_every: 1000                # Frequent saves for tracking progress
-  gradient_accumulation_steps: 1        # [Pass 20] Reduced from 2. Simpler — avoids
-                                        # edge cases where NaN batches interact with
-                                        # accumulation window.
+  gradient_accumulation_steps: 1        # See Journal Pass 20.
 
-  # LR SCHEDULER: DISABLED
-  # [Pass 20] Consistent with training_config_local.yaml. Cosine warm restarts
-  # caused catastrophic regression in prior runs (43%→0% WR crash, pass 18).
-  # Fixed LR is stable. Re-enable only after the model reaches a clear plateau
-  # (loss stable for >5000 steps AND WR stable for >3 test cycles).
+  # LR SCHEDULER: DISABLED - cosine restarts caused 43%->0% WR crash (LOCAL landmine). See Journal Pass 18, 20.
   lr_scheduler:
     enabled: false
-    type: "cosine_warm_restarts"        # (Inactive — kept for reference)
+    type: "cosine_warm_restarts"        # (Inactive - kept for reference)
     T_0: 5000
     T_mult: 2
     eta_min: 5.0e-5
     warmup_steps: 200
 
-  reward_mode: "scoring"                # [Pass 56] Changed from "cycle". Consistent reward
-                                        # signal. "cycle" alternated scoring/uniform epochs,
-                                        # which amplified P1 bias on scoring epochs (high weight
-                                        # for P1 winning moves, low for P2 losing moves).
-                                        # Constant "scoring" provides stable, consistent signal.
+  reward_mode: "scoring"                # Consistent signal; 'cycle' amplifies P1 bias. See Journal Pass 56.
 
 # -----------------------------------------------------------------------------
 # Value Head / TD Learning Settings
 # -----------------------------------------------------------------------------
-# DISABLED: Starting fresh with no checkpoint. Value head adds complexity that
-# isn't needed until the base policy head is working (>30% WR).
-# Enable when the model has a solid policy baseline and you want position
-# evaluation capabilities.
-# -----------------------------------------------------------------------------
 value_head:
-  enabled: false                          # [Pass 61] Keep disabled until policy head reaches
-                                          # >30% WR. Adding value head to weak model adds noise.
-  hidden_size: 128                        # Match server config for future compatibility
-  value_weight: 0.15                      # 85% policy / 15% value if enabled
+  enabled: false                        # Off until policy head reaches >30% WR. See Journal Pass 61.
+  hidden_size: 128                      # Match server config for future compatibility
+  value_weight: 0.15                    # 85% policy / 15% value if enabled
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
@@ -207,32 +97,23 @@ value_head:
 dataloader:
   num_workers: 0                        # FastBatchIterator bypasses DataLoader
   pin_memory: true
-  replay_max_entries: 500000              # [Pass 83] Reduced from 1M. With algo_vs_algo disabled,
-                                        # each cycle adds ~16.8K entries. 500K ≈ 30 cycles of data.
-                                        # 500K × 1168 bytes = ~585MB VRAM. With model (72MB),
-                                        # activations (~1.2GB at batch=8192), total ~1.9GB of 8GB.
-                                        # 500K / 8192 = 61 batches/epoch.
+  replay_max_entries: 500000            # ~30 cycles of data (~585MB). See Journal Pass 83.
   max_moves_per_sample: 32              # Max legal moves in Dama is ~20; saves 50% memory
-  clear_replay_after_load: true          # [Pass 56] Clear replay files after loading into buffer.
-                                        # Prevents disk from filling with stale data. Buffer holds
-                                        # the most recent entries up to replay_max_entries.
+  clear_replay_after_load: true         # Prevent stale-data accumulation on disk. See Journal Pass 56.
 
   ram_cache:
     enabled: true
-    threshold_gb: 16.0                  # 8GB cache limit on 32GB system — leaves 24GB for
-                                        # OS, self-play workers, and GPU driver overhead.
+    threshold_gb: 16.0                  # 16GB cache on 32GB system (~25GB usable under WSL2)
     cache_file: null
 
 # -----------------------------------------------------------------------------
 # Model Testing Settings (ML vs Algorithm)
 # -----------------------------------------------------------------------------
-# Test vs easy to detect early progress. Switch to medium once >50% WR vs easy.
-# -----------------------------------------------------------------------------
 testing:
   enabled: true
-  every_n_steps: 750                    # [Pass 34] Faster feedback during early learning phase
-  num_games: 50                         # [Pass 34] ±14% CI (was 30/±18%). More reliable signal.
-  difficulty: "easy"                    # Start easy — 0% vs medium gives no signal
+  every_n_steps: 750                    # Faster feedback during early learning. See Journal Pass 34.
+  num_games: 50                         # +/-14% CI (was 30/+/-18%). See Journal Pass 34.
+  difficulty: "easy"                    # Start easy - 0% vs medium gives no signal
 
 # -----------------------------------------------------------------------------
 # Paths
@@ -249,16 +130,12 @@ paths:
 # -----------------------------------------------------------------------------
 statistics:
   enabled: true
-  record_every: 200                      # [Pass 83] Reduced from 1000. Grad norm off-by-one bug
-                                        # was fixed in pass 82 — norms are now actually recorded.
-                                        # Need fine-grained data to diagnose next divergence.
-                                        # 200 still only adds 5 CUDA syncs/1000 steps (~250µs).
+  record_every: 200                     # Capture grad norms (off-by-one fixed in Pass 82). See Journal Pass 83.
   system_every: 5000
-  model_health_every: 5000              # 1000 was excessive — each records ~40 .item() syncs.
-                                        # 5000 matches local config.
+  model_health_every: 5000              # 1000 was excessive (~40 .item() syncs). See Journal Pass 17.
   score_dist_every: 500
   buffer_size: 50000
-  flush_every: 500                      # Ensures stats are written frequently
+  flush_every: 500                      # Write stats frequently
   output_dir: "logs/local/stats"
 
 # -----------------------------------------------------------------------------
@@ -267,20 +144,15 @@ statistics:
 thermal_protection:
   enabled: true
   temp_limit_c: 90
-  rest_duration: "5m"                    # [Pass 34] 10m was overly conservative; 5m is standard
+  rest_duration: "5m"                   # See Journal Pass 34.
   check_every: 30
 
 # -----------------------------------------------------------------------------
 # Resume Settings
 # -----------------------------------------------------------------------------
-# GradScaler save/restore bug fixed in trainer.py (pass 20). Old checkpoints
-# without scaler state now get conservative scale=1024 automatically.
-# -----------------------------------------------------------------------------
 resume:
   enabled: true
-  checkpoint_path: null                  # Auto-detect latest valid checkpoint.
-                                        # Was hardcoded to model_step_002000.pt — caused
-                                        # restart-from-step-2000 trap on subsequent runs.
+  checkpoint_path: null                 # Auto-detect; never hardcode (restart-from-step trap). See Journal Pass 20 + Landmines.
   skip_corrupted: true
 
 # -----------------------------------------------------------------------------
