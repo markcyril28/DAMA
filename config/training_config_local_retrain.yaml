@@ -3,9 +3,9 @@
 # =============================================================================
 # Fresh training from random weights. The full pass-by-pass history, rationale,
 # and measurements live in config/Journal.md; this file keeps only one-line
-# pointers ("See Journal Pass N"). Current blocker is CONVERGENCE (0% WR), not
-# speed (see Journal "Open questions"). Board encoding flips for P2
-# (move_encoder.py:30-35).
+# pointers ("See Journal Pass N"). The 100-pass 0% WR blocker was an ARCH bug
+# (unnormalized board embedding swamped move features); fixed in model.py via
+# embed_norm. See Journal Pass 102. Board encoding flips for P2 (move_encoder.py:30-35).
 #
 # Usage: bash local_train.sh
 # =============================================================================
