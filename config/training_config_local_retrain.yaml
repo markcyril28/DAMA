@@ -151,7 +151,7 @@ thermal_protection:
 # Resume Settings
 # -----------------------------------------------------------------------------
 resume:
-  enabled: true
+  enabled: false                        # FRESH START (mandatory): embed_norm arch fix obsoletes all old checkpoints. See Journal Pass 102.
   checkpoint_path: null                 # Auto-detect; never hardcode (restart-from-step trap). See Journal Pass 20 + Landmines.
   skip_corrupted: true
 
