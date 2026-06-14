@@ -140,6 +140,22 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== Dama - ML Training ==="
 echo ""
 
+# Cython staleness guard (fail-safe). The compiled .so files are committed but
+# can lag their .pyx sources (a stale committed _fast_search.so silently ran
+# the old alpha-beta search in Jun 2026). Rebuild in-place if any .pyx is newer
+# than its .so. No-op when fresh; never blocks training on a build failure.
+_cython_stale=false
+while IFS= read -r _pyx; do
+    _so="$(ls -t "${_pyx%.pyx}".*.so 2>/dev/null | head -1 || true)"
+    if [ -z "$_so" ] || [ "$_pyx" -nt "$_so" ]; then _cython_stale=true; fi
+done < <(find "${PROJECT_DIR}/src" -name '*.pyx' -not -path '*/build/*' 2>/dev/null)
+if [ "$_cython_stale" = true ]; then
+    echo "Cython sources changed — rebuilding extensions..."
+    ( cd "${PROJECT_DIR}/src" && python setup_cython.py build_ext --inplace ) \
+        || echo "[warn] Cython rebuild failed — using existing .so files."
+    echo ""
+fi
+
 # Verify GPU is available
 python3 -c "import torch; assert torch.cuda.is_available(), 'GPU not available. Training requires GPU.'" || {
     echo ""
