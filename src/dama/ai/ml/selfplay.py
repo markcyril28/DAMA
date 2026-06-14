@@ -1,5 +1,6 @@
 """Self-play for generating training data."""
 
+import gc
 import os
 import random
 import time
@@ -80,8 +81,22 @@ def _selfplay_worker_init():
     identical exploration noise. Reseeding the global random module also
     affects the _random/_randrange bindings above (bound methods of the
     same global Random singleton).
+
+    [Pass 101] gc.freeze() moves every object inherited from the parent via
+    fork (the trainer's live CUDA tensors: training model, in-GPU replay
+    buffer, optimizer state) into a permanent generation the cyclic GC never
+    scans.  Without this, an automatic GC pass in the worker (triggered by
+    object allocation deep inside _fast_search's PyTuple_New) sweeps one of
+    those inherited CUDA tensors; its destructor calls ExchangeDevice
+    (cudaSetDevice), which is invalid in a fork that never initialized CUDA,
+    raising cudaErrorInitializationError from a C++ destructor -> std::terminate
+    -> the worker dies (BrokenProcessPool, then the cycle finishes sequentially).
+    freeze() leaves normal GC active for the worker's OWN allocations, so it
+    cannot leak; it also avoids GC traversal of inherited pages (fewer COW
+    faults, aligning with the Pass 70 copy-on-write goal).
     """
     random.seed((os.getpid() ^ (time.time_ns() & 0xFFFFFFFF)) & 0xFFFFFFFF)
+    gc.freeze()
 
 # [Pass 70] Fork-inherited model for self-play workers.
 # On Linux (fork start method), parent sets this global before creating the

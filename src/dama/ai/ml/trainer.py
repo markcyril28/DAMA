@@ -1695,6 +1695,13 @@ class Trainer:
                 _fork_model.load_state_dict(_sd)
                 _fork_model.eval()
                 fold_batchnorm(_fork_model)
+                # [Pass 101] Guarantee the fork-inherited model is CPU-only.
+                # create_model + the CPU _sd already build a CPU model, but a
+                # stray CUDA param here would mean every forked self-play worker
+                # inherits a live GPU tensor whose GC-triggered destructor
+                # crashes the worker (see _selfplay_worker_init's gc.freeze()).
+                # .cpu() is idempotent insurance that documents the invariant.
+                _fork_model = _fork_model.cpu()
                 _sp_mod._FORK_MODEL = _fork_model
             except Exception:
                 _sp_mod._FORK_MODEL = None

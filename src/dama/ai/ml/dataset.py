@@ -1,5 +1,6 @@
 """Dataset for training the move scorer model."""
 
+import gc
 import os
 import random
 import psutil
@@ -160,6 +161,23 @@ def _encode_moves_fast(
         out[i, 7] = 1.0 if is_king else 0.0
 
     return n
+
+
+def _preprocess_pool_init():
+    """Per-worker initializer for the forked preprocessing pools below.
+
+    [Pass 101] These pools fork from the trainer parent, which holds live CUDA
+    tensors (training model, in-GPU replay buffer, optimizer state).  gc.freeze()
+    moves every inherited object into a permanent generation the cyclic GC never
+    scans, so a worker's automatic GC pass (tripped by object allocation in the
+    encoders) can never sweep an inherited CUDA tensor whose destructor would
+    call cudaSetDevice in a fork that never initialized CUDA
+    (cudaErrorInitializationError -> std::terminate -> dead worker).  Mirrors the
+    self-play fix in selfplay._selfplay_worker_init; GC stays active for the
+    worker's OWN allocations (no leak).  Harmless no-op on the spawn path (a
+    spawned worker inherits no CUDA state).
+    """
+    gc.freeze()
 
 
 def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -554,7 +572,8 @@ def preprocess_entries_to_tensors(
                     }
 
                     # Workers write directly to shared memory — return nothing
-                    with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                    with ProcessPoolExecutor(max_workers=num_workers,
+                                     initializer=_preprocess_pool_init) as pool:
                         list(pool.map(_preprocess_chunk_fork_shm, args))
 
                     # Create torch tensors from shared memory views, then clone
@@ -586,7 +605,8 @@ def preprocess_entries_to_tensors(
 
             if not _shm_ok:
                 # Legacy fork path: workers return arrays via pickle
-                with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                with ProcessPoolExecutor(max_workers=num_workers,
+                                     initializer=_preprocess_pool_init) as pool:
                     results = list(pool.map(_preprocess_chunk_fork, args))
 
                 boards = np.concatenate([r[0] for r in results], axis=0)
@@ -607,7 +627,8 @@ def preprocess_entries_to_tensors(
                 chunk = entry_dicts[start:start + chunk_size]
                 chunks.append((chunk, max_moves_per_sample))
 
-            with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            with ProcessPoolExecutor(max_workers=num_workers,
+                                     initializer=_preprocess_pool_init) as pool:
                 results = list(pool.map(_preprocess_chunk, chunks))
 
             boards = np.concatenate([r[0] for r in results], axis=0)
@@ -854,7 +875,8 @@ class CachedTensorDataset(Dataset):
                             'value_targets': shm_vt.name,
                         }
 
-                        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                        with ProcessPoolExecutor(max_workers=num_workers,
+                                     initializer=_preprocess_pool_init) as pool:
                             list(pool.map(_preprocess_dicts_fork_shm, args))
 
                         boards = torch.from_numpy(np.ndarray(
@@ -899,7 +921,8 @@ class CachedTensorDataset(Dataset):
                 (entry_dicts[i:i + chunk_size], max_moves_per_sample)
                 for i in range(0, n, chunk_size)
             ]
-            with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            with ProcessPoolExecutor(max_workers=num_workers,
+                                     initializer=_preprocess_pool_init) as pool:
                 results = list(pool.map(_preprocess_chunk, chunks))
 
             boards = np.concatenate([r[0] for r in results], axis=0)

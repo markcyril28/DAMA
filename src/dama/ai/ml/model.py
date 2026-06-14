@@ -42,6 +42,15 @@ class BoardEncoder(nn.Module):
         # Final layers to produce embedding
         self.flatten = nn.Flatten()
         self.fc = nn.Linear(channels * 8 * 8, embedding_size)
+        # [Pass 102] Normalize the board embedding to unit scale.  Without this
+        # the embedding magnitude (~4.2, from an unnormalized 8192->emb Linear)
+        # swamps the [0,1] move-feature contribution (~0.04) at the MoveScorer's
+        # fc1 by ~100x, so every move in a position gets a near-identical score
+        # (uniform policy -> 0% WR; the model could not fit even 16 samples).
+        # LayerNorm here flows through ALL forward paths (they all call this
+        # encoder).  elementwise_affine=False adds no params / no new state_dict
+        # keys and exactly matches the verified fix.  See Journal Pass 102.
+        self.embed_norm = nn.LayerNorm(embedding_size, elementwise_affine=False)
 
     def forward(self, board: torch.Tensor) -> torch.Tensor:
         """
@@ -64,6 +73,7 @@ class BoardEncoder(nn.Module):
 
         x = self.flatten(x)
         x = self.fc(x)
+        x = self.embed_norm(x)  # [Pass 102] unit-scale embedding; see __init__
         return x
 
 
