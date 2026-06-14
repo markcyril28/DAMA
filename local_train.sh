@@ -18,9 +18,11 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
 PROCESS_TITLE="micro-trainer"            # Process name shown in htop (requires 'setproctitle' package)
-RESUME_LATEST=true              # Set true to resume from latest checkpoint in models/checkpoints/
-                                 # NOTE: Set to false for fresh retrain — old checkpoints may be
-                                 # degenerate. See config/training_config_local_retrain.yaml.
+RESUME_LATEST=false            # FRESH START (mandatory): embed_norm arch fix makes ALL old checkpoints obsolete. See Journal Pass 102.
+                                 # NOTE: this flag is the EFFECTIVE control — --resume-latest overrides YAML resume.enabled
+                                 # (trainer.py:3982). Pass 100 left this 'true' by mistake (changed only the comment), so the
+                                 # "fresh" run still resumed; the real fix was the model, not the checkpoint. Re-enable ONLY after
+                                 # a healthy (>0% WR) checkpoint on the NEW arch AND archiving old-arch checkpoints (user-action).
 RESUME=""                        # Or set a specific checkpoint path
 TRAIN_DURATION=""                # Train for this duration (empty = use config's time_limit)
                                  # Examples: "2d", "4h", "30m", "1d12h"
