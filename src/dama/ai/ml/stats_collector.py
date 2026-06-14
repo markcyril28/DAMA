@@ -213,6 +213,24 @@ class StatsCollector:
         self.cpu_percent = MetricBuffer(buffer_size)
         self.ram_used_gb = MetricBuffer(buffer_size)
 
+        # --- GPU throttle diagnostics (NVML only) ---
+        # util % alone CANNOT distinguish a power/thermal-capped GPU from a
+        # saturated one: a capped card sits at 100% util while its clocks are
+        # held down.  Project rule: "diagnose thermal throttling by power draw,
+        # not utilization %."  These are the metrics that actually do it.
+        # Absent on ROCm / no-NVML hosts (server) — buffers simply stay empty.
+        # gpu_throttle_reasons is the raw NVML bitmask (decode in _get_gpu_telemetry).
+        self.gpu_power_w = MetricBuffer(buffer_size)
+        self.gpu_sm_clock_mhz = MetricBuffer(buffer_size)
+        self.gpu_temp_c = MetricBuffer(buffer_size)
+        self.gpu_throttle_reasons = MetricBuffer(buffer_size)
+        self._gpu_telemetry_buffers = {
+            'gpu_power_w': self.gpu_power_w,
+            'gpu_sm_clock_mhz': self.gpu_sm_clock_mhz,
+            'gpu_temp_c': self.gpu_temp_c,
+            'gpu_throttle_reasons': self.gpu_throttle_reasons,
+        }
+
         # --- Model health (lower frequency) ---
         self.param_norms: Dict[str, MetricBuffer] = {}  # per-layer L2 norms
         self.param_means: Dict[str, MetricBuffer] = {}
@@ -256,6 +274,17 @@ class StatsCollector:
 
         # --- Checkpoint metadata ---
         self.checkpoint_records: List[Dict[str, Any]] = []
+
+        # --- GPU-idle self-play-starvation diagnostic ---
+        # When self-play cannot refresh the replay buffer within
+        # max_stale_epochs, the trainer BLOCKS the GPU until fresh data arrives
+        # (trainer.py stale-data wait branch). These accumulate how often and
+        # how long the GPU sat idle waiting. Aggregated into the session report
+        # as the single at-a-glance starvation signal: ~0 ⇒ self-play keeps
+        # pace (leave cpu_workers); large ⇒ GPU starved (raise cpu_workers).
+        self.gpu_idle_wait_count: int = 0
+        self.gpu_idle_wait_seconds: float = 0.0
+        self.gpu_idle_wait_max_seconds: float = 0.0
 
     # ===================================================================
     # Configuration
@@ -389,6 +418,15 @@ class StatsCollector:
                     self.gpu_utilization_pct.append(util, step)
                     metrics['gpu_utilization_pct'] = util
 
+                # Power / clock / temp / throttle-reason bitmask (NVML).
+                # These — not util % — reveal whether the GPU is power/thermal
+                # capped (the binding limiter on the local laptop card).
+                for _k, _v in self._get_gpu_telemetry().items():
+                    _buf = self._gpu_telemetry_buffers.get(_k)
+                    if _buf is not None:
+                        _buf.append(_v, step)
+                        metrics[_k] = _v
+
             if HAS_PSUTIL:
                 cpu_pct = psutil.cpu_percent(interval=None)
                 ram = psutil.virtual_memory()
@@ -461,6 +499,59 @@ class StatsCollector:
             pass
 
         return None
+
+    @classmethod
+    def _get_gpu_telemetry(cls) -> Dict[str, float]:
+        """Read GPU power/clock/temp + throttle-reason bitmask via NVML.
+
+        These are the metrics that actually diagnose throttling — a
+        power/thermal-capped GPU can report 100% utilization while its clocks
+        are held down, so util % alone is misleading (project rule: "diagnose
+        thermal throttling by power draw, not utilization %").
+
+        NVML-only and best-effort: returns whatever it can read, or ``{}`` when
+        NVML is unavailable (e.g. the ROCm server), so callers add no columns
+        there.  Each field is guarded independently so one unsupported query
+        doesn't drop the rest.
+
+        ``gpu_throttle_reasons`` is the raw NVML bitmask; decode with:
+          ``& 0x04`` → SW power cap (power-limited)
+          ``& 0x20`` → SW thermal slowdown
+          ``& 0x40`` → HW thermal slowdown (thermal-limited)
+        """
+        if not cls._ensure_nvml():
+            return {}
+        out: Dict[str, float] = {}
+        try:
+            import pynvml
+            h = cls._nvml_handle
+            try:
+                out['gpu_power_w'] = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+            except Exception:
+                pass
+            try:
+                out['gpu_sm_clock_mhz'] = float(
+                    pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+            except Exception:
+                pass
+            try:
+                out['gpu_temp_c'] = float(
+                    pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU))
+            except Exception:
+                pass
+            try:
+                # NVML renamed this across versions (ThrottleReasons →
+                # EventReasons); accept whichever the installed lib exposes.
+                _reasons_fn = (
+                    getattr(pynvml, 'nvmlDeviceGetCurrentClocksThrottleReasons', None)
+                    or getattr(pynvml, 'nvmlDeviceGetCurrentClocksEventReasons', None))
+                if _reasons_fn is not None:
+                    out['gpu_throttle_reasons'] = float(_reasons_fn(h))
+            except Exception:
+                pass
+        except Exception:
+            return out
+        return out
 
     # ===================================================================
     # Model health
@@ -735,6 +826,28 @@ class StatsCollector:
     # ===================================================================
     # Self-play recording
     # ===================================================================
+
+    def record_gpu_idle_wait(self, seconds: float, stale_epochs: int = 0) -> None:
+        """Record a GPU-idle interval spent blocked waiting for fresh self-play data.
+
+        Fired from the trainer's stale-data wait branch, which runs only when
+        self-play failed to refresh the replay buffer within ``max_stale_epochs``
+        and the GPU therefore sits idle. Aggregated into the session report
+        (``summary.gpu_idle_wait_*``) as the single at-a-glance signal of
+        self-play starvation: total≈0 ⇒ self-play keeps pace (leave cpu_workers
+        alone); large/high-pct ⇒ GPU is starved (raise cpu_workers).
+
+        ``stale_epochs`` is accepted for caller context (how stale the buffer was
+        when the wait began) but is not aggregated yet — reserved for future
+        per-event detail; passing it is harmless.
+        """
+        if seconds < 0:
+            seconds = 0.0
+        with self._lock:
+            self.gpu_idle_wait_count += 1
+            self.gpu_idle_wait_seconds += seconds
+            if seconds > self.gpu_idle_wait_max_seconds:
+                self.gpu_idle_wait_max_seconds = seconds
 
     def record_selfplay_epoch(
         self,
@@ -1173,6 +1286,19 @@ class StatsCollector:
                     'total_evaluations': len(self.eval_records),
                     'total_checkpoints': len(self.checkpoint_records),
                     'nan_inf_events': len(self.nan_inf_events),
+                    # GPU-idle self-play-starvation diagnostic (record_gpu_idle_wait).
+                    # The at-a-glance answer to "is self-play starving the GPU?":
+                    # pct≈0 ⇒ self-play keeps pace; high ⇒ raise cpu_workers.
+                    'gpu_idle_wait_count': self.gpu_idle_wait_count,
+                    'gpu_idle_wait_seconds': round(self.gpu_idle_wait_seconds, 3),
+                    'gpu_idle_wait_max_seconds': round(self.gpu_idle_wait_max_seconds, 3),
+                    'gpu_idle_wait_pct': (
+                        # min(100,…): idle is a subset of wall-clock so pct≤100 in
+                        # any real run; the clamp only guards a near-zero-elapsed
+                        # smoke test from printing a nonsense value.
+                        round(min(100.0, 100.0 * self.gpu_idle_wait_seconds / elapsed), 3)
+                        if elapsed > 0 else 0.0
+                    ),
                 },
                 'loss': {
                     'summary': self.loss.summary(1000),
@@ -1208,6 +1334,11 @@ class StatsCollector:
                     'gpu_utilization': self.gpu_utilization_pct.summary(100),
                     'cpu_percent': self.cpu_percent.summary(100),
                     'ram_used_gb': self.ram_used_gb.summary(100),
+                    # Throttle diagnostics (NVML; empty on ROCm/no-NVML).
+                    'gpu_power_w': self.gpu_power_w.summary(100),
+                    'gpu_sm_clock_mhz': self.gpu_sm_clock_mhz.summary(100),
+                    'gpu_temp_c': self.gpu_temp_c.summary(100),
+                    'gpu_throttle_reasons': self.gpu_throttle_reasons.summary(100),
                 },
                 'model_health': {
                     'param_norm_summaries': {
@@ -1378,11 +1509,17 @@ class StatsCollector:
             ram_entries = {e['step']: e for e in self.ram_used_gb.all_entries()}
             gpu_util_entries = {e['step']: e for e in self.gpu_utilization_pct.all_entries()}
             gpu_reserved = {e['step']: e for e in self.gpu_mem_reserved_mb.all_entries()}
+            gpu_power = {e['step']: e for e in self.gpu_power_w.all_entries()}
+            gpu_clock = {e['step']: e for e in self.gpu_sm_clock_mhz.all_entries()}
+            gpu_temp = {e['step']: e for e in self.gpu_temp_c.all_entries()}
+            gpu_throttle = {e['step']: e for e in self.gpu_throttle_reasons.all_entries()}
 
             all_steps = sorted(set(
                 list(gpu_entries.keys()) + list(cpu_entries.keys()) +
                 list(ram_entries.keys()) + list(gpu_util_entries.keys()) +
-                list(gpu_reserved.keys())
+                list(gpu_reserved.keys()) + list(gpu_power.keys()) +
+                list(gpu_clock.keys()) + list(gpu_temp.keys()) +
+                list(gpu_throttle.keys())
             ))
 
             if not all_steps:
@@ -1393,6 +1530,8 @@ class StatsCollector:
                 writer.writerow([
                     'step', 'gpu_mem_allocated_mb', 'gpu_mem_reserved_mb',
                     'gpu_utilization_pct', 'cpu_percent', 'ram_used_gb',
+                    'gpu_power_w', 'gpu_sm_clock_mhz', 'gpu_temp_c',
+                    'gpu_throttle_reasons',
                 ])
                 for step in all_steps:
                     writer.writerow([
@@ -1402,6 +1541,10 @@ class StatsCollector:
                         gpu_util_entries.get(step, {}).get('value', ''),
                         cpu_entries.get(step, {}).get('value', ''),
                         ram_entries.get(step, {}).get('value', ''),
+                        gpu_power.get(step, {}).get('value', ''),
+                        gpu_clock.get(step, {}).get('value', ''),
+                        gpu_temp.get(step, {}).get('value', ''),
+                        gpu_throttle.get(step, {}).get('value', ''),
                     ])
             return str(path)
 
@@ -1459,6 +1602,18 @@ class StatsCollector:
                 sps = conv.get('overall_steps_per_hour', 0)
                 if sps:
                     print(f"    Steps/hour:         {sps:,.0f}")
+
+            # GPU-idle self-play starvation — prints only when it happened, so a
+            # healthy (self-play-keeps-pace) run stays quiet and a starved run is
+            # flagged loudly. This is the at-a-glance cpu_workers signal.
+            if self.gpu_idle_wait_count > 0:
+                _idle_pct = (min(100.0, 100.0 * self.gpu_idle_wait_seconds / elapsed)
+                             if elapsed > 0 else 0.0)
+                print(f"\n  GPU-idle (self-play starvation):")
+                print(f"    Wait events:        {self.gpu_idle_wait_count}")
+                print(f"    Total idle:         {self.gpu_idle_wait_seconds:.1f}s "
+                      f"({_idle_pct:.1f}% of session)")
+                print(f"    Longest wait:       {self.gpu_idle_wait_max_seconds:.1f}s")
 
             # Gradients
             gs = self.grad_norm_global.summary(100)
