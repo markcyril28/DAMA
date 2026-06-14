@@ -1965,6 +1965,12 @@ class Trainer:
                 try:
                     # Respect Pause: do not start a new self-play cycle while
                     # paused (games already in flight still finish).
+                    # NOTE: this loop relies on the main training thread to
+                    # service RESUME/STOP from the control queue (it does not
+                    # call _service_control_queue itself). If train() completes
+                    # naturally while paused, the main loop has exited and won't
+                    # clear _paused; shutdown is then bounded by the bg-thread
+                    # join timeout (see end of train()). Harmless but noted.
                     while self._paused and not self._stopped:
                         time.sleep(0.5)
                     if self._stopped:
@@ -3272,6 +3278,10 @@ class Trainer:
                     # on memorized data (GPU trains ~100-144x faster than self-play).
                     # Use _data_ready_event for zero-latency wakeup instead of
                     # time.sleep(0.5) polling (saves up to 500ms per data arrival).
+                    # Time the GPU-idle wait so the session report aggregates
+                    # self-play starvation (the server cpu_workers signal).
+                    _wait_start = time.monotonic()
+                    _wait_stale = _stale_epochs
                     while not self._stopped:
                         self._service_control_queue()
                         # Respect pause commands while waiting
@@ -3312,6 +3322,19 @@ class Trainer:
                         # Check stop conditions while waiting
                         if self.config.stop_time and datetime.now() >= self.config.stop_time:
                             break
+                    # Wait loop exited — record how long the GPU sat idle so the
+                    # session report's summary.gpu_idle_wait_* aggregates it.
+                    # CAVEAT: this elapsed span includes any GUI-pause time spent
+                    # in the inner _paused loop above, so a PAUSE during this
+                    # branch would over-count starvation. Harmless in practice —
+                    # the branch fires only when self-play falls behind
+                    # (_stale_epochs >= _max_stale), which never happens on local
+                    # (self-play over-produces) and the server runs headless (no
+                    # PAUSE). Revisit (subtract paused time) only if _max_stale is
+                    # ever lowered for a GUI run.
+                    if self.stats_collector is not None:
+                        self.stats_collector.record_gpu_idle_wait(
+                            time.monotonic() - _wait_start, _wait_stale)
             else:
                 # Alternate mode: generate data synchronously, then rebuild dataloader
                 print("Running self-play (alternate mode)...")
