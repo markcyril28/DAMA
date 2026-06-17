@@ -446,6 +446,7 @@ class TrainingConfig:
     pin_memory: bool = True
     ram_cache_enabled: bool = True
     ram_cache_threshold_gb: float = 8.0
+    ram_cache_file: Optional[str] = None
     replay_max_entries: int = 100000  # Max entries to sample from replay buffer per epoch
     clear_replay_after_load: bool = False  # Delete replay files after loading into memory
     max_moves_per_sample: int = 32  # Padding width for move features (max legal moves ~20)
@@ -3073,6 +3074,7 @@ class Trainer:
             pin_memory=self.config.pin_memory,
             use_ram_cache=self.config.ram_cache_enabled,
             ram_threshold_gb=self.config.ram_cache_threshold_gb,
+            cache_file=self.config.ram_cache_file,
             device=self.device,
             capacity=self.config.replay_max_entries if _simultaneous else 0,
             max_moves_per_sample=self.config.max_moves_per_sample,
@@ -3775,6 +3777,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         pin_memory=dataloader_cfg.get('pin_memory', True),
         ram_cache_enabled=dataloader_cfg.get('ram_cache', {}).get('enabled', True),
         ram_cache_threshold_gb=dataloader_cfg.get('ram_cache', {}).get('threshold_gb', 8.0),
+        ram_cache_file=dataloader_cfg.get('ram_cache', {}).get('cache_file'),
         replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
         clear_replay_after_load=dataloader_cfg.get('clear_replay_after_load', False),
         max_moves_per_sample=dataloader_cfg.get('max_moves_per_sample', 32),
