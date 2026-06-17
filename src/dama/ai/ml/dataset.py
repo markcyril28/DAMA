@@ -1,12 +1,15 @@
 """Dataset for training the move scorer model."""
 
+import hashlib
+import json
 import gc
+import time
 import os
 import random
 import psutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -161,6 +164,44 @@ def _encode_moves_fast(
         out[i, 7] = 1.0 if is_king else 0.0
 
     return n
+
+
+def _entry_signature(entries: List[Any], max_samples: int = 64) -> str:
+    """Build a compact fingerprint for a set of replay entries.
+
+    Uses a sampled subset so cache validation is quick while still stable for
+    ordered entry order changes across runs (replay append/sampling).
+    """
+    if not entries:
+        return "empty"
+
+    n = len(entries)
+    if n <= max_samples:
+        sample_indices = range(n)
+    else:
+        sample_indices = {
+            int(round(i * (n - 1) / (max_samples - 1)))
+            for i in range(max_samples)
+        }
+    h = hashlib.blake2b(digest_size=8)
+    h.update(str(n).encode('utf-8'))
+
+    for idx in sorted(sample_indices):
+        entry = entries[idx]
+        if isinstance(entry, dict):
+            payload = entry
+        else:
+            payload = {
+                'state': getattr(entry, 'state', None),
+                'legal_moves_len': len(getattr(entry, 'legal_moves', [])),
+                'chosen_index': getattr(entry, 'chosen_index', -1),
+                'result': getattr(entry, 'result', 0),
+                'score': float(getattr(entry, 'score', 0.0)),
+            }
+        # Sort keys for deterministic ordering; compact separators to reduce CPU cost.
+        h.update(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8'))
+
+    return h.hexdigest()
 
 
 def _preprocess_pool_init():
@@ -720,6 +761,7 @@ class CachedTensorDataset(Dataset):
         targets: torch.Tensor,
         reward_weights: Optional[torch.Tensor] = None,
         value_targets: Optional[torch.Tensor] = None,
+        metadata: Optional[dict] = None,
     ):
         """
         Args:
@@ -744,6 +786,7 @@ class CachedTensorDataset(Dataset):
             self.value_targets = value_targets
         else:
             self.value_targets = torch.zeros(len(boards), dtype=torch.float32)
+        self.metadata = dict(metadata or {})
     
     def __len__(self) -> int:
         return len(self.boards)
@@ -948,16 +991,22 @@ class CachedTensorDataset(Dataset):
             torch.from_numpy(vt),
         )
     
-    def save(self, path: str) -> None:
+    def save(self, path: str, metadata: Optional[dict] = None) -> None:
         """Save the cached tensors to a .pt file."""
-        torch.save({
+        payload = {
             'boards': self.boards,
             'move_features': self.move_features,
             'move_counts': self.move_counts,
             'targets': self.targets,
             'reward_weights': self.reward_weights,
             'value_targets': self.value_targets,
-        }, path)
+            'metadata': {
+                **self.metadata,
+                **(metadata or {}),
+                'created_at': time.time(),
+            },
+        }
+        torch.save(payload, path)
         print(f"Saved cached dataset to {path}")
     
     @classmethod
@@ -971,6 +1020,7 @@ class CachedTensorDataset(Dataset):
             data['targets'],
             data.get('reward_weights', None),  # Backward compat with old caches
             data.get('value_targets', None),   # Backward compat with old caches
+            metadata=data.get('metadata', None),
         )
 
     def concat(self, other: 'CachedTensorDataset', max_entries: int = 0) -> 'CachedTensorDataset':
@@ -1513,6 +1563,7 @@ def create_dataloader(
     pin_memory: bool = True,
     use_ram_cache: bool = True,
     ram_threshold_gb: float = 16.0,
+    cache_file: Optional[str] = None,
     device: Optional[torch.device] = None,
     capacity: int = 0,
     max_moves_per_sample: int = 32,
@@ -1557,11 +1608,53 @@ def create_dataloader(
         print(f"RAM Caching enabled ({available_ram:.1f}GB available, {estimated_size_gb:.2f}GB needed)")
         print("Pre-processing entries to tensors...")
 
+        cache_meta = {
+            'cache_version': 1,
+            'entry_count': len(entries),
+            'entry_signature': _entry_signature(entries),
+            'max_moves_per_sample': max_moves_per_sample,
+            'ram_threshold_gb': ram_threshold_gb,
+        }
+
+        cache_path = Path(cache_file).expanduser() if cache_file else None
+        if cache_path is not None:
+            if cache_path.exists():
+                print(f"RAM cache file found: {cache_path}")
+                try:
+                    cached_dataset = CachedTensorDataset.load(str(cache_path))
+                    cached_meta = cached_dataset.metadata
+                    if (
+                        cached_meta.get('entry_count') == cache_meta['entry_count']
+                        and cached_meta.get('entry_signature') == cache_meta['entry_signature']
+                        and cached_meta.get('max_moves_per_sample') == cache_meta['max_moves_per_sample']
+                    ):
+                        print("Loaded matching RAM cache from file.")
+                        return FastBatchIterator(
+                            cached_dataset,
+                            batch_size=batch_size,
+                            shuffle=shuffle,
+                            drop_last=len(cached_dataset) > batch_size,
+                            pin_memory=pin_memory,
+                            device=device,
+                            capacity=capacity,
+                            amp_enabled=amp_enabled,
+                        )
+                    print("RAM cache file metadata mismatch; rebuilding cache.")
+                except Exception as e:
+                    print(f"RAM cache file invalid ({e}); rebuilding cache.")
+
+            print(f"RAM cache enabled; saving computed dataset to {cache_path}")
         cached_dataset = CachedTensorDataset.from_entries(
             entries,
             max_moves_per_sample=max_moves_per_sample,
             show_progress=True
         )
+        if cache_path is not None:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cached_dataset.save(str(cache_path), metadata=cache_meta)
+            except Exception as e:
+                print(f"Warning: could not save RAM cache file {cache_path}: {e}")
 
         # FastBatchIterator: bypass DataLoader entirely for pre-tensorized data.
         # Direct tensor[indices] is orders of magnitude faster than per-sample
