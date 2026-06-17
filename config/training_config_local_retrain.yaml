@@ -104,7 +104,7 @@ dataloader:
   ram_cache:
     enabled: true
     threshold_gb: 16.0                  # 16GB cache on 32GB system (~25GB usable under WSL2)
-    cache_file: null
+    cache_file: "data/replay_cache/local_retrain_cache.pt"  # Persist RAM cache artifact for warm starts. See Journal Pass 108.
 
 # -----------------------------------------------------------------------------
 # Model Testing Settings (ML vs Algorithm)

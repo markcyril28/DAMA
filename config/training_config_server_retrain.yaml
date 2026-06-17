@@ -106,7 +106,7 @@ dataloader:
   ram_cache:
     enabled: true
     threshold_gb: 64.0                    # 1TB DDR4 available - generous threshold
-    cache_file: null
+    cache_file: "data/replay_cache/server_retrain_cache.pt"  # Persist pre-encoded data across runs; cache fingerprint validates staleness. See Journal Pass 108.
 
 # -----------------------------------------------------------------------------
 # Model Testing Settings (ML vs Algorithm)
