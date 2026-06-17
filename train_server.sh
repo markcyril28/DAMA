@@ -37,9 +37,8 @@ CONFIG_PROFILE=""
 SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
 PROCESS_TITLE="micro_trainer"            # Process name shown in htop or btop (requires 'setproctitle' package)
 RESUME=""                        # Path to checkpoint to resume from
-RESUME_LATEST=true              # Set true to resume from latest checkpoint in models/checkpoints/
-                                 # NOTE: Set to false for fresh retrain — old checkpoints are
-                                 # degenerate. See config/training_config_server_retrain.yaml.
+RESUME_LATEST=false             # Fresh retrain: embed_norm makes old checkpoints obsolete. See Journal Pass 105.
+                                 # NOTE: --resume-latest overrides YAML resume.enabled, so keep this false until a healthy new-arch checkpoint exists.
 
 # -----------------------------------------------------------------------------
 # Time-based Stopping (can override config file)

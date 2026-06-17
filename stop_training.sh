@@ -2,10 +2,6 @@
 # Stop all scheduled training processes
 #
 # Usage:
-#   bash stop_training.sh          # Kill daemon + running session + remove cron
-#   bash stop_training.sh --cron   # Only remove cron schedule
-#   bash stop_training.sh --kill   # Only kill running session (daemon keeps running)
-#   bash stop_training.sh --all    # Kill everything (same as no args)
 
 # This script lives at the project root, so PROJECT_DIR is SCRIPT_DIR itself.
 # scripts/runner.sh writes its PID files into the project root.
