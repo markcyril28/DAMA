@@ -38,6 +38,7 @@ class ReplayEntry:
     chosen_index: int     # Index of chosen move
     result: int           # Game result from this player's perspective (+1, -1, 0)
     score: float = 0.0    # Detailed shaped reward score (from scoring system)
+    sample_weight: float = 1.0  # Extra multiplier for loss weighting
 
     def to_dict(self) -> dict:
         d = {
@@ -49,6 +50,8 @@ class ReplayEntry:
         # Only include score if non-zero (saves space for old-format entries)
         if self.score != 0.0:
             d['score'] = round(self.score, 4)
+        if self.sample_weight != 1.0:
+            d['sample_weight'] = round(float(self.sample_weight), 6)
         return d
 
     @classmethod
@@ -65,6 +68,7 @@ class ReplayEntry:
             chosen_index=chosen_index,
             result=data.get('result', 0),
             score=data.get('score', 0.0),
+            sample_weight=float(data.get('sample_weight', 1.0)),
         )
 
 

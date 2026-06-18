@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import random
+import math
 import argparse
 import tempfile
 import warnings
@@ -80,6 +81,7 @@ from .dataset import (
     create_dataloader, create_dataloader_from_dataset, prepare_training_data,
     CachedTensorDataset, CUDAPrefetcher, FastBatchIterator,
 )
+from .scoring import compute_reward_weight
 from .stats_collector import StatsCollector
 
 
@@ -1525,6 +1527,82 @@ class Trainer:
         with open(self.log_file, 'a') as f:
             f.write(json.dumps(data) + '\n')
 
+    @staticmethod
+    def _balance_side_sample_weights(entry_dicts: list) -> Optional[Dict[str, float]]:
+        """Equalize total reward weight for Player.ONE and Player.TWO entries."""
+        if not entry_dicts:
+            return None
+
+        side_weight = {1: 0.0, 2: 0.0}
+        side_count = {1: 0, 2: 0}
+        valid_entries = []
+
+        for entry in entry_dicts:
+            is_dict = isinstance(entry, dict)
+            state = entry.get('state') if is_dict else getattr(entry, 'state', None)
+            if not isinstance(state, dict):
+                continue
+            try:
+                turn = int(state.get('turn'))
+            except (TypeError, ValueError):
+                continue
+            if turn not in side_weight:
+                continue
+
+            try:
+                score_value = entry.get('score', 0.0) if is_dict else getattr(entry, 'score', 0.0)
+                score = float(score_value)
+            except (TypeError, ValueError):
+                score = 0.0
+            try:
+                weight_value = (
+                    entry.get('sample_weight', 1.0)
+                    if is_dict else getattr(entry, 'sample_weight', 1.0)
+                )
+                sample_weight = float(weight_value)
+            except (TypeError, ValueError):
+                sample_weight = 1.0
+            if not math.isfinite(sample_weight) or sample_weight < 0.0:
+                sample_weight = 1.0
+
+            weight = compute_reward_weight(score) * sample_weight
+            side_weight[turn] += weight
+            side_count[turn] += 1
+            valid_entries.append((entry, is_dict, turn, sample_weight))
+
+        if side_count[1] == 0 or side_count[2] == 0:
+            return None
+        if side_weight[1] <= 0.0 or side_weight[2] <= 0.0:
+            return None
+
+        target_weight = (side_weight[1] + side_weight[2]) * 0.5
+        side_scale = {
+            1: target_weight / side_weight[1],
+            2: target_weight / side_weight[2],
+        }
+
+        for entry, is_dict, turn, sample_weight in valid_entries:
+            balanced_weight = sample_weight * side_scale[turn]
+            if math.isclose(balanced_weight, 1.0, rel_tol=0.0, abs_tol=1e-6):
+                if is_dict:
+                    entry.pop('sample_weight', None)
+                else:
+                    entry.sample_weight = 1.0
+            else:
+                if is_dict:
+                    entry['sample_weight'] = round(balanced_weight, 6)
+                else:
+                    entry.sample_weight = round(balanced_weight, 6)
+
+        return {
+            'p1_count': side_count[1],
+            'p2_count': side_count[2],
+            'p1_weight_before': side_weight[1],
+            'p2_weight_before': side_weight[2],
+            'p1_weight_after': target_weight,
+            'p2_weight_after': target_weight,
+        }
+
     def run_selfplay(self, num_games: int, callback=None,
                      collect_dicts: bool = False,
                      skip_replay: bool = False,
@@ -1782,6 +1860,16 @@ class Trainer:
         if not skip_replay:
             self.replay_buffer.start_new_file()
 
+        side_balance_totals = {
+            'batches': 0,
+            'p1_count': 0,
+            'p2_count': 0,
+            'p1_weight_before': 0.0,
+            'p2_weight_before': 0.0,
+            'p1_weight_after': 0.0,
+            'p2_weight_after': 0.0,
+        }
+
         # --- Submit ALL to one ProcessPoolExecutor ---
         # initializer reseeds each worker's RNG: forked workers otherwise
         # inherit identical random state, correlating exploration noise.
@@ -1791,6 +1879,15 @@ class Trainer:
         # all three paths stay in sync.
         def _consume_batch(entries_data, batch_game_count):
             nonlocal entries, completed_total
+            balance_stats = self._balance_side_sample_weights(entries_data)
+            if balance_stats is not None:
+                side_balance_totals['batches'] += 1
+                for key in (
+                    'p1_count', 'p2_count',
+                    'p1_weight_before', 'p2_weight_before',
+                    'p1_weight_after', 'p2_weight_after',
+                ):
+                    side_balance_totals[key] += balance_stats[key]
             if not skip_replay:
                 self.replay_buffer.add_entry_dicts(entries_data)
             entries += len(entries_data)
@@ -1903,6 +2000,16 @@ class Trainer:
 
         if not skip_replay:
             self.replay_buffer.close()
+        if side_balance_totals['batches'] > 0:
+            print(
+                "  Side weight balance: "
+                f"P1 {side_balance_totals['p1_weight_before']:.1f}->"
+                f"{side_balance_totals['p1_weight_after']:.1f}, "
+                f"P2 {side_balance_totals['p2_weight_before']:.1f}->"
+                f"{side_balance_totals['p2_weight_after']:.1f} "
+                f"({side_balance_totals['p1_count']}/"
+                f"{side_balance_totals['p2_count']} entries)"
+            )
         print(f"Generated {entries} training entries")
 
         # Store collected dicts for incremental preprocessing
@@ -3078,6 +3185,15 @@ class Trainer:
         train_entries, _ = prepare_training_data(
             self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
         print(f"Training entries: {len(train_entries)}")
+        train_balance = self._balance_side_sample_weights(train_entries)
+        if train_balance is not None:
+            print(
+                "Training side weight balance: "
+                f"P1 {train_balance['p1_weight_before']:.1f} to "
+                f"{train_balance['p1_weight_after']:.1f}, "
+                f"P2 {train_balance['p2_weight_before']:.1f} to "
+                f"{train_balance['p2_weight_after']:.1f}"
+            )
 
         if self.config.clear_replay_after_load:
             deleted = self.replay_buffer.clear_files()
@@ -3377,6 +3493,15 @@ class Trainer:
                 self.run_selfplay(self.config.selfplay_games)
                 train_entries, _ = prepare_training_data(
                     self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
+                train_balance = self._balance_side_sample_weights(train_entries)
+                if train_balance is not None:
+                    print(
+                        "Training side weight balance: "
+                        f"P1 {train_balance['p1_weight_before']:.1f} to "
+                        f"{train_balance['p1_weight_after']:.1f}, "
+                        f"P2 {train_balance['p2_weight_before']:.1f} to "
+                        f"{train_balance['p2_weight_after']:.1f}"
+                    )
                 if self.config.clear_replay_after_load:
                     deleted = self.replay_buffer.clear_files()
                     if deleted:
