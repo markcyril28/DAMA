@@ -195,6 +195,20 @@ class TestDataset:
         assert (reward_weights > 0).all()
         assert value_targets.shape == (len(sample_entries),)
 
+    def test_sample_weight_scales_reward_weights(self, sample_entries):
+        """Test extra sample weights are applied to loss weights."""
+        sample_entries[0].sample_weight = 0.25
+
+        dataset = DamaDataset(sample_entries)
+        _, _, _, reward_weight, _ = dataset[0]
+        expected = compute_reward_weight(sample_entries[0].score) * 0.25
+        assert reward_weight == pytest.approx(expected)
+
+        _, _, _, _, reward_weights, _ = preprocess_entries_to_tensors(
+            sample_entries, max_moves_per_sample=64, show_progress=False
+        )
+        assert reward_weights[0].item() == pytest.approx(expected)
+
     def test_cached_tensor_dataset(self, sample_entries):
         """Test CachedTensorDataset creation."""
         cached_dataset = CachedTensorDataset.from_entries(
@@ -404,6 +418,22 @@ class TestScoring:
         restored = ReplayEntry.from_dict(d)
         assert abs(restored.score - 3.14159) < 0.001
 
+    def test_replay_entry_sample_weight_serialization(self):
+        """Test that ReplayEntry sample_weight roundtrips through JSON."""
+        entry = ReplayEntry(
+            state={'turn': 1, 'p1_men': [], 'p1_kings': [], 'p2_men': [], 'p2_kings': []},
+            legal_moves=[],
+            chosen_index=0,
+            result=1,
+            score=3.14159,
+            sample_weight=0.75,
+        )
+        d = entry.to_dict()
+        assert d['sample_weight'] == pytest.approx(0.75)
+
+        restored = ReplayEntry.from_dict(d)
+        assert restored.sample_weight == pytest.approx(0.75)
+
     def test_replay_entry_backward_compat(self):
         """Test backward compatibility - old entries without score field."""
         d = {
@@ -414,6 +444,33 @@ class TestScoring:
         }
         entry = ReplayEntry.from_dict(d)
         assert entry.score == 0.0  # Default value
+        assert entry.sample_weight == 1.0
+
+
+class TestTrainingSideBalance:
+    """Tests for side weight balancing during self-play ingestion."""
+
+    def test_side_balance_equalizes_reward_mass(self):
+        """Trainer normalizer should equalize total P1 and P2 loss weight."""
+        from dama.ai.ml.trainer import Trainer
+
+        entries = [
+            {'state': {'turn': 1}, 'score': 10.0},
+            {'state': {'turn': 1}, 'score': 10.0},
+            {'state': {'turn': 2}, 'score': -10.0},
+        ]
+
+        stats = Trainer._balance_side_sample_weights(entries)
+        assert stats is not None
+
+        def side_mass(side):
+            return sum(
+                compute_reward_weight(e.get('score', 0.0)) * e.get('sample_weight', 1.0)
+                for e in entries
+                if e['state']['turn'] == side
+            )
+
+        assert side_mass(1) == pytest.approx(side_mass(2))
 
 
 if __name__ == "__main__":
