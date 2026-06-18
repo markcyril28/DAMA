@@ -58,6 +58,60 @@ def get_total_ram_gb() -> float:
         return 0.0
 
 
+def _sanitize_sample_weight(value: Any) -> float:
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not np.isfinite(weight) or weight < 0.0:
+        return 1.0
+    return weight
+
+
+def _sample_weight_scales_from_dicts(
+    entry_dicts: List[dict],
+    start_idx: int = 0,
+    end_idx: Optional[int] = None,
+) -> Optional[np.ndarray]:
+    if end_idx is None:
+        end_idx = len(entry_dicts)
+    n = max(0, end_idx - start_idx)
+    scales = None
+    for out_i, src_i in enumerate(range(start_idx, end_idx)):
+        weight = _sanitize_sample_weight(entry_dicts[src_i].get('sample_weight', 1.0))
+        if weight != 1.0:
+            if scales is None:
+                scales = np.ones(n, dtype=np.float32)
+            scales[out_i] = weight
+    return scales
+
+
+def _sample_weight_scales_from_entries(
+    entries: List[Any],
+    start_idx: int = 0,
+    end_idx: Optional[int] = None,
+) -> Optional[np.ndarray]:
+    if end_idx is None:
+        end_idx = len(entries)
+    n = max(0, end_idx - start_idx)
+    scales = None
+    for out_i, src_i in enumerate(range(start_idx, end_idx)):
+        weight = _sanitize_sample_weight(getattr(entries[src_i], 'sample_weight', 1.0))
+        if weight != 1.0:
+            if scales is None:
+                scales = np.ones(n, dtype=np.float32)
+            scales[out_i] = weight
+    return scales
+
+
+def _apply_sample_weight_scales(
+    reward_weights: np.ndarray,
+    scales: Optional[np.ndarray],
+) -> None:
+    if scales is not None:
+        reward_weights *= scales
+
+
 class DamaDataset(Dataset):
     """
     PyTorch dataset for training data.
@@ -90,6 +144,7 @@ class DamaDataset(Dataset):
 
         # Compute reward weight from score
         reward_weight = compute_reward_weight(entry.score)
+        reward_weight *= _sanitize_sample_weight(getattr(entry, 'sample_weight', 1.0))
 
         return (
             torch.from_numpy(board),
@@ -197,6 +252,7 @@ def _entry_signature(entries: List[Any], max_samples: int = 64) -> str:
                 'chosen_index': getattr(entry, 'chosen_index', -1),
                 'result': getattr(entry, 'result', 0),
                 'score': float(getattr(entry, 'score', 0.0)),
+                'sample_weight': float(getattr(entry, 'sample_weight', 1.0)),
             }
         # Sort keys for deterministic ordering; compact separators to reduce CPU cost.
         h.update(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8'))
@@ -273,6 +329,10 @@ def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
 
     # Vectorized reward weight computation — single numpy call for the whole chunk.
     reward_weights[:] = compute_reward_weights_batch(scores_arr)
+    _apply_sample_weight_scales(
+        reward_weights,
+        _sample_weight_scales_from_dicts(entry_dicts),
+    )
 
     return boards, all_move_features, move_counts, targets, reward_weights, value_targets
 
@@ -362,7 +422,12 @@ def _preprocess_chunk_fork_shm(args: Tuple[int, int]) -> None:
                 scores_arr[i] = entry.score
                 vt_slice[i] = float(entry.result)
 
-        reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
+        rw_slice = reward_weights[start_idx:end_idx]
+        rw_slice[:] = compute_reward_weights_batch(scores_arr)
+        _apply_sample_weight_scales(
+            rw_slice,
+            _sample_weight_scales_from_entries(entries, start_idx, end_idx),
+        )
     finally:
         # Close (detach) shared memory handles — parent still owns them
         shm_boards.close()
@@ -414,6 +479,10 @@ def _preprocess_chunk_fork(args: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarra
             value_targets[i] = float(entry.result)
 
     reward_weights[:] = compute_reward_weights_batch(scores_arr)
+    _apply_sample_weight_scales(
+        reward_weights,
+        _sample_weight_scales_from_entries(entries, start_idx, end_idx),
+    )
 
     return boards, all_move_features, move_counts, targets, reward_weights, value_targets
 
@@ -484,7 +553,12 @@ def _preprocess_dicts_fork_shm(args: Tuple[int, int]) -> None:
                 scores_arr[i] = ed.get('score', 0.0)
                 vt_slice[i] = float(ed.get('result', 0))
 
-        reward_weights[start_idx:end_idx] = compute_reward_weights_batch(scores_arr)
+        rw_slice = reward_weights[start_idx:end_idx]
+        rw_slice[:] = compute_reward_weights_batch(scores_arr)
+        _apply_sample_weight_scales(
+            rw_slice,
+            _sample_weight_scales_from_dicts(entries, start_idx, end_idx),
+        )
     finally:
         # Close (detach) shared memory handles — parent still owns them
         shm_boards.close()
@@ -731,6 +805,10 @@ def preprocess_entries_to_tensors(
 
     # Vectorized reward weight computation.
     reward_weights = compute_reward_weights_batch(scores_arr)
+    _apply_sample_weight_scales(
+        reward_weights,
+        _sample_weight_scales_from_entries(entries, 0, n),
+    )
 
     if show_progress:
         print(f"  Pre-processing complete: {n} entries")
