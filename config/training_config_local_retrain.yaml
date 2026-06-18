@@ -38,7 +38,7 @@ model:
 # ML-vs-algo gives balanced P1/P2 teacher signal. See Journal "Reference".
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 12                        # 8->6; GPU is power/thermal-capped, self-play-heat thesis refuted. See Journal Pass 85-89.
+  cpu_workers: 6                        # 8->6; GPU is power/thermal-capped, self-play-heat thesis refuted. See Journal Pass 85-89.
   games_per_epoch: 500*4                # =2000 (eval'd by _eval_expr); compensates algo_vs_algo removal. See Journal Pass 86.
   difficulties:
     - "easy"                            # Learnable signal for a weak model.
@@ -144,7 +144,7 @@ statistics:
 thermal_protection:
   enabled: true
   temp_limit_c: 90
-  rest_duration: "5m"                   # See Journal Pass 34.
+  rest_duration: "30m"                   # See Journal Pass 34.
   check_every: 30
 
 # -----------------------------------------------------------------------------
@@ -160,4 +160,4 @@ resume:
 # -----------------------------------------------------------------------------
 time_limit:
   enabled: true
-  duration: "6h"
+  duration: "10h"

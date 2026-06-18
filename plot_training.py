@@ -10,7 +10,9 @@ quick image viewing or sharing. Pass --static to generate only the PNG.
 """
 
 import argparse
+from bisect import bisect_left
 import json
+import math
 import os
 import platform
 import subprocess
@@ -103,6 +105,9 @@ _DASHBOARD_CSS = """
   --button-fg: #222222;
   --button-border: #cccccc;
   --button-hover-bg: #ececec;
+  --button-active-bg: #e8f5ee;
+  --button-active-fg: #0f5f3a;
+  --button-active-border: #82c99d;
   --summary-bg: wheat;
   --summary-fg: #222222;
 }
@@ -119,6 +124,9 @@ _DASHBOARD_CSS = """
   --button-fg: #e5e7eb;
   --button-border: #3b4657;
   --button-hover-bg: #2d3647;
+  --button-active-bg: #123225;
+  --button-active-fg: #9ce2b8;
+  --button-active-border: #2f8f58;
   --summary-bg: #1e2430;
   --summary-fg: #e5e7eb;
 }
@@ -148,7 +156,39 @@ body {
 .theme-toggle:hover { background: var(--button-hover-bg); }
 .theme-toggle:focus-visible { outline: 2px solid #4f8cff; outline-offset: 2px; }
 h1 { text-align: center; font-weight: 600; font-size: 22px; margin: 4px 0 16px; }
-.page-meta { text-align: center; margin: -8px 0 16px; color: var(--muted-fg); font-size: 12px; }
+.page-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+  margin: -8px 0 16px;
+  color: var(--muted-fg);
+  font-size: 12px;
+}
+.page-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.page-action {
+  cursor: pointer;
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-fg);
+  border-radius: 6px;
+  padding: 4px 9px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.page-action:hover { background: var(--button-hover-bg); }
+.page-action:focus-visible { outline: 2px solid #4f8cff; outline-offset: 2px; }
+.page-action[aria-pressed="true"] {
+  border-color: var(--button-active-border);
+  background: var(--button-active-bg);
+  color: var(--button-active-fg);
+}
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .card {
   border: 1px solid var(--card-border);
@@ -211,6 +251,8 @@ var AUTO_REFRESH_MS = %%REFRESH_MS%%;
 var GENERATED_AT = "%%GENERATED_AT%%";
 var SCROLL_KEY = "training-progress-scroll-y";
 var THEME_STORAGE_KEY = "%%THEME_STORAGE_KEY%%";
+var autoRefreshTimer = null;
+var autoRefreshEnabled = true;
 
 function getPreferredTheme() {
   try {
@@ -298,12 +340,18 @@ document.addEventListener('webkitfullscreenchange', resizeAllPlots);
 window.addEventListener('resize', resizeAllPlots);
 
 window.addEventListener('DOMContentLoaded', function () {
-  var btn = document.getElementById('theme-toggle');
-  if (!btn) return;
-  btn.addEventListener('click', function () {
+  var themeBtn = document.getElementById('theme-toggle');
+  var refreshBtn = document.getElementById('refresh-now');
+  var autoRefreshBtn = document.getElementById('auto-refresh-toggle');
+
+  if (themeBtn) themeBtn.addEventListener('click', function () {
     var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
     applyTheme(next, true);
   });
+
+  if (refreshBtn) refreshBtn.addEventListener('click', refreshPage);
+  if (autoRefreshBtn) autoRefreshBtn.addEventListener('click', toggleAutoRefresh);
+  updateAutoRefreshButton();
 });
 
 window.addEventListener('load', function () {
@@ -322,29 +370,59 @@ window.addEventListener('beforeunload', function () {
   } catch (e) {}
 });
 
-function scheduleAutoRefresh() {
-  if (!AUTO_REFRESH_MS || AUTO_REFRESH_MS <= 0) return;
+function refreshPage() {
+  window.location.reload();
+}
 
+async function checkForUpdatedReport() {
   if (window.location.protocol === 'file:') {
-    window.setTimeout(function () {
-      window.location.reload();
-    }, AUTO_REFRESH_MS);
+    refreshPage();
     return;
   }
 
-  window.setInterval(async function () {
-    try {
-      var response = await fetch(window.location.href, { cache: 'no-store' });
-      var html = await response.text();
-      var match = html.match(/<meta name="report-generated-at" content="([^"]+)"/i);
-      if (match && match[1] !== GENERATED_AT) {
-        window.location.reload();
-      }
-    } catch (e) {}
-  }, AUTO_REFRESH_MS);
+  try {
+    var response = await fetch(window.location.href, { cache: 'no-store' });
+    var html = await response.text();
+    var match = html.match(/<meta name="report-generated-at" content="([^"]+)"/i);
+    if (match && match[1] !== GENERATED_AT) {
+      refreshPage();
+    }
+  } catch (e) {}
 }
 
-scheduleAutoRefresh();
+function updateAutoRefreshButton() {
+  var btn = document.getElementById('auto-refresh-toggle');
+  if (!btn) return;
+  btn.textContent = autoRefreshEnabled ? 'Auto refresh: On' : 'Auto refresh: Off';
+  btn.setAttribute('aria-pressed', autoRefreshEnabled ? 'true' : 'false');
+  btn.setAttribute('aria-label', autoRefreshEnabled ? 'Turn auto refresh off' : 'Turn auto refresh on');
+}
+
+function startAutoRefresh() {
+  if (!AUTO_REFRESH_MS || AUTO_REFRESH_MS <= 0 || autoRefreshTimer) return;
+  autoRefreshEnabled = true;
+  updateAutoRefreshButton();
+  autoRefreshTimer = window.setInterval(checkForUpdatedReport, AUTO_REFRESH_MS);
+}
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer) {
+    window.clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  autoRefreshEnabled = false;
+  updateAutoRefreshButton();
+}
+
+function toggleAutoRefresh() {
+  if (autoRefreshTimer) {
+    stopAutoRefresh();
+  } else {
+    startAutoRefresh();
+  }
+}
+
+startAutoRefresh();
 """
 
 _CARD_TEMPLATE = """  <div class="card" id="card-%%KEY%%">
@@ -390,7 +468,13 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false">Dark mode</button>
 </div>
 <h1>%%TITLE%%</h1>
-<div class="page-meta">Updated %%GENERATED_AT%% • Auto-refresh every %%REFRESH_SECONDS%%s</div>
+<div class="page-meta">
+  <span>Updated %%GENERATED_AT%%</span>
+  <span class="page-actions" aria-label="Refresh controls">
+    <button id="refresh-now" class="page-action" type="button">Refresh</button>
+    <button id="auto-refresh-toggle" class="page-action" type="button" aria-pressed="true">Auto refresh: On</button>
+  </span>
+</div>
 <div class="grid">
 %%CARDS%%
 </div>
@@ -543,6 +627,181 @@ def _apply_interactive_layout(fig: go.Figure, y_title: str, y_range=None) -> go.
     return fig
 
 
+def _as_finite_float(value) -> float | None:
+    """Return a finite float, or None for missing/non-numeric metric values."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _metric_container(stats: dict, path: tuple[str, ...]):
+    """Fetch a nested metric container from a stats dict."""
+    current = stats
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _normalise_metric_container(container):
+    """Return the list-like payload from a metric container when available."""
+    if isinstance(container, dict):
+        for key in ('history', 'entries', 'all', 'values'):
+            values = container.get(key)
+            if isinstance(values, list):
+                return values
+        return None
+    return container
+
+
+def _step_metric_entries(stats: dict, candidates: list[tuple[tuple[str, ...], tuple[str, ...]]]) -> list[tuple[float, float]]:
+    """Extract ordered ``(step, value)`` metric entries from any known stats shape."""
+    for path, value_keys in candidates:
+        entries = _normalise_metric_container(_metric_container(stats, path))
+        if not isinstance(entries, list):
+            continue
+
+        parsed = []
+        for entry in entries:
+            step = None
+            value = None
+            if isinstance(entry, dict):
+                step = _as_finite_float(entry.get('step'))
+                for key in value_keys:
+                    value = _as_finite_float(entry.get(key))
+                    if value is not None:
+                        break
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                step = _as_finite_float(entry[0])
+                value = _as_finite_float(entry[1])
+
+            if step is not None and value is not None:
+                parsed.append((step, value))
+
+        if parsed:
+            return parsed
+    return []
+
+
+def _step_metric_series(stats: dict, candidates: list[tuple[tuple[str, ...], tuple[str, ...]]]) -> list[tuple[float, float]]:
+    """Extract a sorted, de-duplicated ``(step, value)`` series."""
+    by_step = {
+        step: value
+        for step, value in _step_metric_entries(stats, candidates)
+    }
+    return sorted(by_step.items())
+
+
+def _nearest_step_value(steps: list[float], values: list[float], step: float) -> float | None:
+    """Return the value recorded at the nearest metric step."""
+    if not steps:
+        return None
+    idx = bisect_left(steps, step)
+    if idx <= 0:
+        return values[0]
+    if idx >= len(steps):
+        return values[-1]
+    before = idx - 1
+    if abs(steps[idx] - step) < abs(step - steps[before]):
+        return values[idx]
+    return values[before]
+
+
+def _ordered_metric_values_for_steps(steps: list[float], entries: list[tuple[float, float]]) -> list[float | None]:
+    """Align an ordered metric stream to ordered loss steps.
+
+    Training stats can contain duplicate step values when a run resumes or
+    restarts.  This keeps the original metric order so duplicate steps match the
+    corresponding occurrence instead of a later sorted duplicate.
+    """
+    values = []
+    cursor = 0
+    last_value = None
+    for raw_step in steps:
+        step = _as_finite_float(raw_step)
+        value = None
+        if step is None:
+            values.append(last_value)
+            continue
+
+        while cursor < len(entries):
+            metric_step, metric_value = entries[cursor]
+            if metric_step == step:
+                value = metric_value
+                last_value = metric_value
+                cursor += 1
+                break
+            if metric_step > step:
+                break
+            last_value = metric_value
+            cursor += 1
+
+        values.append(value if value is not None else last_value)
+    return values
+
+
+def _format_metric(value: float | None, precision: int = 6) -> str:
+    return 'N/A' if value is None else f'{value:.{precision}g}'
+
+
+def _learning_rates_for_losses(sampled_losses: list[dict], stats: dict) -> list[float | None]:
+    """Return per-loss learning rates from direct loss entries or LR history."""
+    lr_candidates = [
+        (('lr_history',), ('lr', 'learning_rate', 'value')),
+        (('learning_rate_history',), ('learning_rate', 'lr', 'value')),
+        (('learning_rate',), ('learning_rate', 'lr', 'value')),
+    ]
+    lr_entries = _step_metric_entries(stats, lr_candidates)
+    ordered_rates = _ordered_metric_values_for_steps(
+        [loss_entry.get('step') for loss_entry in sampled_losses if isinstance(loss_entry, dict)],
+        lr_entries,
+    )
+    lr_series = sorted({step: value for step, value in lr_entries}.items())
+    lr_steps = [step for step, _ in lr_series]
+    lr_values = [value for _, value in lr_series]
+
+    rates: list[float | None] = []
+    for idx, loss_entry in enumerate(sampled_losses):
+        direct = None
+        if isinstance(loss_entry, dict):
+            direct = _as_finite_float(loss_entry.get('learning_rate'))
+            if direct is None:
+                direct = _as_finite_float(loss_entry.get('lr'))
+        if direct is not None:
+            rates.append(direct)
+            continue
+
+        step = _as_finite_float(loss_entry.get('step')) if isinstance(loss_entry, dict) else None
+        ordered = ordered_rates[idx] if idx < len(ordered_rates) else None
+        if ordered is not None:
+            rates.append(ordered)
+        else:
+            rates.append(_nearest_step_value(lr_steps, lr_values, step) if step is not None else None)
+    return rates
+
+
+def _gpu_hours_for_steps(steps: list[float], stats: dict) -> list[float]:
+    """Return cumulative GPU-hours at each step using recorded step durations."""
+    step_time_entries = _step_metric_entries(stats, [
+        (('step_times',), ('time_sec', 'step_time_sec', 'seconds', 'value')),
+        (('step_time_history',), ('time_sec', 'step_time_sec', 'seconds', 'value')),
+        (('throughput', 'step_time_sec'), ('time_sec', 'step_time_sec', 'seconds', 'value')),
+    ])
+    cumulative: list[tuple[float, float]] = []
+    total_seconds = 0.0
+    for step, seconds in step_time_entries:
+        if seconds > 0:
+            total_seconds += seconds
+        cumulative.append((step, total_seconds / 3600.0))
+
+    if not cumulative:
+        return [0.0 for _ in steps]
+    return [float(value or 0.0) for value in _ordered_metric_values_for_steps(steps, cumulative)]
+
+
 def _fig_overall(steps, win_rates) -> go.Figure:
     """Overall ML win-rate vs the algorithm, with a polynomial trend line."""
     fig = go.Figure()
@@ -586,16 +845,33 @@ def _fig_position(steps, p1_win_rates, p2_win_rates) -> go.Figure:
 def _fig_loss(stats: dict) -> go.Figure:
     """Training loss (downsampled) plus a moving average."""
     fig = go.Figure()
+    trace_x_steps = []
+    trace_x_gpu_hours = []
     loss_history = stats.get('loss_history', [])
     if loss_history:
         # Sample every N points to avoid overcrowding
         sample_rate = max(1, len(loss_history) // SAMPLE_RATE_TARGET)
-        loss_steps = [l['step'] for l in loss_history[::sample_rate]]
-        losses = [l['loss'] for l in loss_history[::sample_rate]]
+        sampled_losses = loss_history[::sample_rate]
+        loss_steps = [l['step'] for l in sampled_losses]
+        losses = [l['loss'] for l in sampled_losses]
+        learning_rates = _learning_rates_for_losses(sampled_losses, stats)
+        loss_gpu_hours = _gpu_hours_for_steps(loss_steps, stats)
+        loss_customdata = [
+            [step, f'{gpu_hours:.4f}', _format_metric(lr)]
+            for step, gpu_hours, lr in zip(loss_steps, loss_gpu_hours, learning_rates)
+        ]
+        trace_x_steps.append(loss_steps)
+        trace_x_gpu_hours.append(loss_gpu_hours)
         fig.add_trace(go.Scatter(
             x=loss_steps, y=losses, mode='lines', name='Loss',
             line=dict(color='royalblue', width=1), opacity=0.7,
-            hovertemplate='Step %{x:,}<br>Loss %{y:.4f}<extra></extra>',
+            customdata=loss_customdata,
+            hovertemplate=(
+                'Step %{customdata[0]:,}<br>'
+                'GPU Hours %{customdata[1]}<br>'
+                'Loss %{y:.4f}<br>'
+                'learning_rate %{customdata[2]}<extra></extra>'
+            ),
         ))
 
         # Moving average
@@ -603,12 +879,61 @@ def _fig_loss(stats: dict) -> go.Figure:
         if window > 1:
             moving_avg = np.convolve(losses, np.ones(window) / window, mode='valid')
             ma_steps = loss_steps[window - 1:]
+            ma_gpu_hours = loss_gpu_hours[window - 1:]
+            ma_learning_rates = learning_rates[window - 1:]
+            ma_customdata = [
+                [step, f'{gpu_hours:.4f}', _format_metric(lr)]
+                for step, gpu_hours, lr in zip(ma_steps, ma_gpu_hours, ma_learning_rates)
+            ]
+            trace_x_steps.append(ma_steps)
+            trace_x_gpu_hours.append(ma_gpu_hours)
             fig.add_trace(go.Scatter(
                 x=ma_steps, y=moving_avg, mode='lines', name=f'Moving Avg ({window})',
                 line=dict(color='red', width=2),
-                hovertemplate='Step %{x:,}<br>Avg Loss %{y:.4f}<extra></extra>',
+                customdata=ma_customdata,
+                hovertemplate=(
+                    'Step %{customdata[0]:,}<br>'
+                    'GPU Hours %{customdata[1]}<br>'
+                    'Avg Loss %{y:.4f}<br>'
+                    'learning_rate %{customdata[2]}<extra></extra>'
+                ),
             ))
-    return _apply_interactive_layout(fig, 'Loss')
+
+    fig = _apply_interactive_layout(fig, 'Loss')
+    if trace_x_steps and any(any(hours > 0 for hours in trace) for trace in trace_x_gpu_hours):
+        fig.update_layout(
+            margin=dict(l=58, r=18, t=66, b=46),
+            updatemenus=[dict(
+                type='buttons',
+                direction='right',
+                showactive=True,
+                active=0,
+                x=1.0,
+                xanchor='right',
+                y=1.24,
+                yanchor='top',
+                buttons=[
+                    dict(
+                        label='Steps',
+                        method='update',
+                        args=[
+                            {'x': trace_x_steps},
+                            {'xaxis.title.text': 'Training Steps', 'xaxis.tickformat': ',d'},
+                        ],
+                    ),
+                    dict(
+                        label='GPU hours',
+                        method='update',
+                        args=[
+                            {'x': trace_x_gpu_hours},
+                            {'xaxis.title.text': 'GPU Hours', 'xaxis.tickformat': '.2f'},
+                        ],
+                    ),
+                ],
+            )],
+        )
+        fig.update_xaxes(tickformat=',d')
+    return fig
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
