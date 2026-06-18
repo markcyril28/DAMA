@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Plot training progress and ML model improvement against algorithm.
 
-By default produces a self-contained interactive HTML (Plotly): every subplot
-can be panned (click-drag) and zoomed (scroll; over a single axis = that axis
-only), points show hover tooltips, and legend entries toggle series on/off.
+By default produces both:
+- a self-contained interactive HTML (Plotly)
+- a static matplotlib PNG snapshot
 
-Pass --static for the older, static matplotlib PNG instead.
+The HTML supports pan/zoom/hover and auto-refresh; the PNG is convenient for
+quick image viewing or sharing. Pass --static to generate only the PNG.
 """
 
 import argparse
 import json
+import os
 import platform
 import subprocess
 import sys
+import tempfile
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +83,7 @@ INTERACTIVE_CONFIG = {
 }
 
 PAGE_TITLE = 'Filipino Micro ML Model Training Progress'
+AUTO_REFRESH_MS = 15000
 
 # --- Interactive dashboard HTML template ---------------------------------------
 # Built with token replacement (not str.format/f-strings) because the CSS/JS below
@@ -89,6 +94,7 @@ _DASHBOARD_CSS = """
 body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0;
        padding: 14px 18px; color: #222; background: #fafafa; }
 h1 { text-align: center; font-weight: 600; font-size: 22px; margin: 4px 0 16px; }
+.page-meta { text-align: center; margin: -8px 0 16px; color: #666; font-size: 12px; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .card { border: 1px solid #e3e3e3; border-radius: 10px; padding: 8px 10px; background: #fff;
         display: flex; flex-direction: column; height: 440px;
@@ -115,6 +121,10 @@ h1 { text-align: center; font-weight: 600; font-size: 22px; margin: 4px 0 16px; 
 # graph promoted to fullscreen actually grows to fill the screen (Plotly does not
 # re-layout on container size changes on its own for fixed-size renders).
 _DASHBOARD_JS = """
+var AUTO_REFRESH_MS = %%REFRESH_MS%%;
+var GENERATED_AT = "%%GENERATED_AT%%";
+var SCROLL_KEY = "training-progress-scroll-y";
+
 function toggleFs(id) {
   var el = document.getElementById(id);
   if (document.fullscreenElement || document.webkitFullscreenElement) {
@@ -136,6 +146,45 @@ function resizeAllPlots() {
 document.addEventListener('fullscreenchange', resizeAllPlots);
 document.addEventListener('webkitfullscreenchange', resizeAllPlots);
 window.addEventListener('resize', resizeAllPlots);
+
+window.addEventListener('load', function () {
+  try {
+    var scrollY = sessionStorage.getItem(SCROLL_KEY);
+    if (scrollY !== null) {
+      window.scrollTo(0, parseInt(scrollY, 10) || 0);
+    }
+  } catch (e) {}
+});
+
+window.addEventListener('beforeunload', function () {
+  try {
+    sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
+  } catch (e) {}
+});
+
+function scheduleAutoRefresh() {
+  if (!AUTO_REFRESH_MS || AUTO_REFRESH_MS <= 0) return;
+
+  if (window.location.protocol === 'file:') {
+    window.setTimeout(function () {
+      window.location.reload();
+    }, AUTO_REFRESH_MS);
+    return;
+  }
+
+  window.setInterval(async function () {
+    try {
+      var response = await fetch(window.location.href, { cache: 'no-store' });
+      var html = await response.text();
+      var match = html.match(/<meta name="report-generated-at" content="([^"]+)"/i);
+      if (match && match[1] !== GENERATED_AT) {
+        window.location.reload();
+      }
+    } catch (e) {}
+  }, AUTO_REFRESH_MS);
+}
+
+scheduleAutoRefresh();
 """
 
 _CARD_TEMPLATE = """  <div class="card" id="card-%%KEY%%">
@@ -155,12 +204,14 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="report-generated-at" content="%%GENERATED_AT%%"/>
 <title>%%TITLE%%</title>
 <script type="text/javascript">%%PLOTLYJS%%</script>
 <style>%%CSS%%</style>
 </head>
 <body>
 <h1>%%TITLE%%</h1>
+<div class="page-meta">Updated %%GENERATED_AT%% • Auto-refresh every %%REFRESH_SECONDS%%s</div>
 <div class="grid">
 %%CARDS%%
 </div>
@@ -381,6 +432,26 @@ def _fig_loss(stats: dict) -> go.Figure:
     return _apply_interactive_layout(fig, 'Loss')
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write a text file atomically so the browser never reads partial HTML."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode='w', dir=path.parent, suffix='.tmp',
+                delete=False, encoding='utf-8') as tmp:
+            tmp_path = tmp.name
+            tmp.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        raise
+
+
 def _render_dashboard(panels: list, summary_html: str, title: str = PAGE_TITLE) -> str:
     """Assemble the figures + summary into one self-contained HTML page.
 
@@ -399,12 +470,17 @@ def _render_dashboard(panels: list, summary_html: str, title: str = PAGE_TITLE) 
                      .replace('%%NAME%%', name)
                      .replace('%%PLOT%%', plot_div))
     cards.append(_SUMMARY_CARD_TEMPLATE.replace('%%SUMMARY%%', summary_html))
+    generated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     return (_PAGE_TEMPLATE
             .replace('%%TITLE%%', title)
             .replace('%%CSS%%', _DASHBOARD_CSS)
-            .replace('%%JS%%', _DASHBOARD_JS)
+            .replace('%%JS%%', _DASHBOARD_JS
+                     .replace('%%REFRESH_MS%%', str(AUTO_REFRESH_MS))
+                     .replace('%%GENERATED_AT%%', generated_at))
             .replace('%%CARDS%%', '\n'.join(cards))
+            .replace('%%GENERATED_AT%%', generated_at)
+            .replace('%%REFRESH_SECONDS%%', str(AUTO_REFRESH_MS // 1000))
             .replace('%%PLOTLYJS%%', get_plotlyjs()))  # last: library may be large
 
 
@@ -427,10 +503,6 @@ def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "mod
         The list of plotly Figures (overall, position, loss), or None when there
         is no test history.
     """
-    if not test_history:
-        print("No test history found.")
-        return None
-
     # Extract data
     steps = [t['step'] for t in test_history]
     win_rates = [t['ml_win_rate'] * 100 for t in test_history]  # Convert to percentage
@@ -448,11 +520,53 @@ def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "mod
     # Self-contained page (plotly.js embedded inline), so it renders offline and
     # when the CDN is blocked (e.g. opening a WSL2-generated file in a Windows
     # browser). open_file() handles opening it on WSL vs. native.
-    Path(output_path).write_text(_render_dashboard(panels, summary_html), encoding='utf-8')
+    _atomic_write_text(Path(output_path), _render_dashboard(panels, summary_html))
     print(f"Interactive training progress plot saved to: {output_path}")
     if show:
         open_file(output_path)
     return [fig for _, _, fig in panels]
+
+
+def write_progress_report(stats_path: str | Path,
+                          logs_dir: str | Path | None = None,
+                          output_path: str | Path = "models/training_progress.html") -> Path:
+    """Regenerate the interactive HTML report from the latest stats/log files."""
+    stats_path = Path(stats_path)
+    stats = load_stats(str(stats_path))
+
+    logs_path = Path(logs_dir) if logs_dir is not None else stats_path.parent.parent / "logs"
+    log_entries = load_jsonl_logs(str(logs_path)) if logs_path.exists() else []
+    test_history = merge_test_history(stats, log_entries)
+
+    plot_win_rate(stats, test_history, str(output_path), show=False)
+    return Path(output_path)
+
+
+def _companion_png_path(output_path: str | Path) -> Path:
+    """Return the PNG path paired with an interactive HTML output path."""
+    output_path = Path(output_path)
+    return output_path.with_suffix('.png') if output_path.suffix else output_path.with_name(output_path.name + '.png')
+
+
+def write_progress_outputs(stats_path: str | Path,
+                           logs_dir: str | Path | None = None,
+                           html_output_path: str | Path = "models/training_progress.html",
+                           image_output_path: str | Path | None = None,
+                           dpi: int = DEFAULT_DPI) -> dict[str, Path]:
+    """Regenerate both the interactive HTML report and the static PNG snapshot."""
+    stats_path = Path(stats_path)
+    stats = load_stats(str(stats_path))
+
+    logs_path = Path(logs_dir) if logs_dir is not None else stats_path.parent.parent / "logs"
+    log_entries = load_jsonl_logs(str(logs_path)) if logs_path.exists() else []
+    test_history = merge_test_history(stats, log_entries)
+
+    html_output = Path(html_output_path)
+    image_output = Path(image_output_path) if image_output_path is not None else _companion_png_path(html_output)
+
+    plot_win_rate(stats, test_history, str(html_output), show=False)
+    plot_win_rate_static(stats, test_history, str(image_output), dpi=dpi, show=False)
+    return {'html': html_output, 'image': image_output}
 
 
 def plot_win_rate_static(stats: dict, test_history: list[dict],
@@ -473,10 +587,6 @@ def plot_win_rate_static(stats: dict, test_history: list[dict],
         dpi: DPI for the output image
         show: Whether to open the saved PNG in the default viewer
     """
-    if not test_history:
-        print("No test history found.")
-        return
-
     import matplotlib
     matplotlib.use('Agg')  # headless; we open the saved PNG ourselves
     import matplotlib.pyplot as plt
@@ -602,7 +712,7 @@ def main():
     parser.add_argument('--logs', type=str, default=None,
                        help='Path to logs directory containing train_*.jsonl files')
     parser.add_argument('--output', type=str, default=None,
-                       help='Output path (default: models/training_progress.html, or .png with --static)')
+                       help='Output path (default: models/training_progress.html; in default mode a companion .png is also written)')
     parser.add_argument('--static', action='store_true',
                        help='Use the older static matplotlib PNG instead of the interactive HTML dashboard')
     parser.add_argument('--dpi', type=int, default=DEFAULT_DPI,
@@ -659,8 +769,17 @@ def main():
         plot_win_rate_static(stats, test_history, str(output_path),
                              dpi=args.dpi, show=not args.no_show)
     else:
-        print("Generating interactive training progress plot...")
-        plot_win_rate(stats, test_history, str(output_path), show=not args.no_show)
+        image_output = _companion_png_path(output_path)
+        print("Generating interactive training progress report + static PNG snapshot...")
+        outputs = write_progress_outputs(
+            stats_path=stats_path,
+            logs_dir=logs_dir,
+            html_output_path=output_path,
+            image_output_path=image_output,
+            dpi=args.dpi,
+        )
+        if not args.no_show:
+            open_file(str(outputs['html']))
 
 
 if __name__ == '__main__':
