@@ -1284,6 +1284,33 @@ class Trainer:
                     os.unlink(_tmp_path)
                 except Exception:
                     pass
+            return
+
+        self._update_training_progress_report(stats_path)
+
+    def _update_training_progress_report(self, stats_path: Path) -> None:
+        """Regenerate the HTML training report and PNG snapshot after each save."""
+        try:
+            try:
+                from plot_training import write_progress_outputs
+            except ImportError:
+                import importlib.util
+
+                script_path = Path(__file__).resolve().parents[4] / 'plot_training.py'
+                spec = importlib.util.spec_from_file_location('_dama_plot_training', script_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Could not load {script_path}")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                write_progress_outputs = module.write_progress_outputs
+
+            write_progress_outputs(
+                stats_path=stats_path,
+                logs_dir=Path(self.config.log_dir),
+                html_output_path=stats_path.parent / 'training_progress.html',
+            )
+        except Exception as e:
+            print(f"Warning: Failed to update training progress artifacts: {e}")
 
     def _snapshot_stats(self) -> dict:
         """Take a consistent snapshot of training stats for background I/O.
