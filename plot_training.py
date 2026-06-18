@@ -84,36 +84,122 @@ INTERACTIVE_CONFIG = {
 
 PAGE_TITLE = 'Filipino Micro ML Model Training Progress'
 AUTO_REFRESH_MS = 15000
+THEME_STORAGE_KEY = 'training-progress-theme'
 
 # --- Interactive dashboard HTML template ---------------------------------------
 # Built with token replacement (not str.format/f-strings) because the CSS/JS below
 # is full of literal { } braces. Tokens are %%UPPER%% so they can't collide with
 # the embedded plotly.js or the figure HTML.
 _DASHBOARD_CSS = """
+:root {
+  color-scheme: light;
+  --page-bg: #fafafa;
+  --page-fg: #222222;
+  --muted-fg: #666666;
+  --card-bg: #ffffff;
+  --card-border: #e3e3e3;
+  --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --button-bg: #f7f7f7;
+  --button-fg: #222222;
+  --button-border: #cccccc;
+  --button-hover-bg: #ececec;
+  --summary-bg: wheat;
+  --summary-fg: #222222;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page-bg: #0f1117;
+  --page-fg: #e5e7eb;
+  --muted-fg: #a1a1aa;
+  --card-bg: #161b22;
+  --card-border: #30363d;
+  --card-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --button-bg: #222938;
+  --button-fg: #e5e7eb;
+  --button-border: #3b4657;
+  --button-hover-bg: #2d3647;
+  --summary-bg: #1e2430;
+  --summary-fg: #e5e7eb;
+}
+
 * { box-sizing: border-box; }
-body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0;
-       padding: 14px 18px; color: #222; background: #fafafa; }
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  padding: 14px 18px 18px;
+  color: var(--page-fg);
+  background: var(--page-bg);
+  transition: background-color 0.18s ease, color 0.18s ease;
+}
+.toolbar { display: flex; justify-content: flex-end; align-items: center; margin-bottom: 8px; }
+.theme-toggle {
+  cursor: pointer;
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-fg);
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  box-shadow: var(--card-shadow);
+}
+.theme-toggle:hover { background: var(--button-hover-bg); }
+.theme-toggle:focus-visible { outline: 2px solid #4f8cff; outline-offset: 2px; }
 h1 { text-align: center; font-weight: 600; font-size: 22px; margin: 4px 0 16px; }
-.page-meta { text-align: center; margin: -8px 0 16px; color: #666; font-size: 12px; }
+.page-meta { text-align: center; margin: -8px 0 16px; color: var(--muted-fg); font-size: 12px; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.card { border: 1px solid #e3e3e3; border-radius: 10px; padding: 8px 10px; background: #fff;
-        display: flex; flex-direction: column; height: 440px;
-        box-shadow: 0 1px 3px rgba(0,0,0,.06); }
-.card-head { display: flex; justify-content: space-between; align-items: center;
-             margin-bottom: 6px; }
+.card {
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--card-bg);
+  display: flex;
+  flex-direction: column;
+  height: 440px;
+  box-shadow: var(--card-shadow);
+  transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  gap: 12px;
+}
 .card-head .name { font-weight: 600; font-size: 14px; }
-.card-head button { cursor: pointer; border: 1px solid #ccc; background: #f7f7f7;
-                    border-radius: 6px; padding: 3px 9px; font-size: 12px; }
-.card-head button:hover { background: #ececec; }
+.card-head button {
+  cursor: pointer;
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-fg);
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 12px;
+}
+.card-head button:hover { background: var(--button-hover-bg); }
 .plotwrap { position: relative; flex: 1 1 auto; min-height: 0; }
 .plotwrap > div { position: absolute; inset: 0; }
 .plotwrap .plotly-graph-div { width: 100% !important; height: 100% !important; }
-.summary { font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap;
-           font-size: 13px; line-height: 1.5; background: wheat; border-radius: 8px;
-           padding: 14px 16px; overflow: auto; flex: 1 1 auto; min-height: 0; }
+.summary {
+  font-family: ui-monospace, Consolas, monospace;
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--summary-bg);
+  color: var(--summary-fg);
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
 /* Fullscreen one card: fill the screen and let the plot grow to match. */
-.card:fullscreen { height: 100vh; width: 100vw; padding: 16px 20px; background: #fff; }
-.card:-webkit-full-screen { height: 100vh; width: 100vw; padding: 16px 20px; background: #fff; }
+.card:fullscreen { height: 100vh; width: 100vw; padding: 16px 20px; background: var(--card-bg); }
+.card:-webkit-full-screen { height: 100vh; width: 100vw; padding: 16px 20px; background: var(--card-bg); }
+.modebar { background: transparent !important; }
+:root[data-theme="dark"] .modebar { background: rgba(15, 17, 23, 0.85) !important; }
 @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
 """
 
@@ -124,6 +210,70 @@ _DASHBOARD_JS = """
 var AUTO_REFRESH_MS = %%REFRESH_MS%%;
 var GENERATED_AT = "%%GENERATED_AT%%";
 var SCROLL_KEY = "training-progress-scroll-y";
+var THEME_STORAGE_KEY = "%%THEME_STORAGE_KEY%%";
+
+function getPreferredTheme() {
+  try {
+    var saved = localStorage.getItem(THEME_STORAGE_KEY);
+    if (saved === 'dark' || saved === 'light') return saved;
+  } catch (e) {}
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    return 'dark';
+  }
+  return 'light';
+}
+
+function getPlotLayout(theme) {
+  var isDark = theme === 'dark';
+  return {
+    paper_bgcolor: isDark ? '#161b22' : '#ffffff',
+    plot_bgcolor: isDark ? '#161b22' : '#ffffff',
+    font: { color: isDark ? '#e5e7eb' : '#222222' },
+    legend: { font: { color: isDark ? '#e5e7eb' : '#222222' } },
+    xaxis: {
+      gridcolor: isDark ? 'rgba(148, 163, 184, 0.18)' : 'rgba(0, 0, 0, 0.12)',
+      zerolinecolor: isDark ? 'rgba(148, 163, 184, 0.18)' : 'rgba(0, 0, 0, 0.12)',
+      linecolor: isDark ? 'rgba(148, 163, 184, 0.38)' : 'rgba(0, 0, 0, 0.3)',
+      tickfont: { color: isDark ? '#e5e7eb' : '#222222' },
+      title: { font: { color: isDark ? '#e5e7eb' : '#222222' } }
+    },
+    yaxis: {
+      gridcolor: isDark ? 'rgba(148, 163, 184, 0.18)' : 'rgba(0, 0, 0, 0.12)',
+      zerolinecolor: isDark ? 'rgba(148, 163, 184, 0.18)' : 'rgba(0, 0, 0, 0.12)',
+      linecolor: isDark ? 'rgba(148, 163, 184, 0.38)' : 'rgba(0, 0, 0, 0.3)',
+      tickfont: { color: isDark ? '#e5e7eb' : '#222222' },
+      title: { font: { color: isDark ? '#e5e7eb' : '#222222' } }
+    }
+  };
+}
+
+function updateThemeButton(theme) {
+  var btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  var isDark = theme === 'dark';
+  btn.textContent = isDark ? 'Light mode' : 'Dark mode';
+  btn.setAttribute('aria-pressed', isDark ? 'true' : 'false');
+  btn.setAttribute('aria-label', isDark ? 'Switch to light mode' : 'Switch to dark mode');
+}
+
+function updatePlotsForTheme(theme) {
+  if (!window.Plotly) return;
+  var layout = getPlotLayout(theme);
+  document.querySelectorAll('.plotly-graph-div').forEach(function (gd) {
+    try { Plotly.relayout(gd, layout); } catch (e) {}
+  });
+}
+
+function applyTheme(theme, persist) {
+  var next = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  document.documentElement.style.colorScheme = next;
+  updateThemeButton(next);
+  updatePlotsForTheme(next);
+  if (persist) {
+    try { localStorage.setItem(THEME_STORAGE_KEY, next); } catch (e) {}
+  }
+}
 
 function toggleFs(id) {
   var el = document.getElementById(id);
@@ -147,7 +297,17 @@ document.addEventListener('fullscreenchange', resizeAllPlots);
 document.addEventListener('webkitfullscreenchange', resizeAllPlots);
 window.addEventListener('resize', resizeAllPlots);
 
+window.addEventListener('DOMContentLoaded', function () {
+  var btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    applyTheme(next, true);
+  });
+});
+
 window.addEventListener('load', function () {
+  applyTheme(getPreferredTheme(), false);
   try {
     var scrollY = sessionStorage.getItem(SCROLL_KEY);
     if (scrollY !== null) {
@@ -199,6 +359,21 @@ _SUMMARY_CARD_TEMPLATE = """  <div class="card" id="card-summary">
     <div class="summary">%%SUMMARY%%</div>
   </div>"""
 
+_THEME_INIT_SCRIPT = """
+(function () {
+  var key = "%%THEME_STORAGE_KEY%%";
+  var theme = null;
+  try {
+    theme = localStorage.getItem(key);
+  } catch (e) {}
+  if (theme !== 'dark' && theme !== 'light') {
+    theme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', theme);
+  document.documentElement.style.colorScheme = theme;
+})();
+"""
+
 _PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -206,10 +381,14 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <meta name="report-generated-at" content="%%GENERATED_AT%%"/>
 <title>%%TITLE%%</title>
+<script type="text/javascript">%%THEME_INIT%%</script>
 <script type="text/javascript">%%PLOTLYJS%%</script>
 <style>%%CSS%%</style>
 </head>
 <body>
+<div class="toolbar">
+  <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false">Dark mode</button>
+</div>
 <h1>%%TITLE%%</h1>
 <div class="page-meta">Updated %%GENERATED_AT%% • Auto-refresh every %%REFRESH_SECONDS%%s</div>
 <div class="grid">
@@ -475,9 +654,11 @@ def _render_dashboard(panels: list, summary_html: str, title: str = PAGE_TITLE) 
     return (_PAGE_TEMPLATE
             .replace('%%TITLE%%', title)
             .replace('%%CSS%%', _DASHBOARD_CSS)
+            .replace('%%THEME_INIT%%', _THEME_INIT_SCRIPT.replace('%%THEME_STORAGE_KEY%%', THEME_STORAGE_KEY))
             .replace('%%JS%%', _DASHBOARD_JS
                      .replace('%%REFRESH_MS%%', str(AUTO_REFRESH_MS))
-                     .replace('%%GENERATED_AT%%', generated_at))
+                     .replace('%%GENERATED_AT%%', generated_at)
+                     .replace('%%THEME_STORAGE_KEY%%', THEME_STORAGE_KEY))
             .replace('%%CARDS%%', '\n'.join(cards))
             .replace('%%GENERATED_AT%%', generated_at)
             .replace('%%REFRESH_SECONDS%%', str(AUTO_REFRESH_MS // 1000))
