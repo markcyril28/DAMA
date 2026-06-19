@@ -470,6 +470,7 @@ class TrainingConfig:
     stats_score_dist_every: int = 50    # Record score distribution every N steps
     stats_buffer_size: int = 50000      # Ring buffer size for high-frequency metrics
     stats_flush_every: int = 5000       # Flush incremental stats to disk
+    progress_report_every_seconds: float = 30.0  # Regenerate dashboard at most this often
     stats_output_dir: str = 'logs/stats'
 
     # Paths
@@ -666,6 +667,8 @@ class Trainer:
         
         # Timing for step tracking
         self._last_step_time = None
+        self._last_progress_report_time = 0.0
+        self._last_progress_report_step = -1
 
         # Enhanced statistics collector
         self.stats_collector: Optional[StatsCollector] = None
@@ -1367,6 +1370,48 @@ class Trainer:
         # Update best loss
         if loss < self.stats.best_loss:
             self.stats.best_loss = loss
+
+    def _record_epoch_loss(self, loss: float) -> None:
+        """Record the epoch-average loss shown by the console heartbeat."""
+        if self.step <= 0:
+            return
+
+        entry = {
+            'step': self.step,
+            'loss': loss,
+            'timestamp': datetime.now().isoformat(),
+            'source': 'epoch',
+        }
+
+        # If a stats-step loss was recorded at the same step, prefer the
+        # epoch-average value because it is the value printed in "[epoch end]".
+        if self.stats.loss_history and self.stats.loss_history[-1].get('step') == self.step:
+            self.stats.loss_history[-1] = entry
+        else:
+            self.stats.loss_history.append(entry)
+
+        if loss < self.stats.best_loss:
+            self.stats.best_loss = loss
+
+    def _save_progress_report_if_due(self, *, force: bool = False) -> None:
+        """Persist stats and refresh the dashboard without waiting for checkpoints."""
+        if self.step <= 0:
+            return
+
+        now = time.monotonic()
+        interval = max(1.0, float(self.config.progress_report_every_seconds))
+        if not force:
+            if self.step == self._last_progress_report_step:
+                return
+            if now - self._last_progress_report_time < interval:
+                return
+            # Checkpoint saves already persist stats and regenerate the report.
+            if self.config.checkpoint_every > 0 and self.step % self.config.checkpoint_every == 0:
+                return
+
+        self._save_stats()
+        self._last_progress_report_time = now
+        self._last_progress_report_step = self.step
 
     def _record_validation_stats(self, val_loss: float) -> None:
         """Record validation statistics."""
@@ -3354,6 +3399,8 @@ class Trainer:
                                    _loss_acc=_total_loss_acc)
             self.epoch += 1
             self.stats.epochs_completed = self.epoch
+            self._record_epoch_loss(loss)
+            self._save_progress_report_if_due()
             # Skip dataloader refresh / async-test startup when stopping:
             # they only add wind-down latency after a Stop request.
             if self._stopped:
@@ -3946,6 +3993,10 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         stats_score_dist_every=stats_cfg.get('score_dist_every', 50),
         stats_buffer_size=stats_cfg.get('buffer_size', 50000),
         stats_flush_every=stats_cfg.get('flush_every', 5000),
+        progress_report_every_seconds=stats_cfg.get(
+            'progress_report_every_seconds',
+            stats_cfg.get('progress_report_every_sec', 30.0),
+        ),
         stats_output_dir=stats_cfg.get('output_dir', paths_cfg.get('log_dir', 'logs') + '/stats'),
         # Paths
         checkpoint_dir=paths_cfg.get('checkpoint_dir', 'models/checkpoints'),
