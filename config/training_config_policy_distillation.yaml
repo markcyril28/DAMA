@@ -37,7 +37,7 @@ device:
     enabled: false                      # Local RTX 5050 path; server profile enables compile.
     mode: "reduce-overhead"
   matmul_precision: "medium"
-
+ 
 # -----------------------------------------------------------------------------
 # Model Architecture
 # -----------------------------------------------------------------------------
