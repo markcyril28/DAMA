@@ -251,8 +251,10 @@ var AUTO_REFRESH_MS = %%REFRESH_MS%%;
 var GENERATED_AT = "%%GENERATED_AT%%";
 var SCROLL_KEY = "training-progress-scroll-y";
 var THEME_STORAGE_KEY = "%%THEME_STORAGE_KEY%%";
+var CURRENT_SOURCE_FILE = "%%CURRENT_SOURCE_FILE%%";
 var autoRefreshTimer = null;
 var autoRefreshEnabled = true;
+var allStatsVisible = true;
 
 function getPreferredTheme() {
   try {
@@ -343,6 +345,7 @@ window.addEventListener('DOMContentLoaded', function () {
   var themeBtn = document.getElementById('theme-toggle');
   var refreshBtn = document.getElementById('refresh-now');
   var autoRefreshBtn = document.getElementById('auto-refresh-toggle');
+  var allStatsBtn = document.getElementById('all-stats-toggle');
 
   if (themeBtn) themeBtn.addEventListener('click', function () {
     var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
@@ -351,7 +354,10 @@ window.addEventListener('DOMContentLoaded', function () {
 
   if (refreshBtn) refreshBtn.addEventListener('click', refreshPage);
   if (autoRefreshBtn) autoRefreshBtn.addEventListener('click', toggleAutoRefresh);
+  if (allStatsBtn) allStatsBtn.addEventListener('click', toggleAllStats);
   updateAutoRefreshButton();
+  updateAllStatsButton();
+  applyAllStatsVisibility();
 });
 
 window.addEventListener('load', function () {
@@ -422,6 +428,43 @@ function toggleAutoRefresh() {
   }
 }
 
+function updateAllStatsButton() {
+  var btn = document.getElementById('all-stats-toggle');
+  if (!btn) return;
+  btn.textContent = allStatsVisible ? 'All stats: On' : 'All stats: Off';
+  btn.setAttribute('aria-pressed', allStatsVisible ? 'true' : 'false');
+  btn.setAttribute('aria-label', allStatsVisible ? 'Show current run only' : 'Show all training stats');
+}
+
+function traceIsPreviousRun(trace) {
+  if (!trace || !trace.meta || !trace.meta.source_file || !CURRENT_SOURCE_FILE) return false;
+  return trace.meta.source_file !== CURRENT_SOURCE_FILE;
+}
+
+function applyAllStatsVisibility() {
+  if (!window.Plotly) return;
+  document.querySelectorAll('.plotly-graph-div').forEach(function (gd) {
+    var updates = {};
+    var indices = [];
+    (gd.data || []).forEach(function (trace, index) {
+      if (traceIsPreviousRun(trace)) {
+        updates.visible = updates.visible || [];
+        updates.visible.push(allStatsVisible ? true : 'legendonly');
+        indices.push(index);
+      }
+    });
+    if (indices.length) {
+      try { Plotly.restyle(gd, updates, indices); } catch (e) {}
+    }
+  });
+}
+
+function toggleAllStats() {
+  allStatsVisible = !allStatsVisible;
+  updateAllStatsButton();
+  applyAllStatsVisibility();
+}
+
 startAutoRefresh();
 """
 
@@ -471,6 +514,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="page-meta">
   <span>Updated %%GENERATED_AT%%</span>
   <span class="page-actions" aria-label="Refresh controls">
+    <button id="all-stats-toggle" class="page-action" type="button" aria-pressed="true">All stats: On</button>
     <button id="refresh-now" class="page-action" type="button">Refresh</button>
     <button id="auto-refresh-toggle" class="page-action" type="button" aria-pressed="true">Auto refresh: On</button>
   </span>
@@ -491,6 +535,139 @@ def load_stats(stats_path: str = "models/training_stats.json"):
     """Load training statistics from JSON file."""
     with open(stats_path, 'r') as f:
         return json.load(f)
+
+
+def _stats_source_label(path: Path) -> str:
+    """Human-readable label for a training stats file."""
+    name = path.stem
+    if name == 'training_stats':
+        return 'Default'
+    if name.startswith('training_stats_'):
+        return name.removeprefix('training_stats_').replace('_', ' ').title()
+    return name.replace('_', ' ').title()
+
+
+def _candidate_stats_paths(models_dir: Path) -> list[Path]:
+    """Return non-legacy stats files that should appear in the dashboard."""
+    preferred = [
+        models_dir / "training_stats.json",
+        models_dir / "training_stats_local.json",
+        models_dir / "training_stats_server.json",
+        models_dir / "training_stats_policy_distillation.json",
+    ]
+    extras = sorted(
+        p for p in models_dir.glob("training_stats*.json")
+        if p.name != "training_stats_legacy.json" and p not in preferred
+    )
+    return [p for p in preferred if p.exists()] + extras
+
+
+def _copy_history_with_run(entries, run_label: str, source_file: str) -> list:
+    """Copy history entries and tag them with the originating run."""
+    copied = []
+    if not isinstance(entries, list):
+        return copied
+    for entry in entries:
+        if isinstance(entry, dict):
+            tagged = dict(entry)
+            tagged.setdefault('run', run_label)
+            tagged.setdefault('source_file', source_file)
+            copied.append(tagged)
+        else:
+            copied.append(entry)
+    return copied
+
+
+def _aggregate_stats(stats_by_path: list[tuple[Path, dict]]) -> dict:
+    """Merge multiple training stats files while preserving run labels."""
+    if not stats_by_path:
+        return {}
+    if len(stats_by_path) == 1:
+        path, stats = stats_by_path[0]
+        label = _stats_source_label(path)
+        merged = dict(stats)
+        for key in ('loss_history', 'val_loss_history', 'lr_history',
+                    'gpu_mem_history', 'step_times', 'test_history'):
+            merged[key] = _copy_history_with_run(stats.get(key, []), label, path.name)
+        merged['source_files'] = [path.name]
+        merged['current_source_file'] = path.name
+        merged['current_run'] = label
+        return merged
+
+    current_path, _ = max(stats_by_path, key=lambda item: item[0].stat().st_mtime)
+    merged = {
+        'start_time': '',
+        'end_time': '',
+        'total_steps': 0,
+        'epochs_completed': 0,
+        'best_loss': None,
+        'best_val_loss': None,
+        'loss_history': [],
+        'val_loss_history': [],
+        'lr_history': [],
+        'gpu_mem_history': [],
+        'step_times': [],
+        'test_history': [],
+        'source_files': [path.name for path, _ in stats_by_path],
+        'current_source_file': current_path.name,
+        'current_run': _stats_source_label(current_path),
+    }
+
+    start_times = []
+    end_times = []
+    best_losses = []
+    best_val_losses = []
+    for path, stats in stats_by_path:
+        label = _stats_source_label(path)
+        source_file = path.name
+
+        start = stats.get('start_time')
+        end = stats.get('end_time')
+        if isinstance(start, str) and start:
+            start_times.append(start)
+        if isinstance(end, str) and end:
+            end_times.append(end)
+
+        merged['total_steps'] = max(merged['total_steps'], stats.get('total_steps') or 0)
+        merged['epochs_completed'] += stats.get('epochs_completed') or 0
+
+        best_loss = _as_finite_float(stats.get('best_loss'))
+        best_val_loss = _as_finite_float(stats.get('best_val_loss'))
+        if best_loss is not None:
+            best_losses.append(best_loss)
+        if best_val_loss is not None:
+            best_val_losses.append(best_val_loss)
+
+        for key in ('loss_history', 'val_loss_history', 'lr_history',
+                    'gpu_mem_history', 'step_times', 'test_history'):
+            merged[key].extend(_copy_history_with_run(stats.get(key, []), label, source_file))
+
+    merged['start_time'] = min(start_times) if start_times else ''
+    merged['end_time'] = max(end_times) if end_times else ''
+    merged['best_loss'] = min(best_losses) if best_losses else None
+    merged['best_val_loss'] = min(best_val_losses) if best_val_losses else None
+    return merged
+
+
+def load_stats_bundle(stats_path: str | Path, include_related: bool = True) -> tuple[dict, list[Path]]:
+    """Load one stats file plus sibling non-legacy stats files for the dashboard."""
+    stats_path = Path(stats_path)
+    paths = _candidate_stats_paths(stats_path.parent) if include_related else []
+    if stats_path.exists() and stats_path not in paths:
+        paths.append(stats_path)
+    if not paths:
+        return load_stats(str(stats_path)), [stats_path]
+
+    loaded = []
+    for path in paths:
+        try:
+            loaded.append((path, load_stats(str(path))))
+        except Exception as e:
+            print(f"Warning: Could not read stats file {path}: {e}")
+
+    if not loaded:
+        return load_stats(str(stats_path)), [stats_path]
+    return _aggregate_stats(loaded), [path for path, _ in loaded]
 
 
 def load_jsonl_logs(logs_dir: str = "logs") -> list[dict]:
@@ -527,6 +704,19 @@ def load_jsonl_logs(logs_dir: str = "logs") -> list[dict]:
     return test_entries
 
 
+def _tag_log_entries(log_entries: list[dict], stats: dict) -> list[dict]:
+    """Tag external JSONL entries with the current report source when absent."""
+    source_file = stats.get('current_source_file') or 'logs'
+    run_label = stats.get('current_run') or source_file
+    tagged = []
+    for entry in log_entries:
+        copied = dict(entry)
+        copied.setdefault('source_file', source_file)
+        copied.setdefault('run', run_label)
+        tagged.append(copied)
+    return tagged
+
+
 def merge_test_history(stats: dict, log_entries: list[dict]) -> list[dict]:
     """Merge test history from stats file and log files, removing duplicates.
 
@@ -538,20 +728,22 @@ def merge_test_history(stats: dict, log_entries: list[dict]) -> list[dict]:
         Combined and deduplicated test history, sorted by step
     """
     # Start with test_history from stats (skip malformed entries with no step)
-    combined = {
-        entry['step']: entry
-        for entry in stats.get('test_history', [])
-        if entry.get('step') is not None
-    }
-
-    # Add entries from log files (will overwrite duplicates)
-    for entry in log_entries:
+    combined = {}
+    for idx, entry in enumerate(stats.get('test_history', [])):
         step = entry.get('step')
         if step is not None:
-            combined[step] = entry
+            combined[(entry.get('source_file', 'stats'), step, idx)] = entry
+
+    # Add entries from log files (will overwrite duplicates)
+    for idx, entry in enumerate(_tag_log_entries(log_entries, stats)):
+        step = entry.get('step')
+        if step is not None:
+            combined[(entry.get('source_file', 'logs'), step, idx)] = entry
 
     # Sort by step and return as list
-    return [combined[step] for step in sorted(combined.keys())]
+    return [entry for _, entry in sorted(
+        combined.items(), key=lambda item: (item[0][1], item[0][0], item[0][2])
+    )]
 
 
 def _build_summary_text(stats: dict, test_history: list[dict], steps, win_rates) -> str:
@@ -802,42 +994,94 @@ def _gpu_hours_for_steps(steps: list[float], stats: dict) -> list[float]:
     return [float(value or 0.0) for value in _ordered_metric_values_for_steps(steps, cumulative)]
 
 
-def _fig_overall(steps, win_rates) -> go.Figure:
+def _group_history_by_source(entries: list[dict], default_label: str = 'Run') -> list[tuple[str, str, list[dict]]]:
+    """Group history entries by source file while preserving first-seen order."""
+    groups: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        source_file = entry.get('source_file') or default_label
+        run_label = entry.get('run') or source_file
+        if source_file not in groups:
+            groups[source_file] = {'label': run_label, 'entries': []}
+        groups[source_file]['entries'].append(entry)
+    return [(source, data['label'], data['entries']) for source, data in groups.items()]
+
+
+def _stats_for_source(stats: dict, source_file: str) -> dict:
+    """Return a shallow stats view containing only metrics for one run source."""
+    filtered = dict(stats)
+    for key in ('lr_history', 'step_times', 'gpu_mem_history'):
+        filtered[key] = [
+            entry for entry in stats.get(key, [])
+            if not isinstance(entry, dict) or entry.get('source_file') == source_file
+        ]
+    return filtered
+
+
+def _fig_overall(test_history: list[dict]) -> go.Figure:
     """Overall ML win-rate vs the algorithm, with a polynomial trend line."""
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=steps, y=win_rates, mode='lines+markers', name='ML Win Rate',
-        line=dict(color='royalblue', width=2), marker=dict(size=7),
-        fill='tozeroy', fillcolor='rgba(65,105,225,0.2)',
-        hovertemplate='Step %{x:,}<br>Win Rate %{y:.1f}%<extra></extra>',
-    ))
-    if len(steps) > 2:
-        z = np.polyfit(steps, win_rates, TREND_LINE_DEGREE)
-        p = np.poly1d(z)
-        x_smooth = np.linspace(min(steps), max(steps), 100)
+    palette = ['royalblue', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna']
+    for group_idx, (source_file, run_label, entries) in enumerate(
+            _group_history_by_source(test_history)):
+        steps = [t['step'] for t in entries]
+        win_rates = [t['ml_win_rate'] * 100 for t in entries]
+        color = palette[group_idx % len(palette)]
+        meta = {'source_file': source_file, 'run': run_label}
         fig.add_trace(go.Scatter(
-            x=x_smooth, y=np.clip(p(x_smooth), 0, 100), mode='lines', name='Trend',
-            line=dict(color='green', width=2, dash='dash'),
-            hovertemplate='Step %{x:,.0f}<br>Trend %{y:.1f}%<extra></extra>',
+            x=steps, y=win_rates, mode='lines+markers', name=f'{run_label} ML Win Rate',
+            line=dict(color=color, width=2), marker=dict(size=7),
+            fill='tozeroy' if group_idx == 0 else None,
+            fillcolor='rgba(65,105,225,0.12)' if group_idx == 0 else None,
+            meta=meta,
+            customdata=[[run_label] for _ in steps],
+            hovertemplate='Run %{customdata[0]}<br>Step %{x:,}<br>Win Rate %{y:.1f}%<extra></extra>',
         ))
+        if len(steps) > 2:
+            z = np.polyfit(steps, win_rates, TREND_LINE_DEGREE)
+            p = np.poly1d(z)
+            x_smooth = np.linspace(min(steps), max(steps), 100)
+            fig.add_trace(go.Scatter(
+                x=x_smooth, y=np.clip(p(x_smooth), 0, 100), mode='lines',
+                name=f'{run_label} Trend',
+                line=dict(color=color, width=2, dash='dash'),
+                meta=meta,
+                customdata=[[run_label] for _ in x_smooth],
+                hovertemplate='Run %{customdata[0]}<br>Step %{x:,.0f}<br>Trend %{y:.1f}%<extra></extra>',
+            ))
     fig.add_hline(y=50, line_dash='dash', line_color='red', opacity=0.7,
                   annotation_text='50% (Equal)', annotation_position='top left')
     return _apply_interactive_layout(fig, 'Win Rate (%)', y_range=[0, 100])
 
 
-def _fig_position(steps, p1_win_rates, p2_win_rates) -> go.Figure:
+def _fig_position(test_history: list[dict]) -> go.Figure:
     """Win rate split by which side the ML model played (Player 1 vs Player 2)."""
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=steps, y=p1_win_rates, mode='lines+markers', name='ML as Player 1 (White)',
-        line=dict(color='green', width=2), marker=dict(size=6, symbol='square'),
-        hovertemplate='Step %{x:,}<br>P1 Win Rate %{y:.1f}%<extra></extra>',
-    ))
-    fig.add_trace(go.Scatter(
-        x=steps, y=p2_win_rates, mode='lines+markers', name='ML as Player 2 (Black)',
-        line=dict(color='magenta', width=2), marker=dict(size=6, symbol='triangle-up'),
-        hovertemplate='Step %{x:,}<br>P2 Win Rate %{y:.1f}%<extra></extra>',
-    ))
+    p1_palette = ['green', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna']
+    p2_palette = ['magenta', 'firebrick', 'teal', 'goldenrod', 'slateblue', 'gray']
+    for group_idx, (source_file, run_label, entries) in enumerate(
+            _group_history_by_source(test_history)):
+        steps = [t['step'] for t in entries]
+        p1_win_rates = [t['ml_as_p1_win_rate'] * 100 for t in entries]
+        p2_win_rates = [t['ml_as_p2_win_rate'] * 100 for t in entries]
+        meta = {'source_file': source_file, 'run': run_label}
+        fig.add_trace(go.Scatter(
+            x=steps, y=p1_win_rates, mode='lines+markers', name=f'{run_label} P1 (White)',
+            line=dict(color=p1_palette[group_idx % len(p1_palette)], width=2),
+            marker=dict(size=6, symbol='square'),
+            meta=meta,
+            customdata=[[run_label] for _ in steps],
+            hovertemplate='Run %{customdata[0]}<br>Step %{x:,}<br>P1 Win Rate %{y:.1f}%<extra></extra>',
+        ))
+        fig.add_trace(go.Scatter(
+            x=steps, y=p2_win_rates, mode='lines+markers', name=f'{run_label} P2 (Black)',
+            line=dict(color=p2_palette[group_idx % len(p2_palette)], width=2),
+            marker=dict(size=6, symbol='triangle-up'),
+            meta=meta,
+            customdata=[[run_label] for _ in steps],
+            hovertemplate='Run %{customdata[0]}<br>Step %{x:,}<br>P2 Win Rate %{y:.1f}%<extra></extra>',
+        ))
     fig.add_hline(y=50, line_dash='dash', line_color='red', opacity=0.7)
     return _apply_interactive_layout(fig, 'Win Rate (%)', y_range=[0, 100])
 
@@ -848,56 +1092,67 @@ def _fig_loss(stats: dict) -> go.Figure:
     trace_x_steps = []
     trace_x_gpu_hours = []
     loss_history = stats.get('loss_history', [])
+    current_source_file = stats.get('current_source_file')
+    palette = ['royalblue', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna']
     if loss_history:
-        # Sample every N points to avoid overcrowding
-        sample_rate = max(1, len(loss_history) // SAMPLE_RATE_TARGET)
-        sampled_losses = loss_history[::sample_rate]
-        loss_steps = [l['step'] for l in sampled_losses]
-        losses = [l['loss'] for l in sampled_losses]
-        learning_rates = _learning_rates_for_losses(sampled_losses, stats)
-        loss_gpu_hours = _gpu_hours_for_steps(loss_steps, stats)
-        loss_customdata = [
-            [step, f'{gpu_hours:.4f}', _format_metric(lr)]
-            for step, gpu_hours, lr in zip(loss_steps, loss_gpu_hours, learning_rates)
-        ]
-        trace_x_steps.append(loss_steps)
-        trace_x_gpu_hours.append(loss_gpu_hours)
-        fig.add_trace(go.Scatter(
-            x=loss_steps, y=losses, mode='lines', name='Loss',
-            line=dict(color='royalblue', width=1), opacity=0.7,
-            customdata=loss_customdata,
-            hovertemplate=(
-                'Step %{customdata[0]:,}<br>'
-                'GPU Hours %{customdata[1]}<br>'
-                'Loss %{y:.4f}<br>'
-                'learning_rate %{customdata[2]}<extra></extra>'
-            ),
-        ))
-
-        # Moving average
-        window = min(MOVING_AVG_WINDOW, len(losses) // 5) if len(losses) > 10 else 1
-        if window > 1:
-            moving_avg = np.convolve(losses, np.ones(window) / window, mode='valid')
-            ma_steps = loss_steps[window - 1:]
-            ma_gpu_hours = loss_gpu_hours[window - 1:]
-            ma_learning_rates = learning_rates[window - 1:]
-            ma_customdata = [
-                [step, f'{gpu_hours:.4f}', _format_metric(lr)]
-                for step, gpu_hours, lr in zip(ma_steps, ma_gpu_hours, ma_learning_rates)
+        for group_idx, (source_file, run_label, entries) in enumerate(
+                _group_history_by_source(loss_history)):
+            # Sample per run so short recent runs are not skipped by a long history.
+            sample_rate = max(1, len(entries) // SAMPLE_RATE_TARGET)
+            sampled_losses = entries[::sample_rate]
+            loss_steps = [l['step'] for l in sampled_losses]
+            losses = [l['loss'] for l in sampled_losses]
+            group_stats = _stats_for_source(stats, source_file)
+            learning_rates = _learning_rates_for_losses(sampled_losses, group_stats)
+            loss_gpu_hours = _gpu_hours_for_steps(loss_steps, group_stats)
+            color = palette[group_idx % len(palette)]
+            meta = {'source_file': source_file, 'run': run_label}
+            loss_customdata = [
+                [run_label, step, f'{gpu_hours:.4f}', _format_metric(lr)]
+                for step, gpu_hours, lr in zip(loss_steps, loss_gpu_hours, learning_rates)
             ]
-            trace_x_steps.append(ma_steps)
-            trace_x_gpu_hours.append(ma_gpu_hours)
+            trace_x_steps.append(loss_steps)
+            trace_x_gpu_hours.append(loss_gpu_hours)
             fig.add_trace(go.Scatter(
-                x=ma_steps, y=moving_avg, mode='lines', name=f'Moving Avg ({window})',
-                line=dict(color='red', width=2),
-                customdata=ma_customdata,
+                x=loss_steps, y=losses, mode='lines', name=f'{run_label} Loss',
+                line=dict(color=color, width=1), opacity=0.7,
+                meta=meta,
+                customdata=loss_customdata,
                 hovertemplate=(
-                    'Step %{customdata[0]:,}<br>'
-                    'GPU Hours %{customdata[1]}<br>'
-                    'Avg Loss %{y:.4f}<br>'
-                    'learning_rate %{customdata[2]}<extra></extra>'
+                    'Run %{customdata[0]}<br>'
+                    'Step %{customdata[1]:,}<br>'
+                    'GPU Hours %{customdata[2]}<br>'
+                    'Loss %{y:.4f}<br>'
+                    'learning_rate %{customdata[3]}<extra></extra>'
                 ),
             ))
+
+            # Moving average
+            window = min(MOVING_AVG_WINDOW, len(losses) // 5) if len(losses) > 10 else 1
+            if window > 1:
+                moving_avg = np.convolve(losses, np.ones(window) / window, mode='valid')
+                ma_steps = loss_steps[window - 1:]
+                ma_gpu_hours = loss_gpu_hours[window - 1:]
+                ma_learning_rates = learning_rates[window - 1:]
+                ma_customdata = [
+                    [run_label, step, f'{gpu_hours:.4f}', _format_metric(lr)]
+                    for step, gpu_hours, lr in zip(ma_steps, ma_gpu_hours, ma_learning_rates)
+                ]
+                trace_x_steps.append(ma_steps)
+                trace_x_gpu_hours.append(ma_gpu_hours)
+                fig.add_trace(go.Scatter(
+                    x=ma_steps, y=moving_avg, mode='lines', name=f'{run_label} Moving Avg ({window})',
+                    line=dict(color=color, width=2, dash='dash'),
+                    meta=meta,
+                    customdata=ma_customdata,
+                    hovertemplate=(
+                        'Run %{customdata[0]}<br>'
+                        'Step %{customdata[1]:,}<br>'
+                        'GPU Hours %{customdata[2]}<br>'
+                        'Avg Loss %{y:.4f}<br>'
+                        'learning_rate %{customdata[3]}<extra></extra>'
+                    ),
+                ))
 
     fig = _apply_interactive_layout(fig, 'Loss')
     if trace_x_steps and any(any(hours > 0 for hours in trace) for trace in trace_x_gpu_hours):
@@ -956,7 +1211,8 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def _render_dashboard(panels: list, summary_html: str, title: str = PAGE_TITLE) -> str:
+def _render_dashboard(panels: list, summary_html: str, title: str = PAGE_TITLE,
+                      current_source_file: str = "") -> str:
     """Assemble the figures + summary into one self-contained HTML page.
 
     plotly.js is embedded exactly once in the <head>; every figure is emitted
@@ -983,6 +1239,7 @@ def _render_dashboard(panels: list, summary_html: str, title: str = PAGE_TITLE) 
             .replace('%%JS%%', _DASHBOARD_JS
                      .replace('%%REFRESH_MS%%', str(AUTO_REFRESH_MS))
                      .replace('%%GENERATED_AT%%', generated_at)
+                     .replace('%%CURRENT_SOURCE_FILE%%', current_source_file)
                      .replace('%%THEME_STORAGE_KEY%%', THEME_STORAGE_KEY))
             .replace('%%CARDS%%', '\n'.join(cards))
             .replace('%%GENERATED_AT%%', generated_at)
@@ -1017,8 +1274,8 @@ def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "mod
 
     # (div-id key, card title, figure) — keys must be CSS/HTML-id safe.
     panels = [
-        ('overall', 'ML Model vs Algorithm - Overall Win Rate', _fig_overall(steps, win_rates)),
-        ('position', 'Win Rate by Player Position', _fig_position(steps, p1_win_rates, p2_win_rates)),
+        ('overall', 'ML Model vs Algorithm - Overall Win Rate', _fig_overall(test_history)),
+        ('position', 'Win Rate by Player Position', _fig_position(test_history)),
         ('loss', 'Training Loss', _fig_loss(stats)),
     ]
     summary_html = _build_summary_text(stats, test_history, steps, win_rates)
@@ -1026,7 +1283,9 @@ def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "mod
     # Self-contained page (plotly.js embedded inline), so it renders offline and
     # when the CDN is blocked (e.g. opening a WSL2-generated file in a Windows
     # browser). open_file() handles opening it on WSL vs. native.
-    _atomic_write_text(Path(output_path), _render_dashboard(panels, summary_html))
+    _atomic_write_text(Path(output_path), _render_dashboard(
+        panels, summary_html, current_source_file=stats.get('current_source_file', '')
+    ))
     print(f"Interactive training progress plot saved to: {output_path}")
     if show:
         open_file(output_path)
@@ -1038,7 +1297,7 @@ def write_progress_report(stats_path: str | Path,
                           output_path: str | Path = "models/training_progress.html") -> Path:
     """Regenerate the interactive HTML report from the latest stats/log files."""
     stats_path = Path(stats_path)
-    stats = load_stats(str(stats_path))
+    stats, _stats_paths = load_stats_bundle(stats_path)
 
     logs_path = Path(logs_dir) if logs_dir is not None else stats_path.parent.parent / "logs"
     log_entries = load_jsonl_logs(str(logs_path)) if logs_path.exists() else []
@@ -1061,7 +1320,7 @@ def write_progress_outputs(stats_path: str | Path,
                            dpi: int = DEFAULT_DPI) -> dict[str, Path]:
     """Regenerate both the interactive HTML report and the static PNG snapshot."""
     stats_path = Path(stats_path)
-    stats = load_stats(str(stats_path))
+    stats, _stats_paths = load_stats_bundle(stats_path)
 
     logs_path = Path(logs_dir) if logs_dir is not None else stats_path.parent.parent / "logs"
     log_entries = load_jsonl_logs(str(logs_path)) if logs_path.exists() else []
@@ -1185,8 +1444,9 @@ def resolve_stats_path(project_dir: Path, explicit: str | None) -> Path:
 
     With --stats, honor the given path verbatim. Otherwise pick the most
     recently modified non-legacy stats file (training_stats.json,
-    training_stats_local.json, training_stats_server.json) so the no-arg
-    command tracks whichever run last wrote stats. Fall back to
+    training_stats_local.json, training_stats_server.json,
+    training_stats_policy_distillation.json) so the no-arg command tracks
+    whichever run last wrote stats. Fall back to
     training_stats_legacy.json only when none of those exist, then to the
     conventional default path so the caller reports a consistent message.
     """
@@ -1198,6 +1458,7 @@ def resolve_stats_path(project_dir: Path, explicit: str | None) -> Path:
         models_dir / "training_stats.json",
         models_dir / "training_stats_local.json",
         models_dir / "training_stats_server.json",
+        models_dir / "training_stats_policy_distillation.json",
     ]
     existing = [p for p in candidates if p.exists()]
     if existing:
@@ -1255,8 +1516,14 @@ def main():
         print(f"Stats file not found: {stats_path}")
         sys.exit(1)
 
-    print(f"Loading stats from: {stats_path}")
-    stats = load_stats(str(stats_path))
+    stats, stats_paths = load_stats_bundle(stats_path)
+    if len(stats_paths) == 1:
+        print(f"Loading stats from: {stats_paths[0]}")
+    else:
+        print("Loading stats from:")
+        for path in stats_paths:
+            current = " (current)" if path.name == stats.get('current_source_file') else ""
+            print(f"  {path}{current}")
 
     # Load additional test results from log files
     log_entries = []
