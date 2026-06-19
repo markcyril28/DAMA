@@ -9,9 +9,19 @@ set -euo pipefail
 #   RAM: 32 GB
 #   CPU Cores: 12
 #
-# All training parameters are in config/training_config_local_retrain.yaml.
+# All training parameters are in the selected config below.
 # This script only handles session-level overrides (resume, duration, etc.).
 # =============================================================================
+
+# -----------------------------------------------------------------------------
+# CONFIG SELECTION — Uncomment exactly one
+# -----------------------------------------------------------------------------
+#TRAINING_CONFIG="config/training_config_local_retrain.yaml"
+# TRAINING_CONFIG="config/training_config_local.yaml"
+# TRAINING_CONFIG="config/training_config.yaml"
+# TRAINING_CONFIG="config/training_config_server.yaml"
+# TRAINING_CONFIG="config/training_config_server_retrain.yaml"
+TRAINING_CONFIG="config/training_config_policy_distillation.yaml"
 
 # -----------------------------------------------------------------------------
 # SESSION SETTINGS — Edit these per-run
@@ -86,11 +96,11 @@ python -W ignore::FutureWarning -c "import torch; assert torch.cuda.is_available
 }
 
 echo "CUDA verified. Starting training..."
-echo "Config: config/training_config_local_retrain.yaml"
+echo "Config: ${TRAINING_CONFIG}"
 echo ""
 
 # Build command arguments — only session-level overrides
-ARGS="--config ${PROJECT_DIR}/config/training_config_local_retrain.yaml"
+ARGS="--config ${PROJECT_DIR}/${TRAINING_CONFIG}"
 
 # Resume settings
 if [ -n "$RESUME" ]; then
