@@ -240,6 +240,18 @@ h1 { text-align: center; font-weight: 600; font-size: 22px; margin: 4px 0 16px; 
 .card:-webkit-full-screen { height: 100vh; width: 100vw; padding: 16px 20px; background: var(--card-bg); }
 .modebar { background: transparent !important; }
 :root[data-theme="dark"] .modebar { background: rgba(15, 17, 23, 0.85) !important; }
+:root[data-theme="dark"] .updatemenu-item-rect {
+  fill: var(--button-bg) !important;
+  stroke: var(--button-border) !important;
+}
+:root[data-theme="dark"] .updatemenu-item-text { fill: var(--button-fg) !important; }
+:root[data-theme="dark"] .updatemenu-button[data-active="true"] .updatemenu-item-rect {
+  fill: var(--button-active-bg) !important;
+  stroke: var(--button-active-border) !important;
+}
+:root[data-theme="dark"] .updatemenu-button[data-active="true"] .updatemenu-item-text {
+  fill: var(--button-active-fg) !important;
+}
 @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
 """
 
@@ -300,11 +312,29 @@ function updateThemeButton(theme) {
   btn.setAttribute('aria-label', isDark ? 'Switch to light mode' : 'Switch to dark mode');
 }
 
+function updatePlotMenuTheme(gd) {
+  var menuLayouts = gd._fullLayout && gd._fullLayout.updatemenus || [];
+  gd.querySelectorAll('.updatemenu-container').forEach(function (menuEl, menuIndex) {
+    var activeIndex = menuLayouts[menuIndex] ? menuLayouts[menuIndex].active : -1;
+    menuEl.querySelectorAll('.updatemenu-button').forEach(function (buttonEl, buttonIndex) {
+      buttonEl.setAttribute('data-active', buttonIndex === activeIndex ? 'true' : 'false');
+    });
+  });
+}
+
 function updatePlotsForTheme(theme) {
   if (!window.Plotly) return;
   var layout = getPlotLayout(theme);
   document.querySelectorAll('.plotly-graph-div').forEach(function (gd) {
-    try { Plotly.relayout(gd, layout); } catch (e) {}
+    try {
+      Promise.resolve(Plotly.relayout(gd, layout)).then(function () {
+        updatePlotMenuTheme(gd);
+      });
+      if (!gd.__menuThemeListenerAttached && typeof gd.on === 'function') {
+        gd.on('plotly_buttonclicked', function () { updatePlotMenuTheme(gd); });
+        gd.__menuThemeListenerAttached = true;
+      }
+    } catch (e) {}
   });
 }
 
