@@ -176,7 +176,7 @@ thermal_protection:
 # Resume Settings
 # -----------------------------------------------------------------------------
 resume:
-  enabled: true                       # Fresh policy-distillation experiment.
+  enabled: true                       # Continue the latest policy-distillation checkpoint.
   checkpoint_path: null
   skip_corrupted: true
 
@@ -185,7 +185,7 @@ resume:
 # -----------------------------------------------------------------------------
 time_limit:
   enabled: true
-  duration: "10h"
+  duration: "48h"
 
 # =============================================================================
 # Future Soft-Label / KL Direction (not consumed by trainer.py yet)
