@@ -71,6 +71,7 @@ warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
 warnings.filterwarnings('ignore', message='.*pynvml package is deprecated.*')
 
 from .model import MoveScorerNet, create_model, save_model, load_model
+from .move_encoder import ENCODING_VERSION
 from .replay import ReplayBuffer
 from .selfplay import (
     _play_game_worker_algo_vs_algo,
@@ -83,6 +84,11 @@ from .dataset import (
 )
 from .scoring import compute_reward_weight
 from .stats_collector import StatsCollector
+
+
+def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
+    """Assign every teacher difficulty to both player positions."""
+    return [(p1, p2) for p1 in difficulties for p2 in difficulties]
 
 
 def _make_compiled_fwd_loss(model, compile_mode):
@@ -1119,6 +1125,14 @@ class Trainer:
         print(f"Resuming from {path}")
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
 
+        checkpoint_encoding = checkpoint.get('encoding_version', 1)
+        if checkpoint_encoding != ENCODING_VERSION:
+            print(
+                f"WARNING: Migrating checkpoint encoding v{checkpoint_encoding} "
+                f"to v{ENCODING_VERSION}. Model and optimizer state will be "
+                "preserved; Player 2 behavior may shift while training adapts."
+            )
+
         # Handle state_dict from compiled models (torch.compile adds "_orig_mod." prefix)
         state_dict = checkpoint['model_state_dict']
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
@@ -1149,6 +1163,7 @@ class Trainer:
         print(f"  LR reset: {old_lr:.2e} (checkpoint) → {self.config.learning_rate:.2e} (config)")
 
         self.step = checkpoint.get('step', 0)
+        self.epoch = checkpoint.get('epoch', self.stats.epochs_completed)
         self.best_loss = checkpoint.get('loss', float('inf'))
 
         # Restore scheduler state if available
@@ -1193,7 +1208,7 @@ class Trainer:
                     cuda_rng = cuda_rng.to(torch.uint8)
                 torch.cuda.set_rng_state(cuda_rng.cpu())
 
-        print(f"Resumed at step {self.step}")
+        print(f"Resumed at step {self.step}, epoch {self.epoch}")
 
         if self._has_non_finite_tensors():
             self._reset_model_state("Loaded checkpoint contains NaN/Inf")
@@ -1477,6 +1492,7 @@ class Trainer:
                 'value_head_enabled': self.config.value_head_enabled,
                 'value_head_hidden': self.config.value_head_hidden,
             }),
+            'encoding_version': ENCODING_VERSION,
             'rng_state': {
                 'torch': torch.get_rng_state(),
             }
@@ -1748,7 +1764,6 @@ class Trainer:
         #   - better CPU utilization (no idle gaps between phases)
         # ==================================================================
 
-        from itertools import combinations_with_replacement
         from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed
         from concurrent.futures.process import BrokenProcessPool
 
@@ -1802,7 +1817,12 @@ class Trainer:
 
         if algo_vs_algo_games > 0:
             ava_diffs = self.config.algo_vs_algo_difficulties or ['medium']
-            matchups = list(combinations_with_replacement(ava_diffs, 2))
+            # Use ordered matchups.  combinations_with_replacement assigned the
+            # weaker difficulty to P1 and the stronger difficulty to P2 in every
+            # mixed game (e.g. hard vs super_hard), but never generated the
+            # reverse.  That taught Player 2 from a systematically stronger
+            # teacher and created a side-specific policy-quality bias.
+            matchups = _ordered_difficulty_matchups(ava_diffs)
             gpmu = algo_vs_algo_games // len(matchups)
             rem = algo_vs_algo_games % len(matchups)
 
@@ -1860,6 +1880,7 @@ class Trainer:
             torch.save({
                 'model_state_dict': _sd,
                 'arch_params': getattr(self.model, 'arch_params', {}),
+                'encoding_version': ENCODING_VERSION,
                 'step': self.step,
             }, temp_model_path)
 
@@ -2378,6 +2399,7 @@ class Trainer:
         torch.save({
             'model_state_dict': _sd,
             'arch_params': getattr(self.model, 'arch_params', {}),
+            'encoding_version': ENCODING_VERSION,
             'step': self.step,
         }, temp_path)
 
@@ -3333,6 +3355,7 @@ class Trainer:
             torch.save({
                 'model_state_dict': _sd,
                 'arch_params': getattr(self.model, 'arch_params', {}),
+                'encoding_version': ENCODING_VERSION,
                 'step': self.step,
             }, _test_path)
             _async_test_step[0] = self.step
@@ -3875,6 +3898,12 @@ def _auto_detect_resume(resume_cfg: dict, paths_cfg: dict) -> Optional[str]:
     for ckpt in checkpoints:
         try:
             c = torch.load(ckpt, map_location='cpu', weights_only=True)
+            checkpoint_encoding = c.get('encoding_version', 1)
+            if checkpoint_encoding != ENCODING_VERSION:
+                print(
+                    f"  Auto-detected migratable checkpoint: {ckpt} "
+                    f"(encoding v{checkpoint_encoding} -> v{ENCODING_VERSION})"
+                )
             sd = c.get('model_state_dict', c)
             if all(torch.isfinite(v).all() for v in sd.values()
                    if isinstance(v, torch.Tensor)):

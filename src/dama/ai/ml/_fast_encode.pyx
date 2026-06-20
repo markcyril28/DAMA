@@ -93,16 +93,18 @@ cdef inline void _encode_positions(
     object positions,
     np.ndarray[DTYPE_f, ndim=3] planes,
     int plane_idx,
-    bint flip,
+    bint rotate,
 ):
     """Write 1.0 into planes[plane_idx, row, col] for each position tuple."""
     cdef int row, col
     cdef object pos
     for pos in positions:
         row = PyLong_AsLong(_pos_item(pos, 0))
-        if flip:
+        if rotate:
             row = 7 - row
         col = PyLong_AsLong(_pos_item(pos, 1))
+        if rotate:
+            col = 7 - col
         planes[plane_idx, row, col] = 1.0
 
 
@@ -113,16 +115,18 @@ cdef inline void _encode_positions_4d(
     np.ndarray[DTYPE_f, ndim=4] boards,
     int i,
     int plane_idx,
-    bint flip,
+    bint rotate,
 ):
     """Write 1.0 into boards[i, plane_idx, row, col] for each position tuple."""
     cdef int row, col
     cdef object pos
     for pos in positions:
         row = PyLong_AsLong(_pos_item(pos, 0))
-        if flip:
+        if rotate:
             row = 7 - row
         col = PyLong_AsLong(_pos_item(pos, 1))
+        if rotate:
+            col = 7 - col
         boards[i, plane_idx, row, col] = 1.0
 
 
@@ -130,28 +134,29 @@ def encode_board_fast_cy(dict state_dict, np.ndarray[DTYPE_f, ndim=3] planes):
     """Encode board state directly from compact dict into pre-allocated planes.
 
     Cython version: ~3-5x faster than pure Python for large batches.
-    Flips rows for P2 so both sides see canonical orientation.
+    Rotates positions 180 degrees for P2 so both sides see the same canonical
+    orientation while preserving playable-square parity.
 
     [Pass 82] Unrolled plane encoding (no mapping list allocation) +
     C API dict/tuple access.
     """
     cdef int turn = state_dict[_K_TURN]
-    cdef bint flip = (turn == 2)
+    cdef bint rotate = (turn == 2)
 
     # Zero the planes
     planes[:, :, :] = 0.0
 
     # Unrolled: eliminates mapping list [('p1_men', 0), ...] allocation per call
     if turn == 1:
-        _encode_positions(_dict_get(state_dict, _K_P1_MEN), planes, 0, flip)
-        _encode_positions(_dict_get(state_dict, _K_P1_KINGS), planes, 1, flip)
-        _encode_positions(_dict_get(state_dict, _K_P2_MEN), planes, 2, flip)
-        _encode_positions(_dict_get(state_dict, _K_P2_KINGS), planes, 3, flip)
+        _encode_positions(_dict_get(state_dict, _K_P1_MEN), planes, 0, rotate)
+        _encode_positions(_dict_get(state_dict, _K_P1_KINGS), planes, 1, rotate)
+        _encode_positions(_dict_get(state_dict, _K_P2_MEN), planes, 2, rotate)
+        _encode_positions(_dict_get(state_dict, _K_P2_KINGS), planes, 3, rotate)
     else:
-        _encode_positions(_dict_get(state_dict, _K_P2_MEN), planes, 0, flip)
-        _encode_positions(_dict_get(state_dict, _K_P2_KINGS), planes, 1, flip)
-        _encode_positions(_dict_get(state_dict, _K_P1_MEN), planes, 2, flip)
-        _encode_positions(_dict_get(state_dict, _K_P1_KINGS), planes, 3, flip)
+        _encode_positions(_dict_get(state_dict, _K_P2_MEN), planes, 0, rotate)
+        _encode_positions(_dict_get(state_dict, _K_P2_KINGS), planes, 1, rotate)
+        _encode_positions(_dict_get(state_dict, _K_P1_MEN), planes, 2, rotate)
+        _encode_positions(_dict_get(state_dict, _K_P1_KINGS), planes, 3, rotate)
 
     # Plane 4: all ones (bias plane)
     planes[4, :, :] = 1.0
@@ -173,7 +178,7 @@ def encode_moves_fast_cy(
     cdef int n, i
     cdef dict m
     cdef object path, captures, pos
-    cdef bint promotion, is_king, flip
+    cdef bint promotion, is_king, rotate
     cdef int start_r, start_c, end_r, end_c
     cdef int num_captures, path_len
     cdef float cap_ratio
@@ -195,7 +200,7 @@ def encode_moves_fast_cy(
         pos = kings_list[k]
         king_rows[k] = PyLong_AsLong(_pos_item(pos, 0))
         king_cols[k] = PyLong_AsLong(_pos_item(pos, 1))
-    flip = (turn == 2)
+    rotate = (turn == 2)
 
     n = len(legal_moves)
     if n > out.shape[0]:
@@ -222,9 +227,11 @@ def encode_moves_fast_cy(
                 is_king = True
                 break
 
-        if flip:
+        if rotate:
             start_r = 7 - start_r
+            start_c = 7 - start_c
             end_r = 7 - end_r
+            end_c = 7 - end_c
 
         out[i, 0] = start_r / 7.0
         out[i, 1] = start_c / 7.0
@@ -266,7 +273,7 @@ def preprocess_chunk_cy(
     cdef dict state_dict, m_dict
     cdef object path, captures, pos
     cdef list legal_moves_list
-    cdef bint promotion, is_king, flip
+    cdef bint promotion, is_king, rotate
     cdef float cap_ratio
 
     # C-array king lookup (avoids Python set + tuple per entry)
@@ -285,19 +292,19 @@ def preprocess_chunk_cy(
         entry = entries[start_idx + i]
         state_dict = entry.state
         turn = state_dict[_K_TURN]
-        flip = (turn == 2)
+        rotate = (turn == 2)
 
         # ── Encode board (unrolled — no mapping list allocation) ──
         if turn == 1:
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 0, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 1, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 2, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 3, flip)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 0, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 1, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 2, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 3, rotate)
         else:
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 0, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 1, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 2, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 3, flip)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 0, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 1, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 2, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 3, rotate)
 
         # ── Encode moves ── (C-array king lookup)
         if turn == 1:
@@ -336,9 +343,11 @@ def preprocess_chunk_cy(
                     is_king = True
                     break
 
-            if flip:
+            if rotate:
                 start_r = 7 - start_r
+                start_c = 7 - start_c
                 end_r = 7 - end_r
+                end_c = 7 - end_c
 
             all_move_features[i, j, 0] = start_r / 7.0
             all_move_features[i, j, 1] = start_c / 7.0
@@ -389,7 +398,7 @@ def preprocess_dicts_chunk_cy(
     cdef dict state_dict, m_dict, ed
     cdef object path, captures, pos, positions
     cdef list legal_moves_list
-    cdef bint promotion, is_king, flip
+    cdef bint promotion, is_king, rotate
     cdef float cap_ratio
 
     # C-array king lookup (avoids Python set + tuple per entry)
@@ -407,19 +416,19 @@ def preprocess_dicts_chunk_cy(
         ed = entry_dicts[start_idx + i]
         state_dict = ed[_K_STATE]
         turn = state_dict[_K_TURN]
-        flip = (turn == 2)
+        rotate = (turn == 2)
 
         # ── Encode board (unrolled — no mapping list allocation) ──
         if turn == 1:
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 0, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 1, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 2, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 3, flip)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 0, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 1, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 2, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 3, rotate)
         else:
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 0, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 1, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 2, flip)
-            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 3, flip)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_MEN), boards, i, 0, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P2_KINGS), boards, i, 1, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_MEN), boards, i, 2, rotate)
+            _encode_positions_4d(_dict_get(state_dict, _K_P1_KINGS), boards, i, 3, rotate)
 
         # ── Encode moves ── (C-array king lookup)
         if turn == 1:
@@ -458,9 +467,11 @@ def preprocess_dicts_chunk_cy(
                     is_king = True
                     break
 
-            if flip:
+            if rotate:
                 start_r = 7 - start_r
+                start_c = 7 - start_c
                 end_r = 7 - end_r
+                end_c = 7 - end_c
 
             all_move_features[i, j, 0] = start_r / 7.0
             all_move_features[i, j, 1] = start_c / 7.0

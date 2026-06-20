@@ -22,6 +22,48 @@ from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QBrush
 from ..config import get_config
 
 
+CUSTOM_TRAINING_LABEL = "Custom GUI settings"
+
+
+def _load_training_preset_metadata(config_path: Optional[str]) -> dict:
+    """Read the small subset of a YAML training preset needed by the GUI."""
+    if not config_path:
+        return {
+            'checkpoint_dir': 'models/checkpoints',
+            'latest_model': 'models/latest.pt',
+            'stats_file': 'models/training_stats.json',
+            'train_steps': 10000,
+        }
+
+    import yaml
+
+    with open(config_path, 'r') as config_file:
+        data = yaml.safe_load(config_file) or {}
+    paths = data.get('paths', {})
+    training = data.get('training', {})
+    return {
+        'checkpoint_dir': paths.get('checkpoint_dir', 'models/checkpoints'),
+        'latest_model': paths.get('latest_model', 'models/latest.pt'),
+        'stats_file': paths.get('stats_file', 'models/training_stats.json'),
+        'train_steps': training.get('train_steps', 10000),
+    }
+
+
+def _training_preset_paths() -> list[Path]:
+    """Return available YAML training presets in stable display order."""
+    config_dir = Path('config')
+    if not config_dir.exists():
+        return []
+    paths = list(config_dir.glob('training_config*.yaml'))
+    policy = config_dir / 'training_config_policy_distillation.yaml'
+    return sorted(paths, key=lambda path: (path != policy, path.name))
+
+
+def _training_preset_label(path: Path) -> str:
+    name = path.stem.removeprefix('training_config').strip('_') or 'default'
+    return name.replace('_', ' ').title()
+
+
 # Use 'spawn' start method for CUDA compatibility
 # This must be set before creating any multiprocessing objects
 try:
@@ -50,29 +92,41 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
     """
     try:
         # Import here to avoid loading torch in main process
-        from ..ai.ml.trainer import Trainer, TrainingConfig
-
-        config = TrainingConfig(
-            device=args.get('device', 'cuda'),
-            amp=args.get('amp', True),
-            cpu_workers=args.get('cpu_workers', 10),
-            selfplay_games=args.get('selfplay_games', 500),
-            batch_size=args.get('batch_size', 256),
-            learning_rate=args.get('learning_rate', 3e-4),
-            train_steps=args.get('train_steps', 10000),
-            checkpoint_every=args.get('checkpoint_every', 1000),
-            resume=args.get('resume'),
-            pipeline_mode=args.get('pipeline_mode', 'simultaneous'),
-            # Algo-vs-algo settings
-            algo_vs_algo_enabled=args.get('algo_vs_algo_enabled', False),
-            algo_vs_algo_games=args.get('algo_vs_algo_games', 100),
-            algo_vs_algo_difficulties=args.get('algo_vs_algo_difficulties', ['easy', 'medium', 'hard']),
-            # Model testing settings
-            test_vs_algo=args.get('test_vs_algo', True),
-            test_every=args.get('test_every', 5000),
-            test_games=args.get('test_games', 50),
-            test_difficulty=args.get('test_difficulty', 'medium'),
+        from ..ai.ml.trainer import (
+            Trainer, TrainingConfig, config_from_yaml, load_config_from_yaml,
         )
+
+        config_path = args.get('config_path')
+        if config_path:
+            yaml_config = load_config_from_yaml(config_path)
+            # The GUI owns the explicit Start Fresh/checkpoint selection. Avoid
+            # a second auto-detection pass while converting the YAML preset.
+            yaml_config['resume'] = {'enabled': False}
+            config = config_from_yaml(yaml_config)
+            config.resume = args.get('resume')
+        else:
+            config = TrainingConfig(
+                device=args.get('device', 'cuda'),
+                amp=args.get('amp', True),
+                cpu_workers=args.get('cpu_workers', 10),
+                selfplay_games=args.get('selfplay_games', 500),
+                batch_size=args.get('batch_size', 256),
+                learning_rate=args.get('learning_rate', 3e-4),
+                train_steps=args.get('train_steps', 10000),
+                checkpoint_every=args.get('checkpoint_every', 1000),
+                resume=args.get('resume'),
+                pipeline_mode=args.get('pipeline_mode', 'simultaneous'),
+                # Algo-vs-algo settings
+                algo_vs_algo_enabled=args.get('algo_vs_algo_enabled', False),
+                algo_vs_algo_games=args.get('algo_vs_algo_games', 100),
+                algo_vs_algo_difficulties=args.get(
+                    'algo_vs_algo_difficulties', ['easy', 'medium', 'hard']),
+                # Model testing settings
+                test_vs_algo=args.get('test_vs_algo', True),
+                test_every=args.get('test_every', 5000),
+                test_games=args.get('test_games', 50),
+                test_difficulty=args.get('test_difficulty', 'medium'),
+            )
 
         trainer = Trainer(config)
 
@@ -607,9 +661,15 @@ class LossChartWidget(QWidget):
 class StatsPanel(QWidget):
     """Panel for displaying training statistics."""
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, stats_file: str = 'models/training_stats.json'):
         super().__init__(parent)
+        self.stats_file = stats_file
         self._init_ui()
+
+    def set_stats_file(self, stats_file: str) -> None:
+        """Select the statistics file associated with the active preset."""
+        self.stats_file = stats_file
+        self.load_stats()
     
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -670,7 +730,7 @@ class StatsPanel(QWidget):
         """Load stats from file."""
         try:
             from ..ai.ml.trainer import load_training_stats
-            stats = load_training_stats()
+            stats = load_training_stats(self.stats_file)
             if stats:
                 self.update_stats(stats)
             else:
@@ -732,6 +792,7 @@ class TestPanel(QWidget):
         self._test_worker: Optional[TestWorker] = None
         
         self._init_ui()
+        self._refresh_models()
         self._load_latest_results()
     
     def _init_ui(self):
@@ -866,23 +927,24 @@ class TestPanel(QWidget):
     def _refresh_models(self):
         """Refresh the list of available models."""
         try:
-            from ..ai.ml.trainer import list_checkpoints
-            checkpoints = list_checkpoints()
+            from .settings_dialog import discover_models
+            model_paths = discover_models()
             
             self.model_combo.clear()
-            
-            # Add latest first
-            latest_path = Path('models/latest.pt')
-            if latest_path.exists():
-                self.model_combo.addItem("Latest (models/latest.pt)", str(latest_path))
-            
-            # Add checkpoints
-            for cp in reversed(checkpoints):
-                label = f"Step {cp['step']:,} ({cp['name']})"
-                self.model_combo.addItem(label, cp['path'])
+
+            latest_models = [path for path in model_paths if Path(path).name.startswith('latest')]
+            checkpoint_models = [path for path in model_paths if path not in latest_models]
+            for path in latest_models + list(reversed(checkpoint_models)):
+                self.model_combo.addItem(str(path), str(path))
         
         except Exception as e:
             print(f"Error refreshing models: {e}")
+
+    def select_model(self, model_path: str) -> None:
+        """Select a model associated with the active training preset."""
+        index = self.model_combo.findData(model_path)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
     
     def _start_test(self):
         """Start the model vs algorithm test."""
@@ -1133,11 +1195,13 @@ class TrainingPanel(QWidget):
         self._status_queue: Optional[mp.Queue] = None
         self._worker: Optional[TrainingWorker] = None
         self._stop_requested = False
+        self._active_latest_path = 'models/latest.pt'
 
         # Live chart data
         self._live_loss_data: List[float] = []
 
         self._init_ui()
+        self._populate_training_presets()
         self._refresh_checkpoints()
 
     def _init_ui(self):
@@ -1166,6 +1230,14 @@ class TrainingPanel(QWidget):
         # Configuration group
         config_group = QGroupBox("Training Configuration")
         config_layout = QFormLayout(config_group)
+
+        self.training_config_combo = QComboBox()
+        self.training_config_combo.setToolTip(
+            "Use a YAML preset to preserve its architecture, replay, checkpoint, "
+            "statistics, and distillation settings.")
+        self.training_config_combo.currentIndexChanged.connect(
+            self._on_training_preset_changed)
+        config_layout.addRow("Training Preset:", self.training_config_combo)
 
         self.device_combo = QComboBox()
         self.device_combo.addItems(['cuda', 'cpu'])
@@ -1310,6 +1382,48 @@ class TrainingPanel(QWidget):
 
         layout.addLayout(reload_layout)
 
+    def _populate_training_presets(self) -> None:
+        """Populate presets and prefer an existing policy-distillation run."""
+        self.training_config_combo.blockSignals(True)
+        self.training_config_combo.clear()
+        self.training_config_combo.addItem(CUSTOM_TRAINING_LABEL, None)
+
+        preferred_index = 0
+        for path in _training_preset_paths():
+            metadata = _load_training_preset_metadata(str(path))
+            self.training_config_combo.addItem(_training_preset_label(path), str(path))
+            checkpoint_dir = Path(metadata['checkpoint_dir'])
+            if (path.name == 'training_config_policy_distillation.yaml'
+                    and any(checkpoint_dir.glob('model_step_*.pt'))):
+                preferred_index = self.training_config_combo.count() - 1
+
+        self.training_config_combo.setCurrentIndex(preferred_index)
+        self.training_config_combo.blockSignals(False)
+        self._apply_training_preset_state()
+
+    def _selected_preset_metadata(self) -> dict:
+        return _load_training_preset_metadata(self.training_config_combo.currentData())
+
+    def _apply_training_preset_state(self) -> None:
+        """Lock manual controls when a YAML preset owns those settings."""
+        using_preset = self.training_config_combo.currentData() is not None
+        editable = not using_preset and self._process is None
+        for widget in (
+            self.device_combo, self.workers_spin, self.batch_spin,
+            self.steps_spin, self.games_spin, self.test_enabled_check,
+            self.test_every_spin, self.test_games_spin,
+            self.test_difficulty_combo,
+        ):
+            widget.setEnabled(editable)
+
+        metadata = self._selected_preset_metadata()
+        self.stats_panel.set_stats_file(metadata['stats_file'])
+        self.test_panel.select_model(metadata['latest_model'])
+
+    def _on_training_preset_changed(self) -> None:
+        self._apply_training_preset_state()
+        self._refresh_checkpoints()
+
     def _log(self, message: str):
         """Add message to log."""
         self.log_text.append(message)
@@ -1321,7 +1435,9 @@ class TrainingPanel(QWidget):
         """Refresh the list of available checkpoints."""
         try:
             from ..ai.ml.trainer import list_checkpoints
-            checkpoints = list_checkpoints()
+            metadata = self._selected_preset_metadata()
+            checkpoints = list_checkpoints(metadata['checkpoint_dir'])
+            previous_path = self.checkpoint_combo.currentData()
             
             # Clear and repopulate
             self.checkpoint_combo.clear()
@@ -1331,10 +1447,21 @@ class TrainingPanel(QWidget):
                 label = f"Step {cp['step']:,} ({cp['name']})"
                 self.checkpoint_combo.addItem(label, cp['path'])
             
-            # Add option for latest.pt
-            latest_path = Path('models/latest.pt')
+            # Add the preset-specific latest model alias after numbered
+            # checkpoints. The newest numbered checkpoint remains the default.
+            latest_path = Path(metadata['latest_model'])
             if latest_path.exists():
-                self.checkpoint_combo.insertItem(1, "Latest (models/latest.pt)", str(latest_path))
+                self.checkpoint_combo.addItem(
+                    f"Latest alias ({latest_path})", str(latest_path))
+
+            previous_index = (
+                self.checkpoint_combo.findData(previous_path)
+                if previous_path else -1
+            )
+            if previous_index >= 0:
+                self.checkpoint_combo.setCurrentIndex(previous_index)
+            elif self.training_config_combo.currentData() is not None and checkpoints:
+                self.checkpoint_combo.setCurrentIndex(1)
             
         except Exception as e:
             self._log(f"Error loading checkpoints: {e}")
@@ -1343,11 +1470,16 @@ class TrainingPanel(QWidget):
         """Start the training process."""
         # Get resume checkpoint
         resume_path = self.checkpoint_combo.currentData()
+        config_path = self.training_config_combo.currentData()
+        metadata = self._selected_preset_metadata()
+        self._active_latest_path = metadata['latest_model']
         
         if resume_path:
             self._log(f"Resuming from: {resume_path}")
         else:
             self._log("Starting fresh training...")
+        if config_path:
+            self._log(f"Using training preset: {config_path}")
 
         # Prepare arguments
         args = {
@@ -1359,6 +1491,7 @@ class TrainingPanel(QWidget):
             'selfplay_games': self.games_spin.value(),
             'checkpoint_every': 1000,
             'resume': resume_path,
+            'config_path': config_path,
             # Model testing settings
             'test_vs_algo': self.test_enabled_check.isChecked(),
             'test_every': self.test_every_spin.value(),
@@ -1391,7 +1524,8 @@ class TrainingPanel(QWidget):
         # Update UI
         self._set_training_state(True)
         self.state_label.setText("State: Running")
-        self.progress_bar.setRange(0, self.steps_spin.value())
+        target_steps = metadata['train_steps'] if config_path else self.steps_spin.value()
+        self.progress_bar.setRange(0, min(int(target_steps), 2_147_483_647))
 
     def _pause_training(self):
         """Pause training."""
@@ -1474,12 +1608,12 @@ class TrainingPanel(QWidget):
         if stopped:
             QMessageBox.information(self, "Training Stopped",
                                    "Training was stopped.\n\n"
-                                   "A final checkpoint was saved at models/latest.pt\n"
+                                   f"The latest model is at {self._active_latest_path}\n"
                                    "View the Statistics tab for training metrics.")
         else:
             QMessageBox.information(self, "Training Complete",
                                    "ML model training has completed successfully.\n\n"
-                                   "The trained model is saved at models/latest.pt\n"
+                                   f"The trained model is at {self._active_latest_path}\n"
                                    "View the Statistics tab for training metrics.")
 
     def _on_error(self, message: str):
@@ -1496,12 +1630,20 @@ class TrainingPanel(QWidget):
         self.resume_btn.setEnabled(False)
         self.stop_btn.setEnabled(running)
 
-        # Disable config during training
-        self.device_combo.setEnabled(not running)
-        self.workers_spin.setEnabled(not running)
-        self.batch_spin.setEnabled(not running)
-        self.steps_spin.setEnabled(not running)
-        self.games_spin.setEnabled(not running)
+        # YAML presets own their settings; custom controls are editable only
+        # while idle.
+        self.training_config_combo.setEnabled(not running)
+        using_preset = self.training_config_combo.currentData() is not None
+        manual_enabled = not running and not using_preset
+        self.device_combo.setEnabled(manual_enabled)
+        self.workers_spin.setEnabled(manual_enabled)
+        self.batch_spin.setEnabled(manual_enabled)
+        self.steps_spin.setEnabled(manual_enabled)
+        self.games_spin.setEnabled(manual_enabled)
+        self.test_enabled_check.setEnabled(manual_enabled)
+        self.test_every_spin.setEnabled(manual_enabled)
+        self.test_games_spin.setEnabled(manual_enabled)
+        self.test_difficulty_combo.setEnabled(manual_enabled)
         self.checkpoint_combo.setEnabled(not running)
 
     def _cleanup(self):

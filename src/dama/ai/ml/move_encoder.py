@@ -8,6 +8,12 @@ from ...game_state import GameState
 from ...board import Board
 
 
+# Increment whenever the tensor representation changes.  Persistent tensor
+# caches include this value so data encoded with incompatible semantics is not
+# silently reused.
+ENCODING_VERSION = 2
+
+
 def encode_board(state: GameState) -> np.ndarray:
     """
     Encode board state as a tensor for the neural network.
@@ -27,12 +33,13 @@ def encode_board(state: GameState) -> np.ndarray:
     # Initialize planes
     planes = np.zeros((5, 8, 8), dtype=np.float32)
 
-    flip = current == Player.TWO
+    rotate = current == Player.TWO
 
     for pos, piece in board.get_pieces():
         row, col = pos
-        if flip:
+        if rotate:
             row = 7 - row
+            col = 7 - col
 
         if piece.player == current:
             if piece.is_king:
@@ -55,9 +62,11 @@ def encode_move(move: Move, piece: Piece, current_player: Player = Player.ONE) -
     """
     Encode a move as a feature vector.
 
-    When current_player is Player.TWO, rows are flipped so both sides
-    see the board from the same canonical orientation (pieces at top,
-    advancing downward).
+    When current_player is Player.TWO, positions are rotated 180 degrees so
+    both sides see the same canonical orientation (pieces at top, advancing
+    downward).  Rotating both axes is essential: flipping only rows maps every
+    playable dark square to a light square and gives the two sides different
+    input distributions.
 
     Returns:
         numpy array of shape (8,):
@@ -75,7 +84,9 @@ def encode_move(move: Move, piece: Piece, current_player: Player = Player.ONE) -
 
     if current_player == Player.TWO:
         from_row = 7 - from_row
+        from_col = 7 - from_col
         to_row = 7 - to_row
+        to_col = 7 - to_col
 
     features = np.array([
         from_row / 7.0,           # Normalize to [0, 1]
@@ -127,23 +138,24 @@ def decode_board(planes: np.ndarray, current_player: Player = Player.ONE) -> Gam
     Returns:
         GameState
     """
-    # Un-flip rows for P2 before mapping back to board positions
-    flip = current_player == Player.TWO
+    # Undo the 180-degree canonical rotation for P2.
+    rotate = current_player == Player.TWO
 
     board = Board()
     opponent = current_player.opponent()
 
     for row in range(8):
         for col in range(8):
-            board_row = 7 - row if flip else row
+            board_row = 7 - row if rotate else row
+            board_col = 7 - col if rotate else col
             if planes[0, row, col] > 0.5:
-                board.set_piece((board_row, col), Piece(current_player, PieceType.MAN))
+                board.set_piece((board_row, board_col), Piece(current_player, PieceType.MAN))
             elif planes[1, row, col] > 0.5:
-                board.set_piece((board_row, col), Piece(current_player, PieceType.KING))
+                board.set_piece((board_row, board_col), Piece(current_player, PieceType.KING))
             elif planes[2, row, col] > 0.5:
-                board.set_piece((board_row, col), Piece(opponent, PieceType.MAN))
+                board.set_piece((board_row, board_col), Piece(opponent, PieceType.MAN))
             elif planes[3, row, col] > 0.5:
-                board.set_piece((board_row, col), Piece(opponent, PieceType.KING))
+                board.set_piece((board_row, board_col), Piece(opponent, PieceType.KING))
 
     return GameState(board, current_player)
 

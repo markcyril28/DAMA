@@ -15,7 +15,7 @@ from ..config import get_config, save_config, Config
 
 
 def discover_models() -> list[str]:
-    """Scan standard directories for .pt model files."""
+    """Scan model roots and all named checkpoint directories for models."""
     models_dirs = [
         Path("models"),
         Path("models/checkpoints"),
@@ -26,6 +26,10 @@ def discover_models() -> list[str]:
     for d in models_dirs:
         if d.exists():
             for pt_file in d.glob("*.pt"):
+                found.add(str(pt_file))
+    for models_root in {Path("models"), Path.cwd() / "models"}:
+        if models_root.exists():
+            for pt_file in models_root.glob("checkpoints*/*.pt"):
                 found.add(str(pt_file))
     return sorted(found)
 

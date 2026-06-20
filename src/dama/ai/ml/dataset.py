@@ -170,13 +170,14 @@ def _encode_board_fast(state_dict: dict, planes: np.ndarray) -> None:
     else:
         mapping = (('p2_men', 0), ('p2_kings', 1), ('p1_men', 2), ('p1_kings', 3))
 
-    flip = turn == 2
+    rotate = turn == 2
 
     planes[:] = 0.0
     for key, plane_idx in mapping:
         for pos in state_dict.get(key, ()):
-            row = 7 - pos[0] if flip else pos[0]
-            planes[plane_idx, row, pos[1]] = 1.0
+            row = 7 - pos[0] if rotate else pos[0]
+            col = 7 - pos[1] if rotate else pos[1]
+            planes[plane_idx, row, col] = 1.0
     planes[4, :, :] = 1.0
 
 
@@ -193,7 +194,7 @@ def _encode_moves_fast(
     turn = state_dict['turn']
     king_key = 'p1_kings' if turn == 1 else 'p2_kings'
     king_set = {(pos[0], pos[1]) for pos in state_dict.get(king_key, ())}
-    flip = turn == 2
+    rotate = turn == 2
 
     n = min(len(legal_moves), out.shape[0])
     for i in range(n):
@@ -205,13 +206,15 @@ def _encode_moves_fast(
         end = path[-1]
         is_king = (start[0], start[1]) in king_set
 
-        start_r = 7 - start[0] if flip else start[0]
-        end_r = 7 - end[0] if flip else end[0]
+        start_r = 7 - start[0] if rotate else start[0]
+        start_c = 7 - start[1] if rotate else start[1]
+        end_r = 7 - end[0] if rotate else end[0]
+        end_c = 7 - end[1] if rotate else end[1]
 
         out[i, 0] = start_r / 7.0
-        out[i, 1] = start[1] / 7.0
+        out[i, 1] = start_c / 7.0
         out[i, 2] = end_r / 7.0
-        out[i, 3] = end[1] / 7.0
+        out[i, 3] = end_c / 7.0
         out[i, 4] = 1.0 if captures else 0.0
         num_captures = len(captures)
         out[i, 5] = min(num_captures / 4.0, 1.0)
@@ -1686,8 +1689,11 @@ def create_dataloader(
         print(f"RAM Caching enabled ({available_ram:.1f}GB available, {estimated_size_gb:.2f}GB needed)")
         print("Pre-processing entries to tensors...")
 
+        from .move_encoder import ENCODING_VERSION
+
         cache_meta = {
-            'cache_version': 1,
+            'cache_version': 2,
+            'encoding_version': ENCODING_VERSION,
             'entry_count': len(entries),
             'entry_signature': _entry_signature(entries),
             'max_moves_per_sample': max_moves_per_sample,
@@ -1702,7 +1708,9 @@ def create_dataloader(
                     cached_dataset = CachedTensorDataset.load(str(cache_path))
                     cached_meta = cached_dataset.metadata
                     if (
-                        cached_meta.get('entry_count') == cache_meta['entry_count']
+                        cached_meta.get('cache_version') == cache_meta['cache_version']
+                        and cached_meta.get('encoding_version') == cache_meta['encoding_version']
+                        and cached_meta.get('entry_count') == cache_meta['entry_count']
                         and cached_meta.get('entry_signature') == cache_meta['entry_signature']
                         and cached_meta.get('max_moves_per_sample') == cache_meta['max_moves_per_sample']
                     ):

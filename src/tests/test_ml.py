@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dama.types import Player, Move, Position
+from dama.board import Board
 from dama.game_state import GameState
 from dama.ai.ml.move_encoder import (
     encode_board,
@@ -30,6 +31,8 @@ from dama.ai.ml.move_encoder import (
 from dama.ai.ml.dataset import (
     DamaDataset,
     CachedTensorDataset,
+    _encode_board_fast,
+    _encode_moves_fast,
     preprocess_entries_to_tensors,
     collate_batch,
     get_available_ram_gb,
@@ -79,8 +82,8 @@ class TestMoveEncoder:
         assert encoded.shape == (len(moves), MOVE_FEATURE_SIZE)
         assert encoded.dtype == np.float32
 
-    def test_encode_board_p2_flip(self):
-        """Test that P2 board encoding flips rows so pieces appear at top."""
+    def test_encode_board_p2_rotation(self):
+        """Test that P2 board encoding rotates positions onto playable squares."""
         state = GameState.initial()
 
         # P1 encoding: P1 men should be in rows 0-2 (top)
@@ -95,17 +98,30 @@ class TestMoveEncoder:
         assert state_p2.current_player == Player.TWO
 
         # P2 encoding: P2's own men (plane 0) should appear in rows 0-2
-        # because rows are flipped — P2's actual rows 5-7 map to 0-2
+        # because positions are rotated — P2's actual rows 5-7 map to 0-2
         p2_enc = encode_board(state_p2)
-        # Current player's men (P2) should be at top after flip
+        # Current player's men (P2) should be at top after rotation
         assert p2_enc[0, :3, :].sum() > 0
-        # Opponent's men (P1) should be at bottom after flip
+        # Opponent's men (P1) should be at bottom after rotation
         assert p2_enc[2, 5:, :].sum() > 0
+        # A row-only mirror changes square parity.  A 180-degree rotation keeps
+        # every encoded piece on the same playable-square color as P1.
+        occupied = np.argwhere(p2_enc[:4].sum(axis=0) > 0)
+        assert all((row + col) % 2 == 1 for row, col in occupied)
 
-    def test_encode_move_p2_flip(self):
-        """Test that P2 move encoding flips rows."""
+    def test_canonical_board_is_identical_for_equivalent_sides(self):
+        """Equivalent P1/P2 positions must have one canonical tensor."""
+        p1_state = GameState.initial()
+        # The initial board is invariant under a 180-degree rotation plus a
+        # player swap, so changing the side to move creates its P2 equivalent.
+        p2_state = GameState(Board.initial(), Player.TWO)
+
+        assert np.array_equal(encode_board(p1_state), encode_board(p2_state))
+
+    def test_encode_move_p2_rotation(self):
+        """Test that P2 move encoding rotates both rows and columns."""
         from dama.types import Piece, PieceType
-        # A P2 move from (5,0) to (4,1) should flip to (2,0) -> (3,1)
+        # A P2 move from (5,0) to (4,1) rotates to (2,7) -> (3,6).
         move = Move(path=((5, 0), (4, 1)), captures=())
         piece = Piece(Player.TWO, PieceType.MAN)
 
@@ -119,10 +135,8 @@ class TestMoveEncoder:
         # P2: from_row=(7-5)/7=2/7, to_row=(7-4)/7=3/7
         assert abs(enc_p2[0] - 2 / 7.0) < 1e-6
         assert abs(enc_p2[2] - 3 / 7.0) < 1e-6
-
-        # Columns should be unchanged
-        assert enc_p1[1] == enc_p2[1]
-        assert enc_p1[3] == enc_p2[3]
+        assert abs(enc_p2[1] - 7 / 7.0) < 1e-6
+        assert abs(enc_p2[3] - 6 / 7.0) < 1e-6
 
     def test_decode_board_p2_roundtrip(self):
         """Test that encode -> decode round-trips correctly for P2."""
@@ -139,6 +153,38 @@ class TestMoveEncoder:
             assert decoded_piece is not None, f"Missing piece at {pos}"
             assert decoded_piece.player == piece.player
             assert decoded_piece.is_king == piece.is_king
+
+    def test_fast_encoders_match_reference_for_p2(self):
+        """Optimized P2 encoding must retain the reference rotation semantics."""
+        state = GameState(Board.initial(), Player.TWO)
+        moves = state.legal_moves()
+        state_dict = state.to_compact()
+        move_dicts = [move.to_dict() for move in moves]
+
+        board_fast = np.empty((BOARD_PLANES, 8, 8), dtype=np.float32)
+        _encode_board_fast(state_dict, board_fast)
+        assert np.array_equal(board_fast, encode_board(state))
+
+        moves_fast = np.zeros((len(moves), MOVE_FEATURE_SIZE), dtype=np.float32)
+        count = _encode_moves_fast(state_dict, move_dicts, moves_fast)
+        assert count == len(moves)
+        assert np.array_equal(moves_fast, encode_moves(state, moves))
+
+        try:
+            from dama.ai.ml._fast_encode import (
+                encode_board_fast_cy,
+                encode_moves_fast_cy,
+            )
+        except ImportError:
+            return
+
+        board_cy = np.empty_like(board_fast)
+        moves_cy = np.zeros_like(moves_fast)
+        encode_board_fast_cy(state_dict, board_cy)
+        cy_count = encode_moves_fast_cy(state_dict, move_dicts, moves_cy)
+        assert cy_count == len(moves)
+        assert np.array_equal(board_cy, board_fast)
+        assert np.array_equal(moves_cy, moves_fast)
 
 
 class TestDataset:
@@ -276,6 +322,35 @@ class TestModel:
             scores = model(boards, move_features, move_counts)
         
         assert scores.shape == (num_moves,)
+
+    def test_checkpoint_encoding_version_migrates_with_warning(self, tmp_path):
+        """Legacy weights remain loadable while the encoding transition is explicit."""
+        from dama.ai.ml.model import create_model, load_model, save_model
+        from dama.ai.ml.move_encoder import ENCODING_VERSION
+
+        model = create_model()
+        current_path = tmp_path / 'current.pt'
+        save_model(model, str(current_path))
+        checkpoint = torch.load(current_path, weights_only=True)
+        assert checkpoint['encoding_version'] == ENCODING_VERSION
+        assert load_model(str(current_path), torch.device('cpu')) is not None
+
+        legacy_path = tmp_path / 'legacy.pt'
+        checkpoint.pop('encoding_version')
+        torch.save(checkpoint, legacy_path)
+        with pytest.warns(RuntimeWarning, match='encoding version 1'):
+            assert load_model(str(legacy_path), torch.device('cpu')) is not None
+
+    def test_teacher_difficulties_are_assigned_to_both_sides(self):
+        """Mixed teacher strengths must be generated in both orientations."""
+        from dama.ai.ml.trainer import _ordered_difficulty_matchups
+
+        assert _ordered_difficulty_matchups(['hard', 'super_hard']) == [
+            ('hard', 'hard'),
+            ('hard', 'super_hard'),
+            ('super_hard', 'hard'),
+            ('super_hard', 'super_hard'),
+        ]
 
 
 class TestScoring:

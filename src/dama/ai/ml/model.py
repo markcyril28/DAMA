@@ -1,10 +1,12 @@
 """Neural network model for move scoring."""
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .move_encoder import BOARD_PLANES, MOVE_FEATURE_SIZE
+from .move_encoder import BOARD_PLANES, MOVE_FEATURE_SIZE, ENCODING_VERSION
 
 
 class ResidualBlock(nn.Module):
@@ -456,6 +458,17 @@ def load_model(path: str, device: torch.device = None) -> MoveScorerNet:
     # weights_only=False needed for checkpoint dicts; safe since we control the saved files
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
+    checkpoint_encoding = checkpoint.get('encoding_version', 1)
+    if checkpoint_encoding != ENCODING_VERSION:
+        warnings.warn(
+            f"Checkpoint {path} uses encoding version {checkpoint_encoding}; "
+            f"continuing with version {ENCODING_VERSION}. Player 2 behavior may "
+            "shift until the existing weights adapt if training continues with "
+            "180-degree canonicalization.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     # Handle different checkpoint formats
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
@@ -544,6 +557,7 @@ def save_model(model: MoveScorerNet, path: str, **kwargs) -> None:
         'arch_params': getattr(model, 'arch_params', {
             'embedding_size': 128, 'num_blocks': 4, 'hidden_size': 64, 'channels': 64,
         }),
+        'encoding_version': ENCODING_VERSION,
         **kwargs
     }
     torch.save(checkpoint, path)
