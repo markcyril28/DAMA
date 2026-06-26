@@ -58,7 +58,7 @@ model:
 # of mixing in moves selected by the current ML model.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 8
+  cpu_workers: 10
   games_per_epoch: 0                   # No ML-vs-algo or ML-vs-ML data.
   difficulties:
     - "hard"                           # Unused while games_per_epoch is 0.
@@ -138,7 +138,7 @@ testing:
   enabled: true
   every_n_steps: 1000
   num_games: 50
-  difficulty: "hard"
+  difficulty: "easy"
 
 # -----------------------------------------------------------------------------
 # Paths
@@ -168,8 +168,8 @@ statistics:
 # -----------------------------------------------------------------------------
 thermal_protection:
   enabled: true
-  temp_limit_c: 90
-  rest_duration: "20m"
+  temp_limit_c: 89
+  rest_duration: "10m"
   check_every: 30
 
 # -----------------------------------------------------------------------------
@@ -253,7 +253,7 @@ profiles:
       enabled: true
       every_n_steps: 1000
       num_games: 50
-      difficulty: "hard"
+      difficulty: "easy"
 
     thermal_protection:
       enabled: false
