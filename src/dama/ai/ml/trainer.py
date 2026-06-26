@@ -634,6 +634,9 @@ class Trainer:
         # Control flags for IPC
         self._paused = False
         self._stopped = False
+        self._process_title_base = os.environ.get('PROCESS_TITLE')
+        self._process_title_setter = None
+        self._last_process_title = None
 
         # GUI IPC queues (attached via set_control_queues when run from the
         # GUI).  When attached, train() drains control messages and pushes
@@ -726,6 +729,14 @@ class Trainer:
                 'value_head_hidden': config.value_head_hidden,
                 'value_weight': config.value_weight,
             })
+
+        if self._process_title_base:
+            try:
+                import setproctitle
+                self._process_title_setter = setproctitle.setproctitle
+                self._process_title_setter(self._process_title_base)
+            except Exception:
+                self._process_title_setter = None
 
         # Logging
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2540,6 +2551,24 @@ class Trainer:
         """Determine whether to use the scoring system for the upcoming epoch."""
         return self._should_use_scoring_for_epoch(self.epoch + 1)
 
+    def _update_process_title(self, step: int, loss: Optional[float] = None) -> None:
+        if self._process_title_setter is None:
+            return
+        if loss is None:
+            title = self._process_title_base
+        else:
+            try:
+                title = f"{self._process_title_base} | step={step} loss={float(loss):.4f}"
+            except (TypeError, ValueError):
+                title = self._process_title_base
+        if title is None or title == self._last_process_title:
+            return
+        try:
+            self._process_title_setter(title)
+            self._last_process_title = title
+        except Exception:
+            self._process_title_setter = None
+
     # Interval for expensive sanity checks (isfinite on large tensors).
     # Each check forces a CUDA sync (~20-100μs). Checking every step wastes
     # GPU pipeline throughput; periodic checks still catch numerical issues.
@@ -3040,6 +3069,7 @@ class Trainer:
             # Progress — print at the stats interval (which already computed .item()).
             # Avoids extra CUDA syncs from a separate hardcoded interval.
             if _loss_val is not None and _is_stats_step:
+                self._update_process_title(_step, _loss_val)
                 print(f"  Step {_step}, Loss: {_loss_val:.4f}")
 
             if _step >= _train_steps:

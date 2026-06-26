@@ -1203,7 +1203,11 @@ def _fig_loss(stats: dict) -> go.Figure:
                         method='update',
                         args=[
                             {'x': trace_x_steps},
-                            {'xaxis.title.text': 'Training Steps', 'xaxis.tickformat': ',d'},
+                            {
+                                'xaxis.title.text': 'Training Steps',
+                                'xaxis.tickformat': ',d',
+                                'xaxis.autorange': True,
+                            },
                         ],
                     ),
                     dict(
@@ -1211,7 +1215,11 @@ def _fig_loss(stats: dict) -> go.Figure:
                         method='update',
                         args=[
                             {'x': trace_x_gpu_hours},
-                            {'xaxis.title.text': 'GPU Hours', 'xaxis.tickformat': '.2f'},
+                            {
+                                'xaxis.title.text': 'GPU Hours',
+                                'xaxis.tickformat': '.2f',
+                                'xaxis.autorange': True,
+                            },
                         ],
                     ),
                 ],
