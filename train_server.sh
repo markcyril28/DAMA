@@ -21,7 +21,8 @@ set -euo pipefail
 
 # Config file to use (comment/uncomment to switch)
 # Note: These are relative to PROJECT_DIR, resolved after SCRIPT_DIR is set
-_CONFIG_FILE="config/training_config_server_retrain.yaml"
+#_CONFIG_FILE="config/training_config_server_retrain.yaml"
+_CONFIG_FILE="config/training_config_server_policy_distillation.yaml"
 # _CONFIG_FILE="config/training_config_server.yaml"
 # _CONFIG_FILE="config/training_config.yaml"
 
