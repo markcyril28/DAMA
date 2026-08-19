@@ -1,3 +1,15 @@
+# HOW TO RUN (PowerShell, from the DAMA repository)
+#   Validate without training: .\local_train.ps1 -ValidateOnly
+#   Policy recovery baseline: .\local_train.ps1
+#   Enhanced stage after promotion:
+#     .\local_train.ps1 -EnhancedStage -Resume models\checkpoints_policy_distillation\model_step_NNNNNN.pt
+#   Other config, latest:     .\local_train.ps1 -Config config\training_config.yaml
+#   Other config, fresh:      .\local_train.ps1 -Config config\training_config.yaml -FreshStart
+#   One-process policy bypass:
+#     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\local_train.ps1 -ValidateOnly
+#
+# Run .\setup_conda.ps1 first if the Windows "dama" environment is not ready.
+#
 #Requires -Version 5.1
 
 <#
@@ -21,10 +33,19 @@ matches local_train.sh.
 
 .PARAMETER Resume
 Resume from a specific checkpoint. This cannot be combined with FreshStart.
+The policy-distillation recovery config accepts only its preserved step-134000
+baseline.
 
 .PARAMETER FreshStart
 Start without a checkpoint. Without this option or Resume, the launcher uses
-the latest checkpoint, matching the current local_train.sh behavior.
+the preserved step-134000 baseline for the policy-distillation recovery config
+and the latest checkpoint for other configs. FreshStart is rejected for the
+policy-distillation recovery experiment.
+
+.PARAMETER EnhancedStage
+Allow the canonical policy-distillation config to resume from a checkpoint
+recorded as a promoted policy-only model. The trainer verifies the promotion
+record, checkpoint hash, and frozen-suite fingerprint before training starts.
 
 .PARAMETER TrainDuration
 Optional duration such as 2d, 4h, 30m, or 1d12h.
@@ -40,10 +61,10 @@ starting training.
 .\local_train.ps1
 
 .EXAMPLE
-.\local_train.ps1 -FreshStart -TrainDuration 4h
+.\local_train.ps1 -Config config\training_config.yaml -FreshStart -TrainDuration 4h
 
 .EXAMPLE
-.\local_train.ps1 -Resume .\models\checkpoints\model_step_10000.pt
+.\local_train.ps1 -Resume .\models\checkpoints_policy_distillation\model_step_134000.pt
 #>
 
 [CmdletBinding()]
@@ -57,6 +78,11 @@ param(
     [string] $Resume = '',
 
     [switch] $FreshStart,
+
+    [switch] $EnhancedStage,
+
+    [ValidateSet(2, 3)]
+    [int] $EnhancedInferenceDepth = 2,
 
     [ValidatePattern('^(?=.+)(?:\d+d)?(?:\d+h)?(?:\d+m)?$')]
     [string] $TrainDuration = '',
@@ -91,6 +117,21 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Training config not found: $ConfigPath"
 }
 
+$PolicyRecoveryConfigPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $ProjectDirectory 'config\training_config_policy_distillation.yaml')
+)
+$PolicyRecoveryBaselinePath = [System.IO.Path]::GetFullPath(
+    (Join-Path $ProjectDirectory 'models\checkpoints_policy_distillation\model_step_134000.pt')
+)
+$PolicyRecoveryBaselineSha256 = '7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27'
+$IsPolicyRecovery = $ConfigPath.Equals(
+    $PolicyRecoveryConfigPath,
+    [System.StringComparison]::OrdinalIgnoreCase
+)
+if ($EnhancedStage -and -not $IsPolicyRecovery) {
+    throw '-EnhancedStage is available only with training_config_policy_distillation.yaml.'
+}
+
 $ResumePath = ''
 if (-not [string]::IsNullOrWhiteSpace($Resume)) {
     $ResumeCandidate = if ([System.IO.Path]::IsPathRooted($Resume)) {
@@ -99,16 +140,66 @@ if (-not [string]::IsNullOrWhiteSpace($Resume)) {
         Join-Path $ProjectDirectory $Resume
     }
     $ResumePath = [System.IO.Path]::GetFullPath($ResumeCandidate)
-    if (-not (Test-Path -LiteralPath $ResumePath -PathType Leaf)) {
-        throw "Checkpoint not found: $ResumePath"
-    }
 }
 
-$CondaCommand = Get-Command conda -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($null -eq $CondaCommand) {
-    throw 'Conda was not found on PATH. Open an Anaconda or Miniconda PowerShell prompt and try again.'
+if ($IsPolicyRecovery) {
+    if ($FreshStart) {
+        throw 'FreshStart is disabled for the policy-distillation recovery experiment. Resume only from model_step_134000.pt.'
+    }
+    if (-not (Test-Path -LiteralPath $PolicyRecoveryBaselinePath -PathType Leaf)) {
+        throw "Policy recovery baseline not found: $PolicyRecoveryBaselinePath"
+    }
+
+    if ($EnhancedStage) {
+        if ([string]::IsNullOrWhiteSpace($ResumePath)) {
+            throw '-EnhancedStage requires -Resume with the recorded promoted policy-only checkpoint.'
+        }
+        if (-not (Test-Path -LiteralPath $ResumePath -PathType Leaf)) {
+            throw "Promoted policy checkpoint not found: $ResumePath"
+        }
+    } else {
+        if (-not [string]::IsNullOrWhiteSpace($ResumePath) -and
+            -not $ResumePath.Equals(
+                $PolicyRecoveryBaselinePath,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "The policy-distillation recovery experiment must resume from: $PolicyRecoveryBaselinePath"
+        }
+        $ResumePath = $PolicyRecoveryBaselinePath
+    }
+
+    $ActualPolicyRecoverySha256 = (Get-FileHash -LiteralPath $PolicyRecoveryBaselinePath `
+        -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($ActualPolicyRecoverySha256 -ne $PolicyRecoveryBaselineSha256) {
+        throw (
+            "Policy recovery baseline SHA-256 mismatch. Expected " +
+            "$PolicyRecoveryBaselineSha256 but found $ActualPolicyRecoverySha256. " +
+            'Training was not started.'
+        )
+    }
+} elseif (-not [string]::IsNullOrWhiteSpace($ResumePath) -and
+          -not (Test-Path -LiteralPath $ResumePath -PathType Leaf)) {
+    throw "Checkpoint not found: $ResumePath"
 }
-$CondaExecutable = $CondaCommand.Source
+
+$CondaExecutable = $null
+if (-not [string]::IsNullOrWhiteSpace($env:CONDA_EXE) -and
+    (Test-Path -LiteralPath $env:CONDA_EXE -PathType Leaf)) {
+    $CondaExecutable = [System.IO.Path]::GetFullPath($env:CONDA_EXE)
+} else {
+    # An activated Conda PowerShell session defines a function named "conda".
+    # Resolve only native commands so arguments such as "env list --json" are
+    # passed to Conda instead of PowerShell parameter binding.
+    $CondaCommand = Get-Command -Name conda.exe, conda.bat `
+        -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $CondaCommand) {
+        $CondaExecutable = $CondaCommand.Source
+    }
+}
+if ([string]::IsNullOrWhiteSpace($CondaExecutable)) {
+    throw 'A native Conda executable was not found. Open an Anaconda or Miniconda PowerShell prompt and try again.'
+}
 
 $LogDirectory = Join-Path $ProjectDirectory 'logs\local\console'
 [void] [System.IO.Directory]::CreateDirectory($LogDirectory)
@@ -168,6 +259,9 @@ try {
     Write-Host "Config:    $ConfigPath"
     Write-Host "Conda env: $CondaEnvironment"
     Write-Host "Log:       $LogFile"
+    if ($IsPolicyRecovery) {
+        Write-Host "Recovery:  verified step-134000 baseline ($PolicyRecoveryBaselineSha256)"
+    }
     Write-Host ''
     Write-Host 'Source safeguard: no package installation, source build, config edit, or Git mutation is performed.'
     Write-Host 'Expected training outputs may still be written according to the selected config.'
@@ -227,10 +321,16 @@ print(f"GPU: {properties.name}")
 print(f"VRAM: {properties.total_memory / (1024 ** 3):.1f} GB")
 print("DAMA trainer import: OK")
 '@
+    # conda.bat can truncate literal multiline arguments on Windows. Encode the
+    # preflight so Python receives it through one ASCII command-line argument.
+    $PreflightPayload = [System.Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes($PreflightCode)
+    )
+    $PreflightBootstrap = "import base64;exec(base64.b64decode('$PreflightPayload'))"
 
     $PreflightArguments = @(
         'run', '--no-capture-output', '-n', $CondaEnvironment,
-        'python', '-W', 'ignore::FutureWarning', '-c', $PreflightCode
+        'python', '-W', 'ignore::FutureWarning', '-c', $PreflightBootstrap
     )
     Invoke-CondaCommand -Arguments $PreflightArguments
     if ($NativeExitCode -ne 0) {
@@ -255,7 +355,19 @@ print("DAMA trainer import: OK")
         '--config', $ConfigPath
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($ResumePath)) {
+    if ($IsPolicyRecovery) {
+        $TrainerArguments += @('--resume', $ResumePath)
+        if ($EnhancedStage) {
+            $TrainerArguments += @(
+                '--enhanced-stage',
+                '--inference-depth',
+                $EnhancedInferenceDepth.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+            )
+            Write-Host "Resume policy: gated promoted policy checkpoint $ResumePath"
+        } else {
+            Write-Host "Resume policy: locked recovery baseline $PolicyRecoveryBaselinePath"
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($ResumePath)) {
         $TrainerArguments += @('--resume', $ResumePath)
         Write-Host "Resume policy: checkpoint $ResumePath"
     } elseif ($FreshStart) {
