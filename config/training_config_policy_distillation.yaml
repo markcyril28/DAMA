@@ -1,98 +1,68 @@
-# =============================================================================
-# Policy Distillation From Stronger Search
-# =============================================================================
-# Goal:
-#   Generate teacher targets from deeper algorithmic search and train the model
-#   to imitate the strongest available move.
-#
-# What this config supports today:
-#   - hard-label policy distillation through the existing `chosen_index` target
-#   - pure algorithm-vs-algorithm games, so every recorded move is teacher-made
-#   - stronger search teachers via `hard` and `super_hard` difficulties
-#   - isolated checkpoints/replay/logs/stats for this experiment
-#
-# What still requires code changes:
-#   - storing a full teacher distribution over legal moves
-#   - KL divergence / soft-label cross entropy
-#   - per-move teacher scores for all legal moves
-#
-# Usage:
-#   PYTHONPATH=src python -m dama.ai.ml.trainer \
-#       --config config/training_config_policy_distillation.yaml
-#
-# Server profile:
-#   PYTHONPATH=src python -m dama.ai.ml.trainer \
-#       --config config/training_config_policy_distillation.yaml --profile server
-# =============================================================================
+# Policy-distillation recovery configuration
+# Approved baseline: model_step_134000.pt only. This run has no fresh-weight arm.
 
-# -----------------------------------------------------------------------------
-# Device Settings
-# -----------------------------------------------------------------------------
 device:
   type: "cuda"
   amp:
     enabled: true
     dtype: "bfloat16"
   compile:
-    enabled: false                      # Local RTX 5050 path; server profile enables compile.
+    enabled: false
     mode: "reduce-overhead"
   matmul_precision: "medium"
 
-# -----------------------------------------------------------------------------
-# Model Architecture
-# -----------------------------------------------------------------------------
-# Match the current retrain architecture so this can reuse the same inference
-# shape and compare fairly against existing 128/8/256/128 runs.
-# -----------------------------------------------------------------------------
 model:
   channels: 128
   num_blocks: 8
   embedding_size: 256
   hidden_size: 128
 
-# -----------------------------------------------------------------------------
-# Policy Distillation Data Generation
-# -----------------------------------------------------------------------------
-# This config intentionally sets `games_per_epoch: 0` for ML-vs-* games and uses
-# only algo-vs-algo games. That makes every `chosen_index` a teacher move instead
-# of mixing in moves selected by the current ML model.
-# -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 10
-  games_per_epoch: 0                   # No ML-vs-algo or ML-vs-ML data.
-  difficulties:
-    - "hard"                           # Unused while games_per_epoch is 0.
-    - "super_hard"
+  cpu_workers: 12
+
+  # Exactly 72 of 240 trajectories come from the frozen current model.
+  games_per_epoch: 72
+  difficulties: ["easy", "medium", "hard"]
   focus_side: "both"
-  opponent_focus: "algorithm"          # Kept explicit; algo_vs_algo is the active source.
-  noise_prob: 0.0                      # Pure teacher moves; no random-move targets.
-  max_moves_per_game: 150
+  opponent_focus: "algorithm"
+
+  # Exploration changes the played action only. Every stored label is from hard.
+  noise_prob: 0.10
+  teacher_difficulty: "hard"
+  opening_plies: [2, 4, 6, 8]
+  opening_seed: 20260819
+  max_moves_per_game: 200
   pipeline_mode: "simultaneous"
   max_stale_epochs: 100
+  persist_selfplay: true
 
+  generation_mix:
+    total_games_per_cycle: 240
+    algorithm_fraction: 0.70
+    model_fraction: 0.30
+
+  # Exactly 168 of 240 trajectories use diverse algorithm behavior.
+  # Hard teacher relabeling is independent of these behavior difficulties.
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 240               # Local-safe; server profile increases this.
-    difficulties:
-      - "hard"
-      - "super_hard"
+    games_per_epoch: 168
+    difficulties: ["easy", "medium", "hard"]
 
-# -----------------------------------------------------------------------------
-# Training Hyperparameters
-# -----------------------------------------------------------------------------
-# Policy distillation is clean behavior cloning here, so reward weighting is
-# disabled. If later experiments need outcome emphasis, switch reward_mode to
-# "scoring", but that is no longer pure imitation of the teacher policy.
-# -----------------------------------------------------------------------------
+# No useful nontrivial symmetry is available. The rules-valid 180 degree
+# rotation with player swap is already identical after side-to-move encoding.
+augmentation:
+  symmetry: "none"
+
 training:
-  batch_size: 8192
+  stage: "policy_only"
+  batch_size: 2048
   learning_rate: 2.0e-4
-  weight_decay: 1.0e-5
+  weight_decay: 1.0e-4
   grad_clip_norm: 1.0
   train_steps: 100000000000
-  checkpoint_every: 1000
+  checkpoint_every: 2000
   gradient_accumulation_steps: 1
-
+  reward_mode: "none"
   lr_scheduler:
     enabled: false
     type: "cosine_warm_restarts"
@@ -101,61 +71,85 @@ training:
     eta_min: 5.0e-5
     warmup_steps: 200
 
-  reward_mode: "none"                 # Uniform hard-label CE over teacher moves.
+# The active recovery stage remains one-hot policy-only. The enhanced settings
+# are implemented but cannot activate until a policy-only promotion is recorded.
+teacher_policy:
+  target_type: "hard"
+  teacher_difficulty: "hard"
+  temperature: 1.0
+  score_depth: 3
+  value_scale: 1000.0
+  hard_label_blend: 0.25
+  require_policy_gate: true
 
-# -----------------------------------------------------------------------------
-# Value Head
-# -----------------------------------------------------------------------------
-# Disabled for the first distillation run to keep the objective policy-only:
-# imitate the stronger search move. Enable later if you want auxiliary outcome
-# supervision on top of distillation.
-# -----------------------------------------------------------------------------
 value_head:
   enabled: false
   hidden_size: 128
   value_weight: 0.15
 
-# -----------------------------------------------------------------------------
-# DataLoader Settings
-# -----------------------------------------------------------------------------
+validation:
+  enabled: true
+  split_fraction: 0.15
+  split_seed: 20260819
+  every_checkpoints: 1
+  frozen_suite_path: "data/validation_policy_distillation/frozen_hard_5000.jsonl"
+  frozen_suite_size: 5000
+  frozen_suite_seed: 20260819
+  auto_create_suite: true
+  teacher_agreement_threshold: 0.50
+
+corpus_snapshots:
+  enabled: true
+  root: "data/corpus_snapshots/policy_distillation"
+  minimum_fresh_state_fraction: 0.50
+
 dataloader:
-  num_workers: 0                       # FastBatchIterator bypasses DataLoader.
+  num_workers: 0
   pin_memory: true
   prefetch_factor: 2
   replay_max_entries: 1000000
+  replay_max_files: 60
   clear_replay_after_load: false
   max_moves_per_sample: 32
-
   ram_cache:
     enabled: true
     threshold_gb: 16.0
     cache_file: "data/replay_cache/policy_distillation_cache.pt"
 
-# -----------------------------------------------------------------------------
-# Model Testing Settings
-# -----------------------------------------------------------------------------
+# Game strength is evaluated only after held-out teacher-agreement promotion.
+# Each opponent receives 100 games, exactly 50 on each player side.
 testing:
   enabled: true
-  every_n_steps: 1000
-  num_games: 50
+  promoted_only: true
+  every_n_steps: 2000
+  num_games: 100
+  opponents: ["random", "easy"]
   difficulty: "easy"
+  opening_plies: [0, 2, 4, 6, 8]
+  opening_seed: 20260819
+  confidence_method: "wilson_score"
+  confidence_level: 0.95
+  random_match_score_threshold: 0.80
+  random_lower_confidence_bound: 0.70
+  easy_lower_confidence_bound: 0.50
+  easy_side_score_floor: 0.50
+  inference_depth: 1
 
-# -----------------------------------------------------------------------------
-# Paths
-# -----------------------------------------------------------------------------
 paths:
   checkpoint_dir: "models/checkpoints_policy_distillation"
   latest_model: "models/latest_policy_distillation.pt"
+  promoted_model: "models/promoted_policy_distillation.pt"
+  accepted_model: "models/accepted_policy_distillation.pt"
   replay_dir: "data/replay_policy_distillation"
   log_dir: "logs/policy_distillation"
   stats_file: "models/training_stats_policy_distillation.json"
+  promotion_registry: "logs/policy_distillation/promotions.jsonl"
+  acceptance_dir: "logs/policy_distillation/acceptance"
 
-# -----------------------------------------------------------------------------
-# Statistics Collection
-# -----------------------------------------------------------------------------
 statistics:
   enabled: true
   record_every: 200
+  progress_report_every_seconds: 300
   system_every: 5000
   model_health_every: 5000
   score_dist_every: 500
@@ -163,51 +157,27 @@ statistics:
   flush_every: 500
   output_dir: "logs/policy_distillation/stats"
 
-# -----------------------------------------------------------------------------
-# Thermal Protection
-# -----------------------------------------------------------------------------
 thermal_protection:
   enabled: true
   temp_limit_c: 89
   rest_duration: "10m"
   check_every: 30
 
-# -----------------------------------------------------------------------------
-# Resume Settings
-# -----------------------------------------------------------------------------
 resume:
-  enabled: true                       # Continue the latest policy-distillation checkpoint.
-  checkpoint_path: null
-  skip_corrupted: true
+  enabled: true
+  checkpoint_path: "models/checkpoints_policy_distillation/model_step_134000.pt"
+  skip_corrupted: false
 
-# -----------------------------------------------------------------------------
-# Time-based Stopping
-# -----------------------------------------------------------------------------
+recovery_experiment:
+  enabled: true
+  baseline_checkpoint: "models/checkpoints_policy_distillation/model_step_134000.pt"
+  baseline_sha256: "7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
+
 time_limit:
   enabled: true
   duration: "48h"
 
-# =============================================================================
-# Future Soft-Label / KL Direction (not consumed by trainer.py yet)
-# =============================================================================
-# To support the optional improvement described in the docs, the code needs a
-# new replay target format. A future config section could look like this after
-# implementation:
-#
-# teacher_policy:
-#   target_type: "distribution"         # instead of current "chosen_index"
-#   evaluate_all_legal_moves: true
-#   teacher_difficulty: "super_hard"
-#   temperature: 1.0
-#   loss: "kl_divergence"
-#
-# Current trainer ignores this because the replay/dataset/loss path only stores
-# and consumes `chosen_index`.
-# =============================================================================
-
 profiles:
-  # Server GPU / high-CPU profile. Uses the same algorithmic-teacher idea, but
-  # increases data volume and batch size.
   server:
     device:
       type: "cuda"
@@ -221,19 +191,22 @@ profiles:
 
     selfplay:
       cpu_workers: 64
+      games_per_epoch: 360
       max_stale_epochs: 500
+      generation_mix:
+        total_games_per_cycle: 1200
+        algorithm_fraction: 0.70
+        model_fraction: 0.30
       algo_vs_algo:
         enabled: true
-        games_per_epoch: 1200
-        difficulties:
-          - "hard"
-          - "super_hard"
+        games_per_epoch: 840
+        difficulties: ["easy", "medium", "hard", "super_hard"]
 
     training:
       batch_size: 65536
       learning_rate: 4.2e-4
       weight_decay: 1.0e-4
-      checkpoint_every: 1000
+      checkpoint_every: 2000
       lr_scheduler:
         enabled: true
         type: "cosine_warm_restarts"
@@ -248,12 +221,6 @@ profiles:
         enabled: true
         threshold_gb: 64.0
         cache_file: "data/replay_cache/policy_distillation_server_cache.pt"
-
-    testing:
-      enabled: true
-      every_n_steps: 1000
-      num_games: 50
-      difficulty: "easy"
 
     thermal_protection:
       enabled: false
