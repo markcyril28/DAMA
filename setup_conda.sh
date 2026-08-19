@@ -10,9 +10,10 @@ ENV_NAME="dama"                  # Name of the conda environment
 PYTHON_VERSION="3.11"            # Python version (must match environment.yml)
 
 # PyTorch settings
-FORCE_PYTORCH_NIGHTLY=false      # Force nightly PyTorch even on older GPUs
-CUDA_VERSION_STABLE="cu121"      # CUDA version for stable PyTorch (cu118, cu121)
-CUDA_VERSION_NIGHTLY="cu128"     # CUDA version for nightly PyTorch
+# Stable PyTorch has shipped native Blackwell (sm_120 / RTX 50-series) support
+# with CUDA 12.8 wheels since v2.7.0, so nightly builds are no longer needed
+# for RTX 50-series GPUs. cu128 wheels work across Ampere/Ada/Hopper/Blackwell.
+CUDA_VERSION="cu128"              # cu126, cu128, or cu130
 
 # Optional components
 INSTALL_QT_DEPS=true             # Install Qt/X11 system dependencies
@@ -70,26 +71,20 @@ fi
 echo "Active environment: ${CONDA_PREFIX:-unknown}"
 
 echo ""
-echo "Installing PyTorch with CUDA support..."
-echo "Note: RTX 50-series GPUs require PyTorch nightly builds for full support."
+echo "Installing PyTorch (stable) with CUDA ${CUDA_VERSION} support..."
 
-# Try to detect GPU compute capability
-COMPUTE_CAP=$(python -c "import subprocess; result = subprocess.run(['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'], capture_output=True, text=True); print(result.stdout.strip().split('.')[0] if result.returncode == 0 else '0')" 2>/dev/null || echo "0")
-
-if [[ "$COMPUTE_CAP" -ge "10" ]] || [[ "$FORCE_PYTORCH_NIGHTLY" = true ]]; then
-    # RTX 50-series (Blackwell) or newer - use nightly builds
-    if [[ "$COMPUTE_CAP" -ge "10" ]]; then
-        echo "Detected RTX 50-series or newer GPU (compute capability $COMPUTE_CAP.x)"
-    else
-        echo "Forcing PyTorch nightly build as requested"
-    fi
-    echo "Installing PyTorch nightly with CUDA ${CUDA_VERSION_NIGHTLY} support..."
-    pip install --pre torch torchvision --index-url "https://download.pytorch.org/whl/nightly/${CUDA_VERSION_NIGHTLY}"
-else
-    # Older GPUs - use stable release
-    echo "Installing PyTorch stable with CUDA ${CUDA_VERSION_STABLE} support..."
-    pip install torch torchvision --index-url "https://download.pytorch.org/whl/${CUDA_VERSION_STABLE}"
+# Log detected GPU architecture for information only — stable PyTorch >=2.7.0
+# supports everything from Ampere through Blackwell via the cu128/cu130 wheels,
+# so no branching on compute capability is needed anymore.
+COMPUTE_CAP=$(python -c "import subprocess; result = subprocess.run(['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'], capture_output=True, text=True); print(result.stdout.strip().split('.')[0] if result.returncode == 0 else 'unknown')" 2>/dev/null || echo "unknown")
+if [[ "$COMPUTE_CAP" != "unknown" ]]; then
+    echo "Detected GPU compute capability: ${COMPUTE_CAP}.x"
 fi
+
+# Install torch + torchvision unpinned from the stable index. Stable releases
+# are published as matched trios, so there's no risk of the version-mismatch
+# resolver error you get on the nightly channel.
+pip install torch torchvision --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}"
 
 if [[ "$INSTALL_MATPLOTLIB" = true ]]; then
     echo ""
@@ -167,6 +162,7 @@ echo "Python: $(python --version)"
 python -c "import torch; print('PyTorch version:', torch.__version__)"
 python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 python -c "import torch; print('CUDA version:', torch.version.cuda if torch.cuda.is_available() else 'N/A')"
+python -c "from PyQt6.QtCore import QT_VERSION_STR; print('Qt GUI available:', QT_VERSION_STR)"
 
 # WSL detection and hints
 if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
