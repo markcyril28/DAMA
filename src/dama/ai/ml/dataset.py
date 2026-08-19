@@ -1829,6 +1829,7 @@ def prepare_training_data(
     replay_buffer: ReplayBuffer,
     max_entries: int = 100000,
     val_split: float = 0.1,
+    split_seed: int = 20260819,
 ) -> Tuple[List[ReplayEntry], List[ReplayEntry]]:
     """
     Prepare training and validation data from replay buffer.
@@ -1836,23 +1837,31 @@ def prepare_training_data(
     Args:
         replay_buffer: Source of training data
         max_entries: Maximum entries to use
-        val_split: Fraction for validation
+        val_split: Fraction of whole replay files reserved for validation
+        split_seed: Stable seed used to assign whole files to validation
 
     Returns:
         (train_entries, val_entries)
     """
-    # Collect entries
-    entries = replay_buffer.sample_entries(max_entries)
+    if val_split <= 0.0:
+        entries = replay_buffer.sample_entries(max_entries)
+        random.shuffle(entries)
+        return entries, []
 
-    if not entries:
-        return [], []
+    # A record-level split leaks adjacent and duplicate states from the same
+    # game into both partitions. Replay files are the smallest provenance group
+    # retained by legacy data, so reserve complete files and remove every
+    # canonical train state that also occurs in validation.
+    from .corpus import split_replay_by_file
 
-    # Shuffle
-    random.shuffle(entries)
-
-    # Split
-    val_size = int(len(entries) * val_split)
-    val_entries = entries[:val_size]
-    train_entries = entries[val_size:]
-
+    files = replay_buffer.get_replay_files()
+    train_entries, val_entries = split_replay_by_file(
+        files,
+        validation_fraction=val_split,
+        seed=split_seed,
+    )
+    if max_entries > 0 and len(train_entries) > max_entries:
+        rng = random.Random(split_seed)
+        indices = sorted(rng.sample(range(len(train_entries)), max_entries))
+        train_entries = [train_entries[index] for index in indices]
     return train_entries, val_entries
