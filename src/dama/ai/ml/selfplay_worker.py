@@ -18,7 +18,6 @@ from pathlib import Path
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-from dama.types import Player
 from dama.ai.ml.scoring import score_game_dicts
 
 # Try Cython full game loop first (2-7x faster than Python game loop).
@@ -28,9 +27,10 @@ try:
 except ImportError:
     _HAS_FAST_GAME = False
 
-from dama.game_state import GameState
-from dama.board import Board
-from dama.ai.algorithmic.search import get_best_move
+from dama.ai.ml.selfplay import (
+    HARD_TEACHER_DIFFICULTY,
+    play_single_game as _play_single_game_python,
+)
 
 
 def play_single_game(
@@ -40,6 +40,11 @@ def play_single_game(
     start_player: int = 1,
     p1_difficulty: str = None,
     p2_difficulty: str = None,
+    teacher_difficulty: str = HARD_TEACHER_DIFFICULTY,
+    opening_plies: int = 0,
+    opening_seed: int = 0,
+    trajectory_source: str = 'algorithm',
+    game_id: str = None,
 ) -> list:
     """Play a single game and return entries as dicts.
 
@@ -61,6 +66,11 @@ def play_single_game(
             p1_difficulty=_p1_diff, p2_difficulty=_p2_diff,
             max_moves=max_moves, noise_prob=noise_prob,
             start_player=start_player,
+            teacher_difficulty=teacher_difficulty,
+            opening_plies=opening_plies,
+            opening_seed=opening_seed,
+            trajectory_source=trajectory_source,
+            game_id=game_id,
         )
         entries = result['entries']
         score_game_dicts(
@@ -71,86 +81,24 @@ def play_single_game(
         )
         return entries
 
-    # Python fallback
-    start_player = Player(start_player)
-    state = GameState(
-        board=Board.initial(),
-        current_player=start_player,
-        move_count=0,
-    )
-    entries = []
-    move_count = 0
-    player_captures = {Player.ONE: 0, Player.TWO: 0}
-
-    while move_count < max_moves:
-        legal_moves = state.legal_moves()
-        if not legal_moves:
-            break
-
-        cur_diff = _p1_diff if state.current_player == Player.ONE else _p2_diff
-
-        # Select move with optional noise for exploration
-        if random.random() < noise_prob and len(legal_moves) > 1:
-            chosen_move = random.choice(legal_moves)
-        else:
-            chosen_move = get_best_move(state, cur_diff, use_parallel=False)
-            if chosen_move is None:
-                chosen_move = random.choice(legal_moves)
-
-        # Find the index of chosen move
-        try:
-            chosen_index = legal_moves.index(chosen_move)
-        except ValueError:
-            for i, m in enumerate(legal_moves):
-                if m.path == chosen_move.path:
-                    chosen_index = i
-                    break
-            else:
-                chosen_index = 0
-                chosen_move = legal_moves[0]
-
-        # Track captures
-        if chosen_move.is_capture:
-            player_captures[state.current_player] += chosen_move.num_captures
-
-        # Record the position
-        entry = {
-            'state': state.to_compact(),
-            'legal_moves': [m.to_dict() for m in legal_moves],
-            'chosen_index': chosen_index,
-            'result': 0,
-            'score': 0.0,
-        }
-        entries.append(entry)
-
-        # Apply the move
-        state = state.apply_move(chosen_move)
-        move_count += 1
-
-    # Determine winner and score entries
-    winner = state.winner()
-    winner_int = int(winner) if winner is not None else None
-
-    for entry in entries:
-        turn = entry['state']['turn']
-        if winner is None:
-            entry['result'] = 0
-        elif turn == winner_int:
-            entry['result'] = 1
-        else:
-            entry['result'] = -1
-
-    score_game_dicts(
-        entry_dicts=entries,
-        winner_int=winner_int,
-        total_moves=move_count,
+    # Use the shared Python implementation so label/action separation and
+    # replay metadata stay identical to the in-process generator.
+    return _play_single_game_python(
+        difficulty=difficulty,
         max_moves=max_moves,
-        final_state_dict=state.to_compact(),
-        p1_captures=player_captures[Player.ONE],
-        p2_captures=player_captures[Player.TWO],
+        noise_prob=noise_prob,
+        start_player=start_player,
+        p1_policy='algorithmic',
+        p2_policy='algorithmic',
+        p1_difficulty=_p1_diff,
+        p2_difficulty=_p2_diff,
+        return_dicts=True,
+        teacher_difficulty=teacher_difficulty,
+        opening_plies=opening_plies,
+        opening_seed=opening_seed,
+        trajectory_source=trajectory_source,
+        game_id=game_id,
     )
-
-    return entries
 
 
 def main():
@@ -167,6 +115,8 @@ def main():
                         help='Player 2 difficulty (overrides --difficulty)')
     parser.add_argument('--max-moves', type=int, default=200, help='Max moves per game')
     parser.add_argument('--noise-prob', type=float, default=0.1, help='Random move probability')
+    parser.add_argument('--opening-plies', type=int, default=0,
+                        help='Seeded random legal plies before replay recording')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
     args = parser.parse_args()
 
@@ -190,6 +140,10 @@ def main():
                 start_player=start_player,
                 p1_difficulty=args.p1_difficulty,
                 p2_difficulty=args.p2_difficulty,
+                opening_plies=args.opening_plies,
+                opening_seed=(args.seed + game_idx if args.seed is not None else game_idx),
+                trajectory_source='algorithm',
+                game_id=f"worker-game-{game_idx}",
             )
 
             for entry in entries:
