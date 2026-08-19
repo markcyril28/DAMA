@@ -1751,12 +1751,136 @@ cdef dict board_to_compact_dict(signed char *board, int player, int move_count):
     }
 
 
+cdef inline void _copy_move_list(CMoveList *source, CMoveList *target):
+    cdef int i
+    target.count = source.count
+    for i in range(source.count):
+        target.moves[i] = source.moves[i]
+
+
+cdef inline bint _same_cmove(CMove *left, CMove *right):
+    cdef int i
+    if (left.path_len != right.path_len
+            or left.num_captures != right.num_captures
+            or left.promotion != right.promotion):
+        return False
+    for i in range(left.path_len):
+        if (left.path_r[i] != right.path_r[i]
+                or left.path_c[i] != right.path_c[i]):
+            return False
+    for i in range(left.num_captures):
+        if (left.cap_r[i] != right.cap_r[i]
+                or left.cap_c[i] != right.cap_c[i]):
+            return False
+    return True
+
+
+cdef int _find_cmove_index(CMoveList *moves, CMove *target):
+    cdef int i
+    for i in range(moves.count):
+        if _same_cmove(&moves.moves[i], target):
+            return i
+    return 0
+
+
+cdef int _search_game_move(
+    signed char *board,
+    int player,
+    CMoveList *moves,
+    Rules *rules,
+    SearchState *ss,
+    unsigned long long h,
+    str difficulty,
+):
+    """Search one move in a mutable move-list copy and return its final index."""
+    cdef double time_budget
+    cdef int max_depth, best_idx, idx, depth
+    cdef int tt_from_sq = -1, tt_to_sq = -1
+    cdef float dummy_score, dummy_alpha, dummy_beta
+    cdef float previous_score = 0.0
+    cdef float aspiration_alpha, aspiration_beta, aspiration_delta
+    cdef CMove temp_move
+
+    if moves.count <= 1:
+        return 0
+    if difficulty == 'easy':
+        time_budget = 0.2
+        max_depth = 3
+    elif difficulty == 'hard':
+        time_budget = 2.5
+        max_depth = 8
+    elif difficulty == 'super_hard':
+        time_budget = 5.0
+        max_depth = 12
+    else:
+        time_budget = 0.8
+        max_depth = 5
+
+    if _tt_table != NULL:
+        dummy_alpha = -100000.0
+        dummy_beta = 100000.0
+        tt_probe(h, 0, &dummy_score, &dummy_alpha, &dummy_beta,
+                 &tt_from_sq, &tt_to_sq)
+    _order_moves_full(moves, 0, ss, tt_from_sq, tt_to_sq, board, -1, -1)
+    _age_history(ss)
+    ss.deadline = _wall_now() + time_budget
+    ss.nodes = 0
+    ss.timeout = False
+
+    best_idx = 0
+    for depth in range(1, max_depth + 1):
+        ss.timeout = False
+        if depth < 5:
+            idx = search_root(board, player, moves, depth,
+                              -100000.0, 100000.0, rules, ss, h)
+        else:
+            aspiration_delta = 50.0
+            aspiration_alpha = previous_score - aspiration_delta
+            aspiration_beta = previous_score + aspiration_delta
+            while True:
+                idx = search_root(board, player, moves, depth,
+                                  aspiration_alpha, aspiration_beta,
+                                  rules, ss, h)
+                if ss.timeout:
+                    break
+                if (ss.root_score > aspiration_alpha
+                        and ss.root_score < aspiration_beta):
+                    break
+                aspiration_delta = aspiration_delta * 2.0
+                if aspiration_delta >= 5000.0:
+                    ss.timeout = False
+                    idx = search_root(board, player, moves, depth,
+                                      -100000.0, 100000.0, rules, ss, h)
+                    break
+                if ss.root_score <= aspiration_alpha:
+                    aspiration_alpha = previous_score - aspiration_delta
+                else:
+                    aspiration_beta = previous_score + aspiration_delta
+                ss.timeout = False
+        if not ss.timeout:
+            best_idx = idx
+            previous_score = ss.root_score
+            if best_idx != 0:
+                temp_move = moves.moves[0]
+                moves.moves[0] = moves.moves[best_idx]
+                moves.moves[best_idx] = temp_move
+                best_idx = 0
+        if ss.timeout or _check_deadline(ss):
+            break
+    return best_idx
+
+
 def play_full_game_cy(
     str p1_difficulty = 'medium',
     str p2_difficulty = 'medium',
     int max_moves = 100,
     double noise_prob = 0.1,
     int start_player = 1,
+    str teacher_difficulty = 'hard',
+    int opening_plies = 0,
+    object opening_seed = 0,
+    str trajectory_source = 'algorithm',
+    object game_id = None,
 ) -> dict:
     """Play a complete algorithmic game entirely in C.
 
@@ -1772,24 +1896,53 @@ def play_full_game_cy(
 
     cdef signed char board[64]
     cdef signed char new_board[64]
-    cdef CMoveList moves
+    cdef CMoveList moves, teacher_moves, behavior_moves
     cdef Rules rules
-    cdef int player, chosen_idx, apply_idx, move_num, depth, idx, i, j
-    cdef double time_budget
-    cdef int max_depth, best_idx
-    cdef SearchState ss
+    cdef int player, move_num, i
+    cdef int teacher_idx = 0, played_idx = 0, apply_idx = 0
+    cdef int teacher_best_idx = 0, behavior_best_idx = 0
+    cdef int opening_i, opening_index, applied_opening_plies = 0
+    cdef SearchState teacher_ss, behavior_ss
     cdef int p1_caps = 0, p2_caps = 0
     cdef bint game_over = False
+    cdef bint was_exploration = False
     cdef unsigned long long h
-    cdef float _prev_score, _asp_a, _asp_b, _asp_delta
-    cdef int root_order[MAX_MOVES]  # Maps current pos → original pos for replay
-    cdef CMove temp_move
-    cdef float dummy_score, dummy_alpha, dummy_beta
-    cdef int tt_from_sq, tt_to_sq
+    cdef CMove teacher_move, behavior_move
+    cdef object opening_rng
+    cdef object behavior_rng
+
+    if teacher_difficulty != 'hard':
+        raise ValueError("play_full_game_cy requires teacher_difficulty='hard'")
+    if opening_plies < 0:
+        raise ValueError("opening_plies must be non-negative")
+    if noise_prob < 0.0 or noise_prob > 1.0:
+        raise ValueError("noise_prob must be between 0 and 1")
 
     rules = _load_rules()
     init_standard_board(board)
     player = start_player
+
+    # Opening actions are legal and deterministic for a supplied seed. They
+    # alter only trajectory setup and are not emitted as training records.
+    opening_rng = _rng.Random(opening_seed)
+    behavior_rng = _rng.Random(
+        (int(opening_seed or 0) ^ 0x6A09E667F3BCC909) & ((1 << 64) - 1))
+    for opening_i in range(opening_plies):
+        moves.count = 0
+        generate_all_moves_c(board, player, &rules, &moves)
+        if moves.count == 0:
+            game_over = True
+            break
+        opening_index = opening_rng.randrange(moves.count)
+        if moves.moves[opening_index].num_captures > 0:
+            if player == PLAYER_ONE:
+                p1_caps += moves.moves[opening_index].num_captures
+            else:
+                p2_caps += moves.moves[opening_index].num_captures
+        apply_move_c(board, new_board, &moves.moves[opening_index], player)
+        memcpy(board, new_board, 64)
+        player = opponent(player)
+        applied_opening_plies += 1
 
     # Allocate TT once; bump generation once at game start. During the game,
     # TT entries from prior moves are still useful — positions reached from
@@ -1803,7 +1956,8 @@ def play_full_game_cy(
     # Killers and history persist across moves within a game — moves that
     # cause cutoffs at ply N tend to be good at the same ply in later positions.
     h = compute_hash(board, player)
-    _init_search_tables(&ss)
+    _init_search_tables(&teacher_ss)
+    _init_search_tables(&behavior_ss)
 
     cdef list entries = []
     cdef list moves_list
@@ -1820,136 +1974,75 @@ def play_full_game_cy(
             game_over = True
             break
 
-        # Order moves using full heuristic (TT move, killers, history).
-        # TT probe extracts best move from prior search of this position
-        # (iterative deepening reuses TT entries). Killers/history from prior
-        # moves in this game provide additional ordering signal.
-        tt_from_sq = -1; tt_to_sq = -1
-        if _tt_table != NULL:
-            dummy_alpha = -100000.0; dummy_beta = 100000.0
-            tt_probe(h, 0, &dummy_score, &dummy_alpha, &dummy_beta,
-                     &tt_from_sq, &tt_to_sq)
-        _order_moves_full(&moves, 0, &ss, tt_from_sq, tt_to_sq, board, -1, -1)
-        # Initialize index mapping (current pos → original pos for replay)
-        for i in range(moves.count):
-            root_order[i] = i
-
         # Convert board and moves to Python dicts for replay recording
-        state_dict = board_to_compact_dict(board, player, move_num)
+        state_dict = board_to_compact_dict(
+            board, player, applied_opening_plies + move_num)
         moves_list = []
         for i in range(moves.count):
             moves_list.append(cmove_to_dict(&moves.moves[i]))
 
-        # Choose move: noise (exploration) or alpha-beta search
-        # chosen_idx: index into moves_list (original pre-ID-swap order) for replay
-        # apply_idx:  index into moves.moves[] (current, possibly swapped order)
+        # Search the hard teacher for every non-forced position. Behavior and
+        # exploration choose played_idx independently from teacher_idx.
         if moves.count == 1:
-            chosen_idx = 0
+            teacher_idx = 0
+            played_idx = 0
             apply_idx = 0
-        elif _rng.random() < noise_prob:
-            chosen_idx = _rng.randint(0, moves.count - 1)
-            apply_idx = chosen_idx  # no ID swaps in noise path
+            was_exploration = False
         else:
             cur_diff = p1_difficulty if player == PLAYER_ONE else p2_difficulty
+            was_exploration = behavior_rng.random() < noise_prob
 
-            if cur_diff == 'easy':
-                time_budget = 0.2; max_depth = 3
+            if not was_exploration and cur_diff != 'hard':
+                # Keep non-hard behavior searches isolated from the hard
+                # teacher's transposition-table generation.
+                _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
+                _copy_move_list(&moves, &behavior_moves)
+                behavior_best_idx = _search_game_move(
+                    board, player, &behavior_moves, &rules,
+                    &behavior_ss, h, cur_diff)
+                behavior_move = behavior_moves.moves[behavior_best_idx]
+                played_idx = _find_cmove_index(&moves, &behavior_move)
+                _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
+
+            _copy_move_list(&moves, &teacher_moves)
+            teacher_best_idx = _search_game_move(
+                board, player, &teacher_moves, &rules,
+                &teacher_ss, h, 'hard')
+            teacher_move = teacher_moves.moves[teacher_best_idx]
+            teacher_idx = _find_cmove_index(&moves, &teacher_move)
+
+            if was_exploration:
+                played_idx = behavior_rng.randrange(moves.count)
             elif cur_diff == 'hard':
-                time_budget = 2.5; max_depth = 8
-            elif cur_diff == 'super_hard':
-                time_budget = 5.0; max_depth = 12
-            else:
-                time_budget = 0.8; max_depth = 5
+                played_idx = teacher_idx
+            apply_idx = played_idx
 
-            # TT is NOT cleared between moves — entries from prior searches are
-            # still valid (same game, related positions) and provide free hits.
-            # Age history table: halve all entries to prevent long-game saturation.
-            # Without aging, entries cap at 10000 and all quiet moves look equally
-            # good after ~50 moves. Halving preserves relative ordering while
-            # letting recent cutoffs dominate older ones.
-            _age_history(&ss)
-            ss.deadline = _wall_now() + time_budget
-            ss.nodes = 0
-            ss.timeout = False
-
-            best_idx = 0
-            _prev_score = 0.0
-            for depth in range(1, max_depth + 1):
-                ss.timeout = False
-                if depth < 5:
-                    idx = search_root(board, player, &moves, depth,
-                                      -100000.0, 100000.0, &rules, &ss, h)
-                else:
-                    # Progressive aspiration windows: start narrow (±50), widen
-                    # on fail-low/fail-high (2× per retry). Full-window fallback
-                    # at delta ≥5000. Narrower initial windows than the previous
-                    # fixed ±75 mean fewer nodes on ~85% of searches that stay in
-                    # window, while progressive widening handles tactical positions
-                    # without the cost of an immediate full-window re-search.
-                    _asp_delta = 50.0
-                    _asp_a = _prev_score - _asp_delta
-                    _asp_b = _prev_score + _asp_delta
-                    while True:
-                        idx = search_root(board, player, &moves, depth,
-                                          _asp_a, _asp_b, &rules, &ss, h)
-                        if ss.timeout:
-                            break
-                        if ss.root_score > _asp_a and ss.root_score < _asp_b:
-                            break  # Score within window — accept
-                        _asp_delta = _asp_delta * 2.0
-                        if _asp_delta >= 5000.0:
-                            ss.timeout = False
-                            idx = search_root(board, player, &moves, depth,
-                                              -100000.0, 100000.0, &rules, &ss, h)
-                            break
-                        # Widen the failed side
-                        if ss.root_score <= _asp_a:
-                            _asp_a = _prev_score - _asp_delta
-                        else:
-                            _asp_b = _prev_score + _asp_delta
-                        ss.timeout = False
-                if not ss.timeout:
-                    best_idx = idx
-                    _prev_score = ss.root_score
-                    # Swap best move to position 0 for next ID iteration.
-                    # PVS searches move 0 with full window — putting the
-                    # best move from depth N at position 0 for depth N+1
-                    # maximizes PVS effectiveness (the PV move is usually
-                    # still best at the next depth).
-                    if best_idx != 0:
-                        temp_move = moves.moves[0]
-                        moves.moves[0] = moves.moves[best_idx]
-                        moves.moves[best_idx] = temp_move
-                        j = root_order[0]
-                        root_order[0] = root_order[best_idx]
-                        root_order[best_idx] = j
-                        best_idx = 0
-                if ss.timeout or _check_deadline(&ss):
-                    break
-            # chosen_idx: original index for replay entry (maps to moves_list)
-            # apply_idx:  actual position in the (swapped) C array
-            chosen_idx = root_order[best_idx]
-            apply_idx = best_idx
-
-        # Track captures per player (use apply_idx for swapped C array)
+        # Track captures for the played action.
         if moves.moves[apply_idx].num_captures > 0:
             if player == PLAYER_ONE:
                 p1_caps += moves.moves[apply_idx].num_captures
             else:
                 p2_caps += moves.moves[apply_idx].num_captures
 
-        # Record entry (format matches ReplayEntry.to_dict())
-        # chosen_idx indexes into moves_list (original pre-swap order)
-        entries.append({
+        # Record the hard teacher label and separate behavior action.
+        entry_d = {
             'state': state_dict,
             'legal_moves': moves_list,
-            'chosen_index': chosen_idx,
+            'chosen_index': teacher_idx,
+            'played_index': played_idx,
+            'trajectory_source': trajectory_source,
+            'was_exploration': bool(was_exploration),
+            'teacher_difficulty': teacher_difficulty,
+            'opening_plies': applied_opening_plies,
             'result': 0,
             'score': 0.0,
-        })
+        }
+        if game_id is not None:
+            entry_d['game_id'] = str(game_id)
+        entries.append(entry_d)
 
         # Apply move in C (board → new_board, then copy back)
-        # Use apply_idx for the actual move in the (possibly swapped) C array
+        # apply_idx refers to the original, unmodified move list.
         h = _hash_after_move(h, board, &moves.moves[apply_idx], player)
         apply_move_c(board, new_board, &moves.moves[apply_idx], player)
         memcpy(board, new_board, 64)
@@ -1980,12 +2073,14 @@ def play_full_game_cy(
             entry_d['result'] = -1  # Loss
 
     # Final state for scoring
-    final_state_dict = board_to_compact_dict(board, player, actual_moves)
+    final_state_dict = board_to_compact_dict(
+        board, player, applied_opening_plies + actual_moves)
 
     return {
         'entries': entries,
         'winner': winner_py,
         'num_moves': actual_moves,
+        'opening_plies': applied_opening_plies,
         'p1_captures': p1_caps,
         'p2_captures': p2_caps,
         'final_state': final_state_dict,
