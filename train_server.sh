@@ -22,7 +22,7 @@ set -euo pipefail
 # Config file to use (comment/uncomment to switch)
 # Note: These are relative to PROJECT_DIR, resolved after SCRIPT_DIR is set
 #_CONFIG_FILE="config/training_config_server_retrain.yaml"
-_CONFIG_FILE="config/training_config_server_policy_distillation.yaml"
+_CONFIG_FILE="config/training_config_policy_distillation.yaml"
 # _CONFIG_FILE="config/training_config_server.yaml"
 # _CONFIG_FILE="config/training_config.yaml"
 
@@ -30,7 +30,7 @@ _CONFIG_FILE="config/training_config_server_policy_distillation.yaml"
 # CONFIG_PROFILE="server"
 # CONFIG_PROFILE="local"
 # CONFIG_PROFILE="cpu"
-CONFIG_PROFILE=""
+CONFIG_PROFILE="server"
 
 # -----------------------------------------------------------------------------
 # Resume Settings (can override config file)
@@ -38,8 +38,9 @@ CONFIG_PROFILE=""
 SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
 PROCESS_TITLE="micro_trainer"            # Process name shown in htop or btop (requires 'setproctitle' package)
 RESUME=""                        # Path to checkpoint to resume from
-RESUME_LATEST=false             # Fresh retrain: embed_norm makes old checkpoints obsolete. See Journal Pass 105.
-                                 # NOTE: --resume-latest overrides YAML resume.enabled, so keep this false until a healthy new-arch checkpoint exists.
+RESUME_LATEST=false             # Forbidden for the resume-only recovery experiment.
+ENHANCED_STAGE=false            # true only after a policy-only checkpoint is promoted.
+ENHANCED_INFERENCE_DEPTH=2      # Enhanced stage only: 2 or 3.
 
 # -----------------------------------------------------------------------------
 # Time-based Stopping (can override config file)
@@ -58,6 +59,57 @@ PROJECT_DIR="$SCRIPT_DIR"
 # Resolve config file path (relative paths are relative to PROJECT_DIR)
 CONFIG_FILE="${PROJECT_DIR}/${_CONFIG_FILE}"
 [ -f "$CONFIG_FILE" ] || { echo "ERROR: Config file not found: $CONFIG_FILE"; exit 1; }
+CONFIG_FILE="$(readlink -f "$CONFIG_FILE")"
+
+# The approved recovery has one immutable anchor and no fresh/latest arm.
+POLICY_RECOVERY_CONFIG="$(readlink -f "${PROJECT_DIR}/config/training_config_policy_distillation.yaml")"
+POLICY_RECOVERY_BASELINE="${PROJECT_DIR}/models/checkpoints_policy_distillation/model_step_134000.pt"
+POLICY_RECOVERY_SHA256="7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
+if [ "$CONFIG_FILE" = "$POLICY_RECOVERY_CONFIG" ]; then
+    if [ "$RESUME_LATEST" = true ]; then
+        echo "ERROR: --resume-latest is disabled for policy recovery." >&2
+        exit 1
+    fi
+    if [ ! -f "$POLICY_RECOVERY_BASELINE" ]; then
+        echo "ERROR: Recovery baseline not found: $POLICY_RECOVERY_BASELINE" >&2
+        exit 1
+    fi
+    _baseline_sha256="$(sha256sum "$POLICY_RECOVERY_BASELINE" | awk '{print toupper($1)}')"
+    if [ "$_baseline_sha256" != "$POLICY_RECOVERY_SHA256" ]; then
+        echo "ERROR: Policy recovery baseline SHA-256 mismatch." >&2
+        exit 1
+    fi
+    case "$ENHANCED_STAGE" in true|false) ;; *)
+        echo "ERROR: ENHANCED_STAGE must be true or false." >&2; exit 1 ;;
+    esac
+    if [ "$ENHANCED_STAGE" = true ]; then
+        if [ "$ENHANCED_INFERENCE_DEPTH" != 2 ] && [ "$ENHANCED_INFERENCE_DEPTH" != 3 ]; then
+            echo "ERROR: ENHANCED_INFERENCE_DEPTH must be 2 or 3." >&2
+            exit 1
+        fi
+        if [ -z "$RESUME" ]; then
+            echo "ERROR: Enhanced stage requires a recorded promoted policy-only checkpoint in RESUME." >&2
+            exit 1
+        fi
+        [[ "$RESUME" = /* ]] || RESUME="${PROJECT_DIR}/${RESUME}"
+        [ -f "$RESUME" ] || { echo "ERROR: Promoted checkpoint not found: $RESUME" >&2; exit 1; }
+        RESUME="$(readlink -f "$RESUME")"
+    else
+        if [ -z "$RESUME" ]; then
+            RESUME="$POLICY_RECOVERY_BASELINE"
+        else
+            [[ "$RESUME" = /* ]] || RESUME="${PROJECT_DIR}/${RESUME}"
+            RESUME="$(readlink -f "$RESUME")"
+            if [ "$RESUME" != "$(readlink -f "$POLICY_RECOVERY_BASELINE")" ]; then
+                echo "ERROR: Policy recovery must resume from $POLICY_RECOVERY_BASELINE" >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# Make all relative config paths resolve against the repository on every host.
+cd "$PROJECT_DIR"
 
 # Add src to PYTHONPATH
 export PYTHONPATH="${PROJECT_DIR}/src:${PYTHONPATH:-}"
@@ -215,26 +267,29 @@ PYEOF
 fi
 
 # Build command arguments
-ARGS=""
+ARGS=()
 
 # Config file (required)
-ARGS+=" --config ${CONFIG_FILE}"
+ARGS+=(--config "$CONFIG_FILE")
 
 # Profile (optional)
 if [ -n "$CONFIG_PROFILE" ]; then
-    ARGS+=" --profile ${CONFIG_PROFILE}"
+    ARGS+=(--profile "$CONFIG_PROFILE")
 fi
 
 # Resume settings (override config if specified)
 if [ -n "$RESUME" ]; then
-    ARGS+=" --resume ${RESUME}"
+    ARGS+=(--resume "$RESUME")
 elif [ "$RESUME_LATEST" = true ]; then
-    ARGS+=" --resume-latest"
+    ARGS+=(--resume-latest)
+fi
+if [ "$ENHANCED_STAGE" = true ]; then
+    ARGS+=(--enhanced-stage --inference-depth "$ENHANCED_INFERENCE_DEPTH")
 fi
 
 # Time-based stopping (override config if specified)
 if [ -n "$TRAIN_DURATION" ]; then
-    ARGS+=" --train-duration ${TRAIN_DURATION}"
+    ARGS+=(--train-duration "$TRAIN_DURATION")
 fi
 
 echo "Training Configuration:"
@@ -261,4 +316,4 @@ echo ""
 echo "  See ${CONFIG_FILE} for all training parameters."
 echo ""
 
-exec -a "python3" python3 -W ignore::FutureWarning -m dama.ai.ml.trainer ${ARGS}
+exec -a "python3" python3 -W ignore::FutureWarning -m dama.ai.ml.trainer "${ARGS[@]}"
