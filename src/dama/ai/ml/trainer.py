@@ -1373,10 +1373,23 @@ class Trainer:
                 current = float('inf')
             setattr(self.stats, name, min(current, candidate))
 
-        _restore_finite_min(
-            'current_dataset_best_train_loss',
-            checkpoint.get('current_dataset_best_train_loss'),
-        )
+        checkpoint_fingerprint = str(checkpoint.get('dataset_fingerprint', '') or '')
+        stats_fingerprint = str(getattr(self.stats, 'dataset_fingerprint', '') or '')
+        if not stats_fingerprint and checkpoint_fingerprint:
+            # A checkpoint is self-contained when the optional stats sidecar
+            # is absent: preserve its dataset identity so activation does not
+            # spuriously reset the just-restored current-dataset baseline.
+            self.stats.dataset_fingerprint = checkpoint_fingerprint
+            checkpoint_metadata = checkpoint.get('dataset_metadata')
+            if isinstance(checkpoint_metadata, dict) and not self.stats.dataset_metadata:
+                self.stats.dataset_metadata = dict(checkpoint_metadata)
+            stats_fingerprint = checkpoint_fingerprint
+        if (not stats_fingerprint or not checkpoint_fingerprint
+                or stats_fingerprint == checkpoint_fingerprint):
+            _restore_finite_min(
+                'current_dataset_best_train_loss',
+                checkpoint.get('current_dataset_best_train_loss'),
+            )
         _restore_finite_min(
             'historical_best_train_loss',
             checkpoint.get('historical_best_train_loss'),
