@@ -873,6 +873,27 @@ def _summary_confidence_interval(sources) -> tuple:
     return None, None, None
 
 
+def _summary_match_score(sources) -> tuple[str, str]:
+    """Return match-score and interval text for one named result source."""
+    score = _summary_number(sources, 'match_score', 'score')
+    if score is None:
+        wins = _summary_number(sources, 'ml_wins', 'wins')
+        draws = _summary_number(sources, 'draws')
+        games = _summary_number(sources, 'total_games', 'games', 'total')
+        if wins is not None and draws is not None and games:
+            score = (wins + 0.5 * draws) / games
+    lower, upper, text = _summary_confidence_interval(sources)
+    if lower is not None and upper is not None:
+        interval = (
+            f'{_summary_percent_text(lower)} to '
+            f'{_summary_percent_text(upper)}')
+    elif text:
+        interval = text
+    else:
+        interval = 'N/A'
+    return _summary_percent_text(score), interval
+
+
 def _recovery_summary_metrics(stats: dict, test_history: list[dict]) -> dict:
     """Build explicit P0/P1 recovery metric strings with legacy fallbacks."""
     latest_loss = _summary_latest(stats, 'loss_history')
@@ -897,8 +918,10 @@ def _recovery_summary_metrics(stats: dict, test_history: list[dict]) -> dict:
         'game_evaluation', default={})
     acceptance_payload = _summary_value(
         acceptance_metrics, 'metrics', default=acceptance_metrics)
-    acceptance_evaluation = _summary_value(
-        acceptance_payload, 'easy', 'random', default={})
+    random_acceptance = _summary_value(
+        acceptance_payload, 'random', default={})
+    easy_acceptance = _summary_value(
+        acceptance_payload, 'easy', default={})
 
     current_train_loss = _summary_number(
         [stats, latest_loss], 'current_train_loss', 'recent_loss', 'loss')
@@ -921,26 +944,17 @@ def _recovery_summary_metrics(stats: dict, test_history: list[dict]) -> dict:
         'acceptance_state', 'acceptance_status', 'state', 'status',
         'accepted', 'passed')
 
-    evaluation_sources = [
-        stats, evaluation_metrics, latest_test, acceptance_evaluation]
-    match_score = _summary_number(evaluation_sources, 'match_score', 'score')
-    if match_score is None:
-        wins = _summary_number(evaluation_sources, 'ml_wins', 'wins')
-        draws = _summary_number(evaluation_sources, 'draws')
-        games = _summary_number(evaluation_sources, 'total_games', 'games')
-        if wins is not None and draws is not None and games:
-            match_score = (wins + 0.5 * draws) / games
-
-    ci_lower, ci_upper, ci_text = _summary_confidence_interval(evaluation_sources)
-    if ci_lower is not None and ci_upper is not None:
+    if random_acceptance or easy_acceptance:
+        random_score, random_interval = _summary_match_score(
+            [random_acceptance])
+        easy_score, easy_interval = _summary_match_score([easy_acceptance])
+        match_score_text = f'Random {random_score}; Easy {easy_score}'
         interval_text = (
-            f'{_summary_percent_text(ci_lower)} to '
-            f'{_summary_percent_text(ci_upper)}'
-        )
-    elif ci_text:
-        interval_text = ci_text
+            f'Random {random_interval}; Easy {easy_interval}')
     else:
-        interval_text = 'N/A'
+        # Never pair a stale legacy test with an acceptance decision.
+        match_score_text, interval_text = _summary_match_score(
+            [stats, evaluation_metrics, latest_test])
 
     return {
         'current_train_loss': _summary_loss_text(current_train_loss),
@@ -951,7 +965,7 @@ def _recovery_summary_metrics(stats: dict, test_history: list[dict]) -> dict:
             promotion_state, 'Promoted', 'Not promoted'),
         'acceptance_state': _summary_state_text(
             acceptance_state, 'Accepted', 'Not accepted'),
-        'match_score': _summary_percent_text(match_score),
+        'match_score': match_score_text,
         'confidence_interval': interval_text,
     }
 
