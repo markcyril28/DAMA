@@ -125,7 +125,7 @@ testing:
   num_games: 100
   opponents: ["random", "easy"]
   difficulty: "easy"
-  opening_plies: [0, 2, 4, 6, 8]
+  opening_plies: [2, 4, 6, 8]
   opening_seed: 20260819
   confidence_method: "wilson_score"
   confidence_level: 0.95
