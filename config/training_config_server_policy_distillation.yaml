@@ -1,23 +1,7 @@
-# =============================================================================
-# Policy Distillation From Stronger Search - SERVER
-# =============================================================================
-# Goal:
-#   Generate teacher targets from deeper algorithmic search and train the model
-#   to imitate the strongest available move.
-#
-# Server profile notes:
-#   - high-throughput inference settings (compile on, larger batch)
-#   - larger self-play and replay buffers
-#   - longer run-time budget by config default (10h)
-#
-# Usage:
-#   PYTHONPATH=src python -m dama.ai.ml.trainer \
-#       --config config/training_config_server_policy_distillation.yaml
-# =============================================================================
+# Compatibility entry point for the audited server recovery profile.
+# New launches use training_config_policy_distillation.yaml with --profile server;
+# this file remains fail-closed and equivalent for direct legacy invocations.
 
-# -----------------------------------------------------------------------------
-# Device Settings
-# -----------------------------------------------------------------------------
 device:
   type: "cuda"
   amp:
@@ -28,50 +12,48 @@ device:
     mode: "reduce-overhead"
   matmul_precision: "medium"
 
-# -----------------------------------------------------------------------------
-# Model Architecture
-# -----------------------------------------------------------------------------
 model:
   channels: 128
   num_blocks: 8
   embedding_size: 256
   hidden_size: 128
 
-# -----------------------------------------------------------------------------
-# Policy Distillation Data Generation
-# -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 32
-  games_per_epoch: 0
-  difficulties:
-    - "hard"
-    - "super_hard"
+  cpu_workers: 64
+  games_per_epoch: 360
+  difficulties: ["easy", "medium", "hard"]
   focus_side: "both"
   opponent_focus: "algorithm"
-  noise_prob: 0.0
-  max_moves_per_game: 150
+  noise_prob: 0.10
+  teacher_difficulty: "hard"
+  opening_plies: [2, 4, 6, 8]
+  opening_seed: 20260819
+  max_moves_per_game: 200
   pipeline_mode: "simultaneous"
   max_stale_epochs: 500
-
+  persist_selfplay: true
+  generation_mix:
+    total_games_per_cycle: 1200
+    algorithm_fraction: 0.70
+    model_fraction: 0.30
   algo_vs_algo:
     enabled: true
-    games_per_epoch: 1200
-    difficulties:
-      - "hard"
-      - "super_hard"
+    games_per_epoch: 840
+    difficulties: ["easy", "medium", "hard", "super_hard"]
 
-# -----------------------------------------------------------------------------
-# Training Hyperparameters
-# -----------------------------------------------------------------------------
+augmentation:
+  symmetry: "none"
+
 training:
+  stage: "policy_only"
   batch_size: 65536
   learning_rate: 4.2e-4
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
   train_steps: 100000000000
-  checkpoint_every: 1000
+  checkpoint_every: 2000
   gradient_accumulation_steps: 1
-
+  reward_mode: "none"
   lr_scheduler:
     enabled: true
     type: "cosine_warm_restarts"
@@ -80,85 +62,101 @@ training:
     eta_min: 4.2e-5
     warmup_steps: 500
 
-  reward_mode: "none"
+teacher_policy:
+  target_type: "hard"
+  teacher_difficulty: "hard"
+  temperature: 1.0
+  score_depth: 3
+  value_scale: 1000.0
+  hard_label_blend: 0.25
+  require_policy_gate: true
 
-# -----------------------------------------------------------------------------
-# Value Head
-# -----------------------------------------------------------------------------
 value_head:
   enabled: false
   hidden_size: 128
   value_weight: 0.15
 
-# -----------------------------------------------------------------------------
-# DataLoader Settings
-# -----------------------------------------------------------------------------
+validation:
+  enabled: true
+  split_fraction: 0.15
+  split_seed: 20260819
+  every_checkpoints: 1
+  frozen_suite_path: "data/validation_policy_distillation/frozen_hard_5000.jsonl"
+  frozen_suite_size: 5000
+  frozen_suite_seed: 20260819
+  auto_create_suite: true
+  teacher_agreement_threshold: 0.50
+
+corpus_snapshots:
+  enabled: true
+  root: "data/corpus_snapshots/policy_distillation"
+  minimum_fresh_state_fraction: 0.50
+
 dataloader:
   num_workers: 0
   pin_memory: true
   prefetch_factor: 2
   replay_max_entries: 5000000
+  replay_max_files: 60
   clear_replay_after_load: false
   max_moves_per_sample: 32
-
   ram_cache:
     enabled: true
     threshold_gb: 64.0
     cache_file: "data/replay_cache/policy_distillation_server_cache.pt"
 
-# -----------------------------------------------------------------------------
-# Model Testing Settings
-# -----------------------------------------------------------------------------
 testing:
   enabled: true
-  every_n_steps: 1000
-  num_games: 50
+  promoted_only: true
+  every_n_steps: 2000
+  num_games: 100
+  opponents: ["random", "easy"]
   difficulty: "easy"
+  opening_plies: [2, 4, 6, 8]
+  opening_seed: 20260819
+  confidence_method: "wilson_score"
+  confidence_level: 0.95
+  random_match_score_threshold: 0.80
+  random_lower_confidence_bound: 0.70
+  easy_lower_confidence_bound: 0.50
+  easy_side_score_floor: 0.50
+  inference_depth: 1
 
-# -----------------------------------------------------------------------------
-# Paths
-# -----------------------------------------------------------------------------
 paths:
-  checkpoint_dir: "models/checkpoints_policy_distillation_server"
-  latest_model: "models/latest_policy_distillation_server.pt"
-  replay_dir: "data/replay_policy_distillation_server"
-  log_dir: "logs/server/policy_distillation"
-  stats_file: "models/training_stats_policy_distillation_server.json"
+  checkpoint_dir: "models/checkpoints_policy_distillation"
+  latest_model: "models/latest_policy_distillation.pt"
+  promoted_model: "models/promoted_policy_distillation.pt"
+  accepted_model: "models/accepted_policy_distillation.pt"
+  replay_dir: "data/replay_policy_distillation"
+  log_dir: "logs/policy_distillation"
+  stats_file: "models/training_stats_policy_distillation.json"
+  promotion_registry: "logs/policy_distillation/promotions.jsonl"
+  acceptance_dir: "logs/policy_distillation/acceptance"
 
-# -----------------------------------------------------------------------------
-# Statistics Collection
-# -----------------------------------------------------------------------------
 statistics:
   enabled: true
   record_every: 200
+  progress_report_every_seconds: 300
   system_every: 5000
   model_health_every: 5000
   score_dist_every: 500
   buffer_size: 50000
   flush_every: 500
-  output_dir: "logs/server/policy_distillation/stats"
+  output_dir: "logs/policy_distillation/stats"
 
-# -----------------------------------------------------------------------------
-# Thermal Protection
-# -----------------------------------------------------------------------------
 thermal_protection:
   enabled: false
-  temp_limit_c: 89
-  rest_duration: "10m"
-  check_every: 30
 
-# -----------------------------------------------------------------------------
-# Resume Settings
-# -----------------------------------------------------------------------------
 resume:
   enabled: true
-  checkpoint_path: null
-  skip_corrupted: true
+  checkpoint_path: "models/checkpoints_policy_distillation/model_step_134000.pt"
+  skip_corrupted: false
 
-# -----------------------------------------------------------------------------
-# Time-based Stopping
-# -----------------------------------------------------------------------------
+recovery_experiment:
+  enabled: true
+  baseline_checkpoint: "models/checkpoints_policy_distillation/model_step_134000.pt"
+  baseline_sha256: "7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
+
 time_limit:
   enabled: true
   duration: "10h"
-
