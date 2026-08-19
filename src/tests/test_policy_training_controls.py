@@ -75,6 +75,7 @@ def test_checkpoint_load_restores_loss_baselines_monotonically(
         "loss": 0.4,
         "current_dataset_best_train_loss": 0.4,
         "historical_best_train_loss": 0.03,
+        "dataset_fingerprint": "checkpoint-corpus",
     }, checkpoint)
 
     class _Model:
@@ -110,6 +111,13 @@ def test_checkpoint_load_restores_loss_baselines_monotonically(
     assert holder.stats.current_dataset_best_train_loss == pytest.approx(0.4)
     assert holder.stats.historical_best_train_loss == pytest.approx(0.02)
     assert holder.stats.best_loss == pytest.approx(0.02)
+
+    # A checkpoint from another corpus must not contaminate the active
+    # dataset's current-loss baseline.
+    holder.stats.dataset_fingerprint = "different-corpus"
+    holder.stats.current_dataset_best_train_loss = 0.5
+    Trainer._load_checkpoint(holder, str(checkpoint))
+    assert holder.stats.current_dataset_best_train_loss == pytest.approx(0.5)
 
 
 def test_checkpoint_save_never_overwrites_existing_step(tmp_path: Path) -> None:
