@@ -156,9 +156,27 @@ def successful_acceptance_report_path(
             Path(report["checkpoint_path"]).expanduser().resolve(strict=False)))
         task_checkpoint = os.path.normcase(str(
             Path(task["checkpoint_path"]).expanduser().resolve(strict=False)))
-        if (int(report.get("step", -1)) == int(task["step"])
-                and report_checkpoint == task_checkpoint):
-            return path
+        if (int(report.get("step", -1)) != int(task["step"])
+                or report_checkpoint != task_checkpoint):
+            return None
+        # A report is terminal only for the exact durable protocol input.
+        # This prevents an old report for the same checkpoint path/step from
+        # clearing a task whose digest, suite, openings, or runtime changed.
+        provenance_pairs = (
+            ("checkpoint_sha256", "checkpoint_sha256"),
+            ("suite_fingerprint", "frozen_suite_fingerprint"),
+            ("opening_seed", "opening_seed"),
+            ("opening_plies", "opening_plies"),
+            ("inference_depth", "inference_depth"),
+            ("max_moves", "max_moves"),
+            ("num_workers", "num_workers"),
+            ("training_stage", "training_stage"),
+            ("task_id", "task_id"),
+        )
+        for task_key, report_key in provenance_pairs:
+            if task.get(task_key) is not None and report.get(report_key) != task[task_key]:
+                return None
+        return path
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
     return None
@@ -275,8 +293,9 @@ def _validate_pending_acceptance_task(
     if step < 0:
         raise ValueError("Pending acceptance step must be non-negative")
     opening_plies = [int(value) for value in task["opening_plies"]]
-    if any(value < 0 for value in opening_plies):
-        raise ValueError("Pending acceptance opening plies must be non-negative")
+    if not opening_plies or any(value <= 0 for value in opening_plies):
+        raise ValueError(
+            "Pending acceptance opening plies must be non-empty and positive")
     normalized = dict(task)
     normalized.update({
         "schema_version": PENDING_TASK_SCHEMA_VERSION,
