@@ -35,10 +35,17 @@ class ReplayEntry:
     """A single training example from a game."""
     state: dict           # Compact state representation
     legal_moves: list     # List of move dicts
-    chosen_index: int     # Index of chosen move
+    chosen_index: int     # Hard teacher label index
     result: int           # Game result from this player's perspective (+1, -1, 0)
     score: float = 0.0    # Detailed shaped reward score (from scoring system)
     sample_weight: float = 1.0  # Extra multiplier for loss weighting
+    # Policy-distillation audit metadata. Defaults keep old replay readable.
+    played_index: Optional[int] = None
+    trajectory_source: Optional[str] = None
+    was_exploration: Optional[bool] = None
+    teacher_difficulty: Optional[str] = None
+    opening_plies: int = 0
+    game_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -52,6 +59,18 @@ class ReplayEntry:
             d['score'] = round(self.score, 4)
         if self.sample_weight != 1.0:
             d['sample_weight'] = round(float(self.sample_weight), 6)
+        if self.played_index is not None:
+            d['played_index'] = int(self.played_index)
+        if self.trajectory_source is not None:
+            d['trajectory_source'] = self.trajectory_source
+        if self.was_exploration is not None:
+            d['was_exploration'] = bool(self.was_exploration)
+        if self.teacher_difficulty is not None:
+            d['teacher_difficulty'] = self.teacher_difficulty
+        if self.opening_plies:
+            d['opening_plies'] = int(self.opening_plies)
+        if self.game_id is not None:
+            d['game_id'] = self.game_id
         return d
 
     @classmethod
@@ -62,6 +81,12 @@ class ReplayEntry:
             raise ValueError(
                 f"chosen_index {chosen_index} out of bounds for {len(legal_moves)} legal moves"
             )
+        played_index = data.get('played_index')
+        if (played_index is not None and legal_moves
+                and (played_index < 0 or played_index >= len(legal_moves))):
+            raise ValueError(
+                f"played_index {played_index} out of bounds for {len(legal_moves)} legal moves"
+            )
         return cls(
             state=data['state'],
             legal_moves=legal_moves,
@@ -69,6 +94,12 @@ class ReplayEntry:
             result=data.get('result', 0),
             score=data.get('score', 0.0),
             sample_weight=float(data.get('sample_weight', 1.0)),
+            played_index=played_index,
+            trajectory_source=data.get('trajectory_source'),
+            was_exploration=data.get('was_exploration'),
+            teacher_difficulty=data.get('teacher_difficulty'),
+            opening_plies=int(data.get('opening_plies', 0)),
+            game_id=(str(data['game_id']) if data.get('game_id') is not None else None),
         )
 
 
@@ -100,9 +131,16 @@ class ReplayBuffer:
         """Start a new replay file."""
         self._close_current()
 
+        # [Pass 109] The name has only second resolution, and the file is opened
+        # 'w'. Two cycles finishing in the same second used to silently truncate
+        # the first one's data. That was near-harmless while persistence only
+        # ran on the first cycle; now that every cycle persists, disambiguate.
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"replay_{timestamp}.jsonl"
-        filepath = self.replay_dir / filename
+        filepath = self.replay_dir / f"replay_{timestamp}.jsonl"
+        suffix = 0
+        while filepath.exists():
+            suffix += 1
+            filepath = self.replay_dir / f"replay_{timestamp}_{suffix:02d}.jsonl"
 
         self._current_file = filepath
         self._current_writer = open(filepath, 'w')
@@ -120,6 +158,12 @@ class ReplayBuffer:
 
     def add_entries(self, entries: List[ReplayEntry]) -> None:
         """Add multiple entries and flush once."""
+        # Do not create an empty replay shard for a game batch that produced no
+        # positions (for example a zero-move or immediately terminal batch).
+        # Empty JSONL files are indistinguishable from interrupted writes to
+        # corpus scanners and can poison a fail-closed contract audit.
+        if not entries:
+            return
         if self._current_writer is None:
             self.start_new_file()
         # Build all lines then write once — reduces syscall overhead.
@@ -176,6 +220,32 @@ class ReplayBuffer:
         """Close the buffer."""
         self._close_current()
 
+    def discard_current_file(self) -> Optional[Path]:
+        """Close and remove the currently open replay file.
+
+        Self-play writes a cycle to one file.  Callers can use this method
+        when a cycle did not complete, ensuring partial samples cannot be
+        discovered by a later corpus scan.  Only the exact current file is
+        targeted; older replay files and their caches are left untouched.
+        """
+        path = self._current_file
+        self._close_current()
+        if path is None:
+            return None
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Keep the cache consistent even when the filesystem refuses the
+            # unlink.  The caller will reject the cycle, so it is safer to
+            # leave a diagnostic orphan than to admit it as active data.
+            return path
+        self._file_cache.pop(path, None)
+        self._session_entries.pop(path, None)
+        self._session_dicts.pop(path, None)
+        return path
+
     def get_replay_files(self) -> List[Path]:
         """Get all replay files, sorted by modification time (newest first)."""
         files = list(self.replay_dir.glob("replay_*.jsonl"))
@@ -183,16 +253,35 @@ class ReplayBuffer:
         return files
 
     def cleanup_old_files(self) -> int:
-        """Remove old files beyond max_files limit. Returns number deleted."""
+        """Remove old files beyond max_files limit. Returns number deleted.
+
+        [Pass 109] Now actually called, once per persisted self-play cycle.
+        Persisting every cycle writes roughly one 7MB file per minute, so
+        without this the replay directory grows without bound over a 48h run.
+        max_files <= 0 disables pruning.
+        """
+        if self.max_files <= 0:
+            return 0
         files = self.get_replay_files()
         if len(files) <= self.max_files:
             return 0
 
-        to_delete = files[self.max_files:]
-        for f in to_delete:
-            f.unlink()
+        deleted = 0
+        for f in files[self.max_files:]:
+            if f == self._current_file:
+                continue                     # never unlink the open writer
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError:
+                continue
+            # Drop the parsed copy too, otherwise the cache keeps the entries
+            # of a file that no longer exists alive for the whole session.
+            self._file_cache.pop(f, None)
+            self._session_entries.pop(f, None)
+            self._session_dicts.pop(f, None)
 
-        return len(to_delete)
+        return deleted
 
     def clear_files(self) -> int:
         """Delete all replay files and clear the file cache. Returns number deleted.
