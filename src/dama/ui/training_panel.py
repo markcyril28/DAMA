@@ -25,6 +25,205 @@ from ..config import get_config
 CUSTOM_TRAINING_LABEL = "Custom GUI settings"
 
 
+def _stats_value(source, *keys, default=None):
+    """Read the first present key from a stats object or mapping."""
+    for key in keys:
+        if isinstance(source, dict):
+            if key in source:
+                return source[key]
+        elif source is not None and hasattr(source, key):
+            return getattr(source, key)
+    return default
+
+
+def _finite_metric(value):
+    """Return a finite float for display, or None when unavailable."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _latest_mapping(source, *history_keys):
+    """Return the latest mapping from the first available history."""
+    for key in history_keys:
+        history = _stats_value(source, key)
+        if history:
+            for entry in reversed(history):
+                if isinstance(entry, dict):
+                    return entry
+    return {}
+
+
+def _first_metric(sources, *keys):
+    for source in sources:
+        for key in keys:
+            value = _finite_metric(_stats_value(source, key))
+            if value is not None:
+                return value
+    return None
+
+
+def _first_state(sources, *keys):
+    for source in sources:
+        for key in keys:
+            value = _stats_value(source, key)
+            if value is not None and str(value).strip():
+                return value
+    return None
+
+
+def _format_loss_metric(value) -> str:
+    metric = _finite_metric(value)
+    return "N/A" if metric is None else f"{metric:.4f}"
+
+
+def _format_percent_metric(value) -> str:
+    metric = _finite_metric(value)
+    if metric is None:
+        return "N/A"
+    if abs(metric) <= 1.0:
+        metric *= 100.0
+    return f"{metric:.1f}%"
+
+
+def _format_state_metric(value, true_text: str, false_text: str) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, bool):
+        return true_text if value else false_text
+    return str(value)
+
+
+def _confidence_interval(sources) -> tuple:
+    """Read a 95% match-score interval from common scalar/container shapes."""
+    for source in sources:
+        if not source:
+            continue
+        lower = _finite_metric(_stats_value(
+            source, 'match_score_ci_lower', 'match_score_ci_low',
+            'confidence_interval_lower', 'ci_lower', 'lower_bound'))
+        upper = _finite_metric(_stats_value(
+            source, 'match_score_ci_upper', 'match_score_ci_high',
+            'confidence_interval_upper', 'ci_upper', 'upper_bound'))
+        if lower is not None and upper is not None:
+            return lower, upper, None
+
+        container = _stats_value(
+            source, 'match_score_confidence_interval', 'match_score_ci',
+            'match_score_ci_95', 'confidence_interval_95', 'ci_95',
+            'confidence_interval')
+        if isinstance(container, dict):
+            lower = _finite_metric(_stats_value(container, 'lower', 'low', 'lower_bound'))
+            upper = _finite_metric(_stats_value(container, 'upper', 'high', 'upper_bound'))
+            if lower is not None and upper is not None:
+                return lower, upper, None
+        elif isinstance(container, (list, tuple)) and len(container) >= 2:
+            lower = _finite_metric(container[0])
+            upper = _finite_metric(container[1])
+            if lower is not None and upper is not None:
+                return lower, upper, None
+        elif isinstance(container, str) and container.strip():
+            return None, None, container.strip()
+    return None, None, None
+
+
+def _match_score_with_ci(sources) -> str:
+    """Format one explicitly identified evaluation result."""
+    match_score = _first_metric(sources, 'match_score', 'score')
+    if match_score is None:
+        wins = _first_metric(sources, 'ml_wins', 'wins')
+        draws = _first_metric(sources, 'draws')
+        total = _first_metric(sources, 'total_games', 'games', 'total')
+        if wins is not None and draws is not None and total:
+            match_score = (wins + 0.5 * draws) / total
+    text = _format_percent_metric(match_score)
+    lower, upper, interval = _confidence_interval(sources)
+    if lower is not None and upper is not None:
+        text += (
+            f" (95% CI: {_format_percent_metric(lower)} to "
+            f"{_format_percent_metric(upper)})")
+    elif interval:
+        text += f" (95% CI: {interval})"
+    elif match_score is not None:
+        text += " (95% CI: N/A)"
+    return text
+
+
+def _training_presentation_metrics(stats) -> dict:
+    """Normalize new recovery metrics and legacy stats for the GUI."""
+    latest_loss = _latest_mapping(stats, 'loss_history')
+    latest_validation = _latest_mapping(
+        stats, 'validation_teacher_agreement_history',
+        'teacher_agreement_history', 'validation_history')
+    latest_promotion = _latest_mapping(stats, 'promotion_history')
+    latest_acceptance = _latest_mapping(stats, 'acceptance_history')
+    latest_test = _latest_mapping(stats, 'test_history', 'evaluation_history')
+
+    dataset_metrics = _stats_value(stats, 'dataset_metrics', 'current_dataset', default={})
+    validation_metrics = _stats_value(stats, 'validation_metrics', 'validation', default={})
+    promotion_metrics = _stats_value(stats, 'promotion', 'promotion_metrics', default={})
+    acceptance_metrics = _stats_value(
+        stats, 'acceptance', 'acceptance_metrics', default={}) or latest_acceptance
+    evaluation_metrics = _stats_value(
+        stats, 'latest_evaluation', 'evaluation_metrics', 'game_evaluation', default={})
+    acceptance_payload = _stats_value(
+        acceptance_metrics, 'metrics', default=acceptance_metrics)
+    random_acceptance = _stats_value(acceptance_payload, 'random', default={})
+    easy_acceptance = _stats_value(acceptance_payload, 'easy', default={})
+
+    current_train_loss = _first_metric(
+        [stats, latest_loss], 'current_train_loss', 'recent_loss', 'loss')
+    current_dataset_best = _first_metric(
+        [stats, dataset_metrics], 'current_dataset_best_train_loss',
+        'dataset_best_train_loss', 'best_train_loss')
+    historical_best = _first_metric(
+        [stats], 'historical_best_train_loss', 'best_loss')
+    validation_agreement = _first_metric(
+        [stats, validation_metrics, latest_validation],
+        'validation_teacher_agreement', 'held_out_teacher_agreement',
+        'heldout_teacher_agreement', 'teacher_agreement',
+        'top1_teacher_agreement', 'top1_agreement')
+
+    promotion_state = _first_state(
+        [stats, promotion_metrics, latest_promotion],
+        'promotion_state', 'promotion_status', 'state', 'status', 'promoted')
+    acceptance_state = _first_state(
+        [stats, acceptance_metrics, latest_acceptance, evaluation_metrics, latest_test],
+        'acceptance_state', 'acceptance_status', 'state', 'status',
+        'accepted', 'passed')
+
+    if random_acceptance or easy_acceptance:
+        match_score_text = (
+            f"Random: {_match_score_with_ci([random_acceptance])}; "
+            f"Easy: {_match_score_with_ci([easy_acceptance])}")
+    elif str(acceptance_state).strip().lower() in {
+        'accepted', 'passed', 'true', '1', 'yes'
+    }:
+        # An Accepted state is meaningful only with the fixed protocol's
+        # labeled random/easy results. Never display a stale legacy test
+        # score beside it.
+        match_score_text = _match_score_with_ci([{}])
+    else:
+        # Legacy tests remain visible only when no acceptance protocol result
+        # exists; they can no longer be shown beside an Accepted state.
+        match_score_text = _match_score_with_ci(
+            [stats, evaluation_metrics, latest_test])
+
+    return {
+        'current_train_loss': _format_loss_metric(current_train_loss),
+        'current_dataset_best_train_loss': _format_loss_metric(current_dataset_best),
+        'historical_best_train_loss': _format_loss_metric(historical_best),
+        'validation_teacher_agreement': _format_percent_metric(validation_agreement),
+        'promotion_state': _format_state_metric(
+            promotion_state, 'Promoted', 'Not promoted'),
+        'acceptance_state': _format_state_metric(
+            acceptance_state, 'Accepted', 'Not accepted'),
+        'match_score_with_ci': match_score_text,
+    }
+
+
 def _load_training_preset_metadata(config_path: Optional[str]) -> dict:
     """Read the small subset of a YAML training preset needed by the GUI."""
     if not config_path:
@@ -33,6 +232,9 @@ def _load_training_preset_metadata(config_path: Optional[str]) -> dict:
             'latest_model': 'models/latest.pt',
             'stats_file': 'models/training_stats.json',
             'train_steps': 10000,
+            'recovery_enabled': False,
+            'recovery_baseline': None,
+            'training_stage': 'custom',
         }
 
     import yaml
@@ -41,11 +243,15 @@ def _load_training_preset_metadata(config_path: Optional[str]) -> dict:
         data = yaml.safe_load(config_file) or {}
     paths = data.get('paths', {})
     training = data.get('training', {})
+    recovery = data.get('recovery_experiment', {})
     return {
         'checkpoint_dir': paths.get('checkpoint_dir', 'models/checkpoints'),
         'latest_model': paths.get('latest_model', 'models/latest.pt'),
         'stats_file': paths.get('stats_file', 'models/training_stats.json'),
         'train_steps': training.get('train_steps', 10000),
+        'recovery_enabled': bool(recovery.get('enabled', False)),
+        'recovery_baseline': recovery.get('baseline_checkpoint'),
+        'training_stage': training.get('stage', 'policy_only'),
     }
 
 
@@ -94,16 +300,19 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
         # Import here to avoid loading torch in main process
         from ..ai.ml.trainer import (
             Trainer, TrainingConfig, config_from_yaml, load_config_from_yaml,
+            validate_recovery_experiment_config,
         )
 
         config_path = args.get('config_path')
         if config_path:
             yaml_config = load_config_from_yaml(config_path)
-            # The GUI owns the explicit Start Fresh/checkpoint selection. Avoid
-            # a second auto-detection pass while converting the YAML preset.
-            yaml_config['resume'] = {'enabled': False}
             config = config_from_yaml(yaml_config)
-            config.resume = args.get('resume')
+            selected_resume = args.get('resume')
+            # Recovery presets retain their pinned YAML baseline when the GUI
+            # supplies no override. Other presets preserve the historical GUI
+            # Start Fresh/checkpoint behavior.
+            if selected_resume is not None or not config.recovery_enforced:
+                config.resume = selected_resume
         else:
             config = TrainingConfig(
                 device=args.get('device', 'cuda'),
@@ -128,6 +337,7 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
                 test_difficulty=args.get('test_difficulty', 'medium'),
             )
 
+        validate_recovery_experiment_config(config)
         trainer = Trainer(config)
 
         # train() services control_queue internally (PAUSE/RESUME/STOP/
@@ -197,6 +407,9 @@ class TrainingWorker(QThread):
             elif msg_type == MSG_CHECKPOINT:
                 self.status_update.emit(msg)
 
+            elif msg_type == MSG_STATUS:
+                self.status_update.emit(msg)
+
     def stop(self):
         self._running = False
 
@@ -224,6 +437,9 @@ def _tester_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict)
             algo_difficulty=args.get('algo_difficulty', 'medium'),
             num_workers=args.get('num_workers', 4),
             max_moves=args.get('max_moves', 200),
+            # [Pass 109] Random openings, else a deterministic model replays the
+            # same two games and num_games reports a 2-sample measurement.
+            opening_plies=args.get('opening_plies', (0, 2, 4, 6, 8)),
         )
         
         num_games = args.get('num_games', 100)
@@ -684,8 +900,37 @@ class StatsPanel(QWidget):
         self.epochs_label = QLabel("0")
         stats_layout.addRow("Epochs:", self.epochs_label)
         
-        self.best_loss_label = QLabel("N/A")
-        stats_layout.addRow("Best Loss:", self.best_loss_label)
+        self.current_train_loss_label = QLabel("N/A")
+        stats_layout.addRow("Current Train Loss:", self.current_train_loss_label)
+
+        self.current_dataset_best_train_loss_label = QLabel("N/A")
+        stats_layout.addRow(
+            "Current Dataset Best Train Loss:",
+            self.current_dataset_best_train_loss_label,
+        )
+
+        self.historical_best_train_loss_label = QLabel("N/A")
+        stats_layout.addRow(
+            "Historical Best Train Loss:",
+            self.historical_best_train_loss_label,
+        )
+        # Compatibility for code that still references the old widget name.
+        self.best_loss_label = self.historical_best_train_loss_label
+
+        self.validation_teacher_agreement_label = QLabel("N/A")
+        stats_layout.addRow(
+            "Validation Teacher Agreement:",
+            self.validation_teacher_agreement_label,
+        )
+
+        self.promotion_state_label = QLabel("N/A")
+        stats_layout.addRow("Promotion State:", self.promotion_state_label)
+
+        self.acceptance_state_label = QLabel("N/A")
+        stats_layout.addRow("Acceptance State:", self.acceptance_state_label)
+
+        self.match_score_label = QLabel("N/A")
+        stats_layout.addRow("Match Score (95% CI):", self.match_score_label)
         
         self.start_time_label = QLabel("N/A")
         stats_layout.addRow("Started:", self.start_time_label)
@@ -729,8 +974,11 @@ class StatsPanel(QWidget):
     def load_stats(self):
         """Load stats from file."""
         try:
-            from ..ai.ml.trainer import load_training_stats
-            stats = load_training_stats(self.stats_file)
+            stats_path = Path(self.stats_file)
+            stats = None
+            if stats_path.exists():
+                with open(stats_path, 'r') as stats_handle:
+                    stats = json.load(stats_handle)
             if stats:
                 self.update_stats(stats)
             else:
@@ -744,31 +992,44 @@ class StatsPanel(QWidget):
     
     def update_stats(self, stats):
         """Update the display with stats."""
-        self.total_steps_label.setText(str(stats.total_steps))
-        self.epochs_label.setText(str(stats.epochs_completed))
-        
-        if stats.best_loss != float('inf'):
-            self.best_loss_label.setText(f"{stats.best_loss:.4f}")
-        else:
-            self.best_loss_label.setText("N/A")
-        
-        if stats.start_time:
-            self.start_time_label.setText(stats.start_time[:19].replace('T', ' '))
-        
-        if stats.end_time:
-            self.end_time_label.setText(stats.end_time[:19].replace('T', ' '))
+        self.total_steps_label.setText(str(_stats_value(stats, 'total_steps', default=0)))
+        self.epochs_label.setText(str(_stats_value(stats, 'epochs_completed', default=0)))
+
+        metrics = _training_presentation_metrics(stats)
+        self.current_train_loss_label.setText(metrics['current_train_loss'])
+        self.current_dataset_best_train_loss_label.setText(
+            metrics['current_dataset_best_train_loss'])
+        self.historical_best_train_loss_label.setText(
+            metrics['historical_best_train_loss'])
+        self.validation_teacher_agreement_label.setText(
+            metrics['validation_teacher_agreement'])
+        self.promotion_state_label.setText(metrics['promotion_state'])
+        self.acceptance_state_label.setText(metrics['acceptance_state'])
+        self.match_score_label.setText(metrics['match_score_with_ci'])
+
+        start_time = _stats_value(stats, 'start_time', default='')
+        if start_time:
+            self.start_time_label.setText(str(start_time)[:19].replace('T', ' '))
+
+        end_time = _stats_value(stats, 'end_time', default='')
+        if end_time:
+            self.end_time_label.setText(str(end_time)[:19].replace('T', ' '))
         
         # Update latest win rate
-        if stats.test_history:
-            latest_test = stats.test_history[-1]
+        test_history = _stats_value(stats, 'test_history', default=[]) or []
+        if test_history:
+            latest_test = test_history[-1]
             win_rate = latest_test.get('ml_win_rate', 0) * 100
             self.latest_winrate_label.setText(f"{win_rate:.1f}%")
         else:
             self.latest_winrate_label.setText("N/A")
         
         # Update charts
-        self.loss_chart.set_data(stats.loss_history, stats.val_loss_history)
-        self.winrate_chart.set_data(stats.test_history)
+        self.loss_chart.set_data(
+            _stats_value(stats, 'loss_history', default=[]) or [],
+            _stats_value(stats, 'val_loss_history', default=[]) or [],
+        )
+        self.winrate_chart.set_data(test_history)
 
 
 class TestPanel(QWidget):
@@ -1417,6 +1678,8 @@ class TrainingPanel(QWidget):
             widget.setEnabled(editable)
 
         metadata = self._selected_preset_metadata()
+        self.checkpoint_combo.setEnabled(
+            self._process is None and not metadata['recovery_enabled'])
         self.stats_panel.set_stats_file(metadata['stats_file'])
         self.test_panel.select_model(metadata['latest_model'])
 
@@ -1441,6 +1704,21 @@ class TrainingPanel(QWidget):
             
             # Clear and repopulate
             self.checkpoint_combo.clear()
+            if metadata['recovery_enabled']:
+                baseline = metadata.get('recovery_baseline')
+                baseline_path = Path(str(baseline)) if baseline else None
+                if baseline_path is not None and baseline_path.is_file():
+                    self.checkpoint_combo.addItem(
+                        f"Required recovery baseline ({baseline_path.name})",
+                        str(baseline_path),
+                    )
+                else:
+                    self.checkpoint_combo.addItem(
+                        "Required recovery baseline is missing", None)
+                self.checkpoint_combo.setEnabled(False)
+                return
+
+            self.checkpoint_combo.setEnabled(self._process is None)
             self.checkpoint_combo.addItem("Start Fresh", None)
             
             for cp in reversed(checkpoints):  # Most recent first
@@ -1473,6 +1751,19 @@ class TrainingPanel(QWidget):
         config_path = self.training_config_combo.currentData()
         metadata = self._selected_preset_metadata()
         self._active_latest_path = metadata['latest_model']
+
+        if metadata['recovery_enabled']:
+            baseline = metadata.get('recovery_baseline')
+            expected = Path(str(baseline)).resolve() if baseline else None
+            selected = Path(str(resume_path)).resolve() if resume_path else None
+            if expected is None or selected != expected or not expected.is_file():
+                message = (
+                    "Policy-distillation recovery must resume from the preserved "
+                    "model_step_134000.pt baseline; fresh or arbitrary starts are disabled."
+                )
+                self._log(message)
+                QMessageBox.critical(self, "Recovery Baseline Required", message)
+                return
         
         if resume_path:
             self._log(f"Resuming from: {resume_path}")
@@ -1570,11 +1861,20 @@ class TrainingPanel(QWidget):
                 # Refresh stats panel when checkpoint is saved
                 self.stats_panel.load_stats()
             return
+        if status.get('type') == MSG_STATUS and status.get('acceptance'):
+            acceptance = status['acceptance']
+            state = "passed" if acceptance.get('passed') else "failed"
+            self._log(
+                f"Checkpoint acceptance {state} at step "
+                f"{acceptance.get('step', 'unknown')}."
+            )
+            self.stats_panel.load_stats()
+            return
 
         step = status.get('step', 0)
         gpu_mem = status.get('gpu_mem_mb', 0)
         epoch = status.get('epoch', 0)
-        recent_loss = status.get('recent_loss')
+        current_train_loss = status.get('current_train_loss', status.get('recent_loss'))
         paused = status.get('paused', False)
 
         # Reflect the trainer's actual pause state (the buttons set the
@@ -1587,8 +1887,8 @@ class TrainingPanel(QWidget):
         step_text = f"Step: {step}"
         if epoch > 0:
             step_text += f" | Epoch: {epoch}"
-        if recent_loss is not None:
-            step_text += f" | Loss: {recent_loss:.4f}"
+        if current_train_loss is not None:
+            step_text += f" | Current Train Loss: {current_train_loss:.4f}"
         self.step_label.setText(step_text)
 
         self.progress_bar.setValue(step)
