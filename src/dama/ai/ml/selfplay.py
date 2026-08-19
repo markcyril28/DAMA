@@ -1,9 +1,7 @@
 """Self-play for generating training data."""
 
 import gc
-import os
 import random
-import time
 from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
 from ...types import Move, Player
@@ -66,21 +64,13 @@ except ImportError:
 
 from .dataset import _encode_board_fast, _encode_moves_fast
 
-# [Pass 81] Module-level function references avoid attribute lookup on
-# random.random (~50ns) and random.randrange (~50ns) per call.
-# With ~3000-10K noise moves per self-play cycle, saves ~300-1000μs.
-_random = random.random
-_randrange = random.randrange
 
-
-def _selfplay_worker_init():
+def _selfplay_worker_init(seed: int = 0):
     """Per-worker initializer for self-play ProcessPoolExecutor pools.
 
-    With the fork start method, every worker inherits the parent's global
-    random state byte-for-byte, so without reseeding all workers draw
-    identical exploration noise. Reseeding the global random module also
-    affects the _random/_randrange bindings above (bound methods of the
-    same global Random singleton).
+    The seed is experiment-derived, never PID-derived or time-derived.
+    Trajectory exploration itself uses per-game Random instances so worker
+    scheduling cannot change generated actions.
 
     [Pass 101] gc.freeze() moves every object inherited from the parent via
     fork (the trainer's live CUDA tensors: training model, in-GPU replay
@@ -95,7 +85,7 @@ def _selfplay_worker_init():
     cannot leak; it also avoids GC traversal of inherited pages (fewer COW
     faults, aligning with the Pass 70 copy-on-write goal).
     """
-    random.seed((os.getpid() ^ (time.time_ns() & 0xFFFFFFFF)) & 0xFFFFFFFF)
+    random.seed(int(seed) & 0xFFFFFFFF)
     gc.freeze()
 
 # [Pass 70] Fork-inherited model for self-play workers.
@@ -105,6 +95,203 @@ def _selfplay_worker_init():
 # faults on tensor data pages (read-only access).
 # Set to None when not in a self-play cycle (cleanup prevents memory leaks).
 _FORK_MODEL = None
+
+
+HARD_TEACHER_DIFFICULTY = 'hard'
+
+
+def allocate_policy_distillation_games(total_games: int) -> Tuple[int, int]:
+    """Return an exact 70 percent algorithm, 30 percent model allocation.
+
+    Exact integer allocation requires a cycle size divisible by ten. Keeping
+    that constraint explicit prevents silent rounding drift across cycles.
+
+    Returns:
+        ``(algorithm_games, current_model_games)``
+    """
+    if isinstance(total_games, bool) or not isinstance(total_games, int):
+        raise TypeError("total_games must be an integer")
+    if total_games < 0:
+        raise ValueError("total_games must be non-negative")
+    if total_games % 10 != 0:
+        raise ValueError("total_games must be divisible by 10 for an exact 70/30 split")
+    return total_games * 7 // 10, total_games * 3 // 10
+
+
+def apply_random_training_opening(
+    state: GameState,
+    opening_plies: int = 0,
+    opening_seed: Optional[int] = 0,
+) -> Tuple[GameState, int]:
+    """Apply a deterministic sequence of uniformly random legal opening plies.
+
+    Opening moves are trajectory setup only and are not emitted as replay
+    labels. A local RNG keeps opening selection independent from the 0.10
+    played-action exploration stream.
+    """
+    if isinstance(opening_plies, bool) or not isinstance(opening_plies, int):
+        raise TypeError("opening_plies must be an integer")
+    if opening_plies < 0:
+        raise ValueError("opening_plies must be non-negative")
+
+    rng = random.Random(opening_seed)
+    applied = 0
+    for _ in range(opening_plies):
+        legal_moves = state.legal_moves()
+        if not legal_moves:
+            break
+        state = state.apply_move(rng.choice(legal_moves))
+        applied += 1
+    return state, applied
+
+
+def _validate_teacher_difficulty(teacher_difficulty: str) -> None:
+    if teacher_difficulty != HARD_TEACHER_DIFFICULTY:
+        raise ValueError(
+            f"Policy-distillation labels require teacher_difficulty="
+            f"{HARD_TEACHER_DIFFICULTY!r}, got {teacher_difficulty!r}"
+        )
+
+
+def _move_index(move, legal_moves, default: Optional[int] = None) -> int:
+    """Match a Move or move dict to a legal-move sequence without reordering it."""
+    if move is None:
+        if default is None:
+            raise RuntimeError("Teacher or behavior policy returned no move")
+        return default
+    move_path = move.get('path') if isinstance(move, dict) else move.path
+    move_path = tuple(tuple(p) for p in move_path)
+    for idx, candidate in enumerate(legal_moves):
+        path = candidate.get('path') if isinstance(candidate, dict) else candidate.path
+        if tuple(tuple(p) for p in path) == move_path:
+            return idx
+    if default is None:
+        raise RuntimeError("Teacher or behavior move is outside the legal move list")
+    return default
+
+
+def _trajectory_source(p1_policy: str, p2_policy: str, explicit: Optional[str]) -> str:
+    if explicit:
+        return explicit
+    return 'current_model' if 'ml' in (p1_policy, p2_policy) else 'algorithm'
+
+
+def _entry_dict(
+    state: dict,
+    legal_moves: list,
+    teacher_index: int,
+    played_index: int,
+    trajectory_source: str,
+    was_exploration: bool,
+    opening_plies: int,
+    game_id: Optional[str],
+) -> dict:
+    entry = {
+        'state': state,
+        'legal_moves': legal_moves,
+        'chosen_index': teacher_index,
+        'played_index': played_index,
+        'trajectory_source': trajectory_source,
+        'was_exploration': bool(was_exploration),
+        'teacher_difficulty': HARD_TEACHER_DIFFICULTY,
+        'opening_plies': opening_plies,
+        'result': 0,
+        'score': 0.0,
+    }
+    if game_id is not None:
+        entry['game_id'] = str(game_id)
+    return entry
+
+
+def _normalize_ml_task(task: tuple) -> dict:
+    """Normalize legacy or extended ML-trajectory task tuples."""
+    if len(task) < 8:
+        raise ValueError("ML self-play task requires at least 8 fields")
+    difficulty, max_moves, noise_prob, start_player = task[:4]
+    p1_policy, p2_policy, model_path, device = task[4:8]
+    opening_plies = task[8] if len(task) > 8 else 0
+    opening_seed = task[9] if len(task) > 9 else 0
+    explicit_source = task[10] if len(task) > 10 else None
+    game_id = task[11] if len(task) > 11 else None
+    teacher_difficulty = task[12] if len(task) > 12 else HARD_TEACHER_DIFFICULTY
+    inference_depth = task[13] if len(task) > 13 else 1
+    _validate_teacher_difficulty(teacher_difficulty)
+    if isinstance(inference_depth, bool) or int(inference_depth) not in (1, 2, 3):
+        raise ValueError("ML trajectory inference depth must be 1, 2, or 3")
+    return {
+        'difficulty': difficulty,
+        'max_moves': int(max_moves),
+        'noise_prob': float(noise_prob),
+        'start_player': int(start_player),
+        'p1_policy': p1_policy,
+        'p2_policy': p2_policy,
+        'model_path': model_path,
+        'device': device,
+        'opening_plies': int(opening_plies),
+        'opening_seed': opening_seed,
+        'trajectory_source': _trajectory_source(
+            p1_policy, p2_policy, explicit_source),
+        'game_id': str(game_id) if game_id is not None else None,
+        'teacher_difficulty': teacher_difficulty,
+        'inference_depth': int(inference_depth),
+    }
+
+
+def _normalize_algo_task(task: tuple) -> dict:
+    """Normalize legacy or extended algorithm-trajectory task tuples."""
+    if len(task) < 5:
+        raise ValueError("Algorithm self-play task requires at least 5 fields")
+    p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player = task[:5]
+    opening_plies = task[5] if len(task) > 5 else 0
+    opening_seed = task[6] if len(task) > 6 else 0
+    trajectory_source = task[7] if len(task) > 7 else 'algorithm'
+    game_id = task[8] if len(task) > 8 else None
+    teacher_difficulty = task[9] if len(task) > 9 else HARD_TEACHER_DIFFICULTY
+    _validate_teacher_difficulty(teacher_difficulty)
+    return {
+        'p1_difficulty': p1_difficulty,
+        'p2_difficulty': p2_difficulty,
+        'max_moves': int(max_moves),
+        'noise_prob': float(noise_prob),
+        'start_player': int(start_player),
+        'opening_plies': int(opening_plies),
+        'opening_seed': opening_seed,
+        'trajectory_source': trajectory_source or 'algorithm',
+        'game_id': str(game_id) if game_id is not None else None,
+        'teacher_difficulty': teacher_difficulty,
+    }
+
+
+def _apply_compact_random_opening(
+    board_bytes,
+    player: int,
+    opening_plies: int,
+    opening_seed: Optional[int],
+):
+    """Apply a seeded legal opening through the compact Cython board API."""
+    if opening_plies < 0:
+        raise ValueError("opening_plies must be non-negative")
+    rng = random.Random(opening_seed)
+    captures = {1: 0, 2: 0}
+    applied = 0
+    for _ in range(opening_plies):
+        moves = _gen_moves_board(board_bytes, player)
+        if not moves:
+            break
+        move = moves[rng.randrange(len(moves))]
+        previous_player = player
+        board_bytes, player, num_captures = _apply_move_board(
+            board_bytes, player, move)
+        captures[previous_player] += num_captures
+        applied += 1
+    return board_bytes, player, captures, applied
+
+
+# Symmetry augmentation is intentionally omitted. The only global board
+# symmetry that preserves dark squares and men's forward direction is a
+# 180-degree rotation combined with a player swap. The encoder already applies
+# exactly that side-to-move normalization, so augmentation would duplicate the
+# encoded board and move tensors rather than add information.
 
 
 
@@ -128,6 +315,12 @@ def play_single_game(
     p1_difficulty: str = None,
     p2_difficulty: str = None,
     return_dicts: bool = False,
+    teacher_difficulty: str = HARD_TEACHER_DIFFICULTY,
+    opening_plies: int = 0,
+    opening_seed: Optional[int] = 0,
+    trajectory_source: Optional[str] = None,
+    game_id: Optional[str] = None,
+    inference_depth: int = 1,
 ) -> Union[GameRecord, List[dict]]:
     """
     Play a single self-play game using the algorithmic AI as teacher.
@@ -139,10 +332,20 @@ def play_single_game(
         p1_difficulty: Difficulty for Player 1 (overrides difficulty if set)
         p2_difficulty: Difficulty for Player 2 (overrides difficulty if set)
         return_dicts: If True, return List[dict] directly instead of GameRecord
+        teacher_difficulty: Must be ``hard`` for policy distillation.
+        opening_plies: Random legal setup plies played before replay recording.
+        opening_seed: Seed used only for deterministic opening selection.
+        trajectory_source: Audit label such as ``algorithm`` or ``current_model``.
+        game_id: Optional stable game identifier retained in replay metadata.
+        inference_depth: Current-model behavior depth. Values 2 and 3 require
+            an enhanced-stage value head.
 
     Returns:
         GameRecord (default) or List[dict] when return_dicts=True
     """
+    _validate_teacher_difficulty(teacher_difficulty)
+    if isinstance(inference_depth, bool) or inference_depth not in (1, 2, 3):
+        raise ValueError("inference_depth must be one of 1, 2, or 3")
     start_player = Player(start_player)
     # Per-player difficulties default to the shared difficulty
     _p1_diff = p1_difficulty or difficulty
@@ -153,48 +356,62 @@ def play_single_game(
         current_player=start_player,
         move_count=0,
     )
+    state, applied_opening_plies = apply_random_training_opening(
+        state, opening_plies=opening_plies, opening_seed=opening_seed)
+    behavior_rng = random.Random(
+        (int(opening_seed or 0) ^ 0x6A09E667F3BCC909) & ((1 << 64) - 1)
+    )
+    source = _trajectory_source(p1_policy, p2_policy, trajectory_source)
     entries = []
     move_count = 0
     player_captures = {1: 0, 2: 0}
 
-    def _select_move(policy: str, legal_moves: List[Move], player_diff: str):
-        """Select a move. Returns (move, index) tuple."""
-        if _random() < noise_prob and len(legal_moves) > 1:
-            idx = _randrange(len(legal_moves))
-            return legal_moves[idx], idx
-        if policy == 'ml' and get_ml_move_idx is not None:
+    def _select_behavior_index(
+        policy: str,
+        legal_moves: List[Move],
+        player_diff: str,
+        teacher_index: int,
+    ) -> int:
+        """Select the non-exploration behavior action, independent of its label."""
+        if policy == 'ml':
+            # A model trajectory must never silently become an algorithmic
+            # trajectory.  Doing so leaves the audit label saying
+            # ``current_model`` while the action was selected by the teacher.
+            # Fail closed so the caller can quarantine the incomplete cycle.
+            if get_ml_move_idx is None:
+                raise RuntimeError(
+                    "Current-model trajectory inference is unavailable"
+                )
             try:
                 # get_ml_move_idx accepts pre-computed legal_moves, returns
                 # index directly — avoids redundant legal_moves() generation
                 # inside get_ml_move and the O(n) index search afterward.
-                idx = get_ml_move_idx(state, legal_moves, model_path=model_path, device=device)
+                idx = get_ml_move_idx(
+                    state, legal_moves, model_path=model_path, device=device,
+                    depth=inference_depth,
+                )
+                if idx is not None and 0 <= int(idx) < len(legal_moves):
+                    return int(idx)
                 if idx is not None:
-                    return legal_moves[idx], idx
+                    raise RuntimeError(
+                        f"Current-model trajectory returned illegal index {idx}"
+                    )
             except Exception as e:
-                print(f"  Warning: ML inference failed, using random move: {e}")
-            idx = _randrange(len(legal_moves))
-            return legal_moves[idx], idx
+                raise RuntimeError(
+                    "Current-model trajectory inference failed"
+                ) from e
+            raise RuntimeError(
+                "Current-model trajectory returned no move for a legal state"
+            )
+        if policy == 'algorithmic' and player_diff == HARD_TEACHER_DIFFICULTY:
+            return teacher_index
         # use_parallel=False: self-play already parallelizes at the game level
         # via ProcessPoolExecutor. Creating threads per move per worker causes
         # massive oversubscription (N_workers × CPU_COUNT threads).
         # With Cython fast search, this is moot (runs in C, single-threaded),
         # but the flag prevents thread storms if falling back to Python search.
         chosen = get_best_move(state, player_diff, use_parallel=False)
-        if chosen is None:
-            idx = _randrange(len(legal_moves))
-            return legal_moves[idx], idx
-        # Find index for algorithmic move
-        try:
-            idx = legal_moves.index(chosen)
-        except ValueError:
-            for i, m in enumerate(legal_moves):
-                if m.path == chosen.path:
-                    idx = i
-                    break
-            else:
-                idx = 0
-                chosen = legal_moves[0]
-        return chosen, idx
+        return _move_index(chosen, legal_moves)
 
     while move_count < max_moves:
         legal_moves = state.legal_moves()
@@ -203,34 +420,51 @@ def play_single_game(
 
         policy = p1_policy if state.current_player == Player.ONE else p2_policy
         cur_diff = _p1_diff if state.current_player == Player.ONE else _p2_diff
-        chosen_move, chosen_index = _select_move(policy, legal_moves, cur_diff)
+        if len(legal_moves) == 1:
+            teacher_index = 0
+            played_index = 0
+            was_exploration = False
+        else:
+            teacher_move = get_best_move(
+                state, HARD_TEACHER_DIFFICULTY, use_parallel=False)
+            teacher_index = _move_index(teacher_move, legal_moves)
+            was_exploration = behavior_rng.random() < noise_prob
+            if was_exploration:
+                played_index = behavior_rng.randrange(len(legal_moves))
+            else:
+                played_index = _select_behavior_index(
+                    policy, legal_moves, cur_diff, teacher_index)
+        played_move = legal_moves[played_index]
 
         # Track captures per player
-        if chosen_move.is_capture:
-            player_captures[int(state.current_player)] += chosen_move.num_captures
+        if played_move.is_capture:
+            player_captures[int(state.current_player)] += played_move.num_captures
 
         # Record the position — build dicts directly when return_dicts=True
         # to skip ReplayEntry construction + to_dict() roundtrip
         if return_dicts:
-            entry = {
-                'state': state.to_compact(),
-                'legal_moves': [m.to_dict() for m in legal_moves],
-                'chosen_index': chosen_index,
-                'result': 0,
-                'score': 0.0,
-            }
+            entry = _entry_dict(
+                state.to_compact(), [m.to_dict() for m in legal_moves],
+                teacher_index, played_index, source, was_exploration,
+                applied_opening_plies, game_id)
         else:
             entry = ReplayEntry(
                 state=state.to_compact(),
                 legal_moves=[m.to_dict() for m in legal_moves],
-                chosen_index=chosen_index,
+                chosen_index=teacher_index,
                 result=0,  # Will be filled after game ends
                 score=0.0,  # Will be filled by scoring system
+                played_index=played_index,
+                trajectory_source=source,
+                was_exploration=was_exploration,
+                teacher_difficulty=HARD_TEACHER_DIFFICULTY,
+                opening_plies=applied_opening_plies,
+                game_id=str(game_id) if game_id is not None else None,
             )
         entries.append(entry)
 
         # Apply the move
-        state = state.apply_move(chosen_move)
+        state = state.apply_move(played_move)
         move_count += 1
 
     # Determine winner
@@ -296,9 +530,11 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
     loaded or no games use ML policy.
 
     Args:
-        batch_args: List of tuples:
+        batch_args: List of legacy or extended tuples:
             (difficulty, max_moves, noise_prob, start_player,
-             p1_policy, p2_policy, model_path, device)
+             p1_policy, p2_policy, model_path, device,
+             opening_plies=0, opening_seed=0, trajectory_source=None,
+             game_id=None, teacher_difficulty='hard')
 
     Returns:
         List of entry dicts (same format as play_single_game return_dicts=True)
@@ -310,14 +546,18 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
     if not batch_args:
         return []
 
+    specs = [_normalize_ml_task(task) for task in batch_args]
+
     # Extract model_path from first arg (same for all games in batch)
-    _model_path = batch_args[0][6]
+    _model_path = specs[0]['model_path']
 
     # Load model once for the entire batch.
     # [Pass 70] Try fork-inherited model first (zero disk I/O on Linux fork).
     # Falls back to get_model() which loads from disk via cache.
     model = None
-    has_ml = any(a[4] == 'ml' or a[5] == 'ml' for a in batch_args)
+    has_ml = any(
+        spec['p1_policy'] == 'ml' or spec['p2_policy'] == 'ml'
+        for spec in specs)
     if has_ml:
         if _FORK_MODEL is not None:
             model = _FORK_MODEL
@@ -327,8 +567,14 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             except Exception:
                 model = None
 
-    # If no model, fall back to sequential (algo-only or missing model)
+    # A missing model is acceptable only for an algorithm-only batch.  A
+    # current-model trajectory must fail closed rather than silently becoming
+    # algorithmic data with an incorrect provenance label.
     if model is None:
+        if has_ml:
+            raise RuntimeError(
+                "Current-model self-play requires a loadable ML model"
+            )
         return _play_games_batch_sequential(batch_args)
 
     n = len(batch_args)
@@ -346,35 +592,59 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
     games = []
     if _use_compact:
         _init_bb = _init_board_bytes()
-        for difficulty, max_moves, noise_prob, start_player, p1_pol, p2_pol, _mp, _dev in batch_args:
+        for spec in specs:
+            bb, player, opening_captures, applied_opening = (
+                _apply_compact_random_opening(
+                    _init_bb, spec['start_player'], spec['opening_plies'],
+                    spec['opening_seed']))
             games.append({
-                'bb': _init_bb,  # raw board bytes (64 int8)
-                'pl': int(start_player),  # current player (1 or 2)
+                'bb': bb,  # raw board bytes (64 int8)
+                'pl': player,  # current player (1 or 2)
                 'entries': [],
-                'p1_policy': p1_pol,
-                'p2_policy': p2_pol,
-                'difficulty': difficulty,
-                'noise_prob': noise_prob,
-                'max_moves': max_moves,
+                'p1_policy': spec['p1_policy'],
+                'p2_policy': spec['p2_policy'],
+                'difficulty': spec['difficulty'],
+                'noise_prob': spec['noise_prob'],
+                'max_moves': spec['max_moves'],
                 'move_count': 0,
-                'captures': {1: 0, 2: 0},
+                'state_move_count': applied_opening,
+                'captures': opening_captures,
+                'opening_plies': applied_opening,
+                'trajectory_source': spec['trajectory_source'],
+                'game_id': spec['game_id'],
+                'rng': random.Random(
+                    (int(spec['opening_seed'] or 0) ^ 0x6A09E667F3BCC909)
+                    & ((1 << 64) - 1)
+                ),
             })
     else:
-        for difficulty, max_moves, noise_prob, start_player, p1_pol, p2_pol, _mp, _dev in batch_args:
-            games.append({
-                'state': GameState(
+        for spec in specs:
+            state, applied_opening = apply_random_training_opening(
+                GameState(
                     board=Board.initial(),
-                    current_player=Player(start_player),
+                    current_player=Player(spec['start_player']),
                     move_count=0,
                 ),
+                opening_plies=spec['opening_plies'],
+                opening_seed=spec['opening_seed'],
+            )
+            games.append({
+                'state': state,
                 'entries': [],
-                'p1_policy': p1_pol,
-                'p2_policy': p2_pol,
-                'difficulty': difficulty,
-                'noise_prob': noise_prob,
-                'max_moves': max_moves,
+                'p1_policy': spec['p1_policy'],
+                'p2_policy': spec['p2_policy'],
+                'difficulty': spec['difficulty'],
+                'noise_prob': spec['noise_prob'],
+                'max_moves': spec['max_moves'],
                 'move_count': 0,
                 'captures': {1: 0, 2: 0},
+                'opening_plies': applied_opening,
+                'trajectory_source': spec['trajectory_source'],
+                'game_id': spec['game_id'],
+                'rng': random.Random(
+                    (int(spec['opening_seed'] or 0) ^ 0x6A09E667F3BCC909)
+                    & ((1 << 64) - 1)
+                ),
             })
 
     active = list(range(n))
@@ -408,9 +678,9 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
         # [Pass 70] With fast movegen, md comes directly from Cython C
         # movegen (no Move objects created at all). Move objects are only
         # created for the chosen move via Move.from_dict().
-        ml_requests = []     # (game_idx, sd, md)
-        algo_requests = []   # (game_idx, sd, md)
-        immediate = []       # (game_idx, chosen_idx, sd, md)
+        ml_requests = []     # (game_idx, teacher_idx, sd, md)
+        algo_requests = []   # (game_idx, teacher_idx, sd, md)
+        immediate = []       # (game_idx, teacher_idx, played_idx, explored, sd, md)
 
         new_active = []
         for i in active:
@@ -435,13 +705,14 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             new_active.append(i)
 
             if _use_compact:
-                sd = _board_to_compact(g['bb'], g['pl'], g['move_count'])
+                sd = _board_to_compact(
+                    g['bb'], g['pl'], g['state_move_count'])
             else:
                 sd = g['state'].to_compact()
 
             # Single legal move — no inference needed
             if len(md) == 1:
-                immediate.append((i, 0, sd, md))
+                immediate.append((i, 0, 0, False, sd, md))
                 continue
 
             if _use_compact:
@@ -449,40 +720,48 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             else:
                 policy = g['p1_policy'] if g['state'].current_player == Player.ONE else g['p2_policy']
 
-            # Exploration noise
-            if _random() < g['noise_prob']:
-                immediate.append((i, _randrange(len(md)), sd, md))
+            teacher_state = (
+                GameState.from_compact(sd) if _use_compact else g['state'])
+            teacher_move = get_best_move(
+                teacher_state, HARD_TEACHER_DIFFICULTY, use_parallel=False)
+            teacher_idx = _move_index(teacher_move, md)
+
+            # Exploration changes the played action but never the hard label.
+            if g['rng'].random() < g['noise_prob']:
+                immediate.append((
+                    i, teacher_idx, g['rng'].randrange(len(md)), True, sd, md))
             elif policy == 'ml':
-                ml_requests.append((i, sd, md))
+                ml_requests.append((i, teacher_idx, sd, md))
+            elif g['difficulty'] == HARD_TEACHER_DIFFICULTY:
+                immediate.append((
+                    i, teacher_idx, teacher_idx, False, sd, md))
             else:
-                algo_requests.append((i, sd, md))
+                algo_requests.append((i, teacher_idx, sd, md))
 
         active = new_active
         if not active:
             break
 
         # Immediate moves — apply chosen move from dict
-        for game_idx, idx, sd, md in immediate:
+        for game_idx, teacher_idx, played_idx, explored, sd, md in immediate:
             game = games[game_idx]
-            chosen_md = md[idx]
-            game['entries'].append({
-                'state': sd,
-                'legal_moves': md,
-                'chosen_index': idx,
-                'result': 0,
-                'score': 0.0,
-            })
+            played_md = md[played_idx]
+            game['entries'].append(_entry_dict(
+                sd, md, teacher_idx, played_idx,
+                game['trajectory_source'], explored,
+                game['opening_plies'], game['game_id']))
             if _use_compact:
                 prev_pl = game['pl']
                 game['bb'], game['pl'], ncaps = _apply_move_board(
-                    game['bb'], game['pl'], chosen_md)
+                    game['bb'], game['pl'], played_md)
                 if ncaps > 0:
                     game['captures'][prev_pl] += ncaps
+                game['state_move_count'] += 1
             else:
-                captures = chosen_md.get('captures', ())
+                captures = played_md.get('captures', ())
                 if captures:
                     game['captures'][int(game['state'].current_player)] += len(captures)
-                game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
+                game['state'] = game['state'].apply_move(Move.from_dict(played_md))
             game['move_count'] += 1
 
         # Batched ML inference — encode using partition-step dicts
@@ -495,7 +774,7 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             counts = _counts_buf[:batch_sz]
 
             # Dicts already pre-computed in partition step — just encode
-            for j, (game_idx, sd, md) in enumerate(ml_requests):
+            for j, (game_idx, _teacher_idx, sd, md) in enumerate(ml_requests):
                 if _HAS_FAST_ENCODE:
                     _cy_encode_board(sd, boards[j])
                     counts[j] = _cy_encode_moves(sd, md, all_mf[j])
@@ -513,32 +792,34 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             # [Pass 71] Batch argmax: single torch op for all positions.
             best_indices_list = scores.argmax(dim=1).tolist()
 
-            for j, (game_idx, sd, md) in enumerate(ml_requests):
+            for j, (game_idx, teacher_idx, sd, md) in enumerate(ml_requests):
                 best_idx = best_indices_list[j]
+                if not 0 <= best_idx < len(md):
+                    raise RuntimeError(
+                        "Current-model trajectory returned an illegal move index"
+                    )
                 game = games[game_idx]
-                chosen_md = md[best_idx]
-                game['entries'].append({
-                    'state': sd,
-                    'legal_moves': md,
-                    'chosen_index': best_idx,
-                    'result': 0,
-                    'score': 0.0,
-                })
+                played_md = md[best_idx]
+                game['entries'].append(_entry_dict(
+                    sd, md, teacher_idx, best_idx,
+                    game['trajectory_source'], False,
+                    game['opening_plies'], game['game_id']))
                 if _use_compact:
                     prev_pl = game['pl']
                     game['bb'], game['pl'], ncaps = _apply_move_board(
-                        game['bb'], game['pl'], chosen_md)
+                        game['bb'], game['pl'], played_md)
                     if ncaps > 0:
                         game['captures'][prev_pl] += ncaps
+                    game['state_move_count'] += 1
                 else:
-                    captures = chosen_md.get('captures', ())
+                    captures = played_md.get('captures', ())
                     if captures:
                         game['captures'][int(game['state'].current_player)] += len(captures)
-                    game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
+                    game['state'] = game['state'].apply_move(Move.from_dict(played_md))
                 game['move_count'] += 1
 
         # Sequential algo moves — match by path start/end positions
-        for game_idx, sd, md in algo_requests:
+        for game_idx, teacher_idx, sd, md in algo_requests:
             # Compact path: reconstruct GameState from compact dict for algo search.
             # Cost is ~50μs — negligible vs 200ms-2.5s search.
             if _use_compact:
@@ -548,7 +829,9 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             move = get_best_move(_algo_state, games[game_idx]['difficulty'],
                                  use_parallel=False)
             if move is None:
-                idx = _randrange(len(md))
+                raise RuntimeError(
+                    "Algorithm trajectory behavior returned no legal move"
+                )
             else:
                 # Match algo Move to dict by path start+end positions.
                 # Cython fast_search and fast_generate_moves use the same C
@@ -561,32 +844,34 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 mp = move.path
                 mp_start = mp[0]
                 mp_end = mp[-1]
-                idx = 0
+                idx = None
                 for k, m_dict in enumerate(md):
                     dp = m_dict['path']
                     if dp[0] == mp_start and dp[-1] == mp_end:
                         idx = k
                         break
+                if idx is None:
+                    raise RuntimeError(
+                        "Algorithm trajectory behavior move is outside the legal set"
+                    )
             game = games[game_idx]
-            chosen_md = md[idx]
-            game['entries'].append({
-                'state': sd,
-                'legal_moves': md,
-                'chosen_index': idx,
-                'result': 0,
-                'score': 0.0,
-            })
+            played_md = md[idx]
+            game['entries'].append(_entry_dict(
+                sd, md, teacher_idx, idx,
+                game['trajectory_source'], False,
+                game['opening_plies'], game['game_id']))
             if _use_compact:
                 prev_pl = game['pl']
                 game['bb'], game['pl'], ncaps = _apply_move_board(
-                    game['bb'], game['pl'], chosen_md)
+                    game['bb'], game['pl'], played_md)
                 if ncaps > 0:
                     game['captures'][prev_pl] += ncaps
+                game['state_move_count'] += 1
             else:
-                captures = chosen_md.get('captures', ())
+                captures = played_md.get('captures', ())
                 if captures:
                     game['captures'][int(game['state'].current_player)] += len(captures)
-                game['state'] = game['state'].apply_move(Move.from_dict(chosen_md))
+                game['state'] = game['state'].apply_move(Move.from_dict(played_md))
             game['move_count'] += 1
 
     # Score all games' entries
@@ -608,7 +893,8 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 winner_int = None
             else:
                 winner_int = None  # safety fallback (should not reach here)
-            final_state_dict = _board_to_compact(g['bb'], g['pl'], g['move_count'])
+            final_state_dict = _board_to_compact(
+                g['bb'], g['pl'], g['state_move_count'])
         else:
             state = g['state']
             if end_reason == 'no_moves':
@@ -643,14 +929,20 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
 def _play_games_batch_sequential(batch_args: list) -> List[dict]:
     """Sequential fallback for _play_games_batch_worker_full."""
     all_entries = []
-    for (difficulty, max_moves, noise_prob, start_player,
-         p1_policy, p2_policy, model_path, _device) in batch_args:
+    for task in batch_args:
+        spec = _normalize_ml_task(task)
         entry_dicts = play_single_game(
-            difficulty=difficulty, max_moves=max_moves,
-            noise_prob=noise_prob, start_player=start_player,
-            p1_policy=p1_policy, p2_policy=p2_policy,
-            model_path=model_path, device='cpu',
+            difficulty=spec['difficulty'], max_moves=spec['max_moves'],
+            noise_prob=spec['noise_prob'], start_player=spec['start_player'],
+            p1_policy=spec['p1_policy'], p2_policy=spec['p2_policy'],
+            model_path=spec['model_path'], device='cpu',
             return_dicts=True,
+            teacher_difficulty=spec['teacher_difficulty'],
+            opening_plies=spec['opening_plies'],
+            opening_seed=spec['opening_seed'],
+            trajectory_source=spec['trajectory_source'],
+            game_id=spec['game_id'],
+            inference_depth=spec['inference_depth'],
         )
         all_entries.extend(entry_dicts)
     return all_entries
@@ -670,7 +962,12 @@ def _play_games_batch_worker_full(batch_args: list) -> List[dict]:
         return []
 
     # Interleaved play benefits from batching ≥2 games
-    has_ml = any(a[4] == 'ml' or a[5] == 'ml' for a in batch_args)
+    specs = [_normalize_ml_task(task) for task in batch_args]
+    has_ml = any(
+        spec['p1_policy'] == 'ml' or spec['p2_policy'] == 'ml'
+        for spec in specs)
+    if has_ml and any(spec['inference_depth'] > 1 for spec in specs):
+        return _play_games_batch_sequential(batch_args)
     if has_ml and len(batch_args) >= 2:
         return play_games_interleaved(batch_args)
 
@@ -678,37 +975,48 @@ def _play_games_batch_worker_full(batch_args: list) -> List[dict]:
 
 
 def _play_game_worker_algo_vs_algo(
-    args: Tuple[str, str, int, float, int]
+    args: tuple
 ) -> List[dict]:
     """Worker function for algo-vs-algo self-play with per-player difficulties.
 
     Uses Cython full game loop when available for 2-7x speedup.
     Falls back to Python play_single_game with return_dicts=True.
     """
-    p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player = args
+    spec = _normalize_algo_task(args)
     if _HAS_FAST_GAME:
         result = play_full_game_cy(
-            p1_difficulty=p1_difficulty, p2_difficulty=p2_difficulty,
-            max_moves=max_moves, noise_prob=noise_prob,
-            start_player=start_player,
+            p1_difficulty=spec['p1_difficulty'],
+            p2_difficulty=spec['p2_difficulty'],
+            max_moves=spec['max_moves'], noise_prob=spec['noise_prob'],
+            start_player=spec['start_player'],
+            teacher_difficulty=spec['teacher_difficulty'],
+            opening_plies=spec['opening_plies'],
+            opening_seed=spec['opening_seed'],
+            trajectory_source=spec['trajectory_source'],
+            game_id=spec['game_id'],
         )
         score_game_dicts(
             entry_dicts=result['entries'], winner_int=result['winner'],
-            total_moves=result['num_moves'], max_moves=max_moves,
+            total_moves=result['num_moves'], max_moves=spec['max_moves'],
             final_state_dict=result['final_state'],
             p1_captures=result['p1_captures'], p2_captures=result['p2_captures'],
         )
         return result['entries']
     return play_single_game(
-        difficulty=p1_difficulty,
-        max_moves=max_moves,
-        noise_prob=noise_prob,
-        start_player=start_player,
+        difficulty=spec['p1_difficulty'],
+        max_moves=spec['max_moves'],
+        noise_prob=spec['noise_prob'],
+        start_player=spec['start_player'],
         p1_policy='algorithmic',
         p2_policy='algorithmic',
-        p1_difficulty=p1_difficulty,
-        p2_difficulty=p2_difficulty,
+        p1_difficulty=spec['p1_difficulty'],
+        p2_difficulty=spec['p2_difficulty'],
         return_dicts=True,
+        teacher_difficulty=spec['teacher_difficulty'],
+        opening_plies=spec['opening_plies'],
+        opening_seed=spec['opening_seed'],
+        trajectory_source=spec['trajectory_source'],
+        game_id=spec['game_id'],
     )
 
 
@@ -719,30 +1027,42 @@ def _play_games_batch_worker_algo(batch_args: list) -> List[dict]:
     """
     all_entries = []
     if _HAS_FAST_GAME:
-        for p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player in batch_args:
+        for task in batch_args:
+            spec = _normalize_algo_task(task)
             result = play_full_game_cy(
-                p1_difficulty=p1_difficulty, p2_difficulty=p2_difficulty,
-                max_moves=max_moves, noise_prob=noise_prob,
-                start_player=start_player,
+                p1_difficulty=spec['p1_difficulty'],
+                p2_difficulty=spec['p2_difficulty'],
+                max_moves=spec['max_moves'], noise_prob=spec['noise_prob'],
+                start_player=spec['start_player'],
+                teacher_difficulty=spec['teacher_difficulty'],
+                opening_plies=spec['opening_plies'],
+                opening_seed=spec['opening_seed'],
+                trajectory_source=spec['trajectory_source'],
+                game_id=spec['game_id'],
             )
             score_game_dicts(
                 entry_dicts=result['entries'], winner_int=result['winner'],
-                total_moves=result['num_moves'], max_moves=max_moves,
+                total_moves=result['num_moves'], max_moves=spec['max_moves'],
                 final_state_dict=result['final_state'],
                 p1_captures=result['p1_captures'], p2_captures=result['p2_captures'],
             )
             all_entries.extend(result['entries'])
     else:
-        for p1_difficulty, p2_difficulty, max_moves, noise_prob, start_player in batch_args:
+        for task in batch_args:
+            spec = _normalize_algo_task(task)
             entry_dicts = play_single_game(
-                difficulty=p1_difficulty,
-                max_moves=max_moves, noise_prob=noise_prob,
-                start_player=start_player,
+                difficulty=spec['p1_difficulty'],
+                max_moves=spec['max_moves'], noise_prob=spec['noise_prob'],
+                start_player=spec['start_player'],
                 p1_policy='algorithmic', p2_policy='algorithmic',
-                p1_difficulty=p1_difficulty, p2_difficulty=p2_difficulty,
+                p1_difficulty=spec['p1_difficulty'],
+                p2_difficulty=spec['p2_difficulty'],
                 return_dicts=True,
+                teacher_difficulty=spec['teacher_difficulty'],
+                opening_plies=spec['opening_plies'],
+                opening_seed=spec['opening_seed'],
+                trajectory_source=spec['trajectory_source'],
+                game_id=spec['game_id'],
             )
             all_entries.extend(entry_dicts)
     return all_entries
-
-
