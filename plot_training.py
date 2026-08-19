@@ -624,8 +624,12 @@ def _aggregate_stats(stats_by_path: list[tuple[Path, dict]]) -> dict:
         merged['current_run'] = label
         return merged
 
-    current_path, _ = max(stats_by_path, key=lambda item: item[0].stat().st_mtime)
-    merged = {
+    current_path, current_stats = max(
+        stats_by_path, key=lambda item: item[0].stat().st_mtime)
+    # Start from the current run so newly added scalar/nested metrics remain
+    # available even when the dashboard also overlays older stats files.
+    merged = dict(current_stats)
+    merged.update({
         'start_time': '',
         'end_time': '',
         'total_steps': 0,
@@ -641,7 +645,7 @@ def _aggregate_stats(stats_by_path: list[tuple[Path, dict]]) -> dict:
         'source_files': [path.name for path, _ in stats_by_path],
         'current_source_file': current_path.name,
         'current_run': _stats_source_label(current_path),
-    }
+    })
 
     start_times = []
     end_times = []
@@ -776,6 +780,182 @@ def merge_test_history(stats: dict, log_entries: list[dict]) -> list[dict]:
     )]
 
 
+def _summary_value(source, *keys, default=None):
+    """Read the first available key from a summary metric mapping."""
+    if not isinstance(source, dict):
+        return default
+    for key in keys:
+        if key in source:
+            return source[key]
+    return default
+
+
+def _summary_latest(source: dict, *history_keys) -> dict:
+    for key in history_keys:
+        history = _summary_value(source, key)
+        if isinstance(history, list):
+            for entry in reversed(history):
+                if isinstance(entry, dict):
+                    return entry
+    return {}
+
+
+def _summary_number(sources, *keys) -> float | None:
+    for source in sources:
+        for key in keys:
+            value = _as_finite_float(_summary_value(source, key))
+            if value is not None:
+                return value
+    return None
+
+
+def _summary_state(sources, *keys):
+    for source in sources:
+        for key in keys:
+            value = _summary_value(source, key)
+            if value is not None and str(value).strip():
+                return value
+    return None
+
+
+def _summary_loss_text(value) -> str:
+    metric = _as_finite_float(value)
+    return 'N/A' if metric is None else f'{metric:.4f}'
+
+
+def _summary_percent_text(value) -> str:
+    metric = _as_finite_float(value)
+    if metric is None:
+        return 'N/A'
+    if abs(metric) <= 1.0:
+        metric *= 100.0
+    return f'{metric:.1f}%'
+
+
+def _summary_state_text(value, true_text: str, false_text: str) -> str:
+    if value is None:
+        return 'N/A'
+    if isinstance(value, bool):
+        return true_text if value else false_text
+    return str(value)
+
+
+def _summary_confidence_interval(sources) -> tuple:
+    """Return numeric interval bounds or a preformatted interval string."""
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        lower = _summary_number(
+            [source], 'match_score_ci_lower', 'match_score_ci_low',
+            'confidence_interval_lower', 'ci_lower', 'lower_bound')
+        upper = _summary_number(
+            [source], 'match_score_ci_upper', 'match_score_ci_high',
+            'confidence_interval_upper', 'ci_upper', 'upper_bound')
+        if lower is not None and upper is not None:
+            return lower, upper, None
+
+        container = _summary_value(
+            source, 'match_score_confidence_interval', 'match_score_ci',
+            'match_score_ci_95', 'confidence_interval_95', 'ci_95',
+            'confidence_interval')
+        if isinstance(container, dict):
+            lower = _summary_number([container], 'lower', 'low', 'lower_bound')
+            upper = _summary_number([container], 'upper', 'high', 'upper_bound')
+            if lower is not None and upper is not None:
+                return lower, upper, None
+        elif isinstance(container, (list, tuple)) and len(container) >= 2:
+            lower = _as_finite_float(container[0])
+            upper = _as_finite_float(container[1])
+            if lower is not None and upper is not None:
+                return lower, upper, None
+        elif isinstance(container, str) and container.strip():
+            return None, None, container.strip()
+    return None, None, None
+
+
+def _recovery_summary_metrics(stats: dict, test_history: list[dict]) -> dict:
+    """Build explicit P0/P1 recovery metric strings with legacy fallbacks."""
+    latest_loss = _summary_latest(stats, 'loss_history')
+    latest_validation = _summary_latest(
+        stats, 'validation_teacher_agreement_history',
+        'teacher_agreement_history', 'validation_history')
+    latest_promotion = _summary_latest(stats, 'promotion_history')
+    latest_acceptance = _summary_latest(stats, 'acceptance_history')
+    latest_test = test_history[-1] if test_history else _summary_latest(
+        stats, 'test_history', 'evaluation_history')
+
+    dataset_metrics = _summary_value(
+        stats, 'dataset_metrics', 'current_dataset', default={})
+    validation_metrics = _summary_value(
+        stats, 'validation_metrics', 'validation', default={})
+    promotion_metrics = _summary_value(
+        stats, 'promotion', 'promotion_metrics', default={})
+    acceptance_metrics = _summary_value(
+        stats, 'acceptance', 'acceptance_metrics', default={}) or latest_acceptance
+    evaluation_metrics = _summary_value(
+        stats, 'latest_evaluation', 'evaluation_metrics',
+        'game_evaluation', default={})
+    acceptance_payload = _summary_value(
+        acceptance_metrics, 'metrics', default=acceptance_metrics)
+    acceptance_evaluation = _summary_value(
+        acceptance_payload, 'easy', 'random', default={})
+
+    current_train_loss = _summary_number(
+        [stats, latest_loss], 'current_train_loss', 'recent_loss', 'loss')
+    current_dataset_best = _summary_number(
+        [stats, dataset_metrics], 'current_dataset_best_train_loss',
+        'dataset_best_train_loss', 'best_train_loss')
+    historical_best = _summary_number(
+        [stats], 'historical_best_train_loss', 'best_loss')
+    validation_agreement = _summary_number(
+        [stats, validation_metrics, latest_validation],
+        'validation_teacher_agreement', 'held_out_teacher_agreement',
+        'heldout_teacher_agreement', 'teacher_agreement',
+        'top1_teacher_agreement', 'top1_agreement')
+
+    promotion_state = _summary_state(
+        [stats, promotion_metrics, latest_promotion],
+        'promotion_state', 'promotion_status', 'state', 'status', 'promoted')
+    acceptance_state = _summary_state(
+        [stats, acceptance_metrics, latest_acceptance, evaluation_metrics, latest_test],
+        'acceptance_state', 'acceptance_status', 'state', 'status',
+        'accepted', 'passed')
+
+    evaluation_sources = [
+        stats, evaluation_metrics, latest_test, acceptance_evaluation]
+    match_score = _summary_number(evaluation_sources, 'match_score', 'score')
+    if match_score is None:
+        wins = _summary_number(evaluation_sources, 'ml_wins', 'wins')
+        draws = _summary_number(evaluation_sources, 'draws')
+        games = _summary_number(evaluation_sources, 'total_games', 'games')
+        if wins is not None and draws is not None and games:
+            match_score = (wins + 0.5 * draws) / games
+
+    ci_lower, ci_upper, ci_text = _summary_confidence_interval(evaluation_sources)
+    if ci_lower is not None and ci_upper is not None:
+        interval_text = (
+            f'{_summary_percent_text(ci_lower)} to '
+            f'{_summary_percent_text(ci_upper)}'
+        )
+    elif ci_text:
+        interval_text = ci_text
+    else:
+        interval_text = 'N/A'
+
+    return {
+        'current_train_loss': _summary_loss_text(current_train_loss),
+        'current_dataset_best_train_loss': _summary_loss_text(current_dataset_best),
+        'historical_best_train_loss': _summary_loss_text(historical_best),
+        'validation_teacher_agreement': _summary_percent_text(validation_agreement),
+        'promotion_state': _summary_state_text(
+            promotion_state, 'Promoted', 'Not promoted'),
+        'acceptance_state': _summary_state_text(
+            acceptance_state, 'Accepted', 'Not accepted'),
+        'match_score': _summary_percent_text(match_score),
+        'confidence_interval': interval_text,
+    }
+
+
 def _build_summary_text(stats: dict, test_history: list[dict], steps, win_rates) -> str:
     """Build the monospace summary block (uses <br> for Plotly line breaks)."""
     total_games = sum(t['total_games'] for t in test_history)
@@ -796,8 +976,7 @@ def _build_summary_text(stats: dict, test_history: list[dict], steps, win_rates)
     total_steps_str = f"{total_steps:,}" if total_steps > 0 else 'N/A'
     epochs = stats.get('epochs_completed')
     epochs_str = f"{epochs:,}" if isinstance(epochs, (int, float)) else 'N/A'
-    best_loss = stats.get('best_loss')
-    best_loss_str = f"{best_loss:.4f}" if isinstance(best_loss, (int, float)) else 'N/A'
+    recovery_metrics = _recovery_summary_metrics(stats, test_history)
     start_time = stats.get('start_time', 'N/A')
     start_time_str = start_time[:19] if isinstance(start_time, str) and len(start_time) >= 19 else str(start_time)
     end_time = stats.get('end_time', 'N/A')
@@ -808,7 +987,17 @@ def _build_summary_text(stats: dict, test_history: list[dict], steps, win_rates)
         "================",
         f"Total Training Steps:  {total_steps_str}",
         f"Epochs Completed:      {epochs_str}",
-        f"Best Loss:             {best_loss_str}",
+        f"Current Train Loss:    {recovery_metrics['current_train_loss']}",
+        f"Current Dataset Best:  {recovery_metrics['current_dataset_best_train_loss']}",
+        f"Historical Best Loss:  {recovery_metrics['historical_best_train_loss']}",
+        "",
+        "<b>Validation and Promotion</b>",
+        "========================",
+        f"Teacher Agreement:     {recovery_metrics['validation_teacher_agreement']}",
+        f"Promotion State:       {recovery_metrics['promotion_state']}",
+        f"Acceptance State:      {recovery_metrics['acceptance_state']}",
+        f"Match Score:           {recovery_metrics['match_score']}",
+        f"Match Score 95% CI:    {recovery_metrics['confidence_interval']}",
         "",
         "<b>Model vs Algorithm (cumulative)</b>",
         "================================",
