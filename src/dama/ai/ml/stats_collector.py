@@ -907,6 +907,7 @@ class StatsCollector:
         total_size_bytes: Optional[int] = None,
         oldest_file_age_hours: Optional[float] = None,
         result_balance: Optional[Dict[str, float]] = None,
+        corpus_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Snapshot the state of the replay buffer."""
         with self._lock:
@@ -922,6 +923,8 @@ class StatsCollector:
                 record['oldest_file_age_hours'] = oldest_file_age_hours
             if result_balance:
                 record['result_balance'] = result_balance
+            if corpus_metrics:
+                record['corpus_metrics'] = dict(corpus_metrics)
 
             self.replay_records.append(record)
 
