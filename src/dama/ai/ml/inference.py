@@ -138,10 +138,135 @@ def clear_model_cache() -> None:
         _model_cache.clear()
 
 
+def _validate_inference_depth(depth: int) -> int:
+    """Validate and return the supported ML inference depth."""
+    if isinstance(depth, bool) or not isinstance(depth, int) or depth not in (1, 2, 3):
+        raise ValueError("ML inference depth must be one of 1, 2, or 3")
+    return depth
+
+
+def _inference_device(model: MoveScorerNet, device) -> torch.device:
+    if device is not None:
+        return torch.device(device)
+    return next(model.parameters()).device
+
+
+def _score_policy_moves(
+    state: GameState,
+    moves: List[Move],
+    model: MoveScorerNet,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return policy logits for ``moves`` without selecting an action."""
+    board_tensor = torch.from_numpy(encode_board(state)).unsqueeze(0)
+    move_tensor = torch.from_numpy(encode_moves(state, moves))
+    if device.type != 'cpu':
+        board_tensor = board_tensor.to(device)
+        move_tensor = move_tensor.to(device)
+    with torch.inference_mode():
+        return model.score_single(board_tensor, move_tensor)
+
+
+def _value_for_state(
+    state: GameState,
+    model: MoveScorerNet,
+    device: torch.device,
+) -> float:
+    """Evaluate a state from the current player's perspective."""
+    if getattr(model, 'value_head', None) is None:
+        raise ValueError("ML inference depth 2 or 3 requires a model value head")
+    board_tensor = torch.from_numpy(encode_board(state)).unsqueeze(0)
+    if device.type != 'cpu':
+        board_tensor = board_tensor.to(device)
+    with torch.inference_mode():
+        embedding = model.board_encoder(board_tensor)
+        value = model.value_head(embedding)
+    return float(value.reshape(-1)[0].item())
+
+
+def _negamax_value(
+    state: GameState,
+    model: MoveScorerNet,
+    device: torch.device,
+    remaining_plies: int,
+    alpha: float,
+    beta: float,
+) -> float:
+    """Return shallow negamax value from the side-to-move perspective."""
+    moves = state.legal_moves()
+    if not moves:
+        return -1.0
+    if remaining_plies <= 0:
+        return _value_for_state(state, model, device)
+
+    best = float('-inf')
+    for move in moves:
+        child = state.apply_move(move)
+        score = -_negamax_value(
+            child,
+            model,
+            device,
+            remaining_plies - 1,
+            -beta,
+            -alpha,
+        )
+        if score > best:
+            best = score
+        if score > alpha:
+            alpha = score
+        if alpha >= beta:
+            break
+    return best
+
+
+def _select_move_with_model(
+    state: GameState,
+    moves: List[Move],
+    model: MoveScorerNet,
+    device=None,
+    depth: int = 1,
+) -> Optional[Move]:
+    """Select a move with policy argmax or value-head shallow negamax."""
+    depth = _validate_inference_depth(depth)
+    if not moves:
+        return None
+    if len(moves) == 1:
+        return moves[0]
+
+    resolved_device = _inference_device(model, device)
+    if depth == 1:
+        scores = _score_policy_moves(state, moves, model, resolved_device)
+        return moves[int(scores.argmax().item())]
+
+    if getattr(model, 'value_head', None) is None:
+        raise ValueError("ML inference depth 2 or 3 requires a model value head")
+
+    best_move = moves[0]
+    best_score = float('-inf')
+    alpha = float('-inf')
+    beta = float('inf')
+    for move in moves:
+        score = -_negamax_value(
+            state.apply_move(move),
+            model,
+            resolved_device,
+            depth - 1,
+            -beta,
+            -alpha,
+        )
+        if score > best_score:
+            best_score = score
+            best_move = move
+        if score > alpha:
+            alpha = score
+    return best_move
+
+
 def get_ml_move(
     state: GameState,
     model_path: str = "models/latest.pt",
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    depth: int = 1,
 ) -> Optional[Move]:
     """
     Get the best move according to the ML model.
@@ -150,10 +275,13 @@ def get_ml_move(
         state: Current game state
         model_path: Path to the model checkpoint
         device: Device to run inference on
+        depth: ML inference depth. Depth 1 preserves policy argmax. Depths 2
+            and 3 use shallow negamax and require a model value head.
 
     Returns:
         The best move, or None if no legal moves
     """
+    depth = _validate_inference_depth(depth)
     moves = state.legal_moves()
     if not moves:
         return None
@@ -168,25 +296,7 @@ def get_ml_move(
         warnings.warn(f"Model not found at {resolved_path}")
         raise
 
-    # Encode state and moves
-    board_tensor = torch.from_numpy(encode_board(state)).unsqueeze(0)
-    move_tensor = torch.from_numpy(encode_moves(state, moves))
-
-    # Move to device (skip no-op .to() when already on CPU)
-    if device is None or isinstance(device, str):
-        device = next(model.parameters()).device
-    if device.type != 'cpu':
-        board_tensor = board_tensor.to(device)
-        move_tensor = move_tensor.to(device)
-
-    # inference_mode is faster than no_grad: also disables version counting
-    # and autograd dispatch overhead (~5-10% faster for small forward passes)
-    with torch.inference_mode():
-        scores = model.score_single(board_tensor, move_tensor)
-
-    # Select best move
-    best_idx = scores.argmax().item()
-    return moves[best_idx]
+    return _select_move_with_model(state, moves, model, device=device, depth=depth)
 
 
 def get_ml_move_idx(
@@ -194,6 +304,7 @@ def get_ml_move_idx(
     legal_moves: List[Move],
     model_path: str = "models/latest.pt",
     device: Optional[torch.device] = None,
+    depth: int = 1,
 ) -> Optional[int]:
     """Get index of the best move according to the ML model.
 
@@ -208,10 +319,12 @@ def get_ml_move_idx(
         legal_moves: Pre-computed legal moves for this position
         model_path: Path to the model checkpoint
         device: Device to run inference on
+        depth: ML inference depth in the inclusive range 1 to 3.
 
     Returns:
         Index of the best move, or None if no legal moves
     """
+    depth = _validate_inference_depth(depth)
     if not legal_moves:
         return None
 
@@ -223,21 +336,14 @@ def get_ml_move_idx(
     except FileNotFoundError:
         raise
 
-    # Encode state and moves
-    board_tensor = torch.from_numpy(encode_board(state)).unsqueeze(0)
-    move_tensor = torch.from_numpy(encode_moves(state, legal_moves))
-
-    # Move to device (skip no-op .to() when already on CPU)
-    if device is None or isinstance(device, str):
-        device = next(model.parameters()).device
-    if device.type != 'cpu':
-        board_tensor = board_tensor.to(device)
-        move_tensor = move_tensor.to(device)
-
-    with torch.inference_mode():
-        scores = model.score_single(board_tensor, move_tensor)
-
-    return scores.argmax().item()
+    selected = _select_move_with_model(
+        state,
+        legal_moves,
+        model,
+        device=device,
+        depth=depth,
+    )
+    return legal_moves.index(selected) if selected is not None else None
 
 
 def get_move_scores(
