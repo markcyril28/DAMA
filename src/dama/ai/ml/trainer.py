@@ -7,16 +7,19 @@ import time
 import random
 import math
 import argparse
+import hashlib
+import hmac
 import tempfile
 import warnings
+import numpy as np
 from collections import deque
 import platform
 import threading
 import multiprocessing as mp
-from queue import Empty
+from queue import Empty, Queue
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Mapping
 from dataclasses import dataclass, field
 
 # Set multiprocessing start method before any other multiprocessing imports
@@ -74,6 +77,7 @@ from .model import MoveScorerNet, create_model, save_model, load_model
 from .move_encoder import ENCODING_VERSION
 from .replay import ReplayBuffer
 from .selfplay import (
+    allocate_policy_distillation_games,
     _play_game_worker_algo_vs_algo,
     _play_games_batch_worker_algo, _play_games_batch_worker_full,
     _selfplay_worker_init,
@@ -84,6 +88,25 @@ from .dataset import (
 )
 from .scoring import compute_reward_weight
 from .stats_collector import StatsCollector
+from .corpus import (
+    CorpusSnapshotManager,
+    analyze_replay_files,
+    canonical_state_key,
+    replay_file_sha256,
+)
+from .teacher_validation import (
+    PromotionDecision,
+    PromotionRegistry,
+    create_frozen_teacher_suite,
+    evaluate_teacher_agreement,
+    load_frozen_teacher_suite,
+)
+from .teacher_targets import (
+    EnhancedBatchIterator,
+    create_enhanced_dataloader,
+    soft_target_cross_entropy,
+)
+from . import checkpoint_acceptance as checkpoint_acceptance_tasks
 
 
 def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
@@ -281,6 +304,13 @@ class TrainingStats:
     end_time: str = ""
     total_steps: int = 0
     epochs_completed: int = 0
+    current_train_loss: Optional[float] = None
+    current_dataset_best_train_loss: float = float('inf')
+    historical_best_train_loss: float = float('inf')
+    dataset_fingerprint: str = ""
+    dataset_metadata: dict = field(default_factory=dict)
+    generation_cycles_completed: int = 0
+    best_teacher_agreement: float = 0.0
     best_loss: float = float('inf')
     best_val_loss: float = float('inf')
 
@@ -295,6 +325,9 @@ class TrainingStats:
     gpu_mem_history: object = None
     step_times: object = None
     test_history: list = None  # Model vs algorithm test results (low-volume, list is fine)
+    teacher_agreement_history: list = None
+    promotion_history: list = None
+    acceptance_history: list = None
 
     def __post_init__(self):
         _cap = _STATS_HISTORY_CAP
@@ -320,6 +353,12 @@ class TrainingStats:
             self.step_times = deque(self.step_times, maxlen=_cap)
         if self.test_history is None:
             self.test_history = []
+        if self.teacher_agreement_history is None:
+            self.teacher_agreement_history = []
+        if self.promotion_history is None:
+            self.promotion_history = []
+        if self.acceptance_history is None:
+            self.acceptance_history = []
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization.
@@ -332,21 +371,38 @@ class TrainingStats:
         (Python's json.dump writes 'Infinity' which is non-standard).
         """
         import math
-        _bl = self.best_loss
+        _historical = self.historical_best_train_loss
+        _dataset_best = self.current_dataset_best_train_loss
         _bvl = self.best_val_loss
         return {
             'start_time': self.start_time,
             'end_time': self.end_time,
             'total_steps': self.total_steps,
             'epochs_completed': self.epochs_completed,
-            'best_loss': _bl if math.isfinite(_bl) else None,
+            'current_train_loss': self.current_train_loss,
+            'current_dataset_best_train_loss': (
+                _dataset_best if math.isfinite(_dataset_best) else None
+            ),
+            'historical_best_train_loss': (
+                _historical if math.isfinite(_historical) else None
+            ),
+            # Legacy key retained for older report readers. It is explicitly
+            # historical and is never used for checkpoint promotion.
+            'best_loss': _historical if math.isfinite(_historical) else None,
             'best_val_loss': _bvl if math.isfinite(_bvl) else None,
+            'dataset_fingerprint': self.dataset_fingerprint,
+            'dataset_metadata': dict(self.dataset_metadata),
+            'generation_cycles_completed': self.generation_cycles_completed,
+            'best_teacher_agreement': self.best_teacher_agreement,
             'loss_history': list(self.loss_history),
             'val_loss_history': list(self.val_loss_history),
             'lr_history': list(self.lr_history),
             'gpu_mem_history': list(self.gpu_mem_history),
             'step_times': list(self.step_times),
             'test_history': list(self.test_history),
+            'teacher_agreement_history': list(self.teacher_agreement_history),
+            'promotion_history': list(self.promotion_history),
+            'acceptance_history': list(self.acceptance_history),
         }
     
     @classmethod
@@ -367,14 +423,28 @@ class TrainingStats:
             if isinstance(ts, (int, float)):
                 entry['timestamp'] = datetime.fromtimestamp(ts).isoformat()
 
-        _bl = data.get('best_loss')
+        _legacy_best = data.get('best_loss')
+        _historical = data.get('historical_best_train_loss', _legacy_best)
+        _dataset_best = data.get('current_dataset_best_train_loss')
         _bvl = data.get('best_val_loss')
         return cls(
             start_time=data.get('start_time', ''),
             end_time=data.get('end_time', ''),
             total_steps=data.get('total_steps', 0),
             epochs_completed=data.get('epochs_completed', 0),
-            best_loss=float('inf') if _bl is None else _bl,
+            current_train_loss=data.get('current_train_loss'),
+            current_dataset_best_train_loss=(
+                float('inf') if _dataset_best is None else _dataset_best
+            ),
+            historical_best_train_loss=(
+                float('inf') if _historical is None else _historical
+            ),
+            dataset_fingerprint=data.get('dataset_fingerprint', ''),
+            dataset_metadata=data.get('dataset_metadata', {}),
+            generation_cycles_completed=int(
+                data.get('generation_cycles_completed', 0)),
+            best_teacher_agreement=float(data.get('best_teacher_agreement', 0.0) or 0.0),
+            best_loss=float('inf') if _legacy_best is None else _legacy_best,
             best_val_loss=float('inf') if _bvl is None else _bvl,
             loss_history=loss_history,
             val_loss_history=data.get('val_loss_history', []),
@@ -382,6 +452,9 @@ class TrainingStats:
             gpu_mem_history=data.get('gpu_mem_history', []),
             step_times=data.get('step_times', []),
             test_history=data.get('test_history', []),
+            teacher_agreement_history=data.get('teacher_agreement_history', []),
+            promotion_history=data.get('promotion_history', []),
+            acceptance_history=data.get('acceptance_history', []),
         )
 
 
@@ -410,6 +483,12 @@ class TrainingConfig:
     selfplay_opponent_focus: str = 'both'  # ml, algorithm, both
     selfplay_noise_prob: float = 0.1  # Probability of random move for exploration
     selfplay_max_moves: int = 200  # Maximum moves per game
+    selfplay_opening_plies: tuple = (0, 2, 4, 6, 8)
+    selfplay_opening_seed: int = 20260819
+    symmetry_augmentation: str = 'none'
+    trajectory_algorithm_fraction: float = 0.70
+    trajectory_model_fraction: float = 0.30
+    teacher_difficulty: str = 'hard'
     pipeline_mode: str = 'simultaneous'  # 'simultaneous' or 'alternate'
     max_stale_epochs: int = 0  # Max epochs on unchanged data before yielding (0 = unlimited)
 
@@ -448,6 +527,13 @@ class TrainingConfig:
     value_head_enabled: bool = False
     value_head_hidden: int = 128
     value_weight: float = 0.15  # Weight of value loss relative to policy loss (85% policy / 15% value)
+    policy_stage: str = 'policy_only'
+    teacher_target_type: str = 'hard'
+    teacher_soft_temperature: float = 1.0
+    teacher_value_scale: float = 1000.0
+    teacher_score_depth: int = 3
+    teacher_hard_label_blend: float = 0.25
+    require_policy_gate_for_enhanced: bool = True
 
     # DataLoader settings
     dataloader_workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 2)))
@@ -459,14 +545,47 @@ class TrainingConfig:
     clear_replay_after_load: bool = False  # Delete replay files after loading into memory
     max_moves_per_sample: int = 32  # Padding width for move features (max legal moves ~20)
 
+    # Leakage-resistant validation and corpus snapshots
+    validation_enabled: bool = False
+    validation_fraction: float = 0.15
+    validation_split_seed: int = 20260819
+    validation_every_checkpoints: int = 1
+    frozen_suite_path: str = 'data/validation/frozen_hard_5000.jsonl'
+    frozen_suite_size: int = 5000
+    frozen_suite_seed: int = 20260819
+    frozen_suite_auto_create: bool = False
+    teacher_agreement_threshold: float = 0.50
+    snapshot_enabled: bool = False
+    snapshot_root: str = 'data/corpus_snapshots'
+    snapshot_min_fresh_fraction: float = 0.50
+
     # Stability
     grad_clip_norm: Optional[float] = 1.0
 
     # Model testing settings
     test_vs_algo: bool = False
+    test_promoted_only: bool = False
     test_every: int = 5000  # Run tests every N steps
     test_games: int = 50  # Number of test games per evaluation
+    # [Pass 109] Persist self-play JSONL on every cycle, not just the first.
+    # Without this the corpus never grows across restarts (see the background
+    # self-play loop). replay_max_files bounds the resulting disk usage.
+    persist_selfplay: bool = True
+    replay_max_files: int = 60
     test_difficulty: str = 'medium'
+    # [Pass 109] Random-opening lengths (plies) cycled across test games.
+    # (0,) reproduces the old fixed GameState.initial() opening, which made a
+    # 50-game test only ~2 distinct games under a deterministic argmax model.
+    test_opening_plies: tuple = (0, 2, 4, 6, 8)
+    test_opening_seed: int = 20260819
+    test_opponents: tuple = ('random', 'easy')
+    test_confidence_method: str = 'wilson_score'
+    test_confidence_level: float = 0.95
+    random_match_score_threshold: float = 0.80
+    random_match_score_lower_bound: float = 0.70
+    easy_match_score_lower_bound: float = 0.50
+    easy_side_score_floor: float = 0.50
+    inference_depth: int = 1
 
     # Statistics collection settings
     stats_enabled: bool = True
@@ -482,9 +601,13 @@ class TrainingConfig:
     # Paths
     checkpoint_dir: str = 'models/checkpoints'
     latest_path: str = 'models/latest.pt'
+    promoted_path: str = 'models/promoted.pt'
+    accepted_path: str = 'models/accepted.pt'
     replay_dir: str = 'data/replay'
     log_dir: str = 'logs'
     stats_file: str = 'models/training_stats.json'
+    promotion_registry: str = 'logs/policy_distillation/promotions.jsonl'
+    acceptance_dir: str = 'logs/policy_distillation/acceptance'
 
     # Thermal protection
     thermal_enabled: bool = False
@@ -494,6 +617,9 @@ class TrainingConfig:
 
     # Resume
     resume: Optional[str] = None
+    recovery_enforced: bool = False
+    recovery_baseline_path: Optional[str] = None
+    recovery_baseline_sha256: Optional[str] = None
 
     # Time-based stopping
     stop_time: Optional[datetime] = None  # Calculated from train_duration
@@ -524,7 +650,19 @@ class Trainer:
     """
 
     def __init__(self, config: TrainingConfig):
+        # Validate the recovery contract at the last common entry point, before
+        # creating directories, loading a model, or starting any worker.  CLI
+        # launchers and the GUI perform earlier checks for better diagnostics,
+        # but programmatic callers must not be able to bypass the resume-only
+        # lineage and validation gates.
+        validate_recovery_experiment_config(config)
         self.config = config
+        experiment_seed = int(config.selfplay_opening_seed)
+        random.seed(experiment_seed)
+        np.random.seed(experiment_seed & 0xFFFFFFFF)
+        torch.manual_seed(experiment_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(experiment_seed)
 
         # Set up device
         if config.device == 'cuda' and not torch.cuda.is_available():
@@ -624,7 +762,8 @@ class Trainer:
         # Learning rate scheduler with optional warmup
         self._build_scheduler()
 
-        self.replay_buffer = ReplayBuffer(config.replay_dir)
+        self.replay_buffer = ReplayBuffer(
+            config.replay_dir, max_files=config.replay_max_files)
 
         # Training state
         self.step = 0
@@ -652,6 +791,8 @@ class Trainer:
         self._bg_selfplay_entries: Optional[list] = None
         self._bg_selfplay_dataset: Optional[CachedTensorDataset] = None
         self._bg_selfplay_incremental: Optional[CachedTensorDataset] = None
+        self._bg_snapshot_manifest: Optional[dict] = None
+        self._bg_validation_entries: Optional[list] = None
         self._bg_selfplay_lock = threading.Lock()
         self._last_selfplay_dicts: Optional[list] = None
         self._last_selfplay_preprocessed: Optional[CachedTensorDataset] = None
@@ -663,6 +804,10 @@ class Trainer:
         # Background checkpoint write thread — tracked to avoid concurrent
         # disk I/O from overlapping checkpoints.
         self._checkpoint_thread: Optional[threading.Thread] = None
+        self._acceptance_thread: Optional[threading.Thread] = None
+        self._acceptance_queue: Queue = Queue()
+        self._acceptance_task_lock = threading.Lock()
+        self._acceptance_task_ids: set[str] = set()
 
         # Padded training path flag (set when CachedTensorDataset is used)
         self._use_padded = False
@@ -673,6 +818,27 @@ class Trainer:
         # Training statistics
         self.stats = TrainingStats()
         self._load_stats()
+        self._active_snapshot_manifest: Dict[str, Any] = {}
+        self._validation_entries = []
+        self._validation_dataloader = None
+        self._frozen_suite_entries = []
+        self._frozen_suite_manifest: Dict[str, Any] = {}
+        self._last_promotion_decision = None
+        self._snapshot_manager = None
+        if config.snapshot_enabled:
+            self._snapshot_manager = CorpusSnapshotManager(
+                replay_dir=config.replay_dir,
+                snapshot_root=config.snapshot_root,
+                validation_fraction=config.validation_fraction,
+                split_seed=config.validation_split_seed,
+                min_fresh_fraction=config.snapshot_min_fresh_fraction,
+                enforce_policy_contract=config.recovery_enforced,
+                allowed_opening_plies=config.selfplay_opening_plies,
+            )
+        self._promotion_registry = PromotionRegistry(
+            config.promotion_registry,
+            agreement_threshold=config.teacher_agreement_threshold,
+        )
         
         # Timing for step tracking
         self._last_step_time = None
@@ -859,6 +1025,8 @@ class Trainer:
 
                 del _wb, _wm, _wc
                 torch.cuda.empty_cache()
+
+        self._recover_pending_checkpoint_acceptance()
 
     # ------------------------------------------------------------------
     # Thermal protection
@@ -1100,6 +1268,11 @@ class Trainer:
 
     def _reset_model_state(self, reason: str) -> None:
         """Reset model/optimizer if checkpoint is corrupt."""
+        if self.config.recovery_enforced:
+            raise RuntimeError(
+                f"{reason}. Fresh-weight reset is forbidden during the "
+                "resume-only policy-distillation recovery experiment."
+            )
         print(f"WARNING: {reason}. Resetting model and optimizer state.")
         self.model = create_model(
             embedding_size=self.config.model_embedding,
@@ -1175,7 +1348,40 @@ class Trainer:
 
         self.step = checkpoint.get('step', 0)
         self.epoch = checkpoint.get('epoch', self.stats.epochs_completed)
+        self.stats.generation_cycles_completed = max(
+            self.stats.generation_cycles_completed,
+            int(checkpoint.get('generation_cycles_completed', 0)),
+        )
         self.best_loss = checkpoint.get('loss', float('inf'))
+
+        # Checkpoints carry loss baselines independently of the optional
+        # training-stats sidecar.  Restore them monotonically so a stale or
+        # partially-written sidecar cannot make a resume look better than the
+        # checkpoint already proved, while retaining compatibility with older
+        # checkpoints that did not persist these fields.
+        def _restore_finite_min(name: str, value) -> None:
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(candidate):
+                return
+            current = getattr(self.stats, name, float('inf'))
+            try:
+                current = float(current)
+            except (TypeError, ValueError):
+                current = float('inf')
+            setattr(self.stats, name, min(current, candidate))
+
+        _restore_finite_min(
+            'current_dataset_best_train_loss',
+            checkpoint.get('current_dataset_best_train_loss'),
+        )
+        _restore_finite_min(
+            'historical_best_train_loss',
+            checkpoint.get('historical_best_train_loss'),
+        )
+        self.stats.best_loss = self.stats.historical_best_train_loss
 
         # Restore scheduler state if available
         if (self.scheduler is not None and
@@ -1207,13 +1413,26 @@ class Trainer:
         # Restore RNG state if available
         if 'rng_state' in checkpoint:
             rng = checkpoint['rng_state']
+            if 'python' in rng:
+                random.setstate(rng['python'])
+            if 'numpy' in rng:
+                numpy_rng = rng['numpy']
+                np.random.set_state((
+                    numpy_rng['bit_generator'],
+                    np.asarray(numpy_rng['state'], dtype=np.uint32),
+                    int(numpy_rng['position']),
+                    int(numpy_rng['has_gauss']),
+                    float(numpy_rng['cached_gaussian']),
+                ))
             if 'torch' in rng:
                 # Ensure RNG state is a ByteTensor
                 rng_state = rng['torch']
                 if not isinstance(rng_state, torch.ByteTensor):
                     rng_state = rng_state.to(torch.uint8)
                 torch.set_rng_state(rng_state.cpu())
-            if 'cuda' in rng and torch.cuda.is_available():
+            if 'cuda_all' in rng and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng['cuda_all'])
+            elif 'cuda' in rng and torch.cuda.is_available():
                 cuda_rng = rng['cuda']
                 if not isinstance(cuda_rng, torch.ByteTensor):
                     cuda_rng = cuda_rng.to(torch.uint8)
@@ -1223,6 +1442,78 @@ class Trainer:
 
         if self._has_non_finite_tensors():
             self._reset_model_state("Loaded checkpoint contains NaN/Inf")
+
+    @staticmethod
+    def _checkpoint_file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest().upper()
+
+    def _verified_recovery_rollback_checkpoint(self) -> Path:
+        """Return the newest checkpoint proven to belong to this recovery arm."""
+        anchor = Path(str(self.config.resume)).resolve()
+        baseline_sha256 = str(
+            self.config.recovery_baseline_sha256 or '').upper()
+        anchor_sha256 = baseline_sha256
+        if self.config.policy_stage == 'enhanced':
+            anchor_sha256 = ''
+            for promotion in self._promotion_registry.records():
+                promoted_path = promotion.get('checkpoint_path')
+                if (
+                    promotion.get('promoted')
+                    and promoted_path
+                    and Path(str(promoted_path)).resolve() == anchor
+                ):
+                    anchor_sha256 = str(
+                        promotion.get('checkpoint_sha256', '')).upper()
+                    break
+        candidates = list(Path(self.config.checkpoint_dir).glob('model_step_*.pt'))
+        if anchor.is_file() and anchor not in candidates:
+            candidates.append(anchor)
+
+        def _step(path: Path) -> int:
+            try:
+                return int(path.stem.rsplit('_', 1)[-1])
+            except ValueError:
+                return -1
+
+        for candidate in sorted(candidates, key=_step, reverse=True):
+            if _step(candidate) > self.step:
+                continue
+            resolved = candidate.resolve()
+            if resolved == anchor:
+                # Recheck the approved anchor on every rollback; it may have
+                # changed on disk after the startup readiness gate.
+                if anchor_sha256 and hmac.compare_digest(
+                    self._checkpoint_file_sha256(resolved), anchor_sha256
+                ):
+                    return resolved
+                continue
+            try:
+                checkpoint = torch.load(
+                    candidate, map_location='cpu', weights_only=True)
+                lineage = checkpoint.get('recovery_experiment', {})
+                if not lineage.get('enabled'):
+                    continue
+                if str(lineage.get('baseline_sha256', '')).upper() != baseline_sha256:
+                    continue
+                if lineage.get('training_stage') != self.config.policy_stage:
+                    continue
+                state_dict = checkpoint.get('model_state_dict', {})
+                if not state_dict or not all(
+                    torch.isfinite(value).all()
+                    for value in state_dict.values()
+                    if isinstance(value, torch.Tensor)
+                ):
+                    continue
+                return resolved
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                continue
+        raise RuntimeError(
+            "No verified checkpoint remains in the approved recovery lineage; "
+            "fresh-weight reset is forbidden")
 
     def _load_stats(self) -> None:
         """Load training stats from file if exists, and merge in any missing test history from log files."""
@@ -1393,9 +1684,13 @@ class Trainer:
         # Trimming is handled automatically by deque(maxlen=_STATS_HISTORY_CAP).
         # Previous approach rebuilt the list via slice + copy every ~10K appends.
 
-        # Update best loss
-        if loss < self.stats.best_loss:
-            self.stats.best_loss = loss
+        self.stats.current_train_loss = loss
+        if loss < self.stats.current_dataset_best_train_loss:
+            self.stats.current_dataset_best_train_loss = loss
+        if loss < self.stats.historical_best_train_loss:
+            self.stats.historical_best_train_loss = loss
+        # Keep the legacy attribute synchronized for in-process compatibility.
+        self.stats.best_loss = self.stats.historical_best_train_loss
 
     def _record_epoch_loss(self, loss: float) -> None:
         """Record the epoch-average loss shown by the console heartbeat."""
@@ -1416,8 +1711,12 @@ class Trainer:
         else:
             self.stats.loss_history.append(entry)
 
-        if loss < self.stats.best_loss:
-            self.stats.best_loss = loss
+        self.stats.current_train_loss = loss
+        if loss < self.stats.current_dataset_best_train_loss:
+            self.stats.current_dataset_best_train_loss = loss
+        if loss < self.stats.historical_best_train_loss:
+            self.stats.historical_best_train_loss = loss
+        self.stats.best_loss = self.stats.historical_best_train_loss
 
     def _save_progress_report_if_due(self, *, force: bool = False) -> None:
         """Persist stats and refresh the dashboard without waiting for checkpoints."""
@@ -1438,6 +1737,680 @@ class Trainer:
         self._save_stats()
         self._last_progress_report_time = now
         self._last_progress_report_step = self.step
+
+    def _activate_dataset_manifest(self, manifest: Mapping[str, Any]) -> None:
+        fingerprint = str(manifest.get('fingerprint', ''))
+        if not fingerprint:
+            raise ValueError("Active corpus manifest is missing its fingerprint")
+        if fingerprint != self.stats.dataset_fingerprint:
+            old = self.stats.dataset_fingerprint or '(none)'
+            self.stats.dataset_fingerprint = fingerprint
+            self.stats.current_dataset_best_train_loss = float('inf')
+            print(
+                f"Dataset fingerprint changed: {old[:12]} to {fingerprint[:12]}; "
+                "reset current-dataset training-loss baseline"
+            )
+        self._active_snapshot_manifest = dict(manifest)
+        self.stats.dataset_metadata = {
+            'fingerprint': fingerprint,
+            'version': manifest.get('version'),
+            'manifest_path': manifest.get('manifest_path'),
+            'validation_manifest_path': manifest.get('validation_manifest_path'),
+            'files': [record.get('path', record.get('name'))
+                      for record in manifest.get('files', [])],
+            'metrics': dict(manifest.get('metrics', {})),
+            'teacher_settings': dict(manifest.get('teacher_settings', {})),
+            'noise_settings': dict(manifest.get('noise_settings', {})),
+            'generation_settings': dict(manifest.get('generation_settings', {})),
+        }
+        if getattr(self, 'stats_collector', None) is not None:
+            file_records = manifest.get('files', [])
+            self.stats_collector.record_replay_buffer_state(
+                step=self.step,
+                total_entries=int(manifest.get('metrics', {}).get(
+                    'records', 0)),
+                num_files=len(file_records),
+                total_size_bytes=sum(
+                    int(record.get('size_bytes', 0)) for record in file_records),
+                corpus_metrics=dict(manifest.get('metrics', {})),
+            )
+
+    def _corpus_settings(self) -> tuple[dict, dict, dict]:
+        teacher = {
+            'difficulty': self.config.teacher_difficulty,
+            'target_type': self.config.teacher_target_type,
+            'stage': self.config.policy_stage,
+            'soft_temperature': self.config.teacher_soft_temperature,
+            'score_depth': self.config.teacher_score_depth,
+            'value_scale': self.config.teacher_value_scale,
+            'hard_label_blend': self.config.teacher_hard_label_blend,
+        }
+        noise = {
+            'played_action_probability': self.config.selfplay_noise_prob,
+            'label_is_teacher_move': True,
+        }
+        generation = {
+            'contract_version': 1,
+            'total_games_per_cycle': (
+                self.config.selfplay_games
+                + (self.config.algo_vs_algo_games
+                   if self.config.algo_vs_algo_enabled else 0)
+            ),
+            'algorithm_fraction': self.config.trajectory_algorithm_fraction,
+            'model_fraction': self.config.trajectory_model_fraction,
+            'opening_plies': list(self.config.selfplay_opening_plies),
+            'opening_seed': self.config.selfplay_opening_seed,
+            'max_moves': self.config.selfplay_max_moves,
+            'algorithm_difficulties': list(self.config.selfplay_difficulties),
+            'algo_vs_algo_difficulties': list(
+                self.config.algo_vs_algo_difficulties),
+            'opponent_focus': self.config.selfplay_opponent_focus,
+            'focus_side': self.config.selfplay_focus_side,
+            'symmetry_augmentation': self.config.symmetry_augmentation,
+            'current_model_inference_depth': self.config.inference_depth,
+            # The behavior policy is the exact model state used to generate
+            # this corpus.  A step-qualified identity prevents snapshots from
+            # silently mixing trajectories from different model revisions.
+            'model_behavior_id': f"trainer-step-{int(self.step)}",
+            'model_behavior_step': int(self.step),
+        }
+        return teacher, noise, generation
+
+    def _prepare_training_split(self):
+        if self._snapshot_manager is not None:
+            teacher, noise, generation = self._corpus_settings()
+            while True:
+                decision = self._snapshot_manager.consider_snapshot(
+                    teacher_settings=teacher,
+                    noise_settings=noise,
+                    generation_settings=generation,
+                )
+                if decision.manifest_path is None:
+                    raise RuntimeError(
+                        f"Corpus snapshot unavailable: {decision.reason}"
+                    )
+                settings_match = self._snapshot_manager.snapshot_matches_settings(
+                    decision.manifest_path,
+                    teacher_settings=teacher,
+                    noise_settings=noise,
+                    generation_settings=generation,
+                )
+                if decision.admitted and not settings_match:
+                    raise RuntimeError(
+                        "New corpus snapshot does not match the active data contract"
+                    )
+                if decision.admitted or settings_match:
+                    break
+
+                eligible_before, _ = (
+                    self._snapshot_manager.eligible_replay_files()
+                )
+                before_metrics, _ = analyze_replay_files(eligible_before)
+                print(
+                    "Corpus contract changed; generating repaired data until "
+                    "a fresh snapshot passes the admission gate"
+                )
+                self.run_selfplay(self.config.selfplay_games)
+                pruned = self.replay_buffer.cleanup_old_files()
+                if pruned:
+                    print(
+                        f"Replay: pruned {pruned} old file(s) while preparing "
+                        "the new data contract"
+                    )
+                self._service_control_queue()
+                if self._stopped:
+                    return [], []
+
+                eligible_after, _ = (
+                    self._snapshot_manager.eligible_replay_files()
+                )
+                after_metrics, _ = analyze_replay_files(eligible_after)
+                if (
+                    len(eligible_after) == len(eligible_before)
+                    and int(after_metrics.get('records', 0))
+                    == int(before_metrics.get('records', 0))
+                    and after_metrics.get('state_set_sha256')
+                    == before_metrics.get('state_set_sha256')
+                ):
+                    raise RuntimeError(
+                        "Self-play made no eligible corpus progress for the "
+                        "new data contract"
+                    )
+            if decision.admitted:
+                print(
+                    f"Admitted corpus snapshot {decision.manifest_path.parent.name}: "
+                    f"{decision.metrics.get('fresh_unique_state_rate', 0.0):.1%} fresh, "
+                    f"{decision.metrics.get('unique_state_count', 0):,} unique states"
+                )
+            else:
+                print(f"Corpus snapshot unchanged: {decision.reason}")
+            train_entries, validation_entries, manifest = (
+                self._snapshot_manager.load_split(
+                    decision.manifest_path,
+                    max_train_entries=self.config.replay_max_entries,
+                )
+            )
+            self._activate_dataset_manifest(manifest)
+            return train_entries, validation_entries
+
+        train_entries, validation_entries = prepare_training_data(
+            self.replay_buffer,
+            max_entries=self.config.replay_max_entries,
+            val_split=(self.config.validation_fraction
+                       if self.config.validation_enabled else 0.0),
+            split_seed=self.config.validation_split_seed,
+        )
+        files = self.replay_buffer.get_replay_files()
+        metrics, _ = analyze_replay_files(files)
+        file_records = [
+            {
+                'name': path.name,
+                'path': str(path),
+                'sha256': replay_file_sha256(path),
+                'size_bytes': path.stat().st_size,
+            }
+            for path in files
+        ]
+        teacher, noise, generation = self._corpus_settings()
+        fingerprint = hashlib.sha256(json.dumps({
+            'files': file_records,
+            'state_set_sha256': metrics.get('state_set_sha256'),
+            'teacher_settings': teacher,
+            'noise_settings': noise,
+            'generation_settings': generation,
+        }, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+        self._activate_dataset_manifest({
+            'fingerprint': fingerprint,
+            'version': None,
+            'files': file_records,
+            'metrics': metrics,
+            'teacher_settings': teacher,
+            'noise_settings': noise,
+            'generation_settings': generation,
+        })
+        return train_entries, validation_entries
+
+    def _ensure_frozen_teacher_suite(self) -> None:
+        if not self.config.validation_enabled:
+            return
+        suite_path = Path(self.config.frozen_suite_path)
+        if self._snapshot_manager is not None:
+            replay_files, _ = self._snapshot_manager.eligible_replay_files()
+        else:
+            replay_files = self.replay_buffer.get_replay_files()
+        _, replay_state_keys = analyze_replay_files(replay_files)
+        if not suite_path.exists() and not self.config.frozen_suite_auto_create:
+            raise FileNotFoundError(
+                f"Frozen teacher suite is required before training: {suite_path}"
+            )
+        if not suite_path.exists():
+            print(
+                f"Creating immutable {self.config.frozen_suite_size:,}-state "
+                f"{self.config.teacher_difficulty} teacher suite at {suite_path}"
+            )
+        suite_already_exists = (
+            suite_path.exists()
+            or suite_path.with_suffix(
+                suite_path.suffix + '.manifest.json'
+            ).exists()
+        )
+        create_frozen_teacher_suite(
+            str(suite_path),
+            target_states=self.config.frozen_suite_size,
+            seed=self.config.frozen_suite_seed,
+            teacher_difficulty=self.config.teacher_difficulty,
+            opening_plies=self.config.selfplay_opening_plies,
+            played_action_noise=self.config.selfplay_noise_prob,
+            max_moves_per_game=self.config.selfplay_max_moves,
+            exclude_state_keys=(
+                None if suite_already_exists else replay_state_keys
+            ),
+        )
+        entries, manifest = load_frozen_teacher_suite(
+            str(suite_path),
+            expected_count=self.config.frozen_suite_size,
+        )
+        self._frozen_suite_entries = entries
+        self._frozen_suite_manifest = manifest
+        suite_state_keys = {
+            canonical_state_key(entry.state) for entry in entries
+        }
+        replay_overlap = suite_state_keys.intersection(replay_state_keys)
+        if replay_overlap and self._snapshot_manager is None:
+            raise RuntimeError(
+                "Frozen teacher suite overlaps replay data and no snapshot "
+                "manager is available to filter it"
+            )
+        if self._snapshot_manager is not None:
+            self._snapshot_manager.set_external_validation_state_keys(
+                suite_state_keys)
+            if replay_overlap:
+                print(
+                    f"Frozen suite overlap: excluding {len(replay_overlap):,} "
+                    "revisited state(s) from recovery training"
+                )
+        print(
+            f"Frozen teacher suite verified: {len(entries):,} unique states, "
+            f"SHA-256 {manifest['suite_sha256'][:12]}"
+        )
+
+    def _set_validation_entries(self, entries) -> None:
+        self._validation_entries = list(entries)
+        if not self._validation_entries:
+            self._validation_dataloader = None
+            return
+        if self.config.policy_stage == 'enhanced':
+            iterator = create_enhanced_dataloader(
+                self._validation_entries,
+                batch_size=max(1, self.config.batch_size),
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                teacher_depth=self.config.teacher_score_depth,
+                temperature=self.config.teacher_soft_temperature,
+                value_scale=self.config.teacher_value_scale,
+                hard_label_blend=self.config.teacher_hard_label_blend,
+                shuffle=False,
+                show_progress=True,
+            )
+            self._validation_dataloader = iterator.dataset
+        else:
+            self._validation_dataloader = CachedTensorDataset.from_entries(
+                self._validation_entries,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                show_progress=True,
+            )
+        print(
+            f"Immutable validation entries: {len(self._validation_entries):,} "
+            "from held-out replay files"
+        )
+
+    def _evaluate_validation_loss(self) -> Optional[float]:
+        dataset = self._validation_dataloader
+        if dataset is None or len(dataset) == 0:
+            return None
+        was_training = self.model.training
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        batch_size = max(1, self.config.batch_size)
+        with torch.inference_mode():
+            for start in range(0, len(dataset), batch_size):
+                end = min(start + batch_size, len(dataset))
+                boards = dataset.boards[start:end].to(self.device)
+                move_features = dataset.move_features[start:end].to(self.device)
+                move_counts = dataset.move_counts[start:end].to(self.device)
+                targets = dataset.targets[start:end].to(self.device)
+                weights = dataset.reward_weights[start:end].to(self.device)
+                value_targets = dataset.value_targets[start:end].to(self.device)
+                amp_enabled = self.config.amp and self.device.type == 'cuda'
+                with autocast(
+                    device_type=self.device.type,
+                    dtype=self.amp_dtype,
+                    enabled=amp_enabled,
+                ):
+                    if self.config.value_head_enabled:
+                        scores, values = self.model.forward_padded_with_value(
+                            boards, move_features, move_counts)
+                        if self.config.policy_stage == 'enhanced':
+                            teacher_probabilities = (
+                                dataset.teacher_probabilities[start:end].to(self.device)
+                            )
+                            policy_loss = soft_target_cross_entropy(
+                                scores, move_counts, teacher_probabilities, weights)
+                        else:
+                            policy_loss = self._compute_loss_padded(
+                                scores, move_counts, targets, weights)
+                        value_loss = torch.nn.functional.mse_loss(
+                            values.float(), value_targets.float())
+                        loss = policy_loss + self.config.value_weight * value_loss
+                    else:
+                        scores = self.model.forward_padded(
+                            boards, move_features, move_counts)
+                        loss = self._compute_loss_padded(
+                            scores, move_counts, targets, weights)
+                count = end - start
+                total_loss += float(loss.item()) * count
+                total_samples += count
+        if was_training:
+            self.model.train()
+        value = total_loss / max(1, total_samples)
+        self._record_validation_stats(value)
+        return value
+
+    def _evaluate_teacher_promotion(self, checkpoint_path: Path) -> Optional[dict]:
+        if not self._frozen_suite_entries:
+            return None
+        result = evaluate_teacher_agreement(
+            self.model,
+            self._frozen_suite_entries,
+            max_moves_per_sample=self.config.max_moves_per_sample,
+            batch_size=max(1, min(self.config.batch_size, 2048)),
+        )
+        record = {
+            'step': self.step,
+            'epoch': self.epoch,
+            'generation_cycles_completed': self.stats.generation_cycles_completed,
+            'timestamp': datetime.now().isoformat(),
+            'suite_fingerprint': self._frozen_suite_manifest['suite_sha256'],
+            **result,
+        }
+        self.stats.teacher_agreement_history.append(record)
+        agreement = float(result['top1_teacher_agreement'])
+        self.stats.best_teacher_agreement = max(
+            self.stats.best_teacher_agreement, agreement)
+        decision = self._promotion_registry.consider(
+            checkpoint_path=str(checkpoint_path),
+            step=self.step,
+            agreement=agreement,
+            suite_fingerprint=self._frozen_suite_manifest['suite_sha256'],
+            dataset_fingerprint=self.stats.dataset_fingerprint,
+            training_stage=self.config.policy_stage,
+            comparison_context={
+                'optimizer': 'AdamW',
+                'learning_rate': self.config.learning_rate,
+                'weight_decay': self.config.weight_decay,
+                'batch_size': self.config.batch_size,
+                'gradient_accumulation_steps': (
+                    self.config.gradient_accumulation_steps),
+                'scheduler_enabled': self.config.lr_scheduler_enabled,
+                'scheduler_type': self.config.lr_scheduler_type,
+                'opening_seed': self.config.selfplay_opening_seed,
+                'validation_split_seed': self.config.validation_split_seed,
+                'frozen_suite_seed': self.config.frozen_suite_seed,
+            },
+            persist=False,
+        )
+        promotion_record = dict(decision.record)
+        promotion_record.update({
+            'teacher_correct_states': int(result['correct_states']),
+            'teacher_total_states': int(result['total_states']),
+            'teacher_decision_correct_states': int(
+                result['decision_correct_states']),
+            'teacher_decision_states': int(result['decision_states']),
+            'teacher_forced_move_fraction': float(
+                result['forced_move_fraction']),
+        })
+        print(
+            f"Frozen-suite teacher agreement: {agreement:.2%} "
+            f"({result['correct_states']}/{result['total_states']}), "
+            f"promotion={decision.promoted} ({decision.reason})"
+        )
+        return {'agreement': record, 'promotion': promotion_record}
+
+    def _enqueue_checkpoint_acceptance(
+        self,
+        checkpoint_path: Path,
+        selection: Mapping[str, Any],
+    ) -> None:
+        """Durably record, then queue one promoted-checkpoint evaluation."""
+        promotion = selection.get('promotion', {})
+        if not promotion.get('promoted'):
+            return
+        agreement = float(
+            selection.get('agreement', {}).get('top1_teacher_agreement', 0.0))
+        task = checkpoint_acceptance_tasks.make_pending_acceptance_task(
+            str(checkpoint_path),
+            step=int(promotion.get('step', self.step)),
+            teacher_agreement=agreement,
+            opening_plies=self.config.test_opening_plies,
+            opening_seed=self.config.test_opening_seed,
+            inference_depth=self.config.inference_depth,
+            max_moves=self.config.selfplay_max_moves,
+            num_workers=min(self.config.cpu_workers, 4),
+            training_stage=self.config.policy_stage,
+            checkpoint_sha256=promotion.get('checkpoint_sha256'),
+            suite_fingerprint=promotion.get('suite_fingerprint'),
+            teacher_correct_states=promotion.get('teacher_correct_states'),
+            teacher_total_states=promotion.get('teacher_total_states'),
+        )
+        self._queue_checkpoint_acceptance_task(task, persist=True)
+
+    def _acceptance_task_from_promotion(
+        self,
+        promotion: Mapping[str, Any],
+    ) -> Optional[dict]:
+        """Reconstruct the durable acceptance input for a promotion record."""
+        if not promotion.get('promoted'):
+            return None
+        checkpoint_path = promotion.get('checkpoint_path')
+        checkpoint_sha256 = promotion.get('checkpoint_sha256')
+        if not checkpoint_path or not checkpoint_sha256:
+            raise ValueError(
+                "Promoted checkpoint record lacks path or SHA-256 provenance")
+        return checkpoint_acceptance_tasks.make_pending_acceptance_task(
+            str(checkpoint_path),
+            step=int(promotion['step']),
+            teacher_agreement=float(promotion['teacher_agreement']),
+            opening_plies=self.config.test_opening_plies,
+            opening_seed=self.config.test_opening_seed,
+            inference_depth=self.config.inference_depth,
+            max_moves=self.config.selfplay_max_moves,
+            num_workers=min(self.config.cpu_workers, 4),
+            training_stage=str(
+                promotion.get('training_stage', self.config.policy_stage)),
+            checkpoint_sha256=str(checkpoint_sha256),
+            suite_fingerprint=promotion.get('suite_fingerprint'),
+            teacher_correct_states=promotion.get('teacher_correct_states'),
+            teacher_total_states=promotion.get('teacher_total_states'),
+        )
+
+    def _queue_checkpoint_acceptance_task(
+        self,
+        task: Mapping[str, Any],
+        *,
+        persist: bool,
+    ) -> bool:
+        """Queue a task once, with its pending file already durable."""
+        task = dict(task)
+        task_id = str(task['task_id'])
+        output_dir = self.config.acceptance_dir
+
+        terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
+            output_dir, task)
+        if terminal is not None:
+            checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                output_dir, task)
+            print(
+                f"Acceptance task {task_id} already has terminal report: {terminal}")
+            return False
+
+        with self._acceptance_task_lock:
+            if task_id in self._acceptance_task_ids:
+                return False
+            pending_path = checkpoint_acceptance_tasks.pending_acceptance_task_path(
+                output_dir, task)
+            if persist:
+                checkpoint_acceptance_tasks.persist_pending_acceptance_task(
+                    output_dir, task)
+            elif not pending_path.exists():
+                raise FileNotFoundError(
+                    f"Recovered acceptance task has no pending file: {pending_path}")
+
+            self._acceptance_task_ids.add(task_id)
+            try:
+                self._ensure_checkpoint_acceptance_worker()
+                self._acceptance_queue.put(task)
+            except Exception:
+                self._acceptance_task_ids.discard(task_id)
+                raise
+
+        print(f"Queued acceptance protocol for promoted step {task['step']}")
+        return True
+
+    def _ensure_checkpoint_acceptance_worker(self) -> None:
+        if self._acceptance_thread is not None and self._acceptance_thread.is_alive():
+            return
+
+        def _acceptance_worker() -> None:
+            while True:
+                queued = self._acceptance_queue.get()
+                try:
+                    if queued is None:
+                        return
+                    self._process_checkpoint_acceptance_task(queued)
+                finally:
+                    if queued is not None:
+                        with self._acceptance_task_lock:
+                            self._acceptance_task_ids.discard(
+                                str(queued['task_id']))
+                    self._acceptance_queue.task_done()
+
+        self._acceptance_thread = threading.Thread(
+            target=_acceptance_worker,
+            name='checkpoint-acceptance',
+            daemon=True,
+        )
+        self._acceptance_thread.start()
+
+    def _process_checkpoint_acceptance_task(
+        self,
+        queued: Mapping[str, Any],
+    ) -> None:
+        """Run one durable task and retain it until a terminal report exists."""
+        task = dict(queued)
+        output_dir = self.config.acceptance_dir
+        try:
+            checkpoint_acceptance_tasks.verify_pending_acceptance_checkpoint(task)
+            report = checkpoint_acceptance_tasks.run_checkpoint_acceptance(
+                task['checkpoint_path'],
+                step=task['step'],
+                teacher_agreement=task['teacher_agreement'],
+                opening_plies=task['opening_plies'],
+                opening_seed=task['opening_seed'],
+                inference_depth=task['inference_depth'],
+                max_moves=task['max_moves'],
+                num_workers=task['num_workers'],
+                output_dir=output_dir,
+                training_stage=task['training_stage'],
+                task_id=task['task_id'],
+                checkpoint_sha256=task.get('checkpoint_sha256'),
+                suite_fingerprint=task.get('suite_fingerprint'),
+                teacher_correct_states=task.get('teacher_correct_states'),
+                teacher_total_states=task.get('teacher_total_states'),
+            )
+            durable_report = (
+                checkpoint_acceptance_tasks.successful_acceptance_report_path(
+                    output_dir, task))
+            if durable_report is None:
+                raise RuntimeError(
+                    "Acceptance evaluator returned without a matching durable report")
+
+            self.stats.acceptance_history.append(report)
+            if report['passed']:
+                self._publish_checkpoint_alias(
+                    Path(task['checkpoint_path']),
+                    Path(self.config.accepted_path),
+                )
+            self._save_stats()
+            state = 'PASSED' if report['passed'] else 'FAILED'
+            print(
+                f"Acceptance {state} for step {task['step']}: "
+                f"{durable_report}"
+            )
+            self._put_status({
+                'type': MSG_STATUS,
+                'acceptance': report,
+            })
+        except Exception as exc:
+            try:
+                failure_path = (
+                    checkpoint_acceptance_tasks.write_acceptance_failure_report(
+                        output_dir, task, exc))
+            except Exception as report_exc:
+                print(
+                    f"Acceptance evaluation error for step {task['step']}: {exc}. "
+                    f"Failure report could not be written: {report_exc}"
+                )
+                return
+
+            failure = {
+                'timestamp': datetime.now().isoformat(),
+                'step': task['step'],
+                'checkpoint_path': task['checkpoint_path'],
+                'task_id': task['task_id'],
+                'passed': False,
+                'error': str(exc),
+                'report_path': str(failure_path),
+            }
+            self.stats.acceptance_history.append(failure)
+            try:
+                self._save_stats()
+            except Exception as stats_exc:
+                print(f"Acceptance failure stats could not be saved: {stats_exc}")
+            print(
+                f"Acceptance evaluation error for step {task['step']}: {exc}. "
+                f"Failure report: {failure_path}"
+            )
+        finally:
+            terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
+                output_dir, task)
+            if terminal is not None:
+                try:
+                    checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                        output_dir, task)
+                except OSError as cleanup_exc:
+                    print(
+                        f"Pending acceptance task cleanup failed for "
+                        f"{task['task_id']}: {cleanup_exc}"
+                    )
+
+    def _recover_pending_checkpoint_acceptance(self) -> int:
+        """Requeue pending work and repair promotion-to-task crash windows."""
+        recovered = 0
+        for task in checkpoint_acceptance_tasks.discover_pending_acceptance_tasks(
+            self.config.acceptance_dir
+        ):
+            terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
+                self.config.acceptance_dir, task)
+            if terminal is not None:
+                checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                    self.config.acceptance_dir, task)
+                continue
+            if self._queue_checkpoint_acceptance_task(task, persist=False):
+                recovered += 1
+
+        # A checkpoint and promotion registry entry become durable before the
+        # pending task is written.  Reconcile that narrow crash window by
+        # rebuilding any missing task from the append-only promotion record.
+        # A few lightweight integrations construct a Trainer shell without
+        # initializing the registry (for example, GUI/status recovery tests).
+        # Pending-file recovery remains valid in that case; registry
+        # reconciliation is simply unavailable.
+        promotion_registry = getattr(self, '_promotion_registry', None)
+        if promotion_registry is None:
+            promotion_records = ()
+        else:
+            promotion_records = promotion_registry.records()
+        for promotion in promotion_records:
+            if not promotion.get('promoted'):
+                continue
+            try:
+                task = self._acceptance_task_from_promotion(promotion)
+                if task is not None and self._queue_checkpoint_acceptance_task(
+                    task, persist=True
+                ):
+                    recovered += 1
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                print(
+                    "Could not reconcile promoted checkpoint acceptance task "
+                    f"for step {promotion.get('step')}: {exc}"
+                )
+        if recovered:
+            print(f"Recovered {recovered} pending checkpoint acceptance task(s)")
+        return recovered
+
+    @staticmethod
+    def _publish_checkpoint_alias(source: Path, destination: Path) -> None:
+        """Atomically publish a promoted or accepted checkpoint alias."""
+        import shutil
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + '.tmp')
+        temporary.unlink(missing_ok=True)
+        try:
+            os.link(str(source), str(temporary))
+        except OSError:
+            shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
 
     def _record_validation_stats(self, val_loss: float) -> None:
         """Record validation statistics."""
@@ -1464,7 +2437,25 @@ class Trainer:
                 in the background thread alongside the checkpoint, keeping disk
                 I/O off the training thread (~50-100μs saved per checkpoint).
         """
-        # Copy state dicts to CPU (requires CUDA sync — must be on main thread).
+        # Finish the prior write before selecting against the promotion registry.
+        # This keeps the best-agreement comparison and checkpoint durability in
+        # one strict order.
+        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
+            self._checkpoint_thread.join(timeout=30)
+            if self._checkpoint_thread.is_alive():
+                raise RuntimeError("Previous checkpoint write did not finish within 30 seconds")
+
+        checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
+        if checkpoint_path.exists():
+            print(
+                f"Checkpoint already exists and will remain unchanged: {checkpoint_path}"
+            )
+            return str(checkpoint_path)
+        latest_path = Path(self.config.latest_path)
+        validation_loss = self._evaluate_validation_loss()
+        selection = self._evaluate_teacher_promotion(checkpoint_path)
+
+        # Copy state dicts to CPU. This requires CUDA sync on the main thread.
         # Both model AND optimizer states must be moved to CPU here, not in the
         # background thread.  optimizer.state_dict() returns references to live
         # CUDA tensors (exp_avg, exp_avg_sq); if the background torch.save()
@@ -1494,6 +2485,16 @@ class Trainer:
             'optimizer_state_dict': _opt_sd,
             'step': self.step,
             'loss': loss,
+            'current_train_loss': loss,
+            'current_dataset_best_train_loss': (
+                self.stats.current_dataset_best_train_loss
+                if math.isfinite(self.stats.current_dataset_best_train_loss) else None
+            ),
+            'historical_best_train_loss': (
+                self.stats.historical_best_train_loss
+                if math.isfinite(self.stats.historical_best_train_loss) else None
+            ),
+            'validation_loss': validation_loss,
             'epoch': self.epoch,
             'arch_params': getattr(self.model, 'arch_params', {
                 'embedding_size': self.config.model_embedding,
@@ -1504,7 +2505,64 @@ class Trainer:
                 'value_head_hidden': self.config.value_head_hidden,
             }),
             'encoding_version': ENCODING_VERSION,
+            'dataset_fingerprint': self.stats.dataset_fingerprint,
+            'dataset_metadata': dict(self.stats.dataset_metadata),
+            'snapshot_manifest_path': self._active_snapshot_manifest.get(
+                'manifest_path'),
+            'snapshot_file_list': [
+                dict(record)
+                for record in self._active_snapshot_manifest.get('files', [])
+            ],
+            'snapshot_unique_state_count': self._active_snapshot_manifest.get(
+                'metrics', {}).get('post_dedup_unique_state_count'),
+            'snapshot_forced_move_rate': self._active_snapshot_manifest.get(
+                'metrics', {}).get('forced_move_rate'),
+            'snapshot_forced_move_count': self._active_snapshot_manifest.get(
+                'metrics', {}).get('forced_move_count'),
+            'teacher_settings': dict(
+                self._active_snapshot_manifest.get('teacher_settings', {})),
+            'noise_settings': dict(
+                self._active_snapshot_manifest.get('noise_settings', {})),
+            'generation_settings': dict(
+                self._active_snapshot_manifest.get('generation_settings', {})),
+            'optimizer_context': {
+                'optimizer': type(self.optimizer).__name__,
+                'learning_rate': self.config.learning_rate,
+                'weight_decay': self.config.weight_decay,
+                'batch_size': self.config.batch_size,
+                'gradient_accumulation_steps': (
+                    self.config.gradient_accumulation_steps),
+                'scheduler_enabled': self.config.lr_scheduler_enabled,
+                'scheduler_type': self.config.lr_scheduler_type,
+            },
+            'seed_context': {
+                'selfplay_opening_seed': self.config.selfplay_opening_seed,
+                'validation_split_seed': self.config.validation_split_seed,
+                'frozen_suite_seed': self.config.frozen_suite_seed,
+                'test_opening_seed': self.config.test_opening_seed,
+            },
+            'selection': selection,
+            'selection_basis': 'held_out_teacher_agreement',
+            'checkpoint_role': (
+                'promoted' if selection and selection['promotion'].get('promoted')
+                else 'periodic'
+            ),
+            'recovery_experiment': {
+                'enabled': bool(self.config.recovery_enforced),
+                'baseline_checkpoint': self.config.recovery_baseline_path,
+                'baseline_sha256': self.config.recovery_baseline_sha256,
+                'training_stage': self.config.policy_stage,
+                'resume_anchor': self.config.resume,
+            },
             'rng_state': {
+                'python': random.getstate(),
+                'numpy': {
+                    'bit_generator': np.random.get_state()[0],
+                    'state': np.random.get_state()[1].tolist(),
+                    'position': int(np.random.get_state()[2]),
+                    'has_gauss': int(np.random.get_state()[3]),
+                    'cached_gaussian': float(np.random.get_state()[4]),
+                },
                 'torch': torch.get_rng_state(),
             }
         }
@@ -1517,9 +2575,8 @@ class Trainer:
 
         if torch.cuda.is_available():
             checkpoint['rng_state']['cuda'] = torch.cuda.get_rng_state()
+            checkpoint['rng_state']['cuda_all'] = torch.cuda.get_rng_state_all()
 
-        checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
-        latest_path = Path(self.config.latest_path)
         _step = self.step
         _stats_collector = self.stats_collector
         # Snapshot stats on main thread to avoid reading self.stats from the
@@ -1557,6 +2614,31 @@ class Trainer:
                     import shutil
                     shutil.copy2(str(checkpoint_path), _lp)
 
+                if selection:
+                    promotion_record = dict(selection.get('promotion', {}))
+                    checkpoint_digest = hashlib.sha256()
+                    with checkpoint_path.open('rb') as checkpoint_handle:
+                        for chunk in iter(
+                            lambda: checkpoint_handle.read(1024 * 1024), b''
+                        ):
+                            checkpoint_digest.update(chunk)
+                    promotion_record['checkpoint_sha256'] = (
+                        checkpoint_digest.hexdigest().upper()
+                    )
+                    durable_decision = PromotionDecision(
+                        bool(promotion_record.get('promoted')),
+                        str(promotion_record.get('reason', '')),
+                        promotion_record,
+                    )
+                    self._promotion_registry.persist(durable_decision)
+                    self._last_promotion_decision = durable_decision
+                    self.stats.promotion_history.append(promotion_record)
+                    _stats_snapshot['promotion_history'] = [
+                        *_stats_snapshot.get('promotion_history', []),
+                        promotion_record,
+                    ]
+                    selection['promotion'] = promotion_record
+
                 self._save_stats(_snapshot=_stats_snapshot)
 
                 # Write JSONL log entry (moved from training thread).
@@ -1571,6 +2653,10 @@ class Trainer:
                         step=_step, loss=loss, path=str(checkpoint_path),
                         file_size_mb=ckpt_size,
                     )
+                if selection and selection.get('promotion', {}).get('promoted'):
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, Path(self.config.promoted_path))
+                    self._enqueue_checkpoint_acceptance(checkpoint_path, selection)
                 print(f"Checkpoint saved: {checkpoint_path}")
                 # Notify the GUI so the panel can log the checkpoint and
                 # refresh its stats view (no-op when training headless).
@@ -1581,12 +2667,6 @@ class Trainer:
                 })
             except Exception as e:
                 print(f"Checkpoint save error: {e}")
-
-        # Wait for previous checkpoint write to finish before starting a new one.
-        # Prevents concurrent disk I/O to the same stats file and avoids
-        # accumulating background threads on slow storage.
-        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
-            self._checkpoint_thread.join(timeout=30)
 
         self._checkpoint_thread = threading.Thread(target=_write_checkpoint, daemon=True)
         self._checkpoint_thread.start()
@@ -1708,6 +2788,22 @@ class Trainer:
 
         _selfplay_start = time.time()
         total_games = max(0, num_games)
+        cycle_id = self.stats.generation_cycles_completed
+        # Reserve the identifier for deterministic seeds, but only commit the
+        # completed-cycle counter after every requested game has succeeded.
+        # An interrupted cycle must not look like a valid generation to corpus
+        # recovery or to the next cycle's provenance.
+        opening_choices = tuple(self.config.selfplay_opening_plies) or (0,)
+        opening_seed_base = (
+            int(self.config.selfplay_opening_seed) + cycle_id * 1_000_003)
+        task_order_rng = random.Random(opening_seed_base ^ 0xBB67AE8584CAA73B)
+
+        def _opening_for(game_index: int) -> tuple[int, int]:
+            return (
+                int(opening_choices[game_index % len(opening_choices)]),
+                opening_seed_base + game_index,
+            )
+
         opponent_focus = self.config.selfplay_opponent_focus
         side_focus = self.config.selfplay_focus_side
         _collected = [] if collect_dicts else None
@@ -1742,6 +2838,15 @@ class Trainer:
             vs_algo_games = total_games - ml_self_games
 
         grand_total = total_games + algo_vs_algo_games
+        if self.config.recovery_enforced:
+            expected_algorithm, expected_model = (
+                allocate_policy_distillation_games(grand_total))
+            if algo_vs_algo_games != expected_algorithm or total_games != expected_model:
+                raise RuntimeError(
+                    "Recovery generation must use an exact 70/30 trajectory split: "
+                    f"expected {expected_algorithm}/{expected_model}, got "
+                    f"{algo_vs_algo_games}/{total_games}"
+                )
 
         if opponent_focus == 'ml':
             focus_desc = "ML self-play"
@@ -1821,7 +2926,18 @@ class Trainer:
                             p1_pol, p2_pol, _model_path_str, self.device,
                         ))
 
-        random.shuffle(all_ml_tasks)
+        all_ml_tasks = [
+            task + (
+                _opening_for(index)[0],
+                _opening_for(index)[1],
+                'current_model',
+                f"cycle-{cycle_id:06d}-model-{index:06d}",
+                self.config.teacher_difficulty,
+                self.config.inference_depth,
+            )
+            for index, task in enumerate(all_ml_tasks)
+        ]
+        task_order_rng.shuffle(all_ml_tasks)
 
         # --- Algo-vs-algo task args: (p1_diff, p2_diff, max_moves, noise, start) ---
         all_algo_tasks = []
@@ -1845,7 +2961,17 @@ class Trainer:
                     start = 1 if g % 2 == 0 else 2
                     all_algo_tasks.append((d1, d2, _max_moves, _noise_prob, start))
 
-            random.shuffle(all_algo_tasks)
+            all_algo_tasks = [
+                task + (
+                    _opening_for(len(all_ml_tasks) + index)[0],
+                    _opening_for(len(all_ml_tasks) + index)[1],
+                    'algorithm',
+                    f"cycle-{cycle_id:06d}-algorithm-{index:06d}",
+                    self.config.teacher_difficulty,
+                )
+                for index, task in enumerate(all_algo_tasks)
+            ]
+            task_order_rng.shuffle(all_algo_tasks)
 
         # [Pass 70] Build a CPU model copy for fork-inherited self-play.
         # On Linux (fork start method), workers inherit this global via
@@ -1983,6 +3109,29 @@ class Trainer:
             if completed_total % 100 == 0 or completed_total == grand_total:
                 print(f"  Games: {completed_total}/{grand_total}")
 
+        def _batch_result_is_complete(entries_data, batch):
+            """Reject a worker result that silently dropped one of its games."""
+            # A max_moves=0 game legitimately emits no positions.  All normal
+            # games must emit at least one entry carrying their stable game_id.
+            expected = []
+            for task in batch:
+                if len(task) >= 12:  # extended ML task
+                    game_id = task[11]
+                    max_moves = task[1]
+                elif len(task) >= 9:  # extended algorithm task
+                    game_id = task[8]
+                    max_moves = task[2]
+                else:
+                    game_id = None
+                    max_moves = 1
+                if int(max_moves) > 0:
+                    expected.append(str(game_id) if game_id is not None else None)
+            if not expected:
+                return True
+            seen = {str(entry.get('game_id')) for entry in entries_data
+                    if entry.get('game_id') is not None}
+            return all(game_id in seen for game_id in expected)
+
         # Worker fn per task type, for re-running a batch in-process. ML
         # batches reuse the fork-inherited _FORK_MODEL (set above), so they
         # run correctly in the main process too.
@@ -1995,8 +3144,11 @@ class Trainer:
         unfinished = {}  # future → (task_type, batch_game_count, batch)
 
         try:
-            with ProcessPoolExecutor(max_workers=effective_workers,
-                                     initializer=_selfplay_worker_init) as executor:
+            with ProcessPoolExecutor(
+                max_workers=effective_workers,
+                initializer=_selfplay_worker_init,
+                initargs=(opening_seed_base,),
+            ) as executor:
                 # future → (task_type, num_games_in_batch, batch)
                 future_meta = {}
                 for batch in ml_batches:
@@ -2020,6 +3172,10 @@ class Trainer:
                     task_type, batch_game_count, batch = future_meta[future]
                     try:
                         entries_data = future.result(timeout=600)
+                        if not _batch_result_is_complete(entries_data, batch):
+                            raise RuntimeError(
+                                "self-play worker returned an incomplete batch"
+                            )
                         unfinished.pop(future, None)
                         _consume_batch(entries_data, batch_game_count)
                     except BrokenProcessPool:
@@ -2033,7 +3189,6 @@ class Trainer:
                               f"sequentially")
                         break
                     except Exception as e:
-                        unfinished.pop(future, None)
                         print(f"Self-play error ({task_type}): {e}")
 
             # Pool torn down. Re-run any batches the broken pool never
@@ -2051,32 +3206,51 @@ class Trainer:
                         print(f"Self-play sequential re-run error ({task_type}): {e}")
         except Exception as e:
             print(f"Unified pool failed ({e}), falling back to sequential")
-            # Sequential fallback for algo-vs-algo only (ML fallback is rarely needed)
-            for task_a in all_algo_tasks:
+            # Retry every still-owed batch in-process.  A partial retry is not
+            # admissible: the completion gate below quarantines the whole
+            # cycle if any batch remains incomplete.
+            if not unfinished:
+                for batch in ml_batches:
+                    unfinished[('ml', id(batch))] = ('ml', len(batch), batch)
+                for batch in algo_batches:
+                    unfinished[('algo', id(batch))] = ('algo', len(batch), batch)
+            for task_type, batch_game_count, batch in list(unfinished.values()):
                 self._service_control_queue()
                 if self._stopped:
                     break
                 try:
-                    entries_data = _play_game_worker_algo_vs_algo(task_a)
-                    if not skip_replay:
-                        self.replay_buffer.add_entry_dicts(entries_data)
-                    entries += len(entries_data)
-                    if _collected is not None:
-                        _collected.extend(entries_data)
-                    if _preprocess_chunks is not None and entries_data:
-                        _preprocess_chunks.append(
-                            _pp_chunk((entries_data, _pp_max_moves)))
-                    completed_total += 1
-                    if callback:
-                        callback(completed_total, grand_total)
+                    entries_data = _batch_fn[task_type](batch)
+                    if not _batch_result_is_complete(entries_data, batch):
+                        raise RuntimeError(
+                            "self-play sequential retry returned an incomplete batch"
+                        )
+                    _consume_batch(entries_data, batch_game_count)
                 except Exception as e:
-                    print(f"Sequential fallback error: {e}")
+                    print(f"Sequential fallback error ({task_type}): {e}")
 
         # [Pass 70] Clean up fork-inherited model to free CPU memory.
         _sp_mod._FORK_MODEL = None
 
+        cycle_complete = completed_total == grand_total and not self._stopped
+        if not cycle_complete:
+            # Never leave a partial file discoverable by replay/corpus scans.
+            # The in-memory paths are cleared as well because callers may use
+            # collect_dicts or inline preprocessing instead of replay I/O.
+            if not skip_replay:
+                self.replay_buffer.discard_current_file()
+            if _collected is not None:
+                _collected.clear()
+            if _preprocess_chunks is not None:
+                _preprocess_chunks.clear()
+            self._last_selfplay_dicts = None
+            self._last_selfplay_preprocessed = None
+            raise RuntimeError(
+                f"self-play cycle {cycle_id} incomplete: "
+                f"completed {completed_total}/{grand_total} games"
+            )
         if not skip_replay:
             self.replay_buffer.close()
+        self.stats.generation_cycles_completed = cycle_id + 1
         if side_balance_totals['batches'] > 0:
             print(
                 "  Side weight balance: "
@@ -2168,6 +3342,71 @@ class Trainer:
             return  # already running
 
         def _worker():
+            if self._snapshot_manager is not None:
+                while not self._stopped:
+                    try:
+                        while self._paused and not self._stopped:
+                            time.sleep(0.5)
+                        if self._stopped:
+                            break
+
+                        self.run_selfplay(
+                            num_games,
+                            collect_dicts=False,
+                            skip_replay=False,
+                            preprocess_inline=False,
+                        )
+                        pruned = self.replay_buffer.cleanup_old_files()
+                        if pruned:
+                            print(
+                                f"  Replay: pruned {pruned} old file(s) "
+                                f"(keeping newest {self.config.replay_max_files})"
+                            )
+
+                        teacher, noise, generation = self._corpus_settings()
+                        decision = self._snapshot_manager.consider_snapshot(
+                            teacher_settings=teacher,
+                            noise_settings=noise,
+                            generation_settings=generation,
+                        )
+                        if not decision.admitted:
+                            print(
+                                "  Corpus candidate not activated: "
+                                f"{decision.reason}"
+                            )
+                            continue
+
+                        train_entries, validation_entries, manifest = (
+                            self._snapshot_manager.load_split(
+                                decision.manifest_path,
+                                max_train_entries=self.config.replay_max_entries,
+                            )
+                        )
+                        dataset = CachedTensorDataset.from_entries(
+                            train_entries,
+                            max_moves_per_sample=self.config.max_moves_per_sample,
+                            show_progress=True,
+                        )
+                        with self._bg_selfplay_lock:
+                            self._bg_selfplay_entries = None
+                            self._bg_selfplay_dataset = dataset
+                            self._bg_selfplay_incremental = None
+                            self._bg_snapshot_manifest = manifest
+                            self._bg_validation_entries = validation_entries
+                        self._data_ready_event.set()
+                        print(
+                            f"  Corpus snapshot {manifest['version']} ready: "
+                            f"{manifest['metrics']['fresh_unique_state_rate']:.1%} "
+                            "fresh canonical states"
+                        )
+                    except Exception as exc:
+                        import traceback
+                        print(f"Background snapshot self-play error: {exc}")
+                        traceback.print_exc()
+                        if not self._stopped:
+                            time.sleep(2.0)
+                return
+
             _existing = getattr(self, '_current_dataset', None)
             _max_entries = self.config.replay_max_entries
             # Track entry count as integer to avoid holding ~2GB of CPU
@@ -2195,7 +3434,19 @@ class Trainer:
                     if self._stopped:
                         break
 
-                    _skip = _existing_count > 0
+                    _has_existing = _existing_count > 0
+
+                    # [Pass 109] JSONL persistence used to be skipped for every
+                    # cycle after the first (`skip_replay = _existing_count > 0`).
+                    # Self-play then lived only in the GPU-resident buffer and
+                    # died with the process, so each restart reloaded the SAME
+                    # stale corpus and every fresh game generated since was lost.
+                    # That is why data/replay_policy_distillation/ had no file
+                    # newer than 2026-08-11 despite weeks of training. The write
+                    # happens on this background thread between game batches, so
+                    # it costs the training loop nothing; persist unless the
+                    # config explicitly opts out.
+                    _skip = _has_existing and not self.config.persist_selfplay
 
                     # Always use inline preprocessing: preprocess entries as each
                     # game batch completes in the as_completed() loop.  Eliminates
@@ -2204,8 +3455,14 @@ class Trainer:
                     # per cycle (entire preprocessing phase overlapped with games).
                     # collect_dicts is still needed on first cycle for fallback.
                     self.run_selfplay(
-                        num_games, collect_dicts=not _skip,
+                        num_games, collect_dicts=not _has_existing,
                         skip_replay=_skip, preprocess_inline=True)
+
+                    if not _skip:
+                        _pruned = self.replay_buffer.cleanup_old_files()
+                        if _pruned:
+                            print(f"  Replay: pruned {_pruned} old file(s) "
+                                  f"(keeping newest {self.config.replay_max_files})")
 
                     # Check for inline-preprocessed data first (fast path).
                     incremental = getattr(self, '_last_selfplay_preprocessed', None)
@@ -2229,7 +3486,10 @@ class Trainer:
                         if _existing_count == 0:
                             # Check for existing replay data on disk
                             train_entries, _ = prepare_training_data(
-                                self.replay_buffer, max_entries=_max_entries, val_split=0.0)
+                                self.replay_buffer, max_entries=_max_entries,
+                                val_split=(self.config.validation_fraction
+                                           if self.config.validation_enabled else 0.0),
+                                split_seed=self.config.validation_split_seed)
                             if train_entries:
                                 existing_ds = CachedTensorDataset.from_entries(
                                     train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
@@ -2262,7 +3522,10 @@ class Trainer:
                         else:
                             incremental = None
                             train_entries, _ = prepare_training_data(
-                                self.replay_buffer, max_entries=_max_entries, val_split=0.0)
+                                self.replay_buffer, max_entries=_max_entries,
+                                val_split=(self.config.validation_fraction
+                                           if self.config.validation_enabled else 0.0),
+                                split_seed=self.config.validation_split_seed)
                             if self.config.clear_replay_after_load:
                                 deleted = self.replay_buffer.clear_files()
                                 if deleted:
@@ -2317,6 +3580,13 @@ class Trainer:
             self._bg_selfplay_dataset = None
             self._bg_selfplay_incremental = None
             self._bg_selfplay_entries = None
+            manifest = self._bg_snapshot_manifest
+            validation_entries = self._bg_validation_entries
+            self._bg_snapshot_manifest = None
+            self._bg_validation_entries = None
+        if manifest is not None:
+            self._activate_dataset_manifest(manifest)
+            self._set_validation_entries(validation_entries or [])
         return dataset, incremental
 
     def _refresh_dataloader(self, dataloader, bg_dataset, bg_incremental,
@@ -2420,6 +3690,7 @@ class Trainer:
                 algo_difficulty=self.config.test_difficulty,
                 num_workers=min(self.config.cpu_workers, 4),
                 max_moves=self.config.selfplay_max_moves,
+                opening_plies=self.config.test_opening_plies,
             )
 
             def progress(completed, total, stats):
@@ -2490,6 +3761,7 @@ class Trainer:
             algo_difficulty=difficulty,
             num_workers=num_workers,
             max_moves=max_moves,
+            opening_plies=self.config.test_opening_plies,
         )
 
         def progress(completed, total, stats):
@@ -2630,6 +3902,7 @@ class Trainer:
         _amp_dtype = self.amp_dtype
         _value_head_enabled = _cfg.value_head_enabled
         _value_weight = _cfg.value_weight
+        _soft_targets_enabled = _cfg.policy_stage == 'enhanced'
         _scaler = self.scaler
         _optimizer = self.optimizer
         _scheduler = self.scheduler
@@ -2646,7 +3919,11 @@ class Trainer:
         # Compiled fwd+loss: use when available and padded.
         # Now supports both policy-only and policy+value head paths.
         _compiled_fwd_loss = self._compiled_fwd_loss
-        _use_compiled = (_compiled_fwd_loss is not None and _use_padded)
+        _use_compiled = (
+            _compiled_fwd_loss is not None
+            and _use_padded
+            and not _soft_targets_enabled
+        )
 
         # Pre-allocate uniform weights for non-scoring epochs so the compiled
         # path always receives a tensor (never None).
@@ -2661,13 +3938,24 @@ class Trainer:
         # is already GPU-resident (no transfer to overlap, prefetcher just adds
         # stream-sync overhead).
         _data_on_gpu = getattr(dataloader, 'on_gpu', False)
-        _use_prefetcher = _device.type == 'cuda' and not _data_on_gpu
+        _use_prefetcher = (
+            _device.type == 'cuda'
+            and not _data_on_gpu
+            and not _soft_targets_enabled
+        )
         if _use_prefetcher:
             iter_loader = CUDAPrefetcher(dataloader, _device)
         else:
             iter_loader = dataloader
 
-        for boards, move_features, move_counts, targets, reward_weights, value_targets in iter_loader:
+        for batch in iter_loader:
+            if len(batch) == 7:
+                (boards, move_features, move_counts, targets, reward_weights,
+                 value_targets, teacher_probabilities) = batch
+            else:
+                (boards, move_features, move_counts, targets, reward_weights,
+                 value_targets) = batch
+                teacher_probabilities = None
             if first_batch:
                 print(f"  First batch loaded. Processing {total_batches} batches...")
                 sys.stdout.flush()
@@ -2696,6 +3984,9 @@ class Trainer:
                 move_features = move_features.to(_device, non_blocking=True)
                 move_counts = move_counts.to(_device, non_blocking=True)
                 targets = targets.to(_device, non_blocking=True)
+                if teacher_probabilities is not None:
+                    teacher_probabilities = teacher_probabilities.to(
+                        _device, non_blocking=True)
             # Conditionally load reward weights / value targets
             if not use_scoring:
                 # Compiled path needs a tensor (never None); reuse pre-allocated ones.
@@ -2832,7 +4123,13 @@ class Trainer:
                                 self.step, 'model_scores', 'Non-finite output scores')
                         continue
                 _current_scores = scores.detach()
-                if _use_padded:
+                if _soft_targets_enabled:
+                    if teacher_probabilities is None:
+                        raise RuntimeError(
+                            "Enhanced stage batch is missing teacher probabilities")
+                    policy_loss = soft_target_cross_entropy(
+                        scores, move_counts, teacher_probabilities, reward_weights)
+                elif _use_padded:
                     policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
                 else:
                     policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
@@ -2887,7 +4184,13 @@ class Trainer:
                                 self.step, 'model_scores', 'Non-finite output scores (FP32)')
                         continue
                 _current_scores = scores.detach()
-                if _use_padded:
+                if _soft_targets_enabled:
+                    if teacher_probabilities is None:
+                        raise RuntimeError(
+                            "Enhanced stage batch is missing teacher probabilities")
+                    policy_loss = soft_target_cross_entropy(
+                        scores, move_counts, teacher_probabilities, reward_weights)
+                elif _use_padded:
                     policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
                 else:
                     policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
@@ -3266,9 +4569,43 @@ class Trainer:
         if not self.stats.start_time:
             self.stats.start_time = datetime.now().isoformat()
 
-        # Generate initial self-play data if needed
-        entry_count = self.replay_buffer.count_entries()
-        if entry_count < self.config.batch_size * 10:
+        # Generate initial self-play data if needed. Snapshot recovery needs at
+        # least two repaired files so one whole file can be frozen for
+        # validation while at least one remains for training.
+        if self._snapshot_manager is not None:
+            eligible_files, rejected_files = (
+                self._snapshot_manager.eligible_replay_files())
+            eligible_metrics, _ = analyze_replay_files(eligible_files)
+            entry_count = int(eligible_metrics.get('records', 0))
+            if rejected_files:
+                print(
+                    f"Excluded {len(rejected_files)} legacy or invalid replay "
+                    "file(s) from recovery training"
+                )
+            minimum_entries = self.config.batch_size * 10
+            while len(eligible_files) < 2 or entry_count < minimum_entries:
+                print(
+                    "\nInsufficient repaired snapshot data "
+                    f"({len(eligible_files)} files, {entry_count} entries)"
+                )
+                before_files = len(eligible_files)
+                before_entries = entry_count
+                self.run_selfplay(self.config.selfplay_games)
+                eligible_files, _ = self._snapshot_manager.eligible_replay_files()
+                eligible_metrics, _ = analyze_replay_files(eligible_files)
+                entry_count = int(eligible_metrics.get('records', 0))
+                if (len(eligible_files) <= before_files and
+                        entry_count <= before_entries):
+                    raise RuntimeError(
+                        "Self-play produced no eligible repaired replay data"
+                    )
+                self._service_control_queue()
+                if self._stopped:
+                    break
+        else:
+            entry_count = self.replay_buffer.count_entries()
+        if (self._snapshot_manager is None and
+                entry_count < self.config.batch_size * 10):
             print(f"\nInsufficient training data ({entry_count} entries)")
             self.run_selfplay(self.config.selfplay_games)
 
@@ -3279,8 +4616,9 @@ class Trainer:
 
         # Prepare data
         print("\nPreparing training data...")
-        train_entries, _ = prepare_training_data(
-            self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
+        self._ensure_frozen_teacher_suite()
+        train_entries, validation_entries = self._prepare_training_split()
+        self._set_validation_entries(validation_entries)
         print(f"Training entries: {len(train_entries)}")
         train_balance = self._balance_side_sample_weights(train_entries)
         if train_balance is not None:
@@ -3306,22 +4644,39 @@ class Trainer:
         
         print(f"Creating DataLoader with {effective_workers} workers...")
         sys.stdout.flush()
-        dataloader = create_dataloader(
-            train_entries,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=effective_workers,
-            pin_memory=self.config.pin_memory,
-            use_ram_cache=self.config.ram_cache_enabled,
-            ram_threshold_gb=self.config.ram_cache_threshold_gb,
-            cache_file=self.config.ram_cache_file,
-            device=self.device,
-            capacity=self.config.replay_max_entries if _simultaneous else 0,
-            max_moves_per_sample=self.config.max_moves_per_sample,
-            amp_enabled=self.config.amp,
-        )
+        if self.config.policy_stage == 'enhanced':
+            dataloader = create_enhanced_dataloader(
+                train_entries,
+                batch_size=self.config.batch_size,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                teacher_depth=self.config.teacher_score_depth,
+                temperature=self.config.teacher_soft_temperature,
+                value_scale=self.config.teacher_value_scale,
+                hard_label_blend=self.config.teacher_hard_label_blend,
+                shuffle=True,
+                show_progress=True,
+            )
+        else:
+            dataloader = create_dataloader(
+                train_entries,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=effective_workers,
+                pin_memory=self.config.pin_memory,
+                use_ram_cache=self.config.ram_cache_enabled,
+                ram_threshold_gb=self.config.ram_cache_threshold_gb,
+                cache_file=self.config.ram_cache_file,
+                device=self.device,
+                capacity=self.config.replay_max_entries if _simultaneous else 0,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                amp_enabled=self.config.amp,
+            )
         _is_fast = isinstance(dataloader, FastBatchIterator)
-        self._use_padded = _is_fast or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
+        self._use_padded = (
+            _is_fast
+            or isinstance(dataloader, EnhancedBatchIterator)
+            or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
+        )
         # Track dataset for incremental updates in background self-play
         if _is_fast:
             self._current_dataset = dataloader.dataset
@@ -3486,7 +4841,17 @@ class Trainer:
                     # Find and load the most recent checkpoint
                     ckpt_dir = Path(self.config.checkpoint_dir)
                     ckpts = sorted(ckpt_dir.glob("model_step_*.pt"))
-                    if ckpts:
+                    if self.config.recovery_enforced:
+                        last_ckpt = str(
+                            self._verified_recovery_rollback_checkpoint())
+                        print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
+                        self._load_checkpoint(last_ckpt)
+                        if self.scaler is not None:
+                            self.scaler = GradScaler(init_scale=2**10)
+                            print(
+                                "  GradScaler reset to conservative "
+                                f"scale={self.scaler.get_scale():.0f}")
+                    elif ckpts:
                         last_ckpt = str(ckpts[-1])
                         print(f"  Rolling back to checkpoint: {last_ckpt}")
                         self._load_checkpoint(last_ckpt)
@@ -3591,8 +4956,8 @@ class Trainer:
                 # Alternate mode: generate data synchronously, then rebuild dataloader
                 print("Running self-play (alternate mode)...")
                 self.run_selfplay(self.config.selfplay_games)
-                train_entries, _ = prepare_training_data(
-                    self.replay_buffer, max_entries=self.config.replay_max_entries, val_split=0.0)
+                train_entries, validation_entries = self._prepare_training_split()
+                self._set_validation_entries(validation_entries)
                 train_balance = self._balance_side_sample_weights(train_entries)
                 if train_balance is not None:
                     print(
@@ -3607,8 +4972,25 @@ class Trainer:
                     if deleted:
                         print(f"Cleared {deleted} replay files after loading")
                 if train_entries:
+                    if self.config.policy_stage == 'enhanced':
+                        dataloader = create_enhanced_dataloader(
+                            train_entries,
+                            batch_size=self.config.batch_size,
+                            max_moves_per_sample=self.config.max_moves_per_sample,
+                            teacher_depth=self.config.teacher_score_depth,
+                            temperature=self.config.teacher_soft_temperature,
+                            value_scale=self.config.teacher_value_scale,
+                            hard_label_blend=self.config.teacher_hard_label_blend,
+                            shuffle=True,
+                            show_progress=True,
+                        )
+                        self._use_padded = True
+                        _gpu_resident = False
+                        continue
                     dataset = CachedTensorDataset.from_entries(
-                        train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True,
+                        train_entries,
+                        max_moves_per_sample=self.config.max_moves_per_sample,
+                        show_progress=True,
                     )
                     # Free old GPU tensors before allocating new ones
                     _was_gpu = getattr(dataloader, 'on_gpu', False)
@@ -3631,6 +5013,7 @@ class Trainer:
 
             # Start async test if due and no test currently running
             if (self.config.test_vs_algo and
+                not self.config.test_promoted_only and
                 self.step > 0 and
                 self.step - last_test_step >= self.config.test_every and
                 (_async_test_thread is None or not _async_test_thread.is_alive())):
@@ -3653,11 +5036,19 @@ class Trainer:
 
         # Final checkpoint
         self._save_checkpoint(loss)
+        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
+            self._checkpoint_thread.join()
+        if self._acceptance_thread is not None and not self._stopped:
+            print("Waiting for queued promoted-checkpoint acceptance evaluations...")
+            self._acceptance_queue.join()
+            self._acceptance_queue.put(None)
+            self._acceptance_thread.join(timeout=5)
 
         # Final test vs algorithm (synchronous — training is done).
         # Skipped when training was explicitly stopped: a Stop request from
         # the GUI should not block on a 100-game evaluation.
-        if self.config.test_vs_algo and not self._stopped:
+        if (self.config.test_vs_algo and not self.config.test_promoted_only
+                and not self._stopped):
             try:
                 print("\nRunning final model evaluation...")
                 self.run_test_vs_algo(num_games=self.config.test_games * 2)
@@ -3798,6 +5189,12 @@ class Trainer:
         recent_loss = None
         if self.stats.loss_history:
             recent_loss = self.stats.loss_history[-1].get('loss')
+        latest_teacher = (
+            self.stats.teacher_agreement_history[-1]
+            if self.stats.teacher_agreement_history else None)
+        latest_acceptance = (
+            self.stats.acceptance_history[-1]
+            if self.stats.acceptance_history else None)
         
         return {
             'step': self.step,
@@ -3806,7 +5203,31 @@ class Trainer:
             'device': str(self.device),
             'gpu_mem_mb': gpu_mem,
             'recent_loss': recent_loss,
-            'best_loss': self.stats.best_loss if self.stats.best_loss != float('inf') else None,
+            'current_train_loss': self.stats.current_train_loss,
+            'current_dataset_best_train_loss': (
+                self.stats.current_dataset_best_train_loss
+                if math.isfinite(self.stats.current_dataset_best_train_loss) else None
+            ),
+            'historical_best_train_loss': (
+                self.stats.historical_best_train_loss
+                if math.isfinite(self.stats.historical_best_train_loss) else None
+            ),
+            'best_loss': (
+                self.stats.historical_best_train_loss
+                if math.isfinite(self.stats.historical_best_train_loss) else None
+            ),
+            'dataset_fingerprint': self.stats.dataset_fingerprint,
+            'best_teacher_agreement': self.stats.best_teacher_agreement,
+            'validation_teacher_agreement': (
+                latest_teacher.get('top1_teacher_agreement')
+                if latest_teacher else None),
+            'latest_promotion': (
+                self.stats.promotion_history[-1]
+                if self.stats.promotion_history else None
+            ),
+            'acceptance': latest_acceptance,
+            'latest_acceptance': latest_acceptance,
+            'dataset_metadata': dict(self.stats.dataset_metadata),
         }
 
     def get_stats(self) -> TrainingStats:
@@ -3977,6 +5398,12 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     lr_sched_cfg = training_cfg.get('lr_scheduler', {})
     value_head_cfg = yaml_config.get('value_head', {})
     thermal_cfg = yaml_config.get('thermal_protection', {})
+    validation_cfg = yaml_config.get('validation', {})
+    snapshot_cfg = yaml_config.get('corpus_snapshots', {})
+    teacher_policy_cfg = yaml_config.get('teacher_policy', {})
+    recovery_cfg = yaml_config.get('recovery_experiment', {})
+    generation_mix_cfg = selfplay_cfg.get('generation_mix', {})
+    augmentation_cfg = yaml_config.get('augmentation', {})
     
     # Parse stop time if duration is set
     stop_time = None
@@ -4004,6 +5431,16 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         selfplay_difficulties=selfplay_cfg.get('difficulties', ['medium']),
         selfplay_noise_prob=selfplay_cfg.get('noise_prob', 0.1),
         selfplay_max_moves=selfplay_cfg.get('max_moves_per_game', 200),
+        selfplay_opening_plies=tuple(
+            selfplay_cfg.get('opening_plies', (0, 2, 4, 6, 8)) or (0,)),
+        selfplay_opening_seed=int(selfplay_cfg.get('opening_seed', 20260819)),
+        symmetry_augmentation=str(
+            augmentation_cfg.get('symmetry', 'none')).strip().lower(),
+        trajectory_algorithm_fraction=float(
+            generation_mix_cfg.get('algorithm_fraction', 0.70)),
+        trajectory_model_fraction=float(
+            generation_mix_cfg.get('model_fraction', 0.30)),
+        teacher_difficulty=str(selfplay_cfg.get('teacher_difficulty', 'hard')),
         pipeline_mode=selfplay_cfg.get('pipeline_mode', 'simultaneous'),
         max_stale_epochs=selfplay_cfg.get('max_stale_epochs', 0),
         # Algo-vs-algo settings
@@ -4030,6 +5467,15 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         value_head_enabled=value_head_cfg.get('enabled', False),
         value_head_hidden=value_head_cfg.get('hidden_size', 128),
         value_weight=value_head_cfg.get('value_weight', 0.15),
+        policy_stage=str(training_cfg.get('stage', 'policy_only')),
+        teacher_target_type=str(teacher_policy_cfg.get('target_type', 'hard')),
+        teacher_soft_temperature=float(teacher_policy_cfg.get('temperature', 1.0)),
+        teacher_value_scale=float(teacher_policy_cfg.get('value_scale', 1000.0)),
+        teacher_score_depth=int(teacher_policy_cfg.get('score_depth', 3)),
+        teacher_hard_label_blend=float(
+            teacher_policy_cfg.get('hard_label_blend', 0.25)),
+        require_policy_gate_for_enhanced=bool(
+            teacher_policy_cfg.get('require_policy_gate', True)),
         # DataLoader settings
         dataloader_workers=dataloader_cfg.get('num_workers', 0),
         pin_memory=dataloader_cfg.get('pin_memory', True),
@@ -4039,11 +5485,45 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
         clear_replay_after_load=dataloader_cfg.get('clear_replay_after_load', False),
         max_moves_per_sample=dataloader_cfg.get('max_moves_per_sample', 32),
+        # Validation and immutable corpus windows
+        validation_enabled=bool(validation_cfg.get('enabled', False)),
+        validation_fraction=float(validation_cfg.get('split_fraction', 0.15)),
+        validation_split_seed=int(validation_cfg.get('split_seed', 20260819)),
+        validation_every_checkpoints=int(
+            validation_cfg.get('every_checkpoints', 1)),
+        frozen_suite_path=str(validation_cfg.get(
+            'frozen_suite_path', 'data/validation/frozen_hard_5000.jsonl')),
+        frozen_suite_size=int(validation_cfg.get('frozen_suite_size', 5000)),
+        frozen_suite_seed=int(validation_cfg.get('frozen_suite_seed', 20260819)),
+        frozen_suite_auto_create=bool(validation_cfg.get('auto_create_suite', False)),
+        teacher_agreement_threshold=float(
+            validation_cfg.get('teacher_agreement_threshold', 0.50)),
+        snapshot_enabled=bool(snapshot_cfg.get('enabled', False)),
+        snapshot_root=str(snapshot_cfg.get('root', 'data/corpus_snapshots')),
+        snapshot_min_fresh_fraction=float(
+            snapshot_cfg.get('minimum_fresh_state_fraction', 0.50)),
         # Testing settings
         test_vs_algo=testing_cfg.get('enabled', False),
+        test_promoted_only=bool(testing_cfg.get('promoted_only', False)),
         test_every=testing_cfg.get('every_n_steps', 5000),
         test_games=testing_cfg.get('num_games', 50),
         test_difficulty=testing_cfg.get('difficulty', 'medium'),
+        persist_selfplay=selfplay_cfg.get('persist_selfplay', True),
+        replay_max_files=dataloader_cfg.get('replay_max_files', 60),
+        test_opening_plies=tuple(
+            testing_cfg.get('opening_plies', (0, 2, 4, 6, 8)) or (0,)),
+        test_opening_seed=int(testing_cfg.get('opening_seed', 20260819)),
+        test_opponents=tuple(testing_cfg.get('opponents', ('random', 'easy'))),
+        test_confidence_method=str(testing_cfg.get('confidence_method', 'wilson_score')),
+        test_confidence_level=float(testing_cfg.get('confidence_level', 0.95)),
+        random_match_score_threshold=float(
+            testing_cfg.get('random_match_score_threshold', 0.80)),
+        random_match_score_lower_bound=float(
+            testing_cfg.get('random_lower_confidence_bound', 0.70)),
+        easy_match_score_lower_bound=float(
+            testing_cfg.get('easy_lower_confidence_bound', 0.50)),
+        easy_side_score_floor=float(testing_cfg.get('easy_side_score_floor', 0.50)),
+        inference_depth=int(testing_cfg.get('inference_depth', 1)),
         # Statistics collection settings
         stats_enabled=stats_cfg.get('enabled', True),
         stats_record_every=stats_cfg.get('record_every', 10),
@@ -4060,9 +5540,15 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         # Paths
         checkpoint_dir=paths_cfg.get('checkpoint_dir', 'models/checkpoints'),
         latest_path=paths_cfg.get('latest_model', 'models/latest.pt'),
+        promoted_path=paths_cfg.get('promoted_model', 'models/promoted.pt'),
+        accepted_path=paths_cfg.get('accepted_model', 'models/accepted.pt'),
         replay_dir=paths_cfg.get('replay_dir', 'data/replay'),
         log_dir=paths_cfg.get('log_dir', 'logs'),
         stats_file=paths_cfg.get('stats_file', 'models/training_stats.json'),
+        promotion_registry=paths_cfg.get(
+            'promotion_registry', 'logs/policy_distillation/promotions.jsonl'),
+        acceptance_dir=paths_cfg.get(
+            'acceptance_dir', 'logs/policy_distillation/acceptance'),
         # Thermal protection
         thermal_enabled=thermal_cfg.get('enabled', False),
         thermal_temp_limit_c=thermal_cfg.get('temp_limit_c', 90),
@@ -4073,8 +5559,226 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         # YAML configs.  Without this, resume.enabled=True + checkpoint_path=null
         # silently starts fresh instead of resuming.
         resume=_auto_detect_resume(resume_cfg, paths_cfg),
+        recovery_enforced=bool(recovery_cfg.get('enabled', False)),
+        recovery_baseline_path=recovery_cfg.get('baseline_checkpoint'),
+        recovery_baseline_sha256=recovery_cfg.get('baseline_sha256'),
         stop_time=stop_time,
     )
+
+
+def validate_recovery_experiment_config(
+    config: TrainingConfig,
+    *,
+    resume_latest_requested: bool = False,
+) -> None:
+    """Fail closed unless the approved resume-only recovery controls are active."""
+
+    if not config.recovery_enforced:
+        return
+    if resume_latest_requested:
+        raise ValueError("The recovery experiment forbids --resume-latest")
+    if not config.recovery_baseline_path or not config.recovery_baseline_sha256:
+        raise ValueError("Recovery baseline path and SHA-256 are required")
+
+    baseline = Path(config.recovery_baseline_path).resolve()
+    if baseline.name != 'model_step_134000.pt':
+        raise ValueError(
+            "Recovery baseline must be the preserved model_step_134000.pt")
+    resume = Path(config.resume).resolve() if config.resume else None
+    if config.policy_stage == 'policy_only' and resume != baseline:
+        raise ValueError(
+            f"Recovery must resume only from {baseline}; received {resume}"
+        )
+    if not baseline.is_file():
+        raise FileNotFoundError(f"Recovery baseline checkpoint not found: {baseline}")
+    digest = hashlib.sha256()
+    with baseline.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    actual = digest.hexdigest().upper()
+    expected = str(config.recovery_baseline_sha256).upper()
+    if actual != expected:
+        raise RuntimeError(
+            f"Recovery baseline SHA-256 mismatch: expected {expected}, got {actual}"
+        )
+
+    failures = []
+    if not config.validation_enabled or abs(config.validation_fraction - 0.15) > 1e-12:
+        failures.append("validation must reserve 15% by whole replay file")
+    if config.frozen_suite_size != 5000:
+        failures.append("frozen teacher suite must contain exactly 5000 states")
+    if config.teacher_agreement_threshold < 0.50:
+        failures.append("teacher agreement promotion threshold must be at least 0.50")
+    if not config.snapshot_enabled:
+        failures.append("versioned corpus snapshots must be enabled")
+    if config.snapshot_min_fresh_fraction < 0.50:
+        failures.append("new snapshots must require at least 50% fresh canonical states")
+    if config.teacher_difficulty != 'hard':
+        failures.append("all recovery labels must use the hard teacher")
+    if abs(config.selfplay_noise_prob - 0.10) > 1e-12:
+        failures.append("played-action exploration must remain 0.10")
+    if abs(config.trajectory_algorithm_fraction - 0.70) > 1e-12:
+        failures.append("algorithm trajectory fraction must be 0.70")
+    if abs(config.trajectory_model_fraction - 0.30) > 1e-12:
+        failures.append("model trajectory fraction must be 0.30")
+    if abs(
+        config.trajectory_algorithm_fraction + config.trajectory_model_fraction - 1.0
+    ) > 1e-12:
+        failures.append("trajectory fractions must sum to 1.0")
+    configured_total_games = config.selfplay_games + (
+        config.algo_vs_algo_games if config.algo_vs_algo_enabled else 0)
+    try:
+        expected_algorithm_games, expected_model_games = (
+            allocate_policy_distillation_games(configured_total_games))
+    except (TypeError, ValueError) as exc:
+        failures.append(f"generation game allocation is invalid: {exc}")
+    else:
+        if config.algo_vs_algo_games != expected_algorithm_games:
+            failures.append(
+                f"algorithm trajectories must be exactly {expected_algorithm_games} "
+                f"of {configured_total_games} games")
+        if config.selfplay_games != expected_model_games:
+            failures.append(
+                f"current-model trajectories must be exactly {expected_model_games} "
+                f"of {configured_total_games} games")
+    if config.selfplay_opponent_focus != 'algorithm':
+        failures.append("current-model trajectories must use the model-vs-algorithm path")
+    if len(set(config.algo_vs_algo_difficulties)) < 2:
+        failures.append("algorithm trajectories must use diverse behavior difficulties")
+    if not any(value > 0 for value in config.selfplay_opening_plies):
+        failures.append("training openings must include positive random plies")
+    if config.symmetry_augmentation != 'none':
+        failures.append(
+            "symmetry augmentation must remain disabled because the only "
+            "rules-valid transform is encoding-identical")
+    if config.test_games != 100:
+        failures.append("promoted checkpoints require 100 games per opponent")
+    if not config.test_vs_algo or not config.test_promoted_only:
+        failures.append("game-strength testing must run only for promoted checkpoints")
+    if set(config.test_opponents) != {'random', 'easy'}:
+        failures.append("acceptance opponents must be random and easy")
+    if not config.test_opening_plies or any(
+        value <= 0 for value in config.test_opening_plies
+    ):
+        failures.append(
+            "every acceptance game must use a positive randomized opening")
+    if config.test_confidence_method != 'wilson_score':
+        failures.append("confidence method must be predeclared as wilson_score")
+    if abs(config.test_confidence_level - 0.95) > 1e-12:
+        failures.append("acceptance confidence level must be 0.95")
+    if abs(config.random_match_score_threshold - 0.80) > 1e-12:
+        failures.append("random acceptance match score must be at least 0.80")
+    if abs(config.random_match_score_lower_bound - 0.70) > 1e-12:
+        failures.append("random lower confidence bound must be above 0.70")
+    if abs(config.easy_match_score_lower_bound - 0.50) > 1e-12:
+        failures.append("easy lower confidence bound must be above 0.50")
+    if abs(config.easy_side_score_floor - 0.50) > 1e-12:
+        failures.append("easy score floor for each player side must be 0.50")
+    if config.policy_stage == 'policy_only':
+        if config.value_head_enabled:
+            failures.append("value head must remain disabled during the policy-only gate")
+        if config.inference_depth != 1:
+            failures.append("inference depth must remain 1 during the policy-only gate")
+        if config.teacher_target_type != 'hard':
+            failures.append("policy-only stage must use hard teacher targets")
+    elif config.policy_stage == 'enhanced':
+        if config.require_policy_gate_for_enhanced:
+            registry_path = Path(config.promotion_registry)
+            gate_passed = False
+            suite_path = Path(config.frozen_suite_path)
+            suite_manifest_path = suite_path.with_suffix(
+                suite_path.suffix + '.manifest.json'
+            )
+            expected_suite_fingerprint = ''
+            if suite_path.is_file() and suite_manifest_path.is_file():
+                try:
+                    with suite_manifest_path.open('r', encoding='utf-8') as handle:
+                        expected_suite_fingerprint = str(
+                            json.load(handle).get('suite_sha256', '')
+                        )
+                except (OSError, ValueError, TypeError):
+                    expected_suite_fingerprint = ''
+            resume_sha256 = ''
+            if resume is not None and resume.is_file():
+                promoted_digest = hashlib.sha256()
+                with resume.open('rb') as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                        promoted_digest.update(chunk)
+                resume_sha256 = promoted_digest.hexdigest().upper()
+            if registry_path.is_file():
+                with registry_path.open('r', encoding='utf-8') as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        promoted_checkpoint = record.get('checkpoint_path')
+                        checkpoint_matches = (
+                            isinstance(promoted_checkpoint, str)
+                            and bool(promoted_checkpoint)
+                            and resume is not None
+                            and Path(promoted_checkpoint).resolve() == resume
+                            and resume.is_file()
+                        )
+                        checkpoint_hash_matches = (
+                            bool(resume_sha256)
+                            and str(record.get('checkpoint_sha256', '')).upper()
+                            == resume_sha256
+                        )
+                        suite_matches = (
+                            bool(expected_suite_fingerprint)
+                            and record.get('suite_fingerprint')
+                            == expected_suite_fingerprint
+                        )
+                        if (record.get('promoted') and
+                                record.get('training_stage', 'policy_only') ==
+                                'policy_only' and
+                                float(record.get('teacher_agreement', 0.0)) >=
+                                config.teacher_agreement_threshold and
+                                checkpoint_matches and
+                                checkpoint_hash_matches and
+                                suite_matches):
+                            gate_passed = True
+                            break
+            if not gate_passed:
+                failures.append(
+                    "enhanced stage must resume from a recorded promoted "
+                    "policy-only checkpoint"
+                )
+        if config.teacher_target_type != 'distribution':
+            failures.append("enhanced stage requires soft distribution targets")
+        if not config.value_head_enabled:
+            failures.append("enhanced stage requires the teacher-evaluation value head")
+        if config.pipeline_mode != 'alternate':
+            failures.append("enhanced stage currently requires alternate pipeline mode")
+        if config.teacher_score_depth < 1:
+            failures.append("enhanced teacher score depth must be positive")
+        if config.teacher_soft_temperature <= 0:
+            failures.append("enhanced teacher temperature must be positive")
+        if config.teacher_value_scale <= 0:
+            failures.append("enhanced teacher value scale must be positive")
+        if not 0.0 <= config.teacher_hard_label_blend < 1.0:
+            failures.append("enhanced hard-label blend must be within [0, 1)")
+        if config.inference_depth not in {2, 3}:
+            failures.append("enhanced inference depth must be 2 or 3")
+    else:
+        failures.append("training stage must be policy_only or enhanced")
+
+    if failures:
+        raise ValueError("Recovery readiness gate failed: " + "; ".join(failures))
+
+
+def activate_enhanced_stage(
+    config: TrainingConfig,
+    inference_depth: int = 2,
+) -> None:
+    """Apply the complete gated P5 runtime profile to a loaded config."""
+    if isinstance(inference_depth, bool) or inference_depth not in {2, 3}:
+        raise ValueError("Enhanced inference depth must be 2 or 3")
+    config.policy_stage = 'enhanced'
+    config.teacher_target_type = 'distribution'
+    config.value_head_enabled = True
+    config.pipeline_mode = 'alternate'
+    config.inference_depth = int(inference_depth)
 
 
 def main():
@@ -4186,6 +5890,10 @@ def main():
                        help='Resume from the latest checkpoint in models/checkpoints/')
     parser.add_argument('--train-duration', type=str, default=None,
                        help='Train for this duration (e.g., 2d, 4h, 30m, 1d12h)')
+    parser.add_argument('--enhanced-stage', action='store_true',
+                       help='Activate the gated P5 soft-policy, value-head, and shallow-search stage')
+    parser.add_argument('--inference-depth', type=int, choices=[2, 3], default=None,
+                       help='Enhanced-stage inference depth (2 or 3; default: 2)')
 
     args = parser.parse_args()
 
@@ -4342,6 +6050,15 @@ def main():
             stop_time=stop_time,
         )
 
+    if args.enhanced_stage:
+        activate_enhanced_stage(config, args.inference_depth or 2)
+    elif args.inference_depth is not None:
+        config.inference_depth = args.inference_depth
+
+    validate_recovery_experiment_config(
+        config,
+        resume_latest_requested=bool(args.resume_latest),
+    )
     trainer = Trainer(config)
     trainer.train()
 
