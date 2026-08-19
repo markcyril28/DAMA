@@ -951,6 +951,12 @@ def _recovery_summary_metrics(stats: dict, test_history: list[dict]) -> dict:
         match_score_text = f'Random {random_score}; Easy {easy_score}'
         interval_text = (
             f'Random {random_interval}; Easy {easy_interval}')
+    elif str(acceptance_state).strip().lower() in {
+        'accepted', 'passed', 'true', '1', 'yes'
+    }:
+        # Do not pair a positive acceptance state with an unlabeled legacy
+        # evaluation. The fixed protocol's random/easy records are required.
+        match_score_text, interval_text = 'N/A', 'N/A'
     else:
         # Never pair a stale legacy test with an acceptance decision.
         match_score_text, interval_text = _summary_match_score(
