@@ -12,10 +12,21 @@ import numpy as np
 # inlining that default -O2 misses. -march=native targets the exact CPU
 # (AVX2/SSE4.2 on modern x86). -ffast-math allows reordering of FP
 # operations.
-_compile_args = ["-O3", "-ffast-math"]
-_link_args = []
-if platform.machine() in ("x86_64", "AMD64"):
-    _compile_args.append("-march=native")
+# MSVC rejects the GCC/Clang spellings above (it ignores them with warning
+# D9002 and silently builds an unoptimized extension), so the Windows toolchain
+# needs its own equivalents: /O2 for full optimization, /fp:fast for the
+# -ffast-math relaxations, /arch:AVX2 as the portable stand-in for
+# -march=native, which MSVC does not have.
+if platform.system() == "Windows":
+    _compile_args = ["/O2", "/fp:fast"]
+    _link_args = []
+    if platform.machine() in ("x86_64", "AMD64"):
+        _compile_args.append("/arch:AVX2")
+else:
+    _compile_args = ["-O3", "-ffast-math"]
+    _link_args = []
+    if platform.machine() in ("x86_64", "AMD64"):
+        _compile_args.append("-march=native")
 
 extensions = [
     Extension(
