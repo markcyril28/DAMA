@@ -65,6 +65,8 @@ CONFIG_FILE="$(readlink -f "$CONFIG_FILE")"
 POLICY_RECOVERY_CONFIG="$(readlink -f "${PROJECT_DIR}/config/training_config_policy_distillation.yaml")"
 POLICY_RECOVERY_BASELINE="${PROJECT_DIR}/models/checkpoints_policy_distillation/model_step_134000.pt"
 POLICY_RECOVERY_SHA256="7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
+POLICY_RECOVERY_LEGACY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation.json"
+POLICY_RECOVERY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation_recovery_wd1e4.json"
 if [ "$CONFIG_FILE" = "$POLICY_RECOVERY_CONFIG" ]; then
     if [ "$RESUME_LATEST" = true ]; then
         echo "ERROR: --resume-latest is disabled for policy recovery." >&2
@@ -191,6 +193,14 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "=== Dama - ML Training ==="
 echo ""
+if [ "$CONFIG_FILE" = "$POLICY_RECOVERY_CONFIG" ] &&
+   [ "$ENHANCED_STAGE" = false ] &&
+   [ ! -e "$POLICY_RECOVERY_STATS" ] &&
+   [ -f "$POLICY_RECOVERY_LEGACY_STATS" ]; then
+    cp -- "$POLICY_RECOVERY_LEGACY_STATS" "$POLICY_RECOVERY_STATS"
+    echo "Recovery stats seeded without modifying the legacy stats file: ${POLICY_RECOVERY_STATS}"
+    echo ""
+fi
 
 # Cython staleness guard (fail-safe). The compiled .so files are committed but
 # can lag their .pyx sources (a stale committed _fast_search.so silently ran
