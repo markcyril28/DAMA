@@ -578,6 +578,8 @@ _STAGE_MUTABLE_DIRECTORY_FIELDS = frozenset({
     'snapshot_root',
 })
 
+_OUTPUT_NAMESPACE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
+
 
 @dataclass
 class TrainingConfig:
@@ -754,6 +756,195 @@ class TrainingConfig:
 
     # Time-based stopping
     stop_time: Optional[datetime] = None  # Calculated from train_duration
+
+
+def _validated_output_namespace(value: Optional[str], label: str) -> str:
+    """Return one safe path-component token used for stage isolation."""
+    token = str(value or '').strip()
+    if not token or not _OUTPUT_NAMESPACE_RE.fullmatch(token):
+        raise ValueError(
+            f"{label} must be a non-empty path-component token containing "
+            "only letters, digits, underscores, and hyphens"
+        )
+    return token
+
+
+def _stage_path_overlap_failures(
+    policy_paths: Mapping[str, str],
+    enhanced_paths: Mapping[str, str],
+) -> list[str]:
+    """Find cross-stage mutable path equality and directory containment."""
+    failures: list[str] = []
+    resolved_policy = {
+        field: Path(value).resolve()
+        for field, value in policy_paths.items()
+    }
+    resolved_enhanced = {
+        field: Path(value).resolve()
+        for field, value in enhanced_paths.items()
+    }
+    for policy_field, policy_path in resolved_policy.items():
+        for enhanced_field, enhanced_path in resolved_enhanced.items():
+            if policy_path == enhanced_path:
+                failures.append(
+                    f"enhanced {enhanced_field} equals policy {policy_field}: "
+                    f"{enhanced_path}"
+                )
+                continue
+            if (
+                policy_field in _STAGE_MUTABLE_DIRECTORY_FIELDS
+                and policy_path in enhanced_path.parents
+            ):
+                failures.append(
+                    f"enhanced {enhanced_field} is inside policy "
+                    f"{policy_field}: {enhanced_path}"
+                )
+            if (
+                enhanced_field in _STAGE_MUTABLE_DIRECTORY_FIELDS
+                and enhanced_path in policy_path.parents
+            ):
+                failures.append(
+                    f"policy {policy_field} is inside enhanced "
+                    f"{enhanced_field}: {policy_path}"
+                )
+    return failures
+
+
+def _derive_enhanced_output_paths(config: TrainingConfig) -> None:
+    """Replace the policy namespace in every mutable output path atomically."""
+    if config.policy_output_paths or config.policy_gate_promotion_registry:
+        raise ValueError("Enhanced output namespace has already been activated")
+    policy_namespace = _validated_output_namespace(
+        config.policy_output_namespace, "policy_output_namespace")
+    enhanced_namespace = _validated_output_namespace(
+        config.enhanced_output_namespace, "enhanced_output_namespace")
+    if policy_namespace == enhanced_namespace:
+        raise ValueError("Policy and enhanced output namespaces must be distinct")
+    if policy_namespace in enhanced_namespace or enhanced_namespace in policy_namespace:
+        raise ValueError(
+            "Policy and enhanced output namespaces must not contain one another"
+        )
+
+    policy_paths: dict[str, str] = {}
+    enhanced_paths: dict[str, str] = {}
+    failures: list[str] = []
+    for field_name in _STAGE_MUTABLE_PATH_FIELDS:
+        raw_value = getattr(config, field_name, None)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            failures.append(f"{field_name} must be a non-empty path")
+            continue
+        if raw_value.count(policy_namespace) != 1:
+            failures.append(
+                f"{field_name} must contain policy namespace exactly once: "
+                f"{raw_value}"
+            )
+            continue
+        derived = raw_value.replace(policy_namespace, enhanced_namespace, 1)
+        policy_paths[field_name] = raw_value
+        enhanced_paths[field_name] = derived
+
+    if not failures:
+        failures.extend(_stage_path_overlap_failures(policy_paths, enhanced_paths))
+    if failures:
+        raise ValueError(
+            "Enhanced output namespace is unsafe: " + "; ".join(failures)
+        )
+
+    config.policy_output_paths = dict(policy_paths)
+    config.policy_gate_promotion_registry = policy_paths['promotion_registry']
+    for field_name, derived in enhanced_paths.items():
+        setattr(config, field_name, derived)
+
+
+def _enhanced_output_isolation_failures(config: TrainingConfig) -> list[str]:
+    """Validate the in-memory policy/enhanced split before any writes occur."""
+    failures: list[str] = []
+    try:
+        policy_namespace = _validated_output_namespace(
+            config.policy_output_namespace, "policy_output_namespace")
+        enhanced_namespace = _validated_output_namespace(
+            config.enhanced_output_namespace, "enhanced_output_namespace")
+    except ValueError as exc:
+        return [str(exc)]
+    if policy_namespace == enhanced_namespace:
+        failures.append("policy and enhanced namespaces are identical")
+    if policy_namespace in enhanced_namespace or enhanced_namespace in policy_namespace:
+        failures.append("policy and enhanced namespaces contain one another")
+
+    policy_paths = dict(config.policy_output_paths or {})
+    expected_fields = set(_STAGE_MUTABLE_PATH_FIELDS)
+    missing = sorted(expected_fields - set(policy_paths))
+    extra = sorted(set(policy_paths) - expected_fields)
+    if missing:
+        failures.append(f"policy output path map is missing: {missing}")
+    if extra:
+        failures.append(f"policy output path map has unknown fields: {extra}")
+
+    enhanced_paths: dict[str, str] = {}
+    for field_name in _STAGE_MUTABLE_PATH_FIELDS:
+        policy_value = policy_paths.get(field_name)
+        enhanced_value = getattr(config, field_name, None)
+        if not isinstance(policy_value, str) or not policy_value:
+            continue
+        if not isinstance(enhanced_value, str) or not enhanced_value:
+            failures.append(f"enhanced {field_name} is empty")
+            continue
+        expected_value = policy_value.replace(
+            policy_namespace, enhanced_namespace, 1)
+        if policy_value.count(policy_namespace) != 1:
+            failures.append(
+                f"policy {field_name} does not contain its namespace exactly once"
+            )
+        elif enhanced_value != expected_value:
+            failures.append(
+                f"enhanced {field_name} was not derived from policy path: "
+                f"{enhanced_value}"
+            )
+        enhanced_paths[field_name] = enhanced_value
+
+    expected_gate_registry = policy_paths.get('promotion_registry')
+    if (
+        not expected_gate_registry
+        or config.policy_gate_promotion_registry != expected_gate_registry
+    ):
+        failures.append(
+            "policy gate registry must remain the original read-only policy registry"
+        )
+    if not missing and not extra and len(enhanced_paths) == len(expected_fields):
+        failures.extend(_stage_path_overlap_failures(policy_paths, enhanced_paths))
+
+        # The enhanced-stage validator runs after activation, so the normal
+        # recovery alias checks below only see the *enhanced* paths.  Check the
+        # preserved policy paths as well: a mutated config must not be able to
+        # turn a policy alias into a numbered checkpoint (or place it inside
+        # the immutable policy checkpoint directory).
+        for stage_name, stage_paths in (
+            ('policy', policy_paths),
+            ('enhanced', enhanced_paths),
+        ):
+            checkpoint_dir = Path(stage_paths['checkpoint_dir']).resolve()
+            numbered_paths = (
+                set(checkpoint_dir.glob('model_step_*.pt'))
+                if checkpoint_dir.is_dir() else set()
+            )
+            for alias_name in ('latest_path', 'promoted_path', 'accepted_path'):
+                alias_path = Path(stage_paths[alias_name]).resolve()
+                if checkpoint_dir == alias_path or checkpoint_dir in alias_path.parents:
+                    failures.append(
+                        f"{stage_name} {alias_name} alias must remain outside "
+                        "its checkpoint directory"
+                    )
+                if re.fullmatch(r'model_step_\d+\.pt', alias_path.name):
+                    failures.append(
+                        f"{stage_name} {alias_name} alias cannot use a numbered "
+                        "checkpoint filename"
+                    )
+                if alias_path in numbered_paths:
+                    failures.append(
+                        f"{stage_name} {alias_name} alias targets an existing "
+                        "numbered checkpoint"
+                    )
+    return failures
 
 
 # IPC message types for GUI <-> trainer communication.  These mirror the
@@ -1752,7 +1943,11 @@ class Trainer:
         anchor_sha256 = baseline_sha256
         if self.config.policy_stage == 'enhanced':
             anchor_sha256 = ''
-            for promotion in self._promotion_registry.records():
+            gate_registry = PromotionRegistry(
+                str(self.config.policy_gate_promotion_registry or ''),
+                agreement_threshold=self.config.teacher_agreement_threshold,
+            )
+            for promotion in gate_registry.records():
                 promoted_path = promotion.get('checkpoint_path')
                 if (
                     promotion.get('promoted')
@@ -6260,6 +6455,8 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
             'promotion_registry', 'logs/policy_distillation/promotions.jsonl'),
         acceptance_dir=paths_cfg.get(
             'acceptance_dir', 'logs/policy_distillation/acceptance'),
+        policy_output_namespace=paths_cfg.get('policy_output_namespace'),
+        enhanced_output_namespace=paths_cfg.get('enhanced_output_namespace'),
         # Thermal protection
         thermal_enabled=thermal_cfg.get('enabled', False),
         thermal_temp_limit_c=thermal_cfg.get('temp_limit_c', 90),
@@ -6315,6 +6512,13 @@ def validate_recovery_experiment_config(
             raise ValueError(
                 f"Recovery must resume only from {baseline}; received {resume}"
             )
+    elif config.policy_stage == 'enhanced':
+        isolation_failures = _enhanced_output_isolation_failures(config)
+        if isolation_failures:
+            raise ValueError(
+                "Unsafe enhanced-stage output isolation: "
+                + "; ".join(isolation_failures)
+            )
 
     # Recovery artifacts must never be allowed to target the preserved anchor
     # or any numbered checkpoint.  The normal alias publisher is intentionally
@@ -6365,12 +6569,24 @@ def validate_recovery_experiment_config(
         )
 
     failures = []
+    try:
+        teacher_agreement_threshold = float(
+            config.teacher_agreement_threshold)
+    except (TypeError, ValueError, OverflowError):
+        teacher_agreement_threshold = float('nan')
+    if (
+        isinstance(config.teacher_agreement_threshold, bool)
+        or not math.isfinite(teacher_agreement_threshold)
+        or not 0.50 <= teacher_agreement_threshold <= 1.0
+    ):
+        failures.append(
+            "teacher agreement promotion threshold must be finite and within "
+            "[0.50, 1.0]"
+        )
     if not config.validation_enabled or abs(config.validation_fraction - 0.15) > 1e-12:
         failures.append("validation must reserve 15% by whole replay file")
     if config.frozen_suite_size != 5000:
         failures.append("frozen teacher suite must contain exactly 5000 states")
-    if config.teacher_agreement_threshold < 0.50:
-        failures.append("teacher agreement promotion threshold must be at least 0.50")
     if not config.snapshot_enabled:
         failures.append("versioned corpus snapshots must be enabled")
     if config.snapshot_min_fresh_fraction < 0.50:
@@ -6444,9 +6660,11 @@ def validate_recovery_experiment_config(
         if config.teacher_target_type != 'hard':
             failures.append("policy-only stage must use hard teacher targets")
     elif config.policy_stage == 'enhanced':
-        if config.require_policy_gate_for_enhanced:
-            registry_path = Path(config.promotion_registry)
-            gate_passed = False
+        if not config.require_policy_gate_for_enhanced:
+            failures.append("enhanced stage must require the policy gate")
+        else:
+            registry_path = Path(str(config.policy_gate_promotion_registry or ''))
+            gate_record: Optional[dict] = None
             suite_path = Path(config.frozen_suite_path)
             suite_manifest_path = suite_path.with_suffix(
                 suite_path.suffix + '.manifest.json'
@@ -6461,6 +6679,14 @@ def validate_recovery_experiment_config(
                 except (OSError, ValueError, TypeError):
                     expected_suite_fingerprint = ''
             resume_sha256 = ''
+            resume_name_match = (
+                re.fullmatch(r'model_step_(\d+)\.pt', resume.name)
+                if resume is not None else None
+            )
+            resume_numbered_step = (
+                int(resume_name_match.group(1))
+                if resume_name_match is not None else -1
+            )
             if resume is not None and resume.is_file():
                 promoted_digest = hashlib.sha256()
                 with resume.open('rb') as handle:
@@ -6468,44 +6694,370 @@ def validate_recovery_experiment_config(
                         promoted_digest.update(chunk)
                 resume_sha256 = promoted_digest.hexdigest().upper()
             if registry_path.is_file():
-                with registry_path.open('r', encoding='utf-8') as handle:
-                    for line in handle:
-                        if not line.strip():
-                            continue
-                        record = json.loads(line)
-                        promoted_checkpoint = record.get('checkpoint_path')
-                        checkpoint_matches = (
-                            isinstance(promoted_checkpoint, str)
-                            and bool(promoted_checkpoint)
-                            and resume is not None
-                            and Path(promoted_checkpoint).resolve() == resume
-                            and resume.is_file()
-                        )
-                        checkpoint_hash_matches = (
-                            bool(resume_sha256)
-                            and str(record.get('checkpoint_sha256', '')).upper()
-                            == resume_sha256
-                        )
-                        suite_matches = (
-                            bool(expected_suite_fingerprint)
-                            and record.get('suite_fingerprint')
-                            == expected_suite_fingerprint
-                        )
-                        if (record.get('promoted') and
-                                record.get('training_stage', 'policy_only') ==
-                                'policy_only' and
-                                float(record.get('teacher_agreement', 0.0)) >=
-                                config.teacher_agreement_threshold and
-                                checkpoint_matches and
-                                checkpoint_hash_matches and
-                                suite_matches):
-                            gate_passed = True
-                            break
-            if not gate_passed:
+                try:
+                    with registry_path.open('r', encoding='utf-8') as handle:
+                        for line in handle:
+                            if not line.strip():
+                                continue
+                            record = json.loads(line)
+                            if not isinstance(record, dict):
+                                raise ValueError(
+                                    "promotion registry record must be an object"
+                                )
+                            raw_step = record.get('step', -1)
+                            record_step = (
+                                raw_step
+                                if isinstance(raw_step, int)
+                                and not isinstance(raw_step, bool)
+                                else -1
+                            )
+                            try:
+                                record_agreement = float(
+                                    record.get('teacher_agreement'))
+                                record_threshold = float(
+                                    record.get('teacher_agreement_threshold'))
+                            except (TypeError, ValueError, OverflowError):
+                                record_agreement = float('nan')
+                                record_threshold = float('nan')
+                            threshold_matches = (
+                                math.isfinite(record_threshold)
+                                and record_threshold
+                                == teacher_agreement_threshold
+                            )
+                            agreement_is_valid = (
+                                math.isfinite(record_agreement)
+                                and 0.0 <= record_agreement <= 1.0
+                            )
+                            promoted_checkpoint = record.get('checkpoint_path')
+                            checkpoint_matches = (
+                                isinstance(promoted_checkpoint, str)
+                                and bool(promoted_checkpoint)
+                                and resume is not None
+                                and Path(promoted_checkpoint).resolve() == resume
+                                and resume.is_file()
+                            )
+                            checkpoint_hash_matches = (
+                                bool(resume_sha256)
+                                and str(record.get('checkpoint_sha256', '')).upper()
+                                == resume_sha256
+                            )
+                            suite_matches = (
+                                bool(expected_suite_fingerprint)
+                                and record.get('suite_fingerprint')
+                                == expected_suite_fingerprint
+                            )
+                            if (record.get('promoted') is True and
+                                    record.get('training_stage') == 'policy_only' and
+                                    threshold_matches and
+                                    agreement_is_valid and
+                                    record_agreement >=
+                                    teacher_agreement_threshold and
+                                    checkpoint_matches and
+                                    record_step == resume_numbered_step and
+                                    checkpoint_hash_matches and
+                                    suite_matches):
+                                gate_record = record
+                                break
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    failures.append(
+                        f"policy promotion registry is unreadable: {exc}"
+                    )
+            if gate_record is None:
                 failures.append(
                     "enhanced stage must resume from a recorded promoted "
                     "policy-only checkpoint"
                 )
+            else:
+                policy_paths = dict(config.policy_output_paths)
+                policy_checkpoint_dir = Path(
+                    policy_paths['checkpoint_dir']).resolve()
+                if (
+                    resume is None
+                    or policy_checkpoint_dir not in resume.parents
+                    or re.fullmatch(r'model_step_\d+\.pt', resume.name) is None
+                ):
+                    failures.append(
+                        "enhanced stage must resume from the exact numbered "
+                        "policy checkpoint, not an alias"
+                    )
+
+                gate_step = int(gate_record['step'])
+                acceptance_root = Path(policy_paths['acceptance_dir'])
+                acceptance_report_path = (
+                    acceptance_root / f"acceptance_step_{gate_step:06d}.json")
+                acceptance_report: Optional[dict] = None
+                if acceptance_report_path.is_file():
+                    try:
+                        with acceptance_report_path.open(
+                            'r', encoding='utf-8'
+                        ) as handle:
+                            acceptance_report = json.load(handle)
+                    except (OSError, ValueError, TypeError) as exc:
+                        failures.append(
+                            f"policy acceptance report is unreadable: {exc}"
+                        )
+                else:
+                    failures.append(
+                        "enhanced stage requires a terminal passing policy "
+                        f"acceptance report: {acceptance_report_path}"
+                    )
+
+                if acceptance_report is not None:
+                    report_checkpoint = acceptance_report.get('checkpoint_path')
+                    report_matches = (
+                        isinstance(report_checkpoint, str)
+                        and bool(report_checkpoint)
+                        and resume is not None
+                        and Path(report_checkpoint).resolve() == resume
+                    )
+                    report_valid = (
+                        acceptance_report.get('passed') is True
+                        and int(acceptance_report.get('step', -1)) == gate_step
+                        and acceptance_report.get('training_stage') == 'policy_only'
+                        and report_matches
+                        and str(acceptance_report.get(
+                            'checkpoint_sha256', '')).upper() == resume_sha256
+                        and acceptance_report.get('frozen_suite_fingerprint')
+                        == expected_suite_fingerprint
+                    )
+                    if not report_valid:
+                        failures.append(
+                            "enhanced stage requires the matching passing policy "
+                            "acceptance result"
+                        )
+                    else:
+                        # A passing bit plus checkpoint/hash fields is not
+                        # enough provenance.  Reconstruct the exact durable
+                        # task that the policy promotion would have queued and
+                        # require every protocol input in the report to match
+                        # it.  This rejects stale reports from another opening
+                        # suite, inference depth, worker count, or task.
+                        try:
+                            expected_task = (
+                                checkpoint_acceptance_tasks
+                                .make_pending_acceptance_task(
+                                    str(resume),
+                                    step=gate_step,
+                                    teacher_agreement=float(
+                                        gate_record['teacher_agreement']),
+                                    opening_plies=config.test_opening_plies,
+                                    opening_seed=config.test_opening_seed,
+                                    # This report belongs to the policy-only
+                                    # acceptance gate. Enhanced inference
+                                    # depth must not become evidence for that
+                                    # earlier gate.
+                                    inference_depth=1,
+                                    max_moves=config.selfplay_max_moves,
+                                    num_workers=min(config.cpu_workers, 4),
+                                    training_stage='policy_only',
+                                    checkpoint_sha256=resume_sha256,
+                                    suite_fingerprint=(
+                                        expected_suite_fingerprint),
+                                    teacher_correct_states=gate_record.get(
+                                        'teacher_correct_states'),
+                                    teacher_total_states=gate_record.get(
+                                        'teacher_total_states'),
+                                )
+                            )
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            failures.append(
+                                "enhanced stage policy acceptance provenance is "
+                                f"invalid: {exc}"
+                            )
+                            expected_task = None
+
+                        if expected_task is not None:
+                            report_provenance = {
+                                'task_id': expected_task['task_id'],
+                                'step': expected_task['step'],
+                                'training_stage': expected_task[
+                                    'training_stage'],
+                                'checkpoint_sha256': resume_sha256,
+                                'frozen_suite_fingerprint': (
+                                    expected_suite_fingerprint),
+                                'opening_seed': expected_task['opening_seed'],
+                                'opening_plies': expected_task['opening_plies'],
+                                'inference_depth': expected_task[
+                                    'inference_depth'],
+                                'max_moves': expected_task['max_moves'],
+                                'num_workers': expected_task['num_workers'],
+                            }
+                            for key, expected_value in report_provenance.items():
+                                actual_value = acceptance_report.get(key)
+                                if key == 'checkpoint_sha256':
+                                    actual_value = str(actual_value or '').upper()
+                                if actual_value != expected_value:
+                                    failures.append(
+                                        "enhanced stage acceptance report has "
+                                        f"unmatched provenance: {key}"
+                                    )
+
+                            report_counts = acceptance_report.get(
+                                'teacher_agreement_counts')
+                            expected_counts = {
+                                'correct_states': expected_task.get(
+                                    'teacher_correct_states'),
+                                'total_states': expected_task.get(
+                                    'teacher_total_states'),
+                            }
+                            if report_counts != expected_counts:
+                                failures.append(
+                                    "enhanced stage acceptance report has "
+                                    "unmatched teacher-agreement counts"
+                                )
+
+                            metrics = acceptance_report.get('metrics')
+                            try:
+                                report_agreement = float(
+                                    metrics['teacher_agreement'])
+                            except (KeyError, TypeError, ValueError, OverflowError):
+                                report_agreement = float('nan')
+                            if (
+                                not math.isfinite(report_agreement)
+                                or report_agreement != float(
+                                    gate_record['teacher_agreement'])
+                            ):
+                                failures.append(
+                                    "enhanced stage acceptance report teacher "
+                                    "agreement provenance does not match promotion"
+                                )
+
+                            if acceptance_report.get('selection_sequence') != [
+                                'held_out_teacher_agreement',
+                                'random_game_strength',
+                                'easy_game_strength',
+                            ]:
+                                failures.append(
+                                    "enhanced stage acceptance report has an "
+                                    "invalid selection sequence"
+                                )
+
+                            random_record = acceptance_report.get('random')
+                            easy_record = acceptance_report.get('easy')
+                            protocol_metadata_valid = all((
+                                isinstance(random_record, dict),
+                                isinstance(easy_record, dict),
+                                random_record.get('model_path') == str(resume)
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('model_path') == str(resume)
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opponent_type') == 'random'
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opponent_type') == 'algorithm'
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('algo_difficulty') == 'easy'
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('algo_difficulty') == 'easy'
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opening_suite_id')
+                                and random_record.get('opening_suite_id')
+                                == easy_record.get('opening_suite_id')
+                                if (isinstance(random_record, dict)
+                                    and isinstance(easy_record, dict)) else False,
+                                random_record.get('opening_suite_size') == 100
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opening_suite_size') == 100
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opening_seed')
+                                == expected_task['opening_seed']
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opening_seed')
+                                == expected_task['opening_seed']
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opening_plies')
+                                == expected_task['opening_plies']
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opening_plies')
+                                == expected_task['opening_plies']
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('ml_inference_depth')
+                                == expected_task['inference_depth']
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('ml_inference_depth')
+                                == expected_task['inference_depth']
+                                if isinstance(easy_record, dict) else False,
+                            ))
+                            if not protocol_metadata_valid:
+                                failures.append(
+                                    "enhanced stage acceptance report game "
+                                    "protocol provenance is invalid"
+                                )
+
+                            # Recompute the acceptance decision from the raw
+                            # W/D/L records.  A forged ``passed: true`` or a
+                            # stale checks mapping must never unlock P5.
+                            try:
+                                recomputed = (
+                                    checkpoint_acceptance_tasks
+                                    .evaluate_acceptance_gates(
+                                        float(gate_record['teacher_agreement']),
+                                        random_record,
+                                        easy_record,
+                                    )
+                                )
+                                report_checks = acceptance_report.get('checks')
+                                if (
+                                    recomputed.passed is not True
+                                    or acceptance_report.get('passed') is not True
+                                    or report_checks != recomputed.checks
+                                    or acceptance_report.get('ci_method')
+                                    != recomputed.to_dict()['ci_method']
+                                    or acceptance_report.get('thresholds')
+                                    != recomputed.thresholds
+                                ):
+                                    raise ValueError(
+                                        "durable acceptance decision does not "
+                                        "match its raw game results"
+                                    )
+                            except (TypeError, ValueError, KeyError):
+                                failures.append(
+                                    "enhanced stage acceptance report does not "
+                                    "prove the required game-strength gates"
+                                )
+
+                accepted_alias = Path(policy_paths['accepted_path'])
+                if not accepted_alias.is_file():
+                    failures.append(
+                        f"accepted policy alias is missing: {accepted_alias}"
+                    )
+                elif resume_sha256:
+                    accepted_digest = hashlib.sha256()
+                    with accepted_alias.open('rb') as handle:
+                        for chunk in iter(
+                            lambda: handle.read(1024 * 1024), b''
+                        ):
+                            accepted_digest.update(chunk)
+                    if accepted_digest.hexdigest().upper() != resume_sha256:
+                        failures.append(
+                            "accepted policy alias does not identify the exact "
+                            "promoted checkpoint"
+                        )
+
+                for pending_path in acceptance_root.glob(
+                    'pending_acceptance_*.json'
+                ):
+                    try:
+                        with pending_path.open('r', encoding='utf-8') as handle:
+                            pending = json.load(handle)
+                        pending_checkpoint = pending.get('checkpoint_path')
+                        matches_checkpoint = (
+                            isinstance(pending_checkpoint, str)
+                            and resume is not None
+                            and Path(pending_checkpoint).resolve() == resume
+                        )
+                        if (
+                            int(pending.get('step', -1)) == gate_step
+                            or matches_checkpoint
+                        ):
+                            failures.append(
+                                "matching policy acceptance task is still pending: "
+                                f"{pending_path}"
+                            )
+                    except (OSError, ValueError, TypeError):
+                        failures.append(
+                            f"pending policy acceptance task is unreadable: "
+                            f"{pending_path}"
+                        )
         if config.teacher_target_type != 'distribution':
             failures.append("enhanced stage requires soft distribution targets")
         if not config.value_head_enabled:
@@ -6536,6 +7088,9 @@ def activate_enhanced_stage(
     """Apply the complete gated P5 runtime profile to a loaded config."""
     if isinstance(inference_depth, bool) or inference_depth not in {2, 3}:
         raise ValueError("Enhanced inference depth must be 2 or 3")
+    if config.policy_stage != 'policy_only':
+        raise ValueError("Enhanced stage can activate only from policy_only config")
+    _derive_enhanced_output_paths(config)
     config.policy_stage = 'enhanced'
     config.teacher_target_type = 'distribution'
     config.value_head_enabled = True
