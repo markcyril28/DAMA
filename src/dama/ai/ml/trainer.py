@@ -6,6 +6,7 @@ import json
 import time
 import random
 import math
+import re
 import argparse
 import hashlib
 import hmac
@@ -112,6 +113,99 @@ from . import checkpoint_acceptance as checkpoint_acceptance_tasks
 def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
     """Assign every teacher difficulty to both player positions."""
     return [(p1, p2) for p1 in difficulties for p2 in difficulties]
+
+
+def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
+    """Tear down a self-play pool without waiting indefinitely.
+
+    ``ProcessPoolExecutor``'s context manager always calls ``shutdown(wait=True)``
+    on exit.  That can deadlock when a worker has completed its future but is
+    stuck during process teardown.  Keep references to the private worker
+    processes before the non-blocking shutdown clears them, give all workers a
+    single bounded grace period, and escalate only the workers that remain.
+
+    The helper deliberately does not touch futures or their bookkeeping.  The
+    caller therefore retains its ``unfinished`` batches for the sequential
+    fallback path when the pool is broken or a stop is requested.
+    """
+    process_map = getattr(executor, '_processes', None) or {}
+    processes = tuple(process_map.values())
+    manager_thread = getattr(executor, '_executor_manager_thread', None)
+
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        # Escalation below is still useful if shutdown itself races with a
+        # broken pool or a test double has a narrower shutdown signature.
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    try:
+        timeout = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        timeout = 5.0
+    deadline = time.monotonic() + timeout
+
+    def _alive(process) -> bool:
+        try:
+            return bool(process.is_alive())
+        except (AssertionError, OSError, ValueError):
+            return False
+
+    def _wait_until(deadline_value: float) -> list:
+        while True:
+            alive = [process for process in processes if _alive(process)]
+            remaining = deadline_value - time.monotonic()
+            if not alive or remaining <= 0.0:
+                return alive
+            time.sleep(min(0.05, remaining))
+
+    lingering = _wait_until(deadline)
+    for process in lingering:
+        try:
+            process.terminate()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    # Termination is normally immediate, but give all workers one short,
+    # shared grace window before resorting to SIGKILL.  No per-worker unbounded
+    # join is allowed here.
+    terminate_deadline = time.monotonic() + min(1.0, max(0.1, timeout))
+    lingering = _wait_until(terminate_deadline)
+    for process in lingering:
+        try:
+            kill = getattr(process, 'kill', None)
+            if callable(kill):
+                kill()
+            else:
+                process.terminate()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    # Reap what we can, including the manager thread, with one final shared
+    # deadline.  This is bounded even when a fake or native process ignores
+    # termination signals.
+    reap_deadline = time.monotonic() + 1.0
+    for process in processes:
+        join = getattr(process, 'join', None)
+        if not callable(join):
+            continue
+        remaining = reap_deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        try:
+            join(timeout=remaining)
+        except (AssertionError, OSError, ValueError):
+            pass
+    if manager_thread is not None:
+        remaining = reap_deadline - time.monotonic()
+        if remaining > 0.0:
+            try:
+                manager_thread.join(timeout=remaining)
+            except (RuntimeError, OSError, ValueError):
+                pass
 
 
 def _make_compiled_fwd_loss(model, compile_mode):
@@ -458,6 +552,33 @@ class TrainingStats:
         )
 
 
+_STAGE_MUTABLE_PATH_FIELDS = (
+    'checkpoint_dir',
+    'runtime_model_root',
+    'latest_path',
+    'promoted_path',
+    'accepted_path',
+    'replay_dir',
+    'log_dir',
+    'stats_file',
+    'promotion_registry',
+    'acceptance_dir',
+    'stats_output_dir',
+    'snapshot_root',
+    'ram_cache_file',
+)
+
+_STAGE_MUTABLE_DIRECTORY_FIELDS = frozenset({
+    'checkpoint_dir',
+    'runtime_model_root',
+    'replay_dir',
+    'log_dir',
+    'acceptance_dir',
+    'stats_output_dir',
+    'snapshot_root',
+})
+
+
 @dataclass
 class TrainingConfig:
     """Training configuration."""
@@ -600,6 +721,7 @@ class TrainingConfig:
 
     # Paths
     checkpoint_dir: str = 'models/checkpoints'
+    runtime_model_root: str = 'logs/runtime_models'
     latest_path: str = 'models/latest.pt'
     promoted_path: str = 'models/promoted.pt'
     accepted_path: str = 'models/accepted.pt'
@@ -608,6 +730,15 @@ class TrainingConfig:
     stats_file: str = 'models/training_stats.json'
     promotion_registry: str = 'logs/policy_distillation/promotions.jsonl'
     acceptance_dir: str = 'logs/policy_distillation/acceptance'
+    # The gated enhanced stage derives a second, fully isolated mutable
+    # namespace from these two explicit tokens.  ``policy_output_paths`` and
+    # ``policy_gate_promotion_registry`` are populated in memory by
+    # activate_enhanced_stage(); the policy checkpoint, frozen suite, and gate
+    # registry remain read-only inputs rather than enhanced-stage outputs.
+    policy_output_namespace: Optional[str] = None
+    enhanced_output_namespace: Optional[str] = None
+    policy_output_paths: Dict[str, str] = field(default_factory=dict)
+    policy_gate_promotion_registry: Optional[str] = None
 
     # Thermal protection
     thermal_enabled: bool = False
@@ -796,6 +927,10 @@ class Trainer:
         self._bg_selfplay_lock = threading.Lock()
         self._last_selfplay_dicts: Optional[list] = None
         self._last_selfplay_preprocessed: Optional[CachedTensorDataset] = None
+        # Per-file durable replay-cycle maxima.  Replay shards are immutable
+        # for normal operation, so avoid reparsing every line on each cycle;
+        # stat identity invalidates entries after a rewrite or append.
+        self._generation_cycle_file_cache: dict = {}
         # Event signalled by the background thread when new data is ready.
         # Replaces time.sleep(0.5) polling in the stale-data wait loop with
         # zero-latency wakeup (~0ms vs up to 500ms).
@@ -818,6 +953,7 @@ class Trainer:
         # Training statistics
         self.stats = TrainingStats()
         self._load_stats()
+        self._runtime_model_dir: Optional[Path] = None
         self._active_snapshot_manifest: Dict[str, Any] = {}
         self._validation_entries = []
         self._validation_dataloader = None
@@ -1304,6 +1440,141 @@ class Trainer:
         # which is expected after a full model reset.
         self._build_scheduler()
 
+    @staticmethod
+    def _history_step(entry: Any) -> Optional[int]:
+        """Return an entry's integer step, or ``None`` for legacy metadata."""
+        if not isinstance(entry, dict) or entry.get('step') is None:
+            return None
+        try:
+            return int(entry['step'])
+        except (TypeError, ValueError):
+            return None
+
+    def _rewind_stats_to_checkpoint(self, checkpoint: Mapping[str, Any]) -> bool:
+        """Remove sidecar observations that occurred after a resumed checkpoint.
+
+        The stats sidecar is process-independent and can be newer than an
+        explicitly selected checkpoint.  Keeping its later observations while
+        rewinding weights produces duplicate/inverted step histories and makes
+        the reported "current" loss belong to a different model trajectory.
+        Durable checkpoint-selection records remain independently preserved in
+        the append-only promotion registry.
+        """
+        resume_step = int(checkpoint.get('step', 0))
+        try:
+            previous_total = int(self.stats.total_steps)
+        except (TypeError, ValueError):
+            previous_total = 0
+
+        history_fields = (
+            'loss_history',
+            'val_loss_history',
+            'lr_history',
+            'gpu_mem_history',
+            'step_times',
+            'test_history',
+            'teacher_agreement_history',
+            'promotion_history',
+            'acceptance_history',
+        )
+        removed_by_field: Dict[str, int] = {}
+        for name in history_fields:
+            history = getattr(self.stats, name, None)
+            if history is None:
+                continue
+            original = list(history)
+            kept = [
+                entry for entry in original
+                if ((entry_step := self._history_step(entry)) is None
+                    or entry_step <= resume_step)
+            ]
+            removed = len(original) - len(kept)
+            if removed:
+                removed_by_field[name] = removed
+            if isinstance(history, deque):
+                setattr(
+                    self.stats,
+                    name,
+                    deque(kept, maxlen=history.maxlen or _STATS_HISTORY_CAP),
+                )
+            else:
+                setattr(self.stats, name, kept)
+
+        rewound = previous_total > resume_step or bool(removed_by_field)
+        if not rewound:
+            return False
+
+        self.stats.total_steps = resume_step
+        self.stats.epochs_completed = int(
+            checkpoint.get('epoch', self.stats.epochs_completed))
+        self.stats.end_time = ''
+
+        checkpoint_loss = checkpoint.get(
+            'current_train_loss', checkpoint.get('loss'))
+        try:
+            checkpoint_loss = float(checkpoint_loss)
+        except (TypeError, ValueError):
+            checkpoint_loss = None
+        self.stats.current_train_loss = (
+            checkpoint_loss
+            if checkpoint_loss is not None and math.isfinite(checkpoint_loss)
+            else None
+        )
+
+        # The current-dataset baseline belongs to the resumed checkpoint, not
+        # to the later sidecar.  The normal checkpoint-baseline restoration
+        # below repopulates this value after the rewind.
+        self.stats.dataset_fingerprint = str(
+            checkpoint.get('dataset_fingerprint', '') or '')
+        checkpoint_metadata = checkpoint.get('dataset_metadata')
+        self.stats.dataset_metadata = (
+            dict(checkpoint_metadata)
+            if isinstance(checkpoint_metadata, dict) else {}
+        )
+        self.stats.current_dataset_best_train_loss = float('inf')
+        self.stats.generation_cycles_completed = int(
+            checkpoint.get('generation_cycles_completed', 0) or 0)
+
+        agreement_values = []
+        for entry in self.stats.teacher_agreement_history:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                value = float(entry.get('teacher_agreement'))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                agreement_values.append(value)
+        self.stats.best_teacher_agreement = max(agreement_values, default=0.0)
+
+        validation_values = []
+        for entry in self.stats.val_loss_history:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                value = float(entry.get('val_loss'))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                validation_values.append(value)
+        try:
+            checkpoint_validation = float(checkpoint.get('validation_loss'))
+        except (TypeError, ValueError):
+            checkpoint_validation = float('inf')
+        if math.isfinite(checkpoint_validation):
+            validation_values.append(checkpoint_validation)
+        self.stats.best_val_loss = min(
+            validation_values, default=float('inf'))
+
+        removed_text = ', '.join(
+            f"{name}={count}" for name, count in removed_by_field.items())
+        print(
+            f"Rewound training stats from step {previous_total} to "
+            f"checkpoint step {resume_step}"
+            + (f"; removed {removed_text}" if removed_text else '')
+        )
+        return True
+
     def _load_checkpoint(self, path: str) -> None:
         """Load training state from checkpoint."""
         print(f"Resuming from {path}")
@@ -1337,21 +1608,30 @@ class Trainer:
             print(f"  Warning: Could not restore optimizer state ({e}). "
                   f"Using fresh optimizer — momentum/variance buffers will be re-estimated.")
 
-        # Reset LR to the config value after loading optimizer state.
-        # load_state_dict() overwrites param_groups['lr'] with the checkpoint's saved LR,
-        # which ignores any change made in the config file (e.g. batch-size scaling).
-        # We always want the config's learning_rate to win on resume.
+        # Reset configured optimizer hyperparameters after loading optimizer
+        # state.  load_state_dict() overwrites param-group values with the
+        # checkpoint's saved settings, which would otherwise silently ignore
+        # recovery-config changes while retaining the useful moment estimates.
         old_lr = self.optimizer.param_groups[0]['lr']
+        old_weight_decay = self.optimizer.param_groups[0].get(
+            'weight_decay', self.config.weight_decay)
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.config.learning_rate
+            pg['weight_decay'] = self.config.weight_decay
         print(f"  LR reset: {old_lr:.2e} (checkpoint) → {self.config.learning_rate:.2e} (config)")
+        print(
+            f"  Weight decay reset: {old_weight_decay:.2e} (checkpoint) "
+            f"→ {self.config.weight_decay:.2e} (config)"
+        )
 
         self.step = checkpoint.get('step', 0)
         self.epoch = checkpoint.get('epoch', self.stats.epochs_completed)
-        self.stats.generation_cycles_completed = max(
-            self.stats.generation_cycles_completed,
-            int(checkpoint.get('generation_cycles_completed', 0)),
-        )
+        stats_rewound = self._rewind_stats_to_checkpoint(checkpoint)
+        if not stats_rewound:
+            self.stats.generation_cycles_completed = max(
+                self.stats.generation_cycles_completed,
+                int(checkpoint.get('generation_cycles_completed', 0)),
+            )
         self.best_loss = checkpoint.get('loss', float('inf'))
 
         # Checkpoints carry loss baselines independently of the optional
@@ -1639,10 +1919,16 @@ class Trainer:
                 spec.loader.exec_module(module)
                 write_progress_outputs = module.write_progress_outputs
 
+            html_output_path = (
+                Path(self.config.log_dir) / 'training_progress.html'
+                if self.config.recovery_enforced
+                else stats_path.parent / 'training_progress.html'
+            )
+
             write_progress_outputs(
                 stats_path=stats_path,
                 logs_dir=Path(self.config.log_dir),
-                html_output_path=stats_path.parent / 'training_progress.html',
+                html_output_path=html_output_path,
             )
         except Exception as e:
             print(f"Warning: Failed to update training progress artifacts: {e}")
@@ -1788,7 +2074,40 @@ class Trainer:
                 corpus_metrics=dict(manifest.get('metrics', {})),
             )
 
-    def _corpus_settings(self) -> tuple[dict, dict, dict]:
+    def _runtime_models_dir(self) -> Path:
+        if self._runtime_model_dir is None:
+            root = Path(self.config.runtime_model_root)
+            root.mkdir(parents=True, exist_ok=True)
+            self._runtime_model_dir = root / f"process-{os.getpid()}-{time.time_ns()}"
+            self._runtime_model_dir.mkdir(parents=True, exist_ok=True)
+        return self._runtime_model_dir
+
+    def _runtime_model_path(self, filename: str) -> Path:
+        return self._runtime_models_dir() / filename
+
+    def _cleanup_runtime_model_file(self, path: str | Path) -> None:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _cleanup_runtime_models_dir(self) -> None:
+        runtime_model_dir = self._runtime_model_dir
+        if runtime_model_dir is None:
+            return
+        try:
+            if not any(runtime_model_dir.iterdir()):
+                runtime_model_dir.rmdir()
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+
+    def _corpus_settings(
+        self, *, model_behavior_step: Optional[int] = None
+    ) -> tuple[dict, dict, dict]:
+        behavior_step = int(
+            self.step if model_behavior_step is None else model_behavior_step)
         teacher = {
             'difficulty': self.config.teacher_difficulty,
             'target_type': self.config.teacher_target_type,
@@ -1824,14 +2143,17 @@ class Trainer:
             # The behavior policy is the exact model state used to generate
             # this corpus.  A step-qualified identity prevents snapshots from
             # silently mixing trajectories from different model revisions.
-            'model_behavior_id': f"trainer-step-{int(self.step)}",
-            'model_behavior_step': int(self.step),
+            'model_behavior_id': f"trainer-step-{behavior_step}",
+            'model_behavior_step': behavior_step,
         }
         return teacher, noise, generation
 
     def _prepare_training_split(self):
         if self._snapshot_manager is not None:
-            teacher, noise, generation = self._corpus_settings()
+            behavior_step = int(self.step)
+            teacher, noise, generation = self._corpus_settings(
+                model_behavior_step=behavior_step
+            )
             while True:
                 decision = self._snapshot_manager.consider_snapshot(
                     teacher_settings=teacher,
@@ -1863,7 +2185,10 @@ class Trainer:
                     "Corpus contract changed; generating repaired data until "
                     "a fresh snapshot passes the admission gate"
                 )
-                self.run_selfplay(self.config.selfplay_games)
+                _, behavior_step = self.run_selfplay(
+                    self.config.selfplay_games,
+                    return_behavior_step=True,
+                )
                 pruned = self.replay_buffer.cleanup_old_files()
                 if pruned:
                     print(
@@ -1889,6 +2214,9 @@ class Trainer:
                         "Self-play made no eligible corpus progress for the "
                         "new data contract"
                     )
+                teacher, noise, generation = self._corpus_settings(
+                    model_behavior_step=behavior_step
+                )
             if decision.admitted:
                 print(
                     f"Admitted corpus snapshot {decision.manifest_path.parent.name}: "
@@ -2089,6 +2417,37 @@ class Trainer:
         self._record_validation_stats(value)
         return value
 
+    def _live_optimizer_context(self) -> dict:
+        """Return metadata from the optimizer state that training actually uses."""
+        param_groups = list(self.optimizer.param_groups)
+        if not param_groups:
+            raise RuntimeError("Optimizer has no parameter groups")
+
+        def _group_value(name: str):
+            try:
+                values = [float(group[name]) for group in param_groups]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Optimizer parameter groups have no valid {name!r} value"
+                ) from exc
+            first = values[0]
+            if all(value == first for value in values[1:]):
+                return first
+            # Retain every group value rather than publishing a false scalar
+            # if a future optimizer intentionally uses heterogeneous groups.
+            return values
+
+        return {
+            'optimizer': type(self.optimizer).__name__,
+            'learning_rate': _group_value('lr'),
+            'weight_decay': _group_value('weight_decay'),
+            'batch_size': self.config.batch_size,
+            'gradient_accumulation_steps': (
+                self.config.gradient_accumulation_steps),
+            'scheduler_enabled': self.config.lr_scheduler_enabled,
+            'scheduler_type': self.config.lr_scheduler_type,
+        }
+
     def _evaluate_teacher_promotion(self, checkpoint_path: Path) -> Optional[dict]:
         if not self._frozen_suite_entries:
             return None
@@ -2118,14 +2477,7 @@ class Trainer:
             dataset_fingerprint=self.stats.dataset_fingerprint,
             training_stage=self.config.policy_stage,
             comparison_context={
-                'optimizer': 'AdamW',
-                'learning_rate': self.config.learning_rate,
-                'weight_decay': self.config.weight_decay,
-                'batch_size': self.config.batch_size,
-                'gradient_accumulation_steps': (
-                    self.config.gradient_accumulation_steps),
-                'scheduler_enabled': self.config.lr_scheduler_enabled,
-                'scheduler_type': self.config.lr_scheduler_type,
+                **self._live_optimizer_context(),
                 'opening_seed': self.config.selfplay_opening_seed,
                 'validation_split_seed': self.config.validation_split_seed,
                 'frozen_suite_seed': self.config.frozen_suite_seed,
@@ -2425,6 +2777,148 @@ class Trainer:
             shutil.copy2(source, temporary)
         os.replace(temporary, destination)
 
+    @staticmethod
+    def _generation_cycle_id_from_replay_entry(entry: Mapping[str, Any]) -> Optional[int]:
+        """Extract a durable generation-cycle id from replay metadata."""
+        for key in ('generation_cycle_id', 'cycle_id'):
+            value = entry.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                cycle_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if cycle_id >= 0:
+                return cycle_id
+
+        game_id = entry.get('game_id')
+        match = re.match(r'^cycle-(\d+)(?:-|$)', str(game_id or ''))
+        if match is None:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _generation_cycle_file_identity(path: Path) -> tuple:
+        """Return the identity used to invalidate a replay-cycle cache entry."""
+        stat = path.stat()
+        return (
+            str(path),
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        )
+
+    def _durable_generation_cycle_max(self) -> int:
+        """Read the highest cycle id already durable in replay JSONL files.
+
+        The scan is intentionally read-only and exact: every non-empty JSONL
+        record is inspected, including legacy records whose cycle is carried
+        only by ``game_id``.  Malformed lines are ignored because corpus
+        loading already treats them as invalid records; an unreadable replay
+        file fails closed so a new cycle cannot accidentally reuse its id.
+        """
+        replay_dir = Path(self.config.replay_dir)
+        cache = getattr(self, '_generation_cycle_file_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._generation_cycle_file_cache = cache
+        if not replay_dir.is_dir():
+            cache.clear()
+            return -1
+
+        try:
+            replay_files = sorted(replay_dir.glob('replay_*.jsonl'))
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot enumerate replay files for generation-cycle allocation: "
+                f"{replay_dir}: {exc}"
+            ) from exc
+
+        # Canonicalize keys so equivalent relative/absolute config paths do
+        # not create duplicate cache entries.  A file disappearing between
+        # glob and stat is simply evicted on this pass.
+        current_paths = set()
+        highest = -1
+        for replay_path in replay_files:
+            try:
+                replay_path = replay_path.resolve()
+                identity = self._generation_cycle_file_identity(replay_path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot stat replay file for generation-cycle allocation: "
+                    f"{replay_path}: {exc}"
+                ) from exc
+            current_paths.add(replay_path)
+            cached = cache.get(replay_path)
+            if cached is not None and cached[0] == identity:
+                highest = max(highest, int(cached[1]))
+                continue
+
+            file_highest = -1
+            try:
+                with replay_path.open('r', encoding='utf-8') as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            continue
+                        if not isinstance(entry, Mapping):
+                            continue
+                        cycle_id = self._generation_cycle_id_from_replay_entry(entry)
+                        if cycle_id is not None:
+                            file_highest = max(file_highest, cycle_id)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot read replay file for generation-cycle allocation: "
+                    f"{replay_path}: {exc}"
+                ) from exc
+            cache[replay_path] = (identity, file_highest)
+            highest = max(highest, file_highest)
+
+        # Do not retain cache records for replay shards removed since the last
+        # allocation scan.
+        for stale_path in set(cache) - current_paths:
+            cache.pop(stale_path, None)
+        return highest
+
+    def _allocate_generation_cycle_id(self) -> int:
+        """Allocate a cycle id above both stats and durable replay history."""
+        try:
+            stats_cycle = int(self.stats.generation_cycles_completed)
+        except (AttributeError, TypeError, ValueError):
+            stats_cycle = 0
+        stats_cycle = max(0, stats_cycle)
+        durable_next = self._durable_generation_cycle_max() + 1
+        return max(stats_cycle, durable_next)
+
+    @staticmethod
+    def _annotate_selfplay_entries(
+        entries_data: list,
+        *,
+        cycle_id: int,
+        behavior_step: int,
+        behavior_id: str,
+        behavior_checkpoint_sha256: Optional[str],
+    ) -> None:
+        """Attach additive behavior provenance before raw JSONL persistence."""
+        for entry in entries_data:
+            if not isinstance(entry, dict):
+                continue
+            entry['generation_cycle_id'] = int(cycle_id)
+            entry['model_behavior_step'] = int(behavior_step)
+            entry['model_behavior_id'] = behavior_id
+            if behavior_checkpoint_sha256 is not None:
+                entry['model_behavior_checkpoint_sha256'] = (
+                    behavior_checkpoint_sha256)
+
     def _record_validation_stats(self, val_loss: float) -> None:
         """Record validation statistics."""
         self.stats.val_loss_history.append({
@@ -2436,6 +2930,173 @@ class Trainer:
 
         if val_loss < self.stats.best_val_loss:
             self.stats.best_val_loss = val_loss
+
+    @staticmethod
+    def _paths_identify_same_file(left: Path, right: Path) -> bool:
+        """Compare paths by file identity when possible, then lexically."""
+        try:
+            return left.is_file() and right.is_file() and os.path.samefile(left, right)
+        except OSError:
+            return left.resolve() == right.resolve()
+
+    def _verify_existing_checkpoint_collision(self, checkpoint_path: Path) -> None:
+        """Fail closed unless an existing step artifact proves its lineage.
+
+        Numbered checkpoints are immutable.  A restart may legitimately reach
+        a step that is already durable, but existence alone is not evidence
+        that the file belongs to this run or is usable.  Verification never
+        writes, replaces, or removes the existing artifact.
+        """
+        try:
+            checkpoint = torch.load(
+                checkpoint_path, map_location='cpu', weights_only=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Existing checkpoint cannot be verified and will not be "
+                f"overwritten: {checkpoint_path}: {exc}"
+            ) from exc
+
+        try:
+            recorded_step = int(checkpoint.get('step'))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Existing checkpoint has no valid step and will not be "
+                f"overwritten: {checkpoint_path}"
+            ) from exc
+        if recorded_step != int(self.step):
+            raise RuntimeError(
+                f"Existing checkpoint step mismatch at {checkpoint_path}: "
+                f"expected {self.step}, found {recorded_step}"
+            )
+
+        state_dict = checkpoint.get('model_state_dict')
+        if not isinstance(state_dict, Mapping):
+            raise RuntimeError(
+                f"Existing checkpoint has no model state and will not be "
+                f"overwritten: {checkpoint_path}"
+            )
+        tensors = [value for value in state_dict.values()
+                   if isinstance(value, torch.Tensor)]
+        if not tensors or any(not torch.isfinite(value).all() for value in tensors):
+            raise RuntimeError(
+                f"Existing checkpoint model state is empty or non-finite and "
+                f"will not be overwritten: {checkpoint_path}"
+            )
+
+        if not self.config.recovery_enforced:
+            return
+
+        recovery = checkpoint.get('recovery_experiment')
+        if not isinstance(recovery, Mapping) or not recovery.get('enabled'):
+            raise RuntimeError(
+                f"Existing checkpoint lacks recovery lineage metadata: "
+                f"{checkpoint_path}"
+            )
+        expected_baseline = str(
+            self.config.recovery_baseline_sha256 or '').upper()
+        recorded_baseline = str(
+            recovery.get('baseline_sha256') or '').upper()
+        if not expected_baseline or recorded_baseline != expected_baseline:
+            raise RuntimeError(
+                f"Existing checkpoint recovery baseline mismatch at "
+                f"{checkpoint_path}"
+            )
+        if str(recovery.get('training_stage')) != str(self.config.policy_stage):
+            raise RuntimeError(
+                f"Existing checkpoint training stage mismatch at "
+                f"{checkpoint_path}"
+            )
+
+        registry = getattr(self, '_promotion_registry', None)
+        if registry is None:
+            raise RuntimeError(
+                f"Cannot verify existing recovery checkpoint without its "
+                f"promotion registry: {checkpoint_path}"
+            )
+        matching_records = []
+        for record in registry.records():
+            try:
+                record_step = int(record.get('step'))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if record_step != int(self.step):
+                continue
+            record_path_value = record.get('checkpoint_path')
+            if not record_path_value:
+                continue
+            if self._paths_identify_same_file(
+                    Path(record_path_value), checkpoint_path):
+                matching_records.append(record)
+        if not matching_records:
+            raise RuntimeError(
+                f"Existing recovery checkpoint has no durable promotion "
+                f"record and will not be reused: {checkpoint_path}"
+            )
+
+        optimizer_state = checkpoint.get('optimizer_state_dict')
+        param_groups = (
+            optimizer_state.get('param_groups')
+            if isinstance(optimizer_state, Mapping) else None
+        )
+        if not isinstance(param_groups, list) or not param_groups:
+            raise RuntimeError(
+                f"Existing recovery checkpoint has no optimizer parameter "
+                f"groups and will not be reused: {checkpoint_path}"
+            )
+
+        def _optimizer_context_matches(record: Mapping[str, Any]) -> bool:
+            context = record.get('comparison_context')
+            if not isinstance(context, Mapping):
+                return False
+            for context_name, group_name in (
+                ('learning_rate', 'lr'),
+                ('weight_decay', 'weight_decay'),
+            ):
+                expected = context.get(context_name)
+                expected_values = (
+                    list(expected) if isinstance(expected, (list, tuple))
+                    else [expected] * len(param_groups)
+                )
+                if len(expected_values) != len(param_groups):
+                    return False
+                try:
+                    actual_values = [
+                        float(group[group_name]) for group in param_groups
+                    ]
+                    expected_values = [float(value) for value in expected_values]
+                except (KeyError, TypeError, ValueError):
+                    return False
+                if any(
+                    not math.isclose(actual, expected_value, rel_tol=1e-12)
+                    for actual, expected_value in zip(
+                        actual_values, expected_values)
+                ):
+                    return False
+            return True
+
+        if not any(_optimizer_context_matches(record)
+                   for record in matching_records):
+            raise RuntimeError(
+                f"Existing recovery checkpoint optimizer state does not match "
+                f"its durable promotion metadata and will not be reused: "
+                f"{checkpoint_path}"
+            )
+
+        digest = hashlib.sha256()
+        with checkpoint_path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        actual_digest = digest.hexdigest().upper()
+        recorded_digests = {
+            str(record.get('checkpoint_sha256') or '').upper()
+            for record in matching_records
+            if record.get('checkpoint_sha256')
+        }
+        if actual_digest not in recorded_digests:
+            raise RuntimeError(
+                f"Existing recovery checkpoint hash does not match its "
+                f"durable promotion record: {checkpoint_path}"
+            )
 
     def _save_checkpoint(self, loss: float, log_entry: Optional[dict] = None) -> str:
         """Save a checkpoint atomically.
@@ -2460,8 +3121,10 @@ class Trainer:
 
         checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
         if checkpoint_path.exists():
+            self._verify_existing_checkpoint_collision(checkpoint_path)
             print(
-                f"Checkpoint already exists and will remain unchanged: {checkpoint_path}"
+                f"Verified existing checkpoint; it will remain unchanged: "
+                f"{checkpoint_path}"
             )
             return str(checkpoint_path)
         latest_path = Path(self.config.latest_path)
@@ -2538,16 +3201,7 @@ class Trainer:
                 self._active_snapshot_manifest.get('noise_settings', {})),
             'generation_settings': dict(
                 self._active_snapshot_manifest.get('generation_settings', {})),
-            'optimizer_context': {
-                'optimizer': type(self.optimizer).__name__,
-                'learning_rate': self.config.learning_rate,
-                'weight_decay': self.config.weight_decay,
-                'batch_size': self.config.batch_size,
-                'gradient_accumulation_steps': (
-                    self.config.gradient_accumulation_steps),
-                'scheduler_enabled': self.config.lr_scheduler_enabled,
-                'scheduler_type': self.config.lr_scheduler_type,
-            },
+            'optimizer_context': self._live_optimizer_context(),
             'seed_context': {
                 'selfplay_opening_seed': self.config.selfplay_opening_seed,
                 'validation_split_seed': self.config.validation_split_seed,
@@ -2768,10 +3422,15 @@ class Trainer:
             'p2_weight_after': target_weight,
         }
 
-    def run_selfplay(self, num_games: int, callback=None,
-                     collect_dicts: bool = False,
-                     skip_replay: bool = False,
-                     preprocess_inline: bool = False) -> int:
+    def run_selfplay(
+        self,
+        num_games: int,
+        callback=None,
+        collect_dicts: bool = False,
+        skip_replay: bool = False,
+        preprocess_inline: bool = False,
+        return_behavior_step: bool = False,
+    ) -> int | tuple[int, int]:
         """Run self-play to generate training data.
 
         Args:
@@ -2790,7 +3449,8 @@ class Trainer:
                 self._last_selfplay_preprocessed (a CachedTensorDataset).
 
         Returns:
-            Total number of training entries generated.
+            Total number of training entries generated, or a tuple of
+            ``(entries, behavior_step)`` when ``return_behavior_step=True``.
         """
         if skip_replay and not collect_dicts and not preprocess_inline:
             raise ValueError(
@@ -2801,7 +3461,7 @@ class Trainer:
 
         _selfplay_start = time.time()
         total_games = max(0, num_games)
-        cycle_id = self.stats.generation_cycles_completed
+        cycle_id = self._allocate_generation_cycle_id()
         # Reserve the identifier for deterministic seeds, but only commit the
         # completed-cycle counter after every requested game has succeeded.
         # An interrupted cycle must not look like a valid generation to corpus
@@ -2875,7 +3535,10 @@ class Trainer:
             f"({focus_desc}; focus side: {side_focus})..."
         )
 
-        temp_model_path = Path(self.config.checkpoint_dir) / "temp_selfplay_model.pt"
+        temp_model_path = self._runtime_model_path("temp_selfplay_model.pt")
+        behavior_step = int(self.step)
+        behavior_id = f"trainer-step-{behavior_step}"
+        behavior_checkpoint_sha256: Optional[str] = None
 
         entries = 0
         completed_total = 0
@@ -3031,8 +3694,19 @@ class Trainer:
                 'model_state_dict': _sd,
                 'arch_params': getattr(self.model, 'arch_params', {}),
                 'encoding_version': ENCODING_VERSION,
-                'step': self.step,
+                'step': behavior_step,
             }, temp_model_path)
+            checkpoint_digest = hashlib.sha256()
+            try:
+                with temp_model_path.open('rb') as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                        checkpoint_digest.update(chunk)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not identify self-play behavior checkpoint: "
+                    f"{temp_model_path}: {exc}"
+                ) from exc
+            behavior_checkpoint_sha256 = checkpoint_digest.hexdigest().upper()
 
         # --- Batch tasks for the unified pool ---
         effective_workers = (
@@ -3095,6 +3769,16 @@ class Trainer:
         # all three paths stay in sync.
         def _consume_batch(entries_data, batch_game_count):
             nonlocal entries, completed_total
+            # Worker output is a raw dict pipeline, so retain provenance in
+            # the durable JSONL without changing ReplayEntry's legacy schema.
+            # The parser intentionally ignores these additive metadata keys.
+            self._annotate_selfplay_entries(
+                entries_data,
+                cycle_id=cycle_id,
+                behavior_step=behavior_step,
+                behavior_id=behavior_id,
+                behavior_checkpoint_sha256=behavior_checkpoint_sha256,
+            )
             balance_stats = self._balance_side_sample_weights(entries_data)
             if balance_stats is not None:
                 side_balance_totals['batches'] += 1
@@ -3156,12 +3840,14 @@ class Trainer:
         # sequentially instead of silently dropping their game data.
         unfinished = {}  # future → (task_type, batch_game_count, batch)
 
+        executor = None
         try:
-            with ProcessPoolExecutor(
+            executor = ProcessPoolExecutor(
                 max_workers=effective_workers,
                 initializer=_selfplay_worker_init,
                 initargs=(opening_seed_base,),
-            ) as executor:
+            )
+            try:
                 # future → (task_type, num_games_in_batch, batch)
                 future_meta = {}
                 for batch in ml_batches:
@@ -3176,10 +3862,9 @@ class Trainer:
                     self._service_control_queue()
                     if self._stopped:
                         # Stop requested: drop queued game batches and return
-                        # with whatever already finished.  Running batches
-                        # still complete (the exit of the with-block waits
-                        # for them), bounding stop latency to one batch.
-                        executor.shutdown(wait=False, cancel_futures=True)
+                        # with whatever already finished.  The bounded pool
+                        # teardown below terminates lingering workers without
+                        # waiting indefinitely for a context-manager exit.
                         unfinished.clear()
                         break
                     task_type, batch_game_count, batch = future_meta[future]
@@ -3203,6 +3888,8 @@ class Trainer:
                         break
                     except Exception as e:
                         print(f"Self-play error ({task_type}): {e}")
+            finally:
+                _shutdown_selfplay_executor(executor)
 
             # Pool torn down. Re-run any batches the broken pool never
             # delivered, in-process (single process = less memory pressure
@@ -3257,6 +3944,8 @@ class Trainer:
                 _preprocess_chunks.clear()
             self._last_selfplay_dicts = None
             self._last_selfplay_preprocessed = None
+            self._cleanup_runtime_model_file(temp_model_path)
+            self._cleanup_runtime_models_dir()
             raise RuntimeError(
                 f"self-play cycle {cycle_id} incomplete: "
                 f"completed {completed_total}/{grand_total} games"
@@ -3328,7 +4017,12 @@ class Trainer:
                     )
                 except Exception:
                     pass  # Non-critical
-
+        if return_behavior_step:
+            self._cleanup_runtime_model_file(temp_model_path)
+            self._cleanup_runtime_models_dir()
+            return entries, behavior_step
+        self._cleanup_runtime_model_file(temp_model_path)
+        self._cleanup_runtime_models_dir()
         return entries
 
     # ------------------------------------------------------------------
@@ -3363,8 +4057,9 @@ class Trainer:
                         if self._stopped:
                             break
 
-                        self.run_selfplay(
+                        _, selfplay_behavior_step = self.run_selfplay(
                             num_games,
+                            return_behavior_step=True,
                             collect_dicts=False,
                             skip_replay=False,
                             preprocess_inline=False,
@@ -3376,7 +4071,9 @@ class Trainer:
                                 f"(keeping newest {self.config.replay_max_files})"
                             )
 
-                        teacher, noise, generation = self._corpus_settings()
+                        teacher, noise, generation = self._corpus_settings(
+                            model_behavior_step=selfplay_behavior_step
+                        )
                         decision = self._snapshot_manager.consider_snapshot(
                             teacher_settings=teacher,
                             noise_settings=noise,
@@ -3681,7 +4378,7 @@ class Trainer:
 
         # Save current model temporarily for testing.
         # Non_blocking D2H copies + single sync (same as _save_checkpoint).
-        temp_path = Path(self.config.checkpoint_dir) / "temp_test_model.pt"
+        temp_path = self._runtime_model_path("temp_test_model.pt")
         temp_path.parent.mkdir(parents=True, exist_ok=True)
 
         if self.device.type == 'cuda':
@@ -3756,8 +4453,8 @@ class Trainer:
 
         finally:
             # Clean up temp file
-            if temp_path.exists():
-                temp_path.unlink()
+            self._cleanup_runtime_model_file(temp_path)
+            self._cleanup_runtime_models_dir()
 
     def _run_test_cpu_only(self, model_path: str, num_games: int,
                            difficulty: str, max_moves: int,
@@ -4742,7 +5439,7 @@ class Trainer:
             nonlocal _async_test_thread
             # Save model with non_blocking D2H copies (same pattern as
             # _save_checkpoint) — avoids per-tensor CUDA sync overhead.
-            _test_path = Path(self.config.checkpoint_dir) / "temp_async_test.pt"
+            _test_path = self._runtime_model_path("temp_async_test.pt")
             _test_path.parent.mkdir(parents=True, exist_ok=True)
             if self.device.type == 'cuda':
                 _sd = {k: v.to('cpu', non_blocking=True)
@@ -4778,10 +5475,8 @@ class Trainer:
                 except Exception as e:
                     print(f"  [async test] error: {e}")
                 finally:
-                    try:
-                        Path(_test_path_str).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    self._cleanup_runtime_model_file(_test_path_str)
+                    self._cleanup_runtime_models_dir()
 
             _async_test_thread = threading.Thread(target=_worker, daemon=True)
             _async_test_thread.start()
@@ -5552,6 +6247,9 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         stats_output_dir=stats_cfg.get('output_dir', paths_cfg.get('log_dir', 'logs') + '/stats'),
         # Paths
         checkpoint_dir=paths_cfg.get('checkpoint_dir', 'models/checkpoints'),
+        runtime_model_root=(
+            paths_cfg.get('runtime_model_root', 'logs/runtime_models')
+        ),
         latest_path=paths_cfg.get('latest_model', 'models/latest.pt'),
         promoted_path=paths_cfg.get('promoted_model', 'models/promoted.pt'),
         accepted_path=paths_cfg.get('accepted_model', 'models/accepted.pt'),
@@ -5597,13 +6295,64 @@ def validate_recovery_experiment_config(
     if baseline.name != 'model_step_134000.pt':
         raise ValueError(
             "Recovery baseline must be the preserved model_step_134000.pt")
-    resume = Path(config.resume).resolve() if config.resume else None
-    if config.policy_stage == 'policy_only' and resume != baseline:
-        raise ValueError(
-            f"Recovery must resume only from {baseline}; received {resume}"
-        )
     if not baseline.is_file():
         raise FileNotFoundError(f"Recovery baseline checkpoint not found: {baseline}")
+    resume = Path(config.resume).resolve() if config.resume else None
+    if config.policy_stage == 'policy_only':
+        # Windows/WSL case-insensitive mounts can expose the same inode through
+        # differently-cased absolute paths (for example PIPELINE/DAMA versus
+        # pipeline/dama).  Enforce exact file identity, then verify the pinned
+        # digest below; lexical Path equality would reject the valid launcher.
+        try:
+            resume_is_baseline = (
+                resume is not None
+                and resume.is_file()
+                and os.path.samefile(resume, baseline)
+            )
+        except OSError:
+            resume_is_baseline = False
+        if not resume_is_baseline:
+            raise ValueError(
+                f"Recovery must resume only from {baseline}; received {resume}"
+            )
+
+    # Recovery artifacts must never be allowed to target the preserved anchor
+    # or any numbered checkpoint.  The normal alias publisher is intentionally
+    # atomic, but ``os.replace`` would still replace a protected path if a
+    # malformed programmatic config pointed an alias there.  Keep all three
+    # aliases outside the checkpoint directory and pairwise distinct.
+    checkpoint_dir = Path(config.checkpoint_dir).resolve()
+    alias_paths = {
+        'latest': Path(config.latest_path).resolve(),
+        'promoted': Path(config.promoted_path).resolve(),
+        'accepted': Path(config.accepted_path).resolve(),
+    }
+    collisions = []
+    if checkpoint_dir == baseline.parent:
+        collisions.append(
+            "checkpoint output directory contains the recovery baseline")
+    for alias_name, alias_path in alias_paths.items():
+        if alias_path == baseline:
+            collisions.append(f"{alias_name} alias targets the recovery baseline")
+        elif checkpoint_dir == alias_path or checkpoint_dir in alias_path.parents:
+            collisions.append(
+                f"{alias_name} alias must remain outside checkpoint directory")
+        elif alias_path.name.startswith('model_step_') and alias_path.suffix == '.pt':
+            collisions.append(
+                f"{alias_name} alias cannot use a numbered checkpoint filename")
+    for left_name, left_path in alias_paths.items():
+        for right_name, right_path in alias_paths.items():
+            if left_name < right_name and left_path == right_path:
+                collisions.append(
+                    f"{left_name} and {right_name} aliases must be distinct")
+    numbered_paths = set(checkpoint_dir.glob('model_step_*.pt')) if checkpoint_dir.is_dir() else set()
+    for alias_name, alias_path in alias_paths.items():
+        if alias_path in numbered_paths:
+            collisions.append(
+                f"{alias_name} alias targets an existing numbered checkpoint")
+    if collisions:
+        raise ValueError("Unsafe recovery model paths: " + "; ".join(collisions))
+
     digest = hashlib.sha256()
     with baseline.open('rb') as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
