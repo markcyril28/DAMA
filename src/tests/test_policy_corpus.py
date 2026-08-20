@@ -354,3 +354,211 @@ def test_recovery_snapshots_exclude_legacy_files_and_audit_exact_game_mix(
         "algorithm": 7,
         "current_model": 3,
     }
+
+
+def test_replay_audit_catches_late_contract_violation():
+    from dama.ai.ml import corpus
+
+    valid = _contract_entry(1, "algorithm", "late-check-1")
+    invalid = _contract_entry(2, "algorithm", "late-check-2")
+    invalid["chosen_index"] = 999
+
+    # Use the real iterator only for the assertion setup below; replacing it
+    # keeps this test independent of JSONL formatting and file I/O.
+    original = corpus._iter_entry_dicts
+    try:
+        corpus._iter_entry_dicts = lambda _path: iter((valid, invalid))
+        result = corpus.audit_policy_replay_file(
+            Path("sentinel.jsonl"), (2, 4, 6, 8))
+    finally:
+        corpus._iter_entry_dicts = original
+    assert result["valid"] is False
+    assert result["records"] == 2
+    assert result["errors"]["invalid_teacher_index"] == 1
+
+
+def test_replay_analysis_cache_matches_cold_scan_and_skips_reparse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    shared = _state(0)
+    first = _entry(0, state=shared)
+    first["game_id"] = "cycle-000001-algorithm-000001"
+    first["trajectory_source"] = "algorithm"
+    second = _entry(1, forced=True)
+    second["game_id"] = "cycle-000001-algorithm-000002"
+    left = tmp_path / "replay_left.jsonl"
+    _write_replay(left, [first, second])
+
+    repeated = _entry(0, state=shared)
+    repeated["game_id"] = "cycle-000002-current-model-000001"
+    repeated["trajectory_source"] = "current_model"
+    unique = _entry(2)
+    unique["game_id"] = "cycle-000002-current-model-000002"
+    right = tmp_path / "replay_right.jsonl"
+    _write_replay(right, [repeated, unique])
+
+    previous = {canonical_state_key(shared)}
+    cold = corpus.analyze_replay_files([left, right], previous)
+
+    original_iterator = corpus._iter_entry_dicts
+
+    def fail_if_reparsed(_path):
+        raise AssertionError("unchanged replay file was reparsed")
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", fail_if_reparsed)
+    warm = corpus.analyze_replay_files([left, right], previous)
+
+    assert warm == cold
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", original_iterator)
+
+
+def test_replay_analysis_cache_invalidates_on_file_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_mutating.jsonl"
+    _write_replay(path, [_entry(0)])
+    cold_before = corpus.analyze_replay_files([path])
+
+    _write_replay(path, [_entry(0), _entry(20, forced=True)])
+    original_iterator = corpus._iter_entry_dicts
+    parse_count = 0
+
+    def counted_iterator(file_path):
+        nonlocal parse_count
+        parse_count += 1
+        yield from original_iterator(file_path)
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", counted_iterator)
+    warm_after_mutation = corpus.analyze_replay_files([path])
+    assert parse_count == 1
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", original_iterator)
+    corpus._clear_replay_file_cache()
+    cold_after_mutation = corpus.analyze_replay_files([path])
+
+    assert warm_after_mutation == cold_after_mutation
+    assert warm_after_mutation != cold_before
+
+
+def test_replay_hash_cache_reuses_and_invalidates_by_file_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_hash.jsonl"
+    _write_replay(path, [_entry(0)])
+    original_hash = corpus._sha256_file_uncached
+    hash_calls = 0
+
+    def counted_hash(file_path):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(file_path)
+
+    monkeypatch.setattr(corpus, "_sha256_file_uncached", counted_hash)
+    first = corpus.replay_file_sha256(path)
+    assert corpus.replay_file_sha256(path) == first
+    assert hash_calls == 1
+
+    _write_replay(path, [_entry(0), _entry(20)])
+    changed = corpus.replay_file_sha256(path)
+    assert changed != first
+    assert hash_calls == 2
+
+
+def test_malformed_replay_json_is_never_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_malformed.jsonl"
+    path.write_text(json.dumps(_entry(0)) + "\nnot-json\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid replay JSON"):
+        corpus.analyze_replay_files([path])
+
+    original_iterator = corpus._iter_entry_dicts
+    parse_count = 0
+
+    def counted_iterator(file_path):
+        nonlocal parse_count
+        parse_count += 1
+        yield from original_iterator(file_path)
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", counted_iterator)
+    with pytest.raises(ValueError, match="Invalid replay JSON"):
+        corpus.analyze_replay_files([path])
+    assert parse_count == 1
+
+
+def test_semantically_malformed_replay_is_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_semantically_malformed.jsonl"
+    path.write_text(
+        json.dumps(_entry(0)) + "\n" + json.dumps({"state": {}}) + "\n",
+        encoding="utf-8",
+    )
+    first, _ = corpus.analyze_replay_files([path])
+    assert first["malformed_records"] == 1
+
+    original_iterator = corpus._iter_entry_dicts
+    parse_count = 0
+
+    def counted_iterator(file_path):
+        nonlocal parse_count
+        parse_count += 1
+        yield from original_iterator(file_path)
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", counted_iterator)
+    second, _ = corpus.analyze_replay_files([path])
+    assert second == first
+    assert parse_count == 1
+
+
+def test_replay_audit_cache_reuses_unchanged_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_audited.jsonl"
+    _write_replay(path, [_contract_entry(1, "algorithm", "audit-1")])
+    cold = corpus.audit_policy_replay_file(path, (2, 4, 6, 8))
+
+    def fail_if_reparsed(_path):
+        raise AssertionError("unchanged replay file was reparsed")
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", fail_if_reparsed)
+    warm = corpus.audit_policy_replay_file(path, (2, 4, 6, 8))
+    assert warm == cold
+
+
+def test_legacy_replay_audit_fails_fast(monkeypatch):
+    from dama.ai.ml import corpus
+
+    legacy = {"state": {}, "legal_moves": []}
+    consumed = []
+
+    def sentinel_iterator(_path):
+        consumed.append(1)
+        yield legacy
+        raise AssertionError("legacy audit must stop after first contract error")
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts", sentinel_iterator)
+    result = corpus.audit_policy_replay_file(Path("legacy.jsonl"), (2, 4, 6, 8))
+    assert result["valid"] is False
+    assert result["records"] == 1
+    assert result["errors"] == {"missing_legal_moves": 1}
+    assert consumed == [1]
