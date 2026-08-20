@@ -107,7 +107,15 @@ from .teacher_targets import (
     create_enhanced_dataloader,
     soft_target_cross_entropy,
 )
+from .acceptance import ACCEPTANCE_GAMES_PER_OPPONENT
 from . import checkpoint_acceptance as checkpoint_acceptance_tasks
+
+# ``ModelVsAlgoTester`` plays each distinct opening once per player side, so a
+# 100-game acceptance run reports ``opening_suite_size == 50``.  The enhanced
+# stage gate must compare against that per-side count; comparing against the
+# 100-game total rejected every genuinely produced acceptance report and made
+# P5 unreachable even after a valid promotion and acceptance.
+_ACCEPTANCE_OPENING_SUITE_SIZE = ACCEPTANCE_GAMES_PER_OPPONENT // 2
 
 
 def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
@@ -1731,7 +1739,15 @@ class Trainer:
             if not isinstance(entry, dict):
                 continue
             try:
-                value = float(entry.get('teacher_agreement'))
+                # ``record_teacher_agreement`` writes this history with the key
+                # ``top1_teacher_agreement``; reading ``teacher_agreement``
+                # silently discarded every entry and rewound the best agreement
+                # to 0.0 on resume.  The second key is kept as a fallback for
+                # any sidecar written before this was corrected.
+                value = float(entry.get(
+                    'top1_teacher_agreement',
+                    entry.get('teacher_agreement'),
+                ))
             except (TypeError, ValueError):
                 continue
             if math.isfinite(value):
@@ -2343,6 +2359,30 @@ class Trainer:
         }
         return teacher, noise, generation
 
+    def _discard_incomplete_selfplay_cycle(
+        self, skip_replay, collected, preprocess_chunks, temp_model_path,
+    ) -> None:
+        """Drop every artifact of a self-play cycle that did not complete.
+
+        Never leave a partial file discoverable by replay/corpus scans: one
+        off-ratio replay file permanently fails the exact 70/30 admission
+        contract.  The in-memory paths are cleared as well because callers may
+        use collect_dicts or inline preprocessing instead of replay I/O.
+        """
+        if not skip_replay:
+            try:
+                self.replay_buffer.discard_current_file()
+            except Exception as exc:  # never mask the originating failure
+                print(f"Failed to discard partial replay file: {exc}")
+        if collected is not None:
+            collected.clear()
+        if preprocess_chunks is not None:
+            preprocess_chunks.clear()
+        self._last_selfplay_dicts = None
+        self._last_selfplay_preprocessed = None
+        self._cleanup_runtime_model_file(temp_model_path)
+        self._cleanup_runtime_models_dir()
+
     def _prepare_training_split(self):
         if self._snapshot_manager is not None:
             behavior_step = int(self.step)
@@ -2411,6 +2451,17 @@ class Trainer:
                     )
                 teacher, noise, generation = self._corpus_settings(
                     model_behavior_step=behavior_step
+                )
+            rejected = decision.metrics.get('rejected_replay_files') or {}
+            if rejected:
+                summary = ', '.join(
+                    f"{name} ({'/'.join(sorted(audit.get('errors', {}))) or 'unknown'})"
+                    for name, audit in sorted(rejected.items())[:5]
+                )
+                more = '' if len(rejected) <= 5 else f", +{len(rejected) - 5} more"
+                print(
+                    f"Corpus admission rejected {len(rejected)} replay file(s): "
+                    f"{summary}{more}"
                 )
             if decision.admitted:
                 print(
@@ -4122,25 +4173,22 @@ class Trainer:
                     _consume_batch(entries_data, batch_game_count)
                 except Exception as e:
                     print(f"Sequential fallback error ({task_type}): {e}")
+        except BaseException:
+            # Ctrl-C and SystemExit are not ``Exception``, so they used to
+            # escape past the completion gate below and leave the partial cycle
+            # file on disk.  Under the enforced 70/30 contract that single
+            # off-ratio file then blocks every later run at corpus admission.
+            self._discard_incomplete_selfplay_cycle(
+                skip_replay, _collected, _preprocess_chunks, temp_model_path)
+            raise
 
         # [Pass 70] Clean up fork-inherited model to free CPU memory.
         _sp_mod._FORK_MODEL = None
 
         cycle_complete = completed_total == grand_total and not self._stopped
         if not cycle_complete:
-            # Never leave a partial file discoverable by replay/corpus scans.
-            # The in-memory paths are cleared as well because callers may use
-            # collect_dicts or inline preprocessing instead of replay I/O.
-            if not skip_replay:
-                self.replay_buffer.discard_current_file()
-            if _collected is not None:
-                _collected.clear()
-            if _preprocess_chunks is not None:
-                _preprocess_chunks.clear()
-            self._last_selfplay_dicts = None
-            self._last_selfplay_preprocessed = None
-            self._cleanup_runtime_model_file(temp_model_path)
-            self._cleanup_runtime_models_dir()
+            self._discard_incomplete_selfplay_cycle(
+                skip_replay, _collected, _preprocess_chunks, temp_model_path)
             raise RuntimeError(
                 f"self-play cycle {cycle_id} incomplete: "
                 f"completed {completed_total}/{grand_total} games"
@@ -6954,9 +7002,11 @@ def validate_recovery_experiment_config(
                                 == easy_record.get('opening_suite_id')
                                 if (isinstance(random_record, dict)
                                     and isinstance(easy_record, dict)) else False,
-                                random_record.get('opening_suite_size') == 100
+                                random_record.get('opening_suite_size')
+                                == _ACCEPTANCE_OPENING_SUITE_SIZE
                                 if isinstance(random_record, dict) else False,
-                                easy_record.get('opening_suite_size') == 100
+                                easy_record.get('opening_suite_size')
+                                == _ACCEPTANCE_OPENING_SUITE_SIZE
                                 if isinstance(easy_record, dict) else False,
                                 random_record.get('opening_seed')
                                 == expected_task['opening_seed']
