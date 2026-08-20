@@ -2,7 +2,7 @@
 #   Validate without training: .\local_train.ps1 -ValidateOnly
 #   Policy recovery baseline: .\local_train.ps1
 #   Enhanced stage after promotion:
-#     .\local_train.ps1 -EnhancedStage -Resume models\checkpoints_policy_distillation\model_step_NNNNNN.pt
+#     .\local_train.ps1 -EnhancedStage -Resume models\checkpoints_policy_distillation_recovery_wd1e4\model_step_NNNNNN.pt
 #   Other config, latest:     .\local_train.ps1 -Config config\training_config.yaml
 #   Other config, fresh:      .\local_train.ps1 -Config config\training_config.yaml -FreshStart
 #   One-process policy bypass:
@@ -124,6 +124,12 @@ $PolicyRecoveryBaselinePath = [System.IO.Path]::GetFullPath(
     (Join-Path $ProjectDirectory 'models\checkpoints_policy_distillation\model_step_134000.pt')
 )
 $PolicyRecoveryBaselineSha256 = '7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27'
+$PolicyRecoveryLegacyStatsPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $ProjectDirectory 'models\training_stats_policy_distillation.json')
+)
+$PolicyRecoveryStatsPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $ProjectDirectory 'models\training_stats_policy_distillation_recovery_wd1e4.json')
+)
 $IsPolicyRecovery = $ConfigPath.Equals(
     $PolicyRecoveryConfigPath,
     [System.StringComparison]::OrdinalIgnoreCase
@@ -346,6 +352,17 @@ print("DAMA trainer import: OK")
     if ($ValidateOnly) {
         Write-Host 'Validation-only mode requested. Training was not started.'
         return
+    }
+
+    if ($IsPolicyRecovery -and -not $EnhancedStage -and
+        -not (Test-Path -LiteralPath $PolicyRecoveryStatsPath) -and
+        (Test-Path -LiteralPath $PolicyRecoveryLegacyStatsPath -PathType Leaf)) {
+        Copy-Item -LiteralPath $PolicyRecoveryLegacyStatsPath `
+            -Destination $PolicyRecoveryStatsPath
+        Write-Host (
+            'Recovery stats seeded without modifying the legacy stats file: ' +
+            $PolicyRecoveryStatsPath
+        )
     }
 
     $TrainerArguments = @(
