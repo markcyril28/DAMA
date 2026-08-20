@@ -235,15 +235,29 @@ def _audit_policy_replay_file_uncached(
     A contract violation is definitive for admission, so there is no value in
     scanning the remaining records of a rejected legacy file.  Candidate-valid
     files are still consumed completely; this keeps all diversity/provenance
-    checks intact for files that can actually enter a snapshot.
+    checks intact for files that can actually enter a snapshot, and lets the
+    whole-file 70/30 trajectory split be checked once the scan finishes.
     """
     allowed = {int(value) for value in allowed_opening_plies}
     errors: Counter[str] = Counter()
     game_sources: Dict[str, str] = {}
     records = 0
 
-    def _result() -> Dict[str, Any]:
+    def _result(complete: bool = False) -> Dict[str, Any]:
         source_games = Counter(game_sources.values())
+        if complete and not errors:
+            # A completed self-play cycle writes exactly one replay file whose
+            # trajectories are an exact 70/30 algorithm/current-model split.  A
+            # fully-parsed file that misses the ratio is a partial cycle: the
+            # process died mid-generation, so the trainer's in-process
+            # quarantine (discard_current_file) never ran.  Admitting it drags
+            # the whole corpus off contract and, because the file is never
+            # rewritten, wedges every later run behind the same aggregate
+            # error.  Reject the one bad file instead.
+            algorithm = source_games.get("algorithm", 0)
+            model = source_games.get("current_model", 0)
+            if algorithm + model == 0 or algorithm * 3 != model * 7:
+                errors["unbalanced_policy_trajectory_split"] += 1
         return {
             "contract_version": POLICY_REPLAY_CONTRACT_VERSION,
             "valid": records > 0 and not errors,
@@ -297,7 +311,7 @@ def _audit_policy_replay_file_uncached(
         if errors:
             return _result()
 
-    return _result()
+    return _result(complete=True)
 
 
 def audit_policy_replay_file(
@@ -720,6 +734,26 @@ class CorpusSnapshotManager:
             )
         return state_keys
 
+    @staticmethod
+    def _realized_split_share(
+        *, validation_files: int, total_files: int,
+    ) -> dict:
+        """Describe the share a frozen validation split actually holds.
+
+        ``split.fraction`` records the *requested* hold-out.  The validation
+        set is frozen once and never grows, so as the rolling corpus expands
+        the realized share falls well below it -- reporting only the requested
+        value lets the manifest assert a hold-out it does not deliver.  These
+        additive fields keep the realized share checkable.
+        """
+        total = max(0, int(total_files))
+        held = max(0, int(validation_files))
+        return {
+            "validation_file_count": held,
+            "source_file_count": total,
+            "realized_file_fraction": (held / total) if total else 0.0,
+        }
+
     def _ensure_validation(self, files: Sequence[Path]) -> Tuple[dict, Set[str]]:
         manifest_path = self.validation_manifest_path
         if manifest_path.exists():
@@ -736,6 +770,21 @@ class CorpusSnapshotManager:
                     "Frozen validation manifest does not match the configured "
                     "whole-file split fraction and seed"
                 )
+            realized = self._realized_split_share(
+                validation_files=len(manifest.get("files", [])),
+                total_files=len(files),
+            )
+            manifest["split"] = dict(split, **realized)
+            # The frozen hold-out never grows, so print what it is actually
+            # worth against today's corpus rather than only the requested
+            # fraction the manifest records.
+            print(
+                f"Immutable validation split: "
+                f"{realized['validation_file_count']} of "
+                f"{realized['source_file_count']} replay file(s) = "
+                f"{realized['realized_file_fraction'] * 100.0:.2f}% realized "
+                f"(requested {self.validation_fraction * 100.0:.2f}%)"
+            )
             return manifest, state_keys
 
         if len(files) < 2:
@@ -777,6 +826,10 @@ class CorpusSnapshotManager:
                 "unit": "replay_file",
                 "fraction": self.validation_fraction,
                 "seed": self.split_seed,
+                **self._realized_split_share(
+                    validation_files=len(file_records),
+                    total_files=len(files),
+                ),
             },
             "encoding_version": ENCODING_VERSION,
             "rules_id": CANONICAL_RULES_ID,
@@ -859,9 +912,24 @@ class CorpusSnapshotManager:
             algorithm_games * 3 != model_games * 7
             or algorithm_games + model_games == 0
         ):
+            # Per-file admission already rejects every off-ratio file, so this
+            # is a backstop.  Name the offenders anyway: an aggregate count on
+            # its own is not actionable.
+            offenders = []
+            for path in train_files:
+                counts = Counter(
+                    _cached_replay_file_analysis(path).game_sources.values())
+                algorithm = counts.get("algorithm", 0)
+                model = counts.get("current_model", 0)
+                if algorithm * 3 != model * 7:
+                    offenders.append(f"{path.name} ({algorithm}/{model})")
+            detail = (
+                f"; off-ratio file(s): {', '.join(offenders)}"
+                if offenders else ""
+            )
             raise RuntimeError(
                 "Eligible replay games do not satisfy the exact 70/30 "
-                f"trajectory contract: {algorithm_games}/{model_games}"
+                f"trajectory contract: {algorithm_games}/{model_games}{detail}"
             )
 
         fingerprint_payload = {
