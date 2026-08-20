@@ -1,11 +1,13 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import dama.ai.ml.trainer as trainer_module
+from dama.ai.ml import checkpoint_acceptance
 from dama.ai.ml.corpus import SnapshotDecision, canonical_state_key
 from dama.ai.ml.trainer import (
     Trainer,
@@ -16,6 +18,84 @@ from dama.ai.ml.trainer import (
     load_config_from_yaml,
     validate_recovery_experiment_config,
 )
+
+
+def test_selfplay_executor_shutdown_captures_workers_before_nonblocking_shutdown() -> None:
+    class _Process:
+        def __init__(self, alive: bool) -> None:
+            self.alive = alive
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.join_calls = []
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def join(self, timeout=None) -> None:
+            self.join_calls.append(timeout)
+
+    class _Executor:
+        def __init__(self, process) -> None:
+            self._processes = {1: process}
+            self.shutdown_calls = []
+
+        def shutdown(self, wait=True, cancel_futures=False) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+            self._processes = None
+
+    process = _Process(alive=False)
+    executor = _Executor(process)
+
+    trainer_module._shutdown_selfplay_executor(executor, timeout=0)
+
+    assert executor.shutdown_calls == [(False, True)]
+    assert process.terminate_calls == 0
+    assert process.kill_calls == 0
+    assert process.join_calls
+
+
+def test_selfplay_executor_shutdown_escalates_only_lingering_workers() -> None:
+    class _Process:
+        def __init__(self, alive: bool) -> None:
+            self.alive = alive
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def join(self, timeout=None) -> None:
+            return None
+
+    class _Executor:
+        def __init__(self, processes) -> None:
+            self._processes = {index: process for index, process in enumerate(processes)}
+
+        def shutdown(self, wait=True, cancel_futures=False) -> None:
+            self._processes = None
+
+    graceful = _Process(alive=False)
+    stuck = _Process(alive=True)
+    executor = _Executor([graceful, stuck])
+
+    trainer_module._shutdown_selfplay_executor(executor, timeout=0)
+
+    assert graceful.terminate_calls == 0
+    assert graceful.kill_calls == 0
+    assert stuck.terminate_calls == 1
+    assert stuck.kill_calls == 1
 
 
 def test_training_stats_separate_current_dataset_and_historical_loss() -> None:
@@ -120,7 +200,232 @@ def test_checkpoint_load_restores_loss_baselines_monotonically(
     assert holder.stats.current_dataset_best_train_loss == pytest.approx(0.5)
 
 
-def test_checkpoint_save_never_overwrites_existing_step(tmp_path: Path) -> None:
+def test_checkpoint_load_resets_optimizer_param_groups_to_config(
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    source_parameters = [
+        torch.nn.Parameter(torch.tensor([1.0])),
+        torch.nn.Parameter(torch.tensor([2.0])),
+    ]
+    source_optimizer = torch.optim.AdamW([
+        {
+            "params": [source_parameters[0]],
+            "lr": 7e-4,
+            "weight_decay": 1e-5,
+        },
+        {
+            "params": [source_parameters[1]],
+            "lr": 8e-4,
+            "weight_decay": 2e-5,
+        },
+    ])
+    checkpoint = tmp_path / "model_step_12.pt"
+    torch.save({
+        "model_state_dict": {},
+        "optimizer_state_dict": source_optimizer.state_dict(),
+        "step": 12,
+    }, checkpoint)
+
+    class _Model:
+        def load_state_dict(self, *_args, **_kwargs):
+            return [], []
+
+    target_parameters = [
+        torch.nn.Parameter(torch.tensor([3.0])),
+        torch.nn.Parameter(torch.tensor([4.0])),
+    ]
+    holder = object.__new__(Trainer)
+    holder.device = torch.device("cpu")
+    holder.config = TrainingConfig(
+        learning_rate=2e-4,
+        weight_decay=1e-4,
+    )
+    holder.model = _Model()
+    holder.optimizer = torch.optim.AdamW([
+        {"params": [target_parameters[0]]},
+        {"params": [target_parameters[1]]},
+    ])
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats = TrainingStats()
+    holder.step = 0
+    holder.epoch = 0
+    holder.best_loss = float("inf")
+    holder._has_non_finite_tensors = lambda: False
+
+    Trainer._load_checkpoint(holder, str(checkpoint))
+
+    for group in holder.optimizer.param_groups:
+        assert group["lr"] == pytest.approx(holder.config.learning_rate)
+        assert group["weight_decay"] == pytest.approx(
+            holder.config.weight_decay)
+
+
+def test_promotion_metadata_records_live_optimizer_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = {
+        "total_states": 4,
+        "correct_states": 2,
+        "top1_teacher_agreement": 0.5,
+        "decision_states": 3,
+        "decision_correct_states": 1,
+        "decision_top1_teacher_agreement": 1 / 3,
+        "forced_move_fraction": 0.25,
+    }
+    monkeypatch.setattr(
+        trainer_module,
+        "evaluate_teacher_agreement",
+        lambda *_args, **_kwargs: result,
+    )
+    captured = {}
+
+    class _Registry:
+        def consider(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                promoted=True,
+                reason="best_held_out_teacher_agreement",
+                record={
+                    **kwargs,
+                    "promoted": True,
+                    "reason": "best_held_out_teacher_agreement",
+                },
+            )
+
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        learning_rate=2e-4,
+        weight_decay=1e-4,
+    )
+    holder.optimizer = SimpleNamespace(param_groups=[{
+        "lr": 3e-4,
+        "weight_decay": 1e-5,
+    }])
+    holder.model = object()
+    holder.stats = TrainingStats(dataset_fingerprint="dataset")
+    holder.step = 12
+    holder.epoch = 3
+    holder._frozen_suite_entries = [object()]
+    holder._frozen_suite_manifest = {"suite_sha256": "suite"}
+    holder._promotion_registry = _Registry()
+
+    selection = Trainer._evaluate_teacher_promotion(
+        holder, tmp_path / "model_step_12.pt")
+
+    context = captured["comparison_context"]
+    assert context["learning_rate"] == pytest.approx(
+        holder.optimizer.param_groups[0]["lr"])
+    assert context["weight_decay"] == pytest.approx(
+        holder.optimizer.param_groups[0]["weight_decay"])
+    assert selection["promotion"]["promoted"] is True
+
+
+def test_checkpoint_load_rewinds_newer_sidecar_histories(
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    checkpoint = tmp_path / "model_step_12.pt"
+    torch.save({
+        "model_state_dict": {},
+        "optimizer_state_dict": {},
+        "step": 12,
+        "epoch": 3,
+        "loss": 0.4,
+        "current_train_loss": 0.4,
+        "current_dataset_best_train_loss": 0.35,
+        "historical_best_train_loss": 0.03,
+        "validation_loss": 0.45,
+        "dataset_fingerprint": "checkpoint-corpus",
+        "dataset_metadata": {"version": 2},
+        "generation_cycles_completed": 2,
+    }, checkpoint)
+
+    class _Model:
+        def load_state_dict(self, *_args, **_kwargs):
+            return [], []
+
+    class _Optimizer:
+        param_groups = [{"lr": 1e-3}]
+
+        def load_state_dict(self, _state):
+            return None
+
+    holder = object.__new__(Trainer)
+    holder.device = torch.device("cpu")
+    holder.config = TrainingConfig(learning_rate=2e-3)
+    holder.model = _Model()
+    holder.optimizer = _Optimizer()
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats = TrainingStats(
+        total_steps=15,
+        epochs_completed=5,
+        current_train_loss=0.1,
+        current_dataset_best_train_loss=0.1,
+        historical_best_train_loss=0.02,
+        dataset_fingerprint="future-corpus",
+        dataset_metadata={"version": 3},
+        generation_cycles_completed=9,
+        loss_history=[
+            {"step": 12, "loss": 0.4},
+            {"step": 15, "loss": 0.1},
+        ],
+        val_loss_history=[
+            {"step": 12, "val_loss": 0.5},
+            {"step": 15, "val_loss": 0.2},
+        ],
+        lr_history=[{"step": 12}, {"step": 15}],
+        gpu_mem_history=[{"step": 12}, {"step": 15}],
+        step_times=[{"step": 12}, {"step": 15}],
+        test_history=[{"step": 12}, {"step": 15}],
+        teacher_agreement_history=[
+            {"step": 12, "teacher_agreement": 0.3},
+            {"step": 15, "teacher_agreement": 0.6},
+        ],
+        promotion_history=[{"step": 12}, {"step": 15}],
+        acceptance_history=[{"step": 12}, {"step": 15}],
+    )
+    holder.step = 0
+    holder.epoch = 0
+    holder.best_loss = float("inf")
+    holder._has_non_finite_tensors = lambda: False
+
+    Trainer._load_checkpoint(holder, str(checkpoint))
+
+    assert holder.step == 12
+    assert holder.epoch == 3
+    assert holder.stats.total_steps == 12
+    assert holder.stats.epochs_completed == 3
+    assert holder.stats.current_train_loss == pytest.approx(0.4)
+    assert holder.stats.dataset_fingerprint == "checkpoint-corpus"
+    assert holder.stats.dataset_metadata == {"version": 2}
+    assert holder.stats.current_dataset_best_train_loss == pytest.approx(0.35)
+    assert holder.stats.historical_best_train_loss == pytest.approx(0.02)
+    assert holder.stats.best_val_loss == pytest.approx(0.45)
+    assert holder.stats.best_teacher_agreement == pytest.approx(0.3)
+    assert holder.stats.generation_cycles_completed == 2
+    for name in (
+        "loss_history",
+        "val_loss_history",
+        "lr_history",
+        "gpu_mem_history",
+        "step_times",
+        "test_history",
+        "teacher_agreement_history",
+        "promotion_history",
+        "acceptance_history",
+    ):
+        assert all(entry.get("step", 0) <= 12 for entry in getattr(holder.stats, name))
+
+
+def test_checkpoint_collision_fails_closed_without_overwriting(
+    tmp_path: Path,
+) -> None:
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     baseline = checkpoint_dir / "model_step_134000.pt"
@@ -130,10 +435,236 @@ def test_checkpoint_save_never_overwrites_existing_step(tmp_path: Path) -> None:
     holder.step = 134000
     holder._checkpoint_thread = None
 
+    with pytest.raises(RuntimeError, match="cannot be verified"):
+        Trainer._save_checkpoint(holder, 1.0)
+
+    assert baseline.read_bytes() == b"preserved baseline"
+
+
+def test_verified_checkpoint_collision_preserves_existing_step(
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "model_step_134000.pt"
+    torch.save({
+        "model_state_dict": {"weight": torch.tensor([1.0])},
+        "step": 134000,
+    }, checkpoint)
+    before = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(checkpoint_dir=str(checkpoint_dir))
+    holder.step = 134000
+    holder._checkpoint_thread = None
+
     saved = Trainer._save_checkpoint(holder, 1.0)
 
-    assert Path(saved) == baseline
-    assert baseline.read_bytes() == b"preserved baseline"
+    assert Path(saved) == checkpoint
+    assert hashlib.sha256(checkpoint.read_bytes()).hexdigest() == before
+
+
+def test_recovery_checkpoint_collision_requires_registry_hash(
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "model_step_136000.pt"
+    torch.save({
+        "model_state_dict": {"weight": torch.tensor([1.0])},
+        "optimizer_state_dict": {
+            "param_groups": [{"lr": 2e-4, "weight_decay": 1e-4}],
+        },
+        "step": 136000,
+        "recovery_experiment": {
+            "enabled": True,
+            "baseline_sha256": "ABC123",
+            "training_stage": "policy_only",
+        },
+    }, checkpoint)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest().upper()
+    records = ({
+        "step": 136000,
+        "checkpoint_path": str(checkpoint),
+        "checkpoint_sha256": digest,
+        "comparison_context": {
+            "learning_rate": 2e-4,
+            "weight_decay": 1e-4,
+        },
+    },)
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        recovery_enforced=True,
+        recovery_baseline_sha256="ABC123",
+        policy_stage="policy_only",
+    )
+    holder.step = 136000
+    holder._checkpoint_thread = None
+    holder._promotion_registry = SimpleNamespace(records=lambda: records)
+
+    assert Trainer._save_checkpoint(holder, 1.0) == str(checkpoint)
+
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        **records[0],
+        "checkpoint_sha256": "0" * 64,
+    },))
+    with pytest.raises(RuntimeError, match="hash does not match"):
+        Trainer._save_checkpoint(holder, 1.0)
+
+
+def test_recovery_checkpoint_collision_rejects_false_optimizer_metadata(
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "model_step_136000.pt"
+    torch.save({
+        "model_state_dict": {"weight": torch.tensor([1.0])},
+        "optimizer_state_dict": {
+            "param_groups": [{"lr": 2e-4, "weight_decay": 1e-5}],
+        },
+        "step": 136000,
+        "recovery_experiment": {
+            "enabled": True,
+            "baseline_sha256": "ABC123",
+            "training_stage": "policy_only",
+        },
+    }, checkpoint)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest().upper()
+    records = ({
+        "step": 136000,
+        "checkpoint_path": str(checkpoint),
+        "checkpoint_sha256": digest,
+        "comparison_context": {
+            "learning_rate": 2e-4,
+            "weight_decay": 1e-4,
+        },
+    },)
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        recovery_enforced=True,
+        recovery_baseline_sha256="ABC123",
+        policy_stage="policy_only",
+    )
+    holder.step = 136000
+    holder._checkpoint_thread = None
+    holder._promotion_registry = SimpleNamespace(records=lambda: records)
+
+    with pytest.raises(RuntimeError, match="optimizer state does not match"):
+        Trainer._save_checkpoint(holder, 1.0)
+
+
+def _cycle_allocator_holder(tmp_path: Path, generation_cycles: int) -> Trainer:
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(replay_dir=str(tmp_path / "replay"))
+    holder.stats = TrainingStats(
+        generation_cycles_completed=generation_cycles,
+    )
+    return holder
+
+
+def test_generation_cycle_allocator_rewinds_stale_missing_stats_from_replay(
+    tmp_path: Path,
+) -> None:
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    (replay_dir / "replay_existing.jsonl").write_text(
+        json.dumps({"game_id": "cycle-000027-model-000001"}) + "\n",
+        encoding="utf-8",
+    )
+    holder = _cycle_allocator_holder(tmp_path, 0)
+
+    assert holder._allocate_generation_cycle_id() == 28
+    assert holder.stats.generation_cycles_completed == 0
+
+
+def test_generation_cycle_allocator_never_collides_with_stats_or_replay(
+    tmp_path: Path,
+) -> None:
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    (replay_dir / "replay_existing.jsonl").write_text(
+        json.dumps({"generation_cycle_id": 27}) + "\n",
+        encoding="utf-8",
+    )
+    holder = _cycle_allocator_holder(tmp_path, 32)
+
+    assert holder._allocate_generation_cycle_id() == 32
+
+
+def test_generation_cycle_allocator_starts_at_zero_for_empty_replay(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "replay").mkdir()
+    holder = _cycle_allocator_holder(tmp_path, 0)
+
+    assert holder._allocate_generation_cycle_id() == 0
+
+
+def test_generation_cycle_allocator_caches_unchanged_replay_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    first = replay_dir / "replay_first.jsonl"
+    second = replay_dir / "replay_second.jsonl"
+    first.write_text(json.dumps({"game_id": "cycle-000003-model-1"}) + "\n")
+    second.write_text(json.dumps({"game_id": "cycle-000007-model-1"}) + "\n")
+    holder = _cycle_allocator_holder(tmp_path, 0)
+
+    real_open = Path.open
+    opened = []
+
+    def counting_open(path, *args, **kwargs):
+        if path.name.startswith("replay_"):
+            opened.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    assert holder._durable_generation_cycle_max() == 7
+    assert len(opened) == 2
+    opened.clear()
+    assert holder._durable_generation_cycle_max() == 7
+    assert opened == []
+
+    first.write_text(json.dumps({"game_id": "cycle-000011-model-1"}) + "\n")
+    third = replay_dir / "replay_third.jsonl"
+    third.write_text(json.dumps({"generation_cycle_id": 13}) + "\n")
+    opened.clear()
+    assert holder._durable_generation_cycle_max() == 13
+    assert {path.name for path in opened} == {first.name, third.name}
+
+    second.unlink()
+    opened.clear()
+    assert holder._durable_generation_cycle_max() == 13
+    assert opened == []
+    assert second.resolve() not in holder._generation_cycle_file_cache
+
+
+def test_selfplay_entries_record_cycle_and_behavior_provenance() -> None:
+    entries = [{"game_id": "cycle-000028-model-000001"}, "not-a-dict"]
+
+    Trainer._annotate_selfplay_entries(
+        entries,
+        cycle_id=28,
+        behavior_step=136000,
+        behavior_id="trainer-step-136000",
+        behavior_checkpoint_sha256="AB" * 32,
+    )
+
+    assert entries[0]["generation_cycle_id"] == 28
+    assert entries[0]["model_behavior_step"] == 136000
+    assert entries[0]["model_behavior_id"] == "trainer-step-136000"
+    assert entries[0]["model_behavior_checkpoint_sha256"] == "AB" * 32
 
 
 def test_changed_stage_contract_waits_for_matching_snapshot(
@@ -185,15 +716,20 @@ def test_changed_stage_contract_waits_for_matching_snapshot(
     holder.config = SimpleNamespace(selfplay_games=72, replay_max_entries=500)
     holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
     holder._stopped = False
-    holder._corpus_settings = lambda: (
+    holder.step = 7
+    holder._corpus_settings = lambda *_, **__: (
         {"stage": "enhanced"},
         {"played_action_probability": 0.10},
         {"current_model_inference_depth": 2},
     )
     selfplay_calls = []
-    holder.run_selfplay = lambda games: (
-        selfplay_calls.append(games), setattr(manager, "progress", True)
-    )[0]
+    def _run_selfplay(games: int, return_behavior_step: bool = False) -> int | tuple[int, int]:
+        selfplay_calls.append(games)
+        manager.progress = True
+        if return_behavior_step:
+            return 0, holder.step
+        return 0
+    holder.run_selfplay = _run_selfplay
     holder._service_control_queue = lambda: None
     activated = []
     holder._activate_dataset_manifest = lambda manifest: activated.append(manifest)
@@ -216,6 +752,235 @@ def test_changed_stage_contract_waits_for_matching_snapshot(
     assert selfplay_calls == [72]
     assert manager.loaded == (new_manifest, 500)
     assert activated == [{"fingerprint": "enhanced", "version": 2}]
+
+
+def test_prepare_training_split_captures_behavior_step_before_selfplay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_manifest = Path("snapshot_v000001")
+    new_manifest = Path("snapshot_v000002")
+    observed_steps = []
+
+    class FakeSnapshotManager:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.loaded = None
+            self.progress = False
+
+        def consider_snapshot(self, **kwargs):
+            self.calls += 1
+            observed_steps.append(
+                int(kwargs["generation_settings"]["model_behavior_step"])
+            )
+            if self.calls == 1:
+                return SnapshotDecision(
+                    False,
+                    "warming",
+                    old_manifest,
+                    {"fresh_unique_state_rate": 0.0},
+                )
+            return SnapshotDecision(
+                True,
+                "admitted",
+                new_manifest,
+                {"fresh_unique_state_rate": 0.50},
+            )
+
+        def snapshot_matches_settings(self, *_args, **_kwargs):
+            return self.calls == 2
+
+        def eligible_replay_files(self):
+            count = 2 if self.progress else 1
+            return [Path(f"replay_{index}.jsonl") for index in range(count)], {}
+
+        def load_split(self, path, max_train_entries=0):
+            self.loaded = (Path(path), max_train_entries)
+            return ["train"], ["validation"], {
+                "fingerprint": "enhanced",
+                "version": 2,
+            }
+
+    manager = FakeSnapshotManager()
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = manager
+    holder.config = SimpleNamespace(
+        selfplay_games=72,
+        replay_max_entries=500,
+        teacher_difficulty="hard",
+        teacher_target_type="hard",
+        teacher_soft_temperature=1.0,
+        teacher_score_depth=3,
+        teacher_value_scale=1000.0,
+        teacher_hard_label_blend=0.25,
+        selfplay_noise_prob=0.10,
+        selfplay_opening_plies=(0,),
+        selfplay_opening_seed=20260819,
+        selfplay_max_moves=200,
+        selfplay_difficulties=None,
+        algo_vs_algo_enabled=False,
+        algo_vs_algo_games=0,
+        trajectory_algorithm_fraction=0.70,
+        trajectory_model_fraction=0.30,
+        selfplay_opponent_focus="algorithm",
+        selfplay_focus_side="both",
+        symmetry_augmentation=False,
+        inference_depth=1,
+    )
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._stopped = False
+    def _corpus_settings(
+        *args, model_behavior_step=None, **_kwargs
+    ) -> tuple[dict, dict, dict]:
+        step = int(model_behavior_step) if model_behavior_step is not None else holder.step
+        return (
+            {"stage": "enhanced"},
+            {"played_action_probability": 0.10},
+            {"current_model_inference_depth": 2, "model_behavior_step": step},
+        )
+    holder._corpus_settings = _corpus_settings
+    holder._service_control_queue = lambda: None
+    holder._activate_dataset_manifest = lambda manifest: None
+    holder.step = 11
+    def _run_selfplay(
+        games: int, return_behavior_step: bool = False
+    ) -> int | tuple[int, int]:
+        holder.step = 99
+        manager.progress = True
+        if return_behavior_step:
+            return 0, 99
+        return 0
+    holder.run_selfplay = _run_selfplay
+
+    monkeypatch.setattr(
+        trainer_module,
+        "analyze_replay_files",
+        lambda files: (
+            {"records": len(files)},
+            set(),
+        ),
+    )
+    train, validation = Trainer._prepare_training_split(holder)
+
+    assert train == ["train"]
+    assert validation == ["validation"]
+    assert holder.step == 99
+    assert observed_steps == [11, 99]
+    assert manager.calls == 2
+
+
+def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    new_manifest = Path("snapshot_v000002")
+    observed_steps = []
+
+    class _FakeThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+            self._running = False
+
+        def start(self):
+            self._running = True
+            try:
+                self._target()
+            finally:
+                self._running = False
+
+        def is_alive(self):
+            return self._running
+
+        def join(self, _timeout=None):
+            return None
+
+    class FakeSnapshotManager:
+        def consider_snapshot(self, **kwargs):
+            observed_steps.append(
+                int(kwargs["generation_settings"]["model_behavior_step"])
+            )
+            return SnapshotDecision(
+                True,
+                "admitted",
+                new_manifest,
+                {"fresh_unique_state_rate": 0.50},
+            )
+
+        def snapshot_matches_settings(self, *_args, **_kwargs):
+            return True
+
+        def eligible_replay_files(self):
+            return [Path("replay.json")], {}
+
+        def load_split(self, path, max_train_entries=0):
+            return ["train"], ["validation"], {
+                "fingerprint": "enhanced",
+                "version": 2,
+            }
+
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = FakeSnapshotManager()
+    holder.config = SimpleNamespace(replay_max_files=60, replay_max_entries=500)
+    holder.config.max_moves_per_sample = 32
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_dataset = None
+    holder._bg_selfplay_entries = None
+    holder._bg_selfplay_incremental = None
+    holder._bg_snapshot_manifest = None
+    holder._bg_validation_entries = None
+    holder._bg_selfplay_lock = trainer_module.threading.Lock()
+    holder._stopped = False
+    holder._paused = False
+    holder._data_ready_event = SimpleNamespace(set=lambda: None)
+    holder.step = 23
+    holder._corpus_settings = lambda model_behavior_step=None, **_: (
+        {"difficulty": "hard", "target_type": "hard"},
+        {"played_action_probability": 0.10},
+        {"model_behavior_step": model_behavior_step},
+    )
+    def _run_selfplay(
+        num_games: int, **_kwargs: object
+    ) -> tuple[int, int]:
+        holder.step = 99
+        holder._stopped = True
+        return 0, 23
+    holder.run_selfplay = _run_selfplay
+
+    monkeypatch.setattr(trainer_module.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(
+        trainer_module.CachedTensorDataset,
+        "from_entries",
+        staticmethod(lambda *_args, **_kwargs: "dataset"),
+    )
+
+    Trainer._start_background_selfplay(holder, 72)
+
+    assert observed_steps == [23]
+    assert holder._bg_snapshot_manifest["fingerprint"] == "enhanced"
+
+
+def test_runtime_model_root_and_cleanup_removes_temporary_files(
+    tmp_path: Path,
+) -> None:
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(runtime_model_root=str(tmp_path / "logs" / "runtime_models"))
+    holder._runtime_model_dir = None
+
+    temp_path = holder._runtime_model_path("temp_selfplay_model.pt")
+    temp_path2 = holder._runtime_model_path("temp_async_test.pt")
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path.write_text("temporary", encoding="utf-8")
+    temp_path2.write_text("shared", encoding="utf-8")
+
+    # Verify overlap-safe cleanup unlinks only the target file.
+    holder._cleanup_runtime_model_file(temp_path)
+    assert not temp_path.exists()
+    assert temp_path2.exists()
+    assert temp_path.parent.exists()
+
+    # Remove the remaining file and confirm the directory is cleaned up.
+    holder._cleanup_runtime_model_file(temp_path2)
+    holder._cleanup_runtime_models_dir()
+    assert not temp_path.parent.exists()
 
 
 def test_existing_frozen_suite_overlap_is_filtered_on_restart(
@@ -286,6 +1051,9 @@ def test_existing_frozen_suite_overlap_is_filtered_on_restart(
 
 def _valid_recovery_config(checkpoint: Path) -> TrainingConfig:
     digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    root = checkpoint.parent
+    policy_namespace = "policy_arm"
+    enhanced_namespace = "enhanced_arm"
     return TrainingConfig(
         resume=str(checkpoint),
         recovery_enforced=True,
@@ -317,6 +1085,22 @@ def _valid_recovery_config(checkpoint: Path) -> TrainingConfig:
         value_head_enabled=False,
         inference_depth=1,
         teacher_target_type="hard",
+        checkpoint_dir=str(root / f"checkpoints_{policy_namespace}"),
+        runtime_model_root=str(root / f"runtime_{policy_namespace}"),
+        latest_path=str(root / f"latest_{policy_namespace}.pt"),
+        promoted_path=str(root / f"promoted_{policy_namespace}.pt"),
+        accepted_path=str(root / f"accepted_{policy_namespace}.pt"),
+        replay_dir=str(root / f"replay_{policy_namespace}"),
+        log_dir=str(root / f"logs_{policy_namespace}"),
+        stats_file=str(root / f"stats_{policy_namespace}.json"),
+        promotion_registry=str(
+            root / f"registry_{policy_namespace}" / "promotions.jsonl"),
+        acceptance_dir=str(root / f"acceptance_{policy_namespace}"),
+        stats_output_dir=str(root / f"stats_output_{policy_namespace}"),
+        snapshot_root=str(root / f"snapshots_{policy_namespace}"),
+        ram_cache_file=str(root / f"cache_{policy_namespace}.pt"),
+        policy_output_namespace=policy_namespace,
+        enhanced_output_namespace=enhanced_namespace,
     )
 
 
@@ -336,6 +1120,19 @@ def test_recovery_gate_accepts_only_exact_baseline_and_controls(tmp_path: Path) 
         validate_recovery_experiment_config(config)
 
 
+def test_recovery_gate_accepts_another_path_to_the_same_baseline_file(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model_step_134000.pt"
+    checkpoint.write_bytes(b"immutable baseline")
+    same_file_alias = tmp_path / "baseline-path-alias.pt"
+    os.link(checkpoint, same_file_alias)
+    config = _valid_recovery_config(checkpoint)
+    config.resume = str(same_file_alias)
+
+    validate_recovery_experiment_config(config)
+
+
 def test_recovery_gate_rejects_unready_data_controls(tmp_path: Path) -> None:
     checkpoint = tmp_path / "model_step_134000.pt"
     checkpoint.write_bytes(b"immutable baseline")
@@ -347,12 +1144,96 @@ def test_recovery_gate_rejects_unready_data_controls(tmp_path: Path) -> None:
         validate_recovery_experiment_config(config)
 
 
+@pytest.mark.parametrize("alias_name", ["latest_path", "promoted_path", "accepted_path"])
+def test_recovery_gate_rejects_alias_targeting_baseline(
+    tmp_path: Path, alias_name: str,
+) -> None:
+    checkpoint = tmp_path / "model_step_134000.pt"
+    checkpoint.write_bytes(b"immutable baseline")
+    config = _valid_recovery_config(checkpoint)
+    setattr(config, alias_name, str(checkpoint))
+
+    with pytest.raises(ValueError, match="recovery baseline"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_requires_checkpoint_output_directory_isolation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model_step_134000.pt"
+    checkpoint.write_bytes(b"immutable baseline")
+    config = _valid_recovery_config(checkpoint)
+    config.checkpoint_dir = str(checkpoint.parent)
+
+    with pytest.raises(ValueError, match="contains the recovery baseline"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_rejects_alias_inside_checkpoint_dir_or_existing_checkpoint(
+    tmp_path: Path,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "model_step_134000.pt"
+    checkpoint.write_bytes(b"immutable baseline")
+    numbered = checkpoint_dir / "model_step_135000.pt"
+    numbered.write_bytes(b"existing checkpoint")
+    config = _valid_recovery_config(checkpoint)
+    config.checkpoint_dir = str(checkpoint_dir)
+    config.promoted_path = str(numbered)
+
+    with pytest.raises(ValueError, match="outside checkpoint directory"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_rejects_colliding_aliases(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model_step_134000.pt"
+    checkpoint.write_bytes(b"immutable baseline")
+    config = _valid_recovery_config(checkpoint)
+    config.promoted_path = config.latest_path
+
+    with pytest.raises(ValueError, match="aliases must be distinct"):
+        validate_recovery_experiment_config(config)
+
+
+def test_alias_publication_preserves_source_and_existing_checkpoint_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    source = tmp_path / "model_step_134000.pt"
+    torch.save({
+        "model_state_dict": {"weight": torch.tensor([1.0])},
+        "step": 134000,
+    }, source)
+    destination = tmp_path / "latest.pt"
+    before = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    Trainer._publish_checkpoint_alias(source, destination)
+
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+    assert destination.read_bytes() == source.read_bytes()
+
+    holder = object.__new__(Trainer)
+    holder._checkpoint_thread = None
+    holder.config = SimpleNamespace(
+        checkpoint_dir=str(tmp_path),
+        recovery_enforced=False,
+    )
+    holder.step = 134000
+    assert Trainer._save_checkpoint(holder, 1.0) == str(source)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+
+
 def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     tmp_path: Path,
 ) -> None:
     baseline = tmp_path / "model_step_134000.pt"
     baseline.write_bytes(b"immutable baseline")
-    promoted = tmp_path / "model_step_140000.pt"
+    config = _valid_recovery_config(baseline)
+    policy_checkpoint_dir = Path(config.checkpoint_dir)
+    policy_checkpoint_dir.mkdir(parents=True)
+    promoted = policy_checkpoint_dir / "model_step_140000.pt"
     promoted.write_bytes(b"promoted policy")
     promoted_sha256 = hashlib.sha256(promoted.read_bytes()).hexdigest()
     suite = tmp_path / "frozen.jsonl"
@@ -361,19 +1242,22 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     suite.with_suffix(".jsonl.manifest.json").write_text(json.dumps({
         "suite_sha256": suite_sha256,
     }), encoding="utf-8")
-    registry = tmp_path / "promotions.jsonl"
+    registry = Path(config.promotion_registry)
+    registry.parent.mkdir(parents=True)
     registry.write_text(json.dumps({
         "promoted": True,
+        "step": 140000,
         "training_stage": "policy_only",
         "teacher_agreement": 0.55,
+        "teacher_agreement_threshold": 0.50,
+        "teacher_correct_states": 55,
+        "teacher_total_states": 100,
         "checkpoint_path": str(promoted),
         "checkpoint_sha256": promoted_sha256,
         "suite_fingerprint": suite_sha256,
     }) + "\n", encoding="utf-8")
 
-    config = _valid_recovery_config(baseline)
     config.resume = str(promoted)
-    config.promotion_registry = str(registry)
     config.frozen_suite_path = str(suite)
     activate_enhanced_stage(config, inference_depth=3)
 
@@ -381,14 +1265,193 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     assert config.value_head_enabled is True
     assert config.pipeline_mode == "alternate"
     assert config.inference_depth == 3
+    assert config.policy_gate_promotion_registry == str(registry)
+    assert config.promotion_registry != str(registry)
+    for field_name in trainer_module._STAGE_MUTABLE_PATH_FIELDS:
+        assert getattr(config, field_name) != config.policy_output_paths[field_name]
+        assert config.enhanced_output_namespace in getattr(config, field_name)
+
+    with pytest.raises(ValueError, match="terminal passing policy acceptance"):
+        validate_recovery_experiment_config(config)
+
+    accepted_alias = Path(config.policy_output_paths["accepted_path"])
+    accepted_alias.write_bytes(promoted.read_bytes())
+    acceptance_dir = Path(config.policy_output_paths["acceptance_dir"])
+    acceptance_dir.mkdir(parents=True)
+    random_result = {
+        "ml_wins": 90,
+        "draws": 0,
+        "algo_wins": 10,
+        "ml_as_p1_wins": 45,
+        "ml_as_p1_draws": 0,
+        "ml_as_p1_losses": 5,
+        "ml_as_p2_wins": 45,
+        "ml_as_p2_draws": 0,
+        "ml_as_p2_losses": 5,
+        "model_path": str(promoted),
+        "opponent_type": "random",
+        "algo_difficulty": "easy",
+        "opening_seed": config.test_opening_seed,
+        "opening_plies": list(config.test_opening_plies),
+        "opening_suite_id": "sha256:test-suite",
+        "opening_suite_size": 100,
+        "ml_inference_depth": 1,
+    }
+    easy_result = {
+        "ml_wins": 65,
+        "draws": 10,
+        "algo_wins": 25,
+        "ml_as_p1_wins": 32,
+        "ml_as_p1_draws": 5,
+        "ml_as_p1_losses": 13,
+        "ml_as_p2_wins": 33,
+        "ml_as_p2_draws": 5,
+        "ml_as_p2_losses": 12,
+        "model_path": str(promoted),
+        "opponent_type": "algorithm",
+        "algo_difficulty": "easy",
+        "opening_seed": config.test_opening_seed,
+        "opening_plies": list(config.test_opening_plies),
+        "opening_suite_id": "sha256:test-suite",
+        "opening_suite_size": 100,
+        "ml_inference_depth": 1,
+    }
+    decision = checkpoint_acceptance.evaluate_acceptance_gates(
+        0.55, random_result, easy_result)
+    expected_task_id = checkpoint_acceptance.acceptance_task_id(
+        str(promoted), 140000)
+    acceptance_report_path = acceptance_dir / "acceptance_step_140000.json"
+    acceptance_report = {
+        "passed": True,
+        "step": 140000,
+        "training_stage": "policy_only",
+        "checkpoint_path": str(promoted),
+        "checkpoint_sha256": promoted_sha256,
+        "frozen_suite_fingerprint": suite_sha256,
+        "task_id": expected_task_id,
+        "teacher_agreement_counts": {
+            "correct_states": 55,
+            "total_states": 100,
+        },
+        "selection_sequence": [
+            "held_out_teacher_agreement",
+            "random_game_strength",
+            "easy_game_strength",
+        ],
+        "opening_seed": config.test_opening_seed,
+        "opening_plies": list(config.test_opening_plies),
+        "inference_depth": 1,
+        "max_moves": config.selfplay_max_moves,
+        "num_workers": 4,
+        "ci_method": decision.to_dict()["ci_method"],
+        "checks": decision.checks,
+        "thresholds": decision.thresholds,
+        "metrics": decision.metrics,
+        "random": random_result,
+        "easy": easy_result,
+    }
+    acceptance_report_path.write_text(
+        json.dumps(acceptance_report), encoding="utf-8")
 
     validate_recovery_experiment_config(config)
 
-    unpromoted = tmp_path / "model_step_142000.pt"
+    # Every durable input that can unlock P5 is independently fail-closed.
+    registry_record = json.loads(registry.read_text(encoding="utf-8"))
+    registry_record["teacher_agreement_threshold"] = 0.51
+    registry.write_text(json.dumps(registry_record) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="recorded promoted policy-only"):
+        validate_recovery_experiment_config(config)
+    registry_record["teacher_agreement_threshold"] = 0.50
+    registry.write_text(json.dumps(registry_record) + "\n", encoding="utf-8")
+
+    acceptance_report["task_id"] = "wrong-task"
+    acceptance_report_path.write_text(
+        json.dumps(acceptance_report), encoding="utf-8")
+    with pytest.raises(ValueError, match="unmatched provenance: task_id"):
+        validate_recovery_experiment_config(config)
+    acceptance_report["task_id"] = expected_task_id
+    acceptance_report_path.write_text(
+        json.dumps(acceptance_report), encoding="utf-8")
+
+    accepted_alias.write_bytes(b"wrong accepted checkpoint")
+    with pytest.raises(ValueError, match="accepted policy alias"):
+        validate_recovery_experiment_config(config)
+    accepted_alias.write_bytes(promoted.read_bytes())
+
+    pending_task = checkpoint_acceptance.make_pending_acceptance_task(
+        str(promoted),
+        step=140000,
+        teacher_agreement=0.55,
+        opening_plies=config.test_opening_plies,
+        opening_seed=config.test_opening_seed,
+        inference_depth=1,
+        max_moves=config.selfplay_max_moves,
+        num_workers=min(config.cpu_workers, 4),
+        training_stage="policy_only",
+        checkpoint_sha256=promoted_sha256,
+        suite_fingerprint=suite_sha256,
+        teacher_correct_states=55,
+        teacher_total_states=100,
+    )
+    pending_path = checkpoint_acceptance.persist_pending_acceptance_task(
+        acceptance_dir, pending_task)
+    with pytest.raises(ValueError, match="still pending"):
+        validate_recovery_experiment_config(config)
+    pending_path.unlink()
+
+    policy_accepted = Path(config.policy_output_paths["accepted_path"])
+    config.policy_output_paths["accepted_path"] = str(promoted)
+    config.accepted_path = str(
+        promoted).replace(
+            config.policy_output_namespace,
+            config.enhanced_output_namespace,
+            1,
+        )
+    with pytest.raises(ValueError, match="alias must remain outside"):
+        validate_recovery_experiment_config(config)
+    config.policy_output_paths["accepted_path"] = str(policy_accepted)
+    config.accepted_path = str(policy_accepted).replace(
+        config.policy_output_namespace,
+        config.enhanced_output_namespace,
+        1,
+    )
+
+    policy_replay = config.policy_output_paths["replay_dir"]
+    config.replay_dir = policy_replay
+    with pytest.raises(ValueError, match="output isolation"):
+        validate_recovery_experiment_config(config)
+    config.replay_dir = policy_replay.replace(
+        config.policy_output_namespace, config.enhanced_output_namespace)
+
+    unpromoted = policy_checkpoint_dir / "model_step_142000.pt"
     unpromoted.write_bytes(b"unpromoted")
     config.resume = str(unpromoted)
     with pytest.raises(ValueError, match="recorded promoted policy-only"):
         validate_recovery_experiment_config(config)
+
+
+def test_enhanced_stage_rejects_incomplete_namespace_without_mutating_config(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "model_step_134000.pt"
+    baseline.write_bytes(b"immutable baseline")
+    config = _valid_recovery_config(baseline)
+    original_paths = {
+        field_name: getattr(config, field_name)
+        for field_name in trainer_module._STAGE_MUTABLE_PATH_FIELDS
+    }
+    config.ram_cache_file = str(tmp_path / "cache-without-policy-token.pt")
+
+    with pytest.raises(ValueError, match="ram_cache_file"):
+        activate_enhanced_stage(config)
+
+    assert config.policy_stage == "policy_only"
+    assert config.policy_output_paths == {}
+    assert config.policy_gate_promotion_registry is None
+    for field_name, original in original_paths.items():
+        if field_name == "ram_cache_file":
+            continue
+        assert getattr(config, field_name) == original
 
 
 @pytest.mark.parametrize(
@@ -413,3 +1476,5 @@ def test_policy_yaml_resolves_all_recovery_controls(
     assert config.snapshot_min_fresh_fraction == pytest.approx(0.50)
     assert config.test_promoted_only is True
     assert config.test_games == 100
+    assert config.policy_output_namespace == "policy_distillation_recovery_wd1e4"
+    assert config.enhanced_output_namespace == "policy_distillation_enhanced_p5_wd1e4"
