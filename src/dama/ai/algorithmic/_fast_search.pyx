@@ -14,7 +14,33 @@ passed as ints through the C call tree — zero per-node Python overhead.
 
 from libc.string cimport memcpy, memset
 from libc.math cimport fabs, sqrt
-from posix.time cimport clock_gettime, timespec, CLOCK_MONOTONIC
+cdef extern from *:
+    """
+    /* Monotonic wall clock for both toolchains.  POSIX clock_gettime lives in
+       <sys/time.h>/<time.h> and does not exist under MSVC, which is why the
+       Windows build previously could not compile this module at all and fell
+       back to the pure-Python search. QueryPerformanceCounter is the Windows
+       equivalent: monotonic, unaffected by system clock changes, and the same
+       resolution class as CLOCK_MONOTONIC. */
+    #if defined(_WIN32)
+    #include <windows.h>
+    static double dama_wall_now(void) {
+        LARGE_INTEGER frequency;
+        LARGE_INTEGER counter;
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&counter);
+        return (double)counter.QuadPart / (double)frequency.QuadPart;
+    }
+    #else
+    #include <time.h>
+    static double dama_wall_now(void) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    }
+    #endif
+    """
+    double dama_wall_now() noexcept nogil
 from libc.stdlib cimport malloc, free, calloc
 
 # ── Board cell values ──
@@ -1305,12 +1331,11 @@ cdef inline double _wall_now() noexcept nogil:
     libc clock() measures process CPU time, which advances slower than wall
     time when many self-play workers contend for cores, so searches would
     run far past their time budgets. CLOCK_MONOTONIC tracks real elapsed
-    time regardless of CPU contention. The .so targets Linux/WSL2 only, so
-    the POSIX API is used unconditionally.
+    time regardless of CPU contention. ``dama_wall_now`` picks the matching
+    monotonic clock per platform: CLOCK_MONOTONIC on Linux/WSL2 and
+    QueryPerformanceCounter on Windows.
     """
-    cdef timespec ts
-    clock_gettime(CLOCK_MONOTONIC, &ts)
-    return <double>ts.tv_sec + <double>ts.tv_nsec * 1e-9
+    return dama_wall_now()
 
 
 cdef bint _check_deadline(SearchState *ss) noexcept nogil:
