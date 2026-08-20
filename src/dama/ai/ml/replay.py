@@ -228,8 +228,20 @@ class ReplayBuffer:
         discovered by a later corpus scan.  Only the exact current file is
         targeted; older replay files and their caches are left untouched.
         """
+        # Close the writer directly instead of via _close_current(): the file
+        # is about to be deleted, so promoting its entries to the read cache is
+        # wasted work, and ReplayEntry.from_dict() on a half-written cycle can
+        # raise — which would leave the partial file on disk, the exact outcome
+        # this method exists to prevent.
         path = self._current_file
-        self._close_current()
+        if self._current_writer is not None:
+            try:
+                self._current_writer.close()
+            except OSError:
+                pass
+            finally:
+                self._current_writer = None
+        self._current_file = None
         if path is None:
             return None
         try:
