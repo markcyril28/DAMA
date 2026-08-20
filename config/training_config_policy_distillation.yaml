@@ -95,12 +95,14 @@ validation:
   frozen_suite_path: "data/validation_policy_distillation/frozen_hard_5000.jsonl"
   frozen_suite_size: 5000
   frozen_suite_seed: 20260819
-  auto_create_suite: true
+  auto_create_suite: false
   teacher_agreement_threshold: 0.50
 
 corpus_snapshots:
   enabled: true
-  root: "data/corpus_snapshots/policy_distillation"
+  # Corrected 1e-4 recovery namespace. The prior 136k-144k recovery outputs
+  # remain preserved under data/corpus_snapshots/policy_distillation.
+  root: "data/corpus_snapshots/policy_distillation_recovery_wd1e4"
   minimum_fresh_state_fraction: 0.50
 
 dataloader:
@@ -114,7 +116,7 @@ dataloader:
   ram_cache:
     enabled: true
     threshold_gb: 16.0
-    cache_file: "data/replay_cache/policy_distillation_cache.pt"
+    cache_file: "data/replay_cache/policy_distillation_recovery_wd1e4_cache.pt"
 
 # Game strength is evaluated only after held-out teacher-agreement promotion.
 # Each opponent receives 100 games, exactly 50 on each player side.
@@ -136,15 +138,24 @@ testing:
   inference_depth: 1
 
 paths:
-  checkpoint_dir: "models/checkpoints_policy_distillation"
-  latest_model: "models/latest_policy_distillation.pt"
-  promoted_model: "models/promoted_policy_distillation.pt"
-  accepted_model: "models/accepted_policy_distillation.pt"
-  replay_dir: "data/replay_policy_distillation"
-  log_dir: "logs/policy_distillation"
-  stats_file: "models/training_stats_policy_distillation.json"
-  promotion_registry: "logs/policy_distillation/promotions.jsonl"
-  acceptance_dir: "logs/policy_distillation/acceptance"
+  # P5 derives every mutable output path by replacing this exact policy token
+  # with the disjoint enhanced token. The frozen suite and exact accepted
+  # policy checkpoint remain read-only inputs.
+  policy_output_namespace: "policy_distillation_recovery_wd1e4"
+  enhanced_output_namespace: "policy_distillation_enhanced_p5_wd1e4"
+  # Corrected 1e-4 recovery writes are isolated from the preserved lineage and
+  # the prior 136k-144k namespace (policy_distillation_recovery).
+  # The approved step-134000 anchor remains in the original directory below.
+  checkpoint_dir: "models/checkpoints_policy_distillation_recovery_wd1e4"
+  runtime_model_root: "logs/policy_distillation_recovery_wd1e4/runtime_models"
+  latest_model: "models/latest_policy_distillation_recovery_wd1e4.pt"
+  promoted_model: "models/promoted_policy_distillation_recovery_wd1e4.pt"
+  accepted_model: "models/accepted_policy_distillation_recovery_wd1e4.pt"
+  replay_dir: "data/replay_policy_distillation_recovery_wd1e4"
+  log_dir: "logs/policy_distillation_recovery_wd1e4"
+  stats_file: "models/training_stats_policy_distillation_recovery_wd1e4.json"
+  promotion_registry: "logs/policy_distillation_recovery_wd1e4/promotions.jsonl"
+  acceptance_dir: "logs/policy_distillation_recovery_wd1e4/acceptance"
 
 statistics:
   enabled: true
@@ -155,7 +166,7 @@ statistics:
   score_dist_every: 500
   buffer_size: 50000
   flush_every: 500
-  output_dir: "logs/policy_distillation/stats"
+  output_dir: "logs/policy_distillation_recovery_wd1e4/stats"
 
 thermal_protection:
   enabled: true
@@ -220,7 +231,7 @@ profiles:
       ram_cache:
         enabled: true
         threshold_gb: 64.0
-        cache_file: "data/replay_cache/policy_distillation_server_cache.pt"
+        cache_file: "data/replay_cache/policy_distillation_recovery_wd1e4_server_cache.pt"
 
     thermal_protection:
       enabled: false
