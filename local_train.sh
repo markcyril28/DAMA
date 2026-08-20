@@ -61,6 +61,8 @@ SELECTED_CONFIG_PATH="$(readlink -f "$SELECTED_CONFIG_PATH")"
 POLICY_RECOVERY_CONFIG="$(readlink -f "${PROJECT_DIR}/config/training_config_policy_distillation.yaml")"
 POLICY_RECOVERY_BASELINE="${PROJECT_DIR}/models/checkpoints_policy_distillation/model_step_134000.pt"
 POLICY_RECOVERY_SHA256="7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
+POLICY_RECOVERY_LEGACY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation.json"
+POLICY_RECOVERY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation_recovery_wd1e4.json"
 IS_POLICY_RECOVERY=false
 
 case "$RESUME_LATEST" in
@@ -173,6 +175,12 @@ echo ""
 if [ "$IS_POLICY_RECOVERY" = true ]; then
     echo "Recovery baseline verified: ${POLICY_RECOVERY_BASELINE}"
     echo "Recovery SHA-256: ${POLICY_RECOVERY_SHA256}"
+    if [ "$ENHANCED_STAGE" = false ] &&
+       [ ! -e "$POLICY_RECOVERY_STATS" ] &&
+       [ -f "$POLICY_RECOVERY_LEGACY_STATS" ]; then
+        cp -- "$POLICY_RECOVERY_LEGACY_STATS" "$POLICY_RECOVERY_STATS"
+        echo "Recovery stats seeded without modifying the legacy stats file: ${POLICY_RECOVERY_STATS}"
+    fi
     echo ""
 fi
 
