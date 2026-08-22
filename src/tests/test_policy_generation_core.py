@@ -248,3 +248,31 @@ def test_compiled_generator_emits_opening_and_label_audit_metadata():
     assert entry["teacher_difficulty"] == "hard"
     assert entry["trajectory_source"] == "algorithm"
     assert entry["game_id"] == "compiled-game"
+
+
+def test_incomplete_cycle_quarantine_removes_partial_replay_file(tmp_path):
+    """An interrupted cycle must not leave an off-ratio file for corpus scans."""
+    pytest.importorskip("torch")
+    from dama.ai.ml.replay import ReplayBuffer
+    from dama.ai.ml.trainer import Trainer
+
+    buffer = ReplayBuffer(str(tmp_path / "replay"))
+    partial = buffer.start_new_file()
+    buffer.add_entry_dicts([{"state": {}, "legal_moves": [[0]]}])
+    assert partial.exists()
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.replay_buffer = buffer
+    trainer._last_selfplay_dicts = ["stale"]
+    trainer._last_selfplay_preprocessed = "stale"
+    trainer._cleanup_runtime_model_file = lambda _path: None
+    trainer._cleanup_runtime_models_dir = lambda: None
+
+    collected = ["stale"]
+    chunks = ["stale"]
+    trainer._discard_incomplete_selfplay_cycle(False, collected, chunks, None)
+
+    assert not partial.exists()
+    assert collected == [] and chunks == []
+    assert trainer._last_selfplay_dicts is None
+    assert trainer._last_selfplay_preprocessed is None
