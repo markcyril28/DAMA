@@ -598,16 +598,33 @@ class CorpusSnapshotManager:
         min_fresh_fraction: float = 0.50,
         enforce_policy_contract: bool = False,
         allowed_opening_plies: Sequence[int] = (),
+        max_retained_snapshots: int = 0,
+        grow_holdout: bool = True,
     ) -> None:
         if not 0.0 < validation_fraction < 1.0:
             raise ValueError("validation_fraction must be between 0 and 1")
         if not 0.0 <= min_fresh_fraction <= 1.0:
             raise ValueError("min_fresh_fraction must be between 0 and 1")
+        if int(max_retained_snapshots) < 0:
+            raise ValueError("max_retained_snapshots must be zero or positive")
         self.replay_dir = Path(replay_dir)
         self.snapshot_root = Path(snapshot_root)
         self.validation_fraction = float(validation_fraction)
         self.split_seed = int(split_seed)
         self.min_fresh_fraction = float(min_fresh_fraction)
+        # Snapshots store whole replay shards with storage="copy" (see
+        # _link_or_copy), so each admission costs another full corpus on disk
+        # and nothing ever reclaimed it.  At the steady-state corpus size a
+        # multi-day run exhausts the volume long before its time limit.  Keep
+        # the newest N admissions and drop older ones; 0 keeps every snapshot,
+        # which is the historical behaviour.
+        self.max_retained_snapshots = int(max_retained_snapshots)
+        # The hold-out is created once from whatever files existed then and,
+        # historically, never grew -- so an approved 15% share decayed to 1.7%
+        # as the rolling corpus expanded, and the manifest asserted a hold-out
+        # it did not deliver.  Growth is append-only: a file that has ever been
+        # held stays held, so no state ever moves from validation into train.
+        self.grow_holdout = bool(grow_holdout)
         self.enforce_policy_contract = bool(enforce_policy_contract)
         self.allowed_opening_plies = tuple(int(value) for value in allowed_opening_plies)
         self.external_validation_state_keys: Set[str] = set()
@@ -754,6 +771,117 @@ class CorpusSnapshotManager:
             "realized_file_fraction": (held / total) if total else 0.0,
         }
 
+    def _validation_rank_key(self, name: str) -> str:
+        """Deterministic hold-out ordering, identical to the creation-time rank."""
+        return hashlib.sha256(
+            f"{self.split_seed}:{name}".encode("utf-8")
+        ).hexdigest()
+
+    def _validation_growth_quota(
+        self, *, total_files: int, held: int, candidates: int,
+    ) -> int:
+        """How many unheld files the hold-out may absorb on this pass."""
+        if total_files <= 0 or candidates <= 0:
+            return 0
+        target = max(1, int(round(total_files * self.validation_fraction)))
+        need = target - held
+        if need <= 0:
+            return 0
+        # consider_snapshot fails closed when the split leaves no training
+        # file, so growth must always leave at least one behind.
+        return max(0, min(need, candidates - 1))
+
+    def _grow_validation(
+        self, manifest: dict, files: Sequence[Path],
+    ) -> Optional[Tuple[dict, Set[str]]]:
+        """Extend the frozen hold-out toward its configured share, append-only.
+
+        Held files are never dropped or reordered, so a canonical state can
+        only ever move from train into validation -- never the reverse -- and
+        the leakage-resistant whole-file property is preserved.  The manifest
+        write is the single commit point: the regenerated key set is written
+        under a new generation-scoped name first, so a crash before the commit
+        leaves the previous generation intact and independently verifiable.
+        """
+        if not self.grow_holdout:
+            return None
+        manifest_path = self.validation_manifest_path
+        validation_dir = manifest_path.parent
+        held_names = {str(record["name"]) for record in manifest.get("files", [])}
+        candidates = sorted(
+            (path for path in files if path.name not in held_names),
+            key=lambda path: self._validation_rank_key(path.name),
+        )
+        add_count = self._validation_growth_quota(
+            total_files=len(files),
+            held=len(held_names),
+            candidates=len(candidates),
+        )
+        if add_count <= 0:
+            return None
+
+        files_dir = validation_dir / "files"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        added_records = []
+        for source in candidates[:add_count]:
+            destination = files_dir / source.name
+            link_mode = _link_or_copy(source, destination)
+            added_records.append({
+                "name": source.name,
+                "path": str(Path("files") / source.name),
+                "sha256": replay_file_sha256(source),
+                "size_bytes": source.stat().st_size,
+                "storage": link_mode,
+            })
+
+        file_records = list(manifest.get("files", [])) + added_records
+        metrics, state_keys = analyze_replay_files(
+            [validation_dir / record["path"] for record in file_records]
+        )
+
+        history = list(manifest.get("growth_history", []))
+        generation = len(history) + 1
+        state_keys_file = f"canonical_state_keys_g{generation:03d}.txt.gz"
+        _write_state_keys(validation_dir / state_keys_file, state_keys)
+        history.append({
+            "generation": generation,
+            "grown_at": datetime.now(timezone.utc).isoformat(),
+            "added_files": [record["name"] for record in added_records],
+            "validation_file_count": len(file_records),
+            "source_file_count": len(files),
+        })
+
+        previous_keys_file = manifest.get("state_keys_file")
+        grown = dict(manifest)
+        grown["files"] = file_records
+        grown["state_keys_file"] = state_keys_file
+        grown["metrics"] = metrics
+        grown["growth_history"] = history
+        grown["split"] = dict(
+            manifest.get("split", {}),
+            **self._realized_split_share(
+                validation_files=len(file_records), total_files=len(files),
+            ),
+        )
+        _write_json_atomic(manifest_path, grown)
+
+        # Unreferenced once the manifest commit lands; snapshots point at the
+        # manifest, never at a key file directly.
+        if (isinstance(previous_keys_file, str)
+                and previous_keys_file != state_keys_file):
+            try:
+                (validation_dir / previous_keys_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        print(
+            f"Validation hold-out grew by {len(added_records)} file(s): "
+            f"{len(file_records)} of {len(files)} = "
+            f"{grown['split']['realized_file_fraction'] * 100.0:.2f}% realized "
+            f"(target {self.validation_fraction * 100.0:.2f}%)"
+        )
+        return grown, state_keys
+
     def _ensure_validation(self, files: Sequence[Path]) -> Tuple[dict, Set[str]]:
         manifest_path = self.validation_manifest_path
         if manifest_path.exists():
@@ -770,20 +898,23 @@ class CorpusSnapshotManager:
                     "Frozen validation manifest does not match the configured "
                     "whole-file split fraction and seed"
                 )
+            grown = self._grow_validation(manifest, files)
+            if grown is not None:
+                manifest, state_keys = grown
+                split = manifest.get("split", {})
             realized = self._realized_split_share(
                 validation_files=len(manifest.get("files", [])),
                 total_files=len(files),
             )
             manifest["split"] = dict(split, **realized)
-            # The frozen hold-out never grows, so print what it is actually
-            # worth against today's corpus rather than only the requested
-            # fraction the manifest records.
+            # Report what the hold-out is actually worth against today's
+            # corpus, not only the fraction the manifest requests.
             print(
-                f"Immutable validation split: "
+                f"Validation hold-out: "
                 f"{realized['validation_file_count']} of "
                 f"{realized['source_file_count']} replay file(s) = "
                 f"{realized['realized_file_fraction'] * 100.0:.2f}% realized "
-                f"(requested {self.validation_fraction * 100.0:.2f}%)"
+                f"(target {self.validation_fraction * 100.0:.2f}%)"
             )
             return manifest, state_keys
 
@@ -839,6 +970,50 @@ class CorpusSnapshotManager:
         }
         _write_json_atomic(manifest_path, manifest)
         return manifest, state_keys
+
+    def _snapshot_dirs(self) -> List[Tuple[int, Path]]:
+        """Return admitted snapshot directories as (version, path), oldest first."""
+        found: List[Tuple[int, Path]] = []
+        if not self.snapshot_root.exists():
+            return found
+        for path in self.snapshot_root.glob("snapshot_v*"):
+            if not path.is_dir():
+                continue
+            try:
+                found.append((int(path.name.removeprefix("snapshot_v")), path))
+            except ValueError:
+                continue
+        found.sort()
+        return found
+
+    def _prune_old_snapshots(self, keep_dir: Path) -> List[str]:
+        """Drop all but the newest ``max_retained_snapshots`` admissions.
+
+        Only ``current.json``/``CURRENT`` are ever read back, ``_next_version``
+        needs only the highest directory name, and the manifest chain links by
+        fingerprint rather than by path -- so older directories are audit
+        history, not live inputs.  Deleting is best-effort: a shard held open
+        by another process (common on drvfs) must never abort an admission,
+        and the next admission retries the same directory.
+        """
+        if self.max_retained_snapshots <= 0:
+            return []
+        snapshots = self._snapshot_dirs()
+        if len(snapshots) <= self.max_retained_snapshots:
+            return []
+        keep_resolved = keep_dir.resolve()
+        stale = snapshots[: len(snapshots) - self.max_retained_snapshots]
+        removed: List[str] = []
+        for _version, path in stale:
+            if path.resolve() == keep_resolved:
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                print(f"[warn] Could not prune corpus snapshot {path.name}: {exc}")
+                continue
+            removed.append(path.name)
+        return removed
 
     def _next_version(self) -> int:
         versions = []
@@ -1012,6 +1187,14 @@ class CorpusSnapshotManager:
             if staging.exists():
                 shutil.rmtree(staging)
             raise
+
+        # Reclaim disk only after the new snapshot is durable and current.
+        pruned = self._prune_old_snapshots(final_dir)
+        if pruned:
+            print(
+                f"  Corpus: pruned {len(pruned)} old snapshot(s) "
+                f"(keeping newest {self.max_retained_snapshots})"
+            )
 
         return SnapshotDecision(True, "admitted", final_dir / "manifest.json", metrics)
 
