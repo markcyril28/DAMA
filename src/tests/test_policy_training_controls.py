@@ -384,8 +384,8 @@ def test_checkpoint_load_rewinds_newer_sidecar_histories(
         step_times=[{"step": 12}, {"step": 15}],
         test_history=[{"step": 12}, {"step": 15}],
         teacher_agreement_history=[
-            {"step": 12, "teacher_agreement": 0.3},
-            {"step": 15, "teacher_agreement": 0.6},
+            {"step": 12, "top1_teacher_agreement": 0.3},
+            {"step": 15, "top1_teacher_agreement": 0.6},
         ],
         promotion_history=[{"step": 12}, {"step": 15}],
         acceptance_history=[{"step": 12}, {"step": 15}],
@@ -1294,7 +1294,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "opening_seed": config.test_opening_seed,
         "opening_plies": list(config.test_opening_plies),
         "opening_suite_id": "sha256:test-suite",
-        "opening_suite_size": 100,
+        "opening_suite_size": 50,
         "ml_inference_depth": 1,
     }
     easy_result = {
@@ -1313,7 +1313,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "opening_seed": config.test_opening_seed,
         "opening_plies": list(config.test_opening_plies),
         "opening_suite_id": "sha256:test-suite",
-        "opening_suite_size": 100,
+        "opening_suite_size": 50,
         "ml_inference_depth": 1,
     }
     decision = checkpoint_acceptance.evaluate_acceptance_gates(
