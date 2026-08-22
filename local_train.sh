@@ -162,6 +162,10 @@ if [ "$SET_PROCESS_TITLE" = true ]; then export PROCESS_TITLE; fi
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
+# Trainer stdout goes through the tee pipe below, so Python block-buffers it.
+# A hard kill (OOM, SIGHUP on terminal close) then discards the buffer and the
+# console log ends at the last shell echo with no trainer output at all.
+export PYTHONUNBUFFERED=1
 
 # Console logging
 LOG_DIR="${PROJECT_DIR}/logs/local/console"
