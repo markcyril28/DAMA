@@ -783,6 +783,10 @@ class CorpusSnapshotManager:
         """How many unheld files the hold-out may absorb on this pass."""
         if total_files <= 0 or candidates <= 0:
             return 0
+        # Target the share of *today's* corpus, which is itself capped by
+        # replay_max_files.  Sizing against an all-time file count instead
+        # would grow the hold-out without bound as shards rotate, eventually
+        # starving training; this settles at the configured share and stops.
         target = max(1, int(round(total_files * self.validation_fraction)))
         need = target - held
         if need <= 0:
