@@ -100,6 +100,9 @@ def test_snapshot_gate_accepts_exact_half_fresh_and_preserves_prior(tmp_path: Pa
         validation_fraction=0.25,
         split_seed=5,
         min_fresh_fraction=0.50,
+        # This case asserts the exact freshness arithmetic of the admission
+        # gate, so the hold-out is pinned; growth has its own coverage.
+        grow_holdout=False,
     )
     settings = {"difficulty": "hard"}
     noise = {"played_action_probability": 0.10, "label_is_teacher": True}
@@ -131,6 +134,219 @@ def test_snapshot_gate_accepts_exact_half_fresh_and_preserves_prior(tmp_path: Pa
     assert not rejected.admitted
     assert "below" in rejected.reason
     assert rejected.manifest_path == second.manifest_path
+
+
+def _admit_series(
+    manager: CorpusSnapshotManager,
+    replay_dir: Path,
+    cycles: int,
+    start_cycle: int = 0,
+) -> list:
+    """Admit ``cycles`` snapshots, feeding all-fresh states each time."""
+    settings = {"difficulty": "hard"}
+    noise = {"played_action_probability": 0.10, "label_is_teacher": True}
+    generation = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+    decisions = []
+    for cycle in range(start_cycle, start_cycle + cycles):
+        # The live pipeline rotates shards out via cleanup_old_files, so each
+        # cycle presents an all-fresh corpus and clears the freshness gate.
+        for stale in replay_dir.glob("replay_*.jsonl"):
+            stale.unlink()
+        for offset in range(4):
+            _write_replay(
+                replay_dir / f"replay_{cycle:02d}_{offset}.jsonl",
+                [_entry(1000 * (cycle + 1) + offset)],
+            )
+        decision = manager.consider_snapshot(settings, noise, generation)
+        assert decision.admitted, decision.reason
+        decisions.append(decision)
+    return decisions
+
+
+def test_snapshot_retention_prunes_oldest_and_keeps_current(tmp_path: Path) -> None:
+    """A positive retention cap must reclaim disk without breaking the active split.
+
+    Each admission stores a full copy of the replay corpus, so an uncapped
+    snapshot root grows without bound and fills the volume mid-run.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.50,
+        max_retained_snapshots=3,
+    )
+    decisions = _admit_series(manager, replay_dir, 5)
+
+    kept = sorted(path.name for path in snapshot_root.glob("snapshot_v*"))
+    assert kept == ["snapshot_v000003", "snapshot_v000004", "snapshot_v000005"]
+
+    # The newest admission stays intact and remains loadable.
+    current = decisions[-1]
+    assert current.manifest_path is not None
+    assert current.manifest_path.is_file()
+    train_entries, _validation_entries, _manifest = manager.load_split()
+    assert train_entries
+
+    # Version numbering must not restart after pruning.
+    assert manager._next_version() == 6
+    later = _admit_series(manager, replay_dir, 1, start_cycle=5)[0]
+    assert later.manifest_path is not None
+    assert later.manifest_path.parent.name == "snapshot_v000006"
+
+    # The frozen validation set is never a pruning candidate.
+    assert (snapshot_root / "validation" / "manifest.json").is_file()
+
+
+def test_snapshot_retention_disabled_by_default_keeps_every_snapshot(
+    tmp_path: Path,
+) -> None:
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.50,
+    )
+    assert manager.max_retained_snapshots == 0
+    _admit_series(manager, replay_dir, 4)
+    assert len(list(snapshot_root.glob("snapshot_v*"))) == 4
+
+
+def test_snapshot_retention_rejects_negative_cap(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        CorpusSnapshotManager(
+            str(tmp_path / "replay"),
+            str(tmp_path / "snapshots"),
+            max_retained_snapshots=-1,
+        )
+
+
+def _validation_manifest(snapshot_root: Path) -> dict:
+    return json.loads(
+        (snapshot_root / "validation" / "manifest.json").read_text(encoding="utf-8")
+    )
+
+
+def test_validation_holdout_grows_append_only_toward_configured_share(
+    tmp_path: Path,
+) -> None:
+    """Audit finding F3: a frozen hold-out decays far below its approved share.
+
+    The split is created from whatever files exist at creation time and, before
+    this behaviour, never grew -- so an approved 15% realized 1.7% against a
+    rolling corpus while the manifest still declared 0.15.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(2):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+    )
+    _admit_series(manager, replay_dir, 1)
+    created = _validation_manifest(snapshot_root)
+    assert len(created["files"]) == 1
+    held_at_creation = {record["name"] for record in created["files"]}
+
+    # Grow the corpus well beyond the creation-time size.
+    for index in range(18):
+        _write_replay(replay_dir / f"replay_grow_{index:02d}.jsonl", [_entry(500 + index)])
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    manifest, _keys = manager._ensure_validation(files)
+
+    split = manifest["split"]
+    assert split["fraction"] == 0.25
+    assert split["validation_file_count"] == round(len(files) * 0.25)
+    assert split["realized_file_fraction"] == pytest.approx(0.25, abs=0.03)
+
+    # Append-only: every originally held file is still held.
+    held_now = {record["name"] for record in manifest["files"]}
+    assert held_at_creation <= held_now
+    assert manifest["growth_history"][-1]["source_file_count"] == len(files)
+
+    # The regenerated key set must satisfy the integrity contract.
+    reloaded, _state_keys = manager._ensure_validation(files)
+    assert len(reloaded["files"]) == len(manifest["files"])
+
+
+def test_validation_growth_never_releases_a_held_file(tmp_path: Path) -> None:
+    """States may move train -> validation, never the reverse."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(2):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.30,
+        split_seed=11,
+        min_fresh_fraction=0.0,
+    )
+    _admit_series(manager, replay_dir, 1)
+    held = {record["name"] for record in _validation_manifest(snapshot_root)["files"]}
+
+    for round_index in range(4):
+        for index in range(5):
+            _write_replay(
+                replay_dir / f"replay_r{round_index}_{index}.jsonl",
+                [_entry(2000 + round_index * 100 + index)],
+            )
+        files = sorted(replay_dir.glob("replay_*.jsonl"))
+        manifest, _keys = manager._ensure_validation(files)
+        now = {record["name"] for record in manifest["files"]}
+        assert held <= now, "growth released a previously held validation file"
+        held = now
+        # A training file must always survive the split.
+        assert len(now) < len(files)
+
+
+def test_validation_holdout_growth_can_be_disabled(tmp_path: Path) -> None:
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(2):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+        grow_holdout=False,
+    )
+    _admit_series(manager, replay_dir, 1)
+    for index in range(18):
+        _write_replay(replay_dir / f"replay_grow_{index:02d}.jsonl", [_entry(500 + index)])
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    manifest, _keys = manager._ensure_validation(files)
+
+    assert len(manifest["files"]) == 1
+    assert "growth_history" not in manifest
+    # The realized share is still reported honestly.
+    assert manifest["split"]["realized_file_fraction"] == pytest.approx(1 / len(files))
 
 
 def test_snapshot_load_removes_validation_overlap(tmp_path: Path) -> None:
@@ -562,3 +778,58 @@ def test_legacy_replay_audit_fails_fast(monkeypatch):
     assert result["records"] == 1
     assert result["errors"] == {"missing_legal_moves": 1}
     assert consumed == [1]
+
+
+def test_partial_cycle_replay_file_is_rejected_by_per_file_split(
+    tmp_path: Path,
+) -> None:
+    """A killed cycle leaves an off-ratio file; it must not poison the corpus."""
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+
+    def _cycle(name: str, algorithm: int, model: int, base: int) -> None:
+        entries = []
+        for index in range(algorithm + model):
+            source = "algorithm" if index < algorithm else "current_model"
+            entries.append(_contract_entry(base + index, source, f"{name}-{index}"))
+        _write_replay(replay_dir / name, entries)
+
+    _cycle("replay_complete_0.jsonl", 7, 3, 0)
+    _cycle("replay_complete_1.jsonl", 7, 3, 100)
+    # Interrupted cycle: the model trajectories were still running when the
+    # process died, so the file holds 7/2 instead of 7/3.
+    _cycle("replay_partial.jsonl", 7, 2, 200)
+
+    partial = corpus.audit_policy_replay_file(
+        replay_dir / "replay_partial.jsonl", (2, 4, 6, 8))
+    assert partial["valid"] is False
+    assert partial["errors"] == {"unbalanced_policy_trajectory_split": 1}
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.50,
+        split_seed=3,
+        min_fresh_fraction=0.50,
+        enforce_policy_contract=True,
+        allowed_opening_plies=(2, 4, 6, 8),
+    )
+    eligible, rejected = manager.eligible_replay_files()
+    assert [path.name for path in eligible] == [
+        "replay_complete_0.jsonl", "replay_complete_1.jsonl",
+    ]
+    assert set(rejected) == {"replay_partial.jsonl"}
+
+    # The aggregate contract holds again once the partial file is excluded.
+    decision = manager.consider_snapshot(
+        {"difficulty": "hard"},
+        {"played_action_probability": 0.10},
+        {"algorithm_fraction": 0.70, "model_fraction": 0.30},
+    )
+    assert decision.admitted
+    assert decision.metrics["source_game_counts"] == {
+        "algorithm": 7, "current_model": 3,
+    }
