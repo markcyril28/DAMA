@@ -689,6 +689,14 @@ class TrainingConfig:
     snapshot_enabled: bool = False
     snapshot_root: str = 'data/corpus_snapshots'
     snapshot_min_fresh_fraction: float = 0.50
+    # 0 keeps every admitted snapshot (historical behaviour). Each admission
+    # copies the whole replay corpus, so an unbounded root fills the volume on
+    # a long run; a positive value keeps only that many newest snapshots.
+    snapshot_max_retained: int = 0
+    # Append-only growth of the whole-file validation hold-out so its realized
+    # share tracks validation_fraction as the rolling corpus expands. Held
+    # files are never released, so states only move train -> validation.
+    validation_grow_holdout: bool = True
 
     # Stability
     grad_clip_norm: Optional[float] = 1.0
@@ -1169,6 +1177,8 @@ class Trainer:
                 min_fresh_fraction=config.snapshot_min_fresh_fraction,
                 enforce_policy_contract=config.recovery_enforced,
                 allowed_opening_plies=config.selfplay_opening_plies,
+                max_retained_snapshots=config.snapshot_max_retained,
+                grow_holdout=config.validation_grow_holdout,
             )
         self._promotion_registry = PromotionRegistry(
             config.promotion_registry,
@@ -6453,6 +6463,10 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         snapshot_root=str(snapshot_cfg.get('root', 'data/corpus_snapshots')),
         snapshot_min_fresh_fraction=float(
             snapshot_cfg.get('minimum_fresh_state_fraction', 0.50)),
+        snapshot_max_retained=int(
+            snapshot_cfg.get('max_retained_snapshots', 0) or 0),
+        validation_grow_holdout=bool(
+            validation_cfg.get('grow_holdout', True)),
         # Testing settings
         test_vs_algo=testing_cfg.get('enabled', False),
         test_promoted_only=bool(testing_cfg.get('promoted_only', False)),
