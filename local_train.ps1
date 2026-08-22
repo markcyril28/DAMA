@@ -211,6 +211,12 @@ $LogDirectory = Join-Path $ProjectDirectory 'logs\local\console'
 [void] [System.IO.Directory]::CreateDirectory($LogDirectory)
 $LogTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $LogFile = Join-Path $LogDirectory "console_windows_$LogTimestamp.txt"
+# Start-Transcript records only what PowerShell itself writes. Everything the
+# trainer prints travels through "conda run --no-capture-output" as native
+# process output, so it never reached the transcript: a crashed run left the
+# log ending at "Starting native Windows training..." with no traceback. The
+# trainer's own stdout and stderr are teed to this second file instead.
+$TrainerLogFile = Join-Path $LogDirectory "console_windows_${LogTimestamp}_trainer.txt"
 
 $Mutex = New-Object System.Threading.Mutex($false, 'Local\DAMA_Local_Train_Windows')
 $MutexAcquired = $false
@@ -232,17 +238,42 @@ foreach ($Name in $EnvironmentNames) {
 function Invoke-CondaCommand {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]] $Arguments
+        [string[]] $Arguments,
+
+        [string] $TeeFile = ''
     )
 
     $SavedPreference = $ErrorActionPreference
+    $Writer = $null
     try {
         # Windows PowerShell can convert native stderr into PowerShell errors.
         # Let the native process exit code determine success instead.
         $ErrorActionPreference = 'Continue'
-        & $script:CondaExecutable @Arguments
-        $script:NativeExitCode = $LASTEXITCODE
+        if ([string]::IsNullOrWhiteSpace($TeeFile)) {
+            & $script:CondaExecutable @Arguments
+            $script:NativeExitCode = $LASTEXITCODE
+        } else {
+            # Tee-Object writes UTF-16 on Windows PowerShell 5.1, so an
+            # explicit UTF-8 writer is used instead. 2>&1 merges the trainer's
+            # stderr, which is where tracebacks appear, into the same stream.
+            $Writer = New-Object System.IO.StreamWriter(
+                $TeeFile, $true, (New-Object System.Text.UTF8Encoding($false)))
+            $Writer.AutoFlush = $true
+            & $script:CondaExecutable @Arguments 2>&1 | ForEach-Object {
+                $Line = if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                    $_.ToString()
+                } else {
+                    [string] $_
+                }
+                Write-Host $Line
+                $Writer.WriteLine($Line)
+            }
+            $script:NativeExitCode = $LASTEXITCODE
+        }
     } finally {
+        if ($null -ne $Writer) {
+            $Writer.Dispose()
+        }
         $ErrorActionPreference = $SavedPreference
     }
 }
@@ -265,6 +296,7 @@ try {
     Write-Host "Config:    $ConfigPath"
     Write-Host "Conda env: $CondaEnvironment"
     Write-Host "Log:       $LogFile"
+    Write-Host "Trainer:   $TrainerLogFile"
     if ($IsPolicyRecovery) {
         Write-Host "Recovery:  verified step-134000 baseline ($PolicyRecoveryBaselineSha256)"
     }
@@ -401,9 +433,10 @@ print("DAMA trainer import: OK")
 
     Write-Host ''
     Write-Host 'CUDA verified. Starting native Windows training...'
-    Invoke-CondaCommand -Arguments $TrainerArguments
+    Write-Host "Trainer output log: $TrainerLogFile"
+    Invoke-CondaCommand -Arguments $TrainerArguments -TeeFile $TrainerLogFile
     if ($NativeExitCode -ne 0) {
-        throw "DAMA training exited with code $NativeExitCode. See log: $LogFile"
+        throw "DAMA training exited with code $NativeExitCode. See log: $TrainerLogFile"
     }
 
     Write-Host 'DAMA training completed successfully.' -ForegroundColor Green
