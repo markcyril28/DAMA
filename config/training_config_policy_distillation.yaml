@@ -97,6 +97,11 @@ validation:
   frozen_suite_seed: 20260819
   auto_create_suite: false
   teacher_agreement_threshold: 0.50
+  # Audit finding F3: the hold-out was frozen when the namespace held 2 files
+  # and never grew, so the approved 15% decayed to 1.7% against a 60-file
+  # corpus. Growth is append-only -- a held file is never released, so states
+  # only ever move train -> validation. false restores the frozen behaviour.
+  grow_holdout: true
 
 corpus_snapshots:
   enabled: true
@@ -104,6 +109,11 @@ corpus_snapshots:
   # remain preserved under data/corpus_snapshots/policy_distillation.
   root: "data/corpus_snapshots/policy_distillation_recovery_wd1e4"
   minimum_fresh_state_fraction: 0.50
+  # Every admission copies the whole replay corpus (~0.9 GB at
+  # replay_max_files: 60) and nothing reclaimed it, so the 48h run exhausted
+  # the volume around the 24h mark. Keep a rolling audit window instead.
+  # 0 restores the old keep-everything behaviour.
+  max_retained_snapshots: 10
 
 dataloader:
   num_workers: 0
