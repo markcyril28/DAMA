@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import hmac
 import tempfile
+import traceback
 import warnings
 import numpy as np
 from collections import deque
@@ -108,6 +109,7 @@ from .teacher_targets import (
     soft_target_cross_entropy,
 )
 from .acceptance import ACCEPTANCE_GAMES_PER_OPPONENT
+from . import run_status
 from . import checkpoint_acceptance as checkpoint_acceptance_tasks
 
 # ``ModelVsAlgoTester`` plays each distinct opening once per player side, so a
@@ -588,6 +590,11 @@ _STAGE_MUTABLE_DIRECTORY_FIELDS = frozenset({
 
 _OUTPUT_NAMESPACE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
 
+# A recovery anchor is always an immutable numbered checkpoint.  Aliases
+# (latest/promoted/accepted) are republished in place, so pinning one would
+# make the "resume-only from a preserved checkpoint" rule unverifiable.
+_RECOVERY_ANCHOR_NAME_RE = re.compile(r'^model_step_\d+\.pt$')
+
 
 @dataclass
 class TrainingConfig:
@@ -697,6 +704,20 @@ class TrainingConfig:
     # share tracks validation_fraction as the rolling corpus expands. Held
     # files are never released, so states only move train -> validation.
     validation_grow_holdout: bool = True
+    # Generation of the whole-file hold-out artifact. Bumping it forces a fresh
+    # split under validation_v<N>/ and refuses to load the superseded one, so a
+    # contaminated hold-out is replaced rather than repaired in place.
+    validation_split_version: int = 1
+    # Approved external predecessor for a rebuilt corpus lineage, plus the
+    # fingerprints of snapshots that must never appear in it.
+    snapshot_lineage_base_manifest: Optional[str] = None
+    snapshot_lineage_base_fingerprint: Optional[str] = None
+    snapshot_lineage_excluded_fingerprints: tuple = ()
+    # Append-only all-time record of every shard/state served as training data.
+    # Off by default: enabling it writes a ledger directory into the snapshot
+    # root, and preserved historical namespaces must stay byte-immutable.
+    snapshot_trained_ledger_enabled: bool = False
+    snapshot_trained_ledger_seed_roots: tuple = ()
 
     # Stability
     grad_clip_norm: Optional[float] = 1.0
@@ -1179,6 +1200,15 @@ class Trainer:
                 allowed_opening_plies=config.selfplay_opening_plies,
                 max_retained_snapshots=config.snapshot_max_retained,
                 grow_holdout=config.validation_grow_holdout,
+                validation_split_version=config.validation_split_version,
+                lineage_base_manifest=config.snapshot_lineage_base_manifest,
+                lineage_base_fingerprint=(
+                    config.snapshot_lineage_base_fingerprint),
+                lineage_excluded_fingerprints=(
+                    config.snapshot_lineage_excluded_fingerprints),
+                trained_ledger_enabled=config.snapshot_trained_ledger_enabled,
+                trained_ledger_seed_roots=(
+                    config.snapshot_trained_ledger_seed_roots),
             )
         self._promotion_registry = PromotionRegistry(
             config.promotion_registry,
@@ -3378,9 +3408,43 @@ class Trainer:
         checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
         if checkpoint_path.exists():
             self._verify_existing_checkpoint_collision(checkpoint_path)
+            # Refusing to overwrite is correct; refusing to *measure* was not.
+            # This early return used to skip _evaluate_validation_loss() and
+            # _evaluate_teacher_promotion() as well, so resuming into a
+            # directory that already holds later checkpoints trained blind --
+            # 31 collisions across ~62,000 steps produced no validation loss and
+            # no teacher-agreement reading at all. Evaluate and record into the
+            # run's own stats; the checkpoint file, latest alias, and the
+            # append-only promotion registry are all left untouched, so nothing
+            # in models/ changes and no duplicate registry record is created.
+            # Measurement is strictly additive: a trainer that cannot measure
+            # (no validation split, no frozen suite, stats not yet wired) must
+            # still complete the collision path exactly as before rather than
+            # turn a benign collision into a crash.
+            collision_val_loss = None
+            collision_selection = None
+            try:
+                collision_val_loss = self._evaluate_validation_loss()
+                if collision_val_loss is not None:
+                    self._record_validation_stats(collision_val_loss)
+                collision_selection = self._evaluate_teacher_promotion(
+                    checkpoint_path)
+                self._save_stats()
+            except Exception as exc:  # never block on measurement
+                print(f"  [warn] Collision-path measurement skipped: {exc}")
+            _val_text = (
+                f", val_loss={collision_val_loss:.4f}"
+                if collision_val_loss is not None else ""
+            )
             print(
                 f"Verified existing checkpoint; it will remain unchanged: "
                 f"{checkpoint_path}"
+            )
+            print(
+                f"  Measured without writing (step {self.step}"
+                f"{_val_text}); promotion registry not modified"
+                if collision_selection is not None else
+                f"  Measured without writing (step {self.step}{_val_text})"
             )
             return str(checkpoint_path)
         latest_path = Path(self.config.latest_path)
@@ -5502,6 +5566,73 @@ class Trainer:
         return -(chosen_log_probs * w).sum() / total_weight
 
     def train(self) -> None:
+        """Run training and record exactly one durable terminal reason.
+
+        Audit Suggestion 5: two WSL logs and one Windows log simply stopped,
+        with no recorded reason and no way to recover one after the fact.  The
+        marker is opened before any training work and closed on every in-process
+        exit path; a run that is killed outright leaves it open, which the next
+        start reports rather than silently overwriting.
+        """
+        log_dir = self.config.log_dir
+        try:
+            unterminated = run_status.begin_run(
+                log_dir,
+                pid=os.getpid(),
+                context={
+                    'checkpoint_dir': str(self.config.checkpoint_dir),
+                    'training_stage': str(self.config.policy_stage),
+                    'resume': str(self.config.resume or ''),
+                },
+            )
+        except OSError as exc:
+            # Never let bookkeeping prevent training from starting.
+            print(f"Warning: could not open run status marker: {exc}")
+            unterminated = None
+        if unterminated is not None:
+            print("")
+            print("=" * 72)
+            print(run_status.describe_unterminated(unterminated))
+            print(f"  Preserved as: {unterminated.get('preserved_path')}")
+            print("=" * 72)
+            print("")
+            sys.stdout.flush()
+
+        reason = run_status.REASON_COMPLETED
+        detail = None
+        traceback_text = None
+        try:
+            self._run_training()
+        except KeyboardInterrupt:
+            reason = run_status.REASON_INTERRUPTED
+            raise
+        except BaseException as exc:
+            reason = run_status.REASON_EXCEPTION
+            detail = f"{type(exc).__name__}: {exc}"
+            traceback_text = traceback.format_exc()
+            raise
+        else:
+            if self._stopped:
+                reason = run_status.REASON_STOP_REQUESTED
+            elif (self.config.stop_time
+                    and datetime.now() >= self.config.stop_time):
+                reason = run_status.REASON_TIME_LIMIT
+        finally:
+            try:
+                run_status.record_terminal_reason(
+                    log_dir,
+                    reason,
+                    detail=detail,
+                    traceback_text=traceback_text,
+                    context={'step': int(self.step), 'epoch': int(self.epoch)},
+                )
+                print(f"Trainer terminal reason recorded: {reason}"
+                      + (f" ({detail})" if detail else ""))
+                sys.stdout.flush()
+            except (OSError, ValueError) as exc:
+                print(f"Warning: could not record terminal reason: {exc}")
+
+    def _run_training(self) -> None:
         """Run the full training loop."""
         print("\n" + "=" * 50)
         print("Filipino Dama - ML Training")
@@ -6361,6 +6492,8 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     thermal_cfg = yaml_config.get('thermal_protection', {})
     validation_cfg = yaml_config.get('validation', {})
     snapshot_cfg = yaml_config.get('corpus_snapshots', {})
+    _snapshot_lineage_cfg = snapshot_cfg.get('lineage') or {}
+    _snapshot_ledger_cfg = snapshot_cfg.get('trained_ledger') or {}
     teacher_policy_cfg = yaml_config.get('teacher_policy', {})
     recovery_cfg = yaml_config.get('recovery_experiment', {})
     generation_mix_cfg = selfplay_cfg.get('generation_mix', {})
@@ -6467,6 +6600,22 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
             snapshot_cfg.get('max_retained_snapshots', 0) or 0),
         validation_grow_holdout=bool(
             validation_cfg.get('grow_holdout', True)),
+        validation_split_version=int(
+            validation_cfg.get('split_version', 1)),
+        snapshot_lineage_base_manifest=(
+            str(_snapshot_lineage_cfg['base_manifest'])
+            if _snapshot_lineage_cfg.get('base_manifest') else None),
+        snapshot_lineage_base_fingerprint=(
+            str(_snapshot_lineage_cfg['base_fingerprint'])
+            if _snapshot_lineage_cfg.get('base_fingerprint') else None),
+        snapshot_lineage_excluded_fingerprints=tuple(
+            str(value) for value in
+            (_snapshot_lineage_cfg.get('excluded_fingerprints') or ())),
+        snapshot_trained_ledger_enabled=bool(
+            _snapshot_ledger_cfg.get('enabled', False)),
+        snapshot_trained_ledger_seed_roots=tuple(
+            str(value) for value in
+            (_snapshot_ledger_cfg.get('seed_from_roots') or ())),
         # Testing settings
         test_vs_algo=testing_cfg.get('enabled', False),
         test_promoted_only=bool(testing_cfg.get('promoted_only', False)),
@@ -6551,9 +6700,17 @@ def validate_recovery_experiment_config(
         raise ValueError("Recovery baseline path and SHA-256 are required")
 
     baseline = Path(config.recovery_baseline_path).resolve()
-    if baseline.name != 'model_step_134000.pt':
+    # The anchor used to be pinned by filename to model_step_134000.pt.  The
+    # approved 2026-08-24 continuation resumes the verified step-174000
+    # checkpoint in a new isolated namespace, so the filename pin would now
+    # reject the approved anchor.  Identity is still enforced -- and enforced
+    # by the stronger control: the anchor must be a preserved *numbered*
+    # checkpoint (never an alias such as latest/promoted/accepted, which move)
+    # and its SHA-256 must equal the configured pin, checked below.
+    if not _RECOVERY_ANCHOR_NAME_RE.match(baseline.name):
         raise ValueError(
-            "Recovery baseline must be the preserved model_step_134000.pt")
+            "Recovery baseline must be a preserved numbered checkpoint named "
+            f"model_step_<step>.pt; received {baseline.name}")
     if not baseline.is_file():
         raise FileNotFoundError(f"Recovery baseline checkpoint not found: {baseline}")
     resume = Path(config.resume).resolve() if config.resume else None
@@ -6967,6 +7124,86 @@ def validate_recovery_experiment_config(
                                     "enhanced stage acceptance report has "
                                     "unmatched teacher-agreement counts"
                                 )
+
+                            # Agreeing with the pending task is not enough: the
+                            # task's own counts were previously accepted
+                            # unchecked, so a 55/100 measurement -- a suite 50x
+                            # smaller than the approved one -- satisfied every
+                            # provenance comparison.  Require the declared suite
+                            # size exactly, and require the recorded agreement
+                            # to be the quotient of the recorded counts.
+                            expected_total_states = int(
+                                config.frozen_suite_size)
+                            correct_states = expected_counts['correct_states']
+                            total_states = expected_counts['total_states']
+                            if (
+                                not isinstance(correct_states, int)
+                                or not isinstance(total_states, int)
+                                or isinstance(correct_states, bool)
+                                or isinstance(total_states, bool)
+                            ):
+                                failures.append(
+                                    "enhanced stage acceptance provenance has no "
+                                    "held-out teacher-agreement counts"
+                                )
+                            elif total_states != expected_total_states:
+                                failures.append(
+                                    "enhanced stage acceptance provenance was "
+                                    f"measured on {total_states} held-out "
+                                    f"state(s), not the required "
+                                    f"{expected_total_states}"
+                                )
+                            elif not 0 <= correct_states <= total_states:
+                                failures.append(
+                                    "enhanced stage acceptance provenance has "
+                                    "impossible teacher-agreement counts"
+                                )
+                            elif (
+                                correct_states / total_states
+                                != float(gate_record['teacher_agreement'])
+                            ):
+                                failures.append(
+                                    "enhanced stage acceptance provenance "
+                                    "teacher agreement is not the quotient of "
+                                    "its recorded counts"
+                                )
+
+                            # Recompute the opening-suite identity instead of
+                            # trusting the field.  Comparing the two reports
+                            # against each other only proves they agree; a
+                            # hand-written pair sharing one invented id passed.
+                            try:
+                                from .model_vs_algo import (
+                                    opening_suite_identity,
+                                )
+                                expected_suite_id = opening_suite_identity(
+                                    expected_task['opening_seed'],
+                                    expected_task['opening_plies'],
+                                    _ACCEPTANCE_OPENING_SUITE_SIZE,
+                                )
+                            except (ImportError, TypeError, ValueError):
+                                expected_suite_id = None
+                                failures.append(
+                                    "enhanced stage acceptance opening suite "
+                                    "identity could not be recomputed"
+                                )
+                            if expected_suite_id is not None:
+                                observed_suite_ids = [
+                                    acceptance_report.get('opening_suite_id')
+                                ]
+                                for key in ('random', 'easy'):
+                                    record = acceptance_report.get(key)
+                                    observed_suite_ids.append(
+                                        record.get('opening_suite_id')
+                                        if isinstance(record, dict) else None
+                                    )
+                                if any(value != expected_suite_id
+                                       for value in observed_suite_ids):
+                                    failures.append(
+                                        "enhanced stage acceptance report was "
+                                        "not produced by the declared opening "
+                                        "suite"
+                                    )
 
                             metrics = acceptance_report.get('metrics')
                             try:
