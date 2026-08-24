@@ -1,6 +1,7 @@
 """Training loop for the move scorer model."""
 
 import os
+import signal
 import sys
 import json
 import time
@@ -10,6 +11,7 @@ import re
 import argparse
 import hashlib
 import hmac
+import shutil
 import tempfile
 import traceback
 import warnings
@@ -767,6 +769,12 @@ class TrainingConfig:
     replay_dir: str = 'data/replay'
     log_dir: str = 'logs'
     stats_file: str = 'models/training_stats.json'
+    # One-time continuity seed for a new namespace: copied to stats_file only
+    # when that file does not yet exist, so the source is never mutated.  The
+    # three launcher shells implement this themselves; the trainer implements
+    # it too, or a GUI-spawned or bare `python -m dama.ai.ml.trainer` run would
+    # silently start a continuation with no training history.
+    stats_seed_file: Optional[str] = None
     promotion_registry: str = 'logs/policy_distillation/promotions.jsonl'
     acceptance_dir: str = 'logs/policy_distillation/acceptance'
     # The gated enhanced stage derives a second, fully isolated mutable
@@ -1950,38 +1958,74 @@ class Trainer:
                 print(f"GradScaler: no saved state in checkpoint, using conservative "
                       f"scale={self.scaler.get_scale():.0f} (will auto-adjust)")
 
-        # Restore RNG state if available
+        # Restore RNG state if available.
+        #
+        # The checkpoint above is loaded with map_location=self.device, so every
+        # tensor in it -- the RNG states included, even though torch always
+        # saves those on the CPU -- arrives on the GPU. All three setters below
+        # require a CPU uint8 tensor and reject a CUDA one with
+        # "RNG state must be a torch.ByteTensor", so each state is moved back
+        # explicitly. The single-device branches always did this; the
+        # set_rng_state_all() branch did not, which made every CUDA resume of a
+        # checkpoint written after cuda_all was introduced abort during
+        # Trainer.__init__ -- including the recovery anchor this run resumes.
+        #
+        # Reproducibility of the RNG stream is a convenience, never a reason to
+        # lose a resume, so failures warn and training continues from a fresh
+        # stream -- matching how the scheduler and scaler restores above behave.
         if 'rng_state' in checkpoint:
             rng = checkpoint['rng_state']
-            if 'python' in rng:
-                random.setstate(rng['python'])
-            if 'numpy' in rng:
-                numpy_rng = rng['numpy']
-                np.random.set_state((
-                    numpy_rng['bit_generator'],
-                    np.asarray(numpy_rng['state'], dtype=np.uint32),
-                    int(numpy_rng['position']),
-                    int(numpy_rng['has_gauss']),
-                    float(numpy_rng['cached_gaussian']),
-                ))
-            if 'torch' in rng:
-                # Ensure RNG state is a ByteTensor
-                rng_state = rng['torch']
-                if not isinstance(rng_state, torch.ByteTensor):
-                    rng_state = rng_state.to(torch.uint8)
-                torch.set_rng_state(rng_state.cpu())
-            if 'cuda_all' in rng and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rng['cuda_all'])
-            elif 'cuda' in rng and torch.cuda.is_available():
-                cuda_rng = rng['cuda']
-                if not isinstance(cuda_rng, torch.ByteTensor):
-                    cuda_rng = cuda_rng.to(torch.uint8)
-                torch.cuda.set_rng_state(cuda_rng.cpu())
+            try:
+                self._restore_rng_state(rng)
+            except Exception as e:
+                print(f"Warning: Could not restore RNG state: {e}. "
+                      f"Continuing with a fresh random stream.")
 
         print(f"Resumed at step {self.step}, epoch {self.epoch}")
 
         if self._has_non_finite_tensors():
             self._reset_model_state("Loaded checkpoint contains NaN/Inf")
+
+    @staticmethod
+    def _as_cpu_byte_state(state) -> 'torch.Tensor':
+        """Return a saved RNG state as the CPU uint8 tensor the setters demand."""
+        return state.detach().to(device='cpu', dtype=torch.uint8)
+
+    def _restore_rng_state(self, rng: dict) -> None:
+        """Restore the python/numpy/torch/CUDA RNG streams from a checkpoint."""
+        if 'python' in rng:
+            random.setstate(rng['python'])
+        if 'numpy' in rng:
+            numpy_rng = rng['numpy']
+            np.random.set_state((
+                numpy_rng['bit_generator'],
+                np.asarray(numpy_rng['state'], dtype=np.uint32),
+                int(numpy_rng['position']),
+                int(numpy_rng['has_gauss']),
+                float(numpy_rng['cached_gaussian']),
+            ))
+        if 'torch' in rng:
+            torch.set_rng_state(self._as_cpu_byte_state(rng['torch']))
+        if not torch.cuda.is_available():
+            return
+        device_count = torch.cuda.device_count()
+        if 'cuda_all' in rng:
+            states = [self._as_cpu_byte_state(s) for s in rng['cuda_all']]
+            if len(states) == device_count:
+                torch.cuda.set_rng_state_all(states)
+                return
+            # Saved on a host with a different GPU count. set_rng_state_all()
+            # indexes devices positionally, so handing it the wrong-length list
+            # either targets a device that does not exist or silently leaves
+            # the trailing ones unseeded. Seed the overlap and say so.
+            print(f"Warning: checkpoint holds {len(states)} CUDA RNG state(s) "
+                  f"but this host has {device_count} device(s); seeding the "
+                  f"first {min(len(states), device_count)}.")
+            for index in range(min(len(states), device_count)):
+                torch.cuda.set_rng_state(states[index], index)
+            return
+        if 'cuda' in rng:
+            torch.cuda.set_rng_state(self._as_cpu_byte_state(rng['cuda']))
 
     @staticmethod
     def _checkpoint_file_sha256(path: Path) -> str:
@@ -2059,8 +2103,41 @@ class Trainer:
             "No verified checkpoint remains in the approved recovery lineage; "
             "fresh-weight reset is forbidden")
 
+    def _seed_stats_file(self) -> None:
+        """Copy ``paths.seed_stats_from`` into a not-yet-existing stats file.
+
+        A continuation namespace starts empty, so without this the progress
+        report and every "previous steps" figure restart from zero even though
+        the run resumes a real anchor.  The launcher shells each do this before
+        exec'ing the trainer; doing it here as well is what makes a GUI-spawned
+        or bare ``python -m dama.ai.ml.trainer`` run behave the same.  It is a
+        no-op when the launcher already ran, and it never touches the source.
+        """
+        seed = getattr(self.config, 'stats_seed_file', None)
+        if not seed or self.config.policy_stage != 'policy_only':
+            return
+        stats_path = Path(self.config.stats_file)
+        seed_path = Path(seed)
+        if stats_path.exists() or not seed_path.is_file():
+            return
+        if seed_path.resolve() == stats_path.resolve():
+            return
+        try:
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = stats_path.with_name(stats_path.name + '.seed.tmp')
+            shutil.copyfile(seed_path, temp_path)
+            os.replace(temp_path, stats_path)
+        except OSError as exc:
+            print(f"Could not seed training stats from {seed_path}: {exc}")
+            return
+        print(
+            "Recovery stats seeded without modifying the legacy stats file: "
+            f"{stats_path}"
+        )
+
     def _load_stats(self) -> None:
         """Load training stats from file if exists, and merge in any missing test history from log files."""
+        self._seed_stats_file()
         stats_path = Path(self.config.stats_file)
         if stats_path.exists():
             try:
@@ -5565,6 +5642,56 @@ class Trainer:
         total_weight = w.sum().clamp(min=1.0)
         return -(chosen_log_probs * w).sum() / total_weight
 
+    def _install_termination_handler(self, log_dir: str) -> None:
+        """Close the run marker on SIGTERM/SIGHUP instead of dying silently.
+
+        Python's default disposition for SIGTERM terminates the interpreter
+        without unwinding the stack, so the ``finally`` in train() never runs.
+        ``stop_training.sh`` -- the project's own stop path -- sends exactly
+        that signal, which left the marker in ``running``: the state reserved
+        for a process killed outright, with the OOM killer named as the prime
+        suspect. An ordinary operator stop therefore manufactured the precise
+        false diagnosis the marker exists to prevent. SIGHUP is covered too: a
+        closed terminal is the other way this run ends without a keystroke.
+
+        The reason is recorded from inside the handler rather than left to the
+        cooperative stop below, because a signal that lands mid-self-play would
+        otherwise wait minutes for the flag to be noticed -- longer than the
+        three seconds stop_training.sh allows before SIGKILL. Setting the flag
+        as well lets a run that is between epochs still shut down cleanly, and
+        the second write from ``finally`` records the same reason.
+        """
+        owner_pid = os.getpid()
+
+        def _handle(signum, _frame):
+            # Self-play workers are forked from this process and inherit both
+            # this handler and the process title stop_training.sh matches on.
+            # Only the trainer owns the marker; a worker must simply die the
+            # way it would have without a handler installed.
+            if os.getpid() != owner_pid:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+                return
+            self._stopped = True
+            try:
+                run_status.record_terminal_reason(
+                    log_dir,
+                    run_status.REASON_STOP_REQUESTED,
+                    detail=f"received {signal.Signals(signum).name}",
+                    context={'step': int(self.step), 'epoch': int(self.epoch)},
+                )
+            except (OSError, ValueError):
+                pass
+
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(_sig, _handle)
+            except (OSError, ValueError, AttributeError):
+                # Not the main thread (the GUI spawns the trainer as a
+                # process, but a future embedding might not), or a platform
+                # without this signal. Never block training on it.
+                pass
+
     def train(self) -> None:
         """Run training and record exactly one durable terminal reason.
 
@@ -5589,6 +5716,7 @@ class Trainer:
             # Never let bookkeeping prevent training from starting.
             print(f"Warning: could not open run status marker: {exc}")
             unterminated = None
+        self._install_termination_handler(log_dir)
         if unterminated is not None:
             print("")
             print("=" * 72)
@@ -5607,7 +5735,15 @@ class Trainer:
             reason = run_status.REASON_INTERRUPTED
             raise
         except BaseException as exc:
-            reason = run_status.REASON_EXCEPTION
+            # A stop signal reaches the forked self-play workers too -- they
+            # carry the same process title stop_training.sh matches on -- so an
+            # operator stop routinely surfaces here as a BrokenProcessPool from
+            # the pool dying first. Reporting that as "exception" would file an
+            # ordinary stop under the crash bucket, complete with a traceback
+            # that looks like a defect. The request is the reason; the raised
+            # error is still recorded as the detail.
+            reason = (run_status.REASON_STOP_REQUESTED if self._stopped
+                      else run_status.REASON_EXCEPTION)
             detail = f"{type(exc).__name__}: {exc}"
             traceback_text = traceback.format_exc()
             raise
@@ -6662,6 +6798,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         replay_dir=paths_cfg.get('replay_dir', 'data/replay'),
         log_dir=paths_cfg.get('log_dir', 'logs'),
         stats_file=paths_cfg.get('stats_file', 'models/training_stats.json'),
+        stats_seed_file=paths_cfg.get('seed_stats_from'),
         promotion_registry=paths_cfg.get(
             'promotion_registry', 'logs/policy_distillation/promotions.jsonl'),
         acceptance_dir=paths_cfg.get(
@@ -7399,6 +7536,29 @@ def activate_enhanced_stage(
     config.inference_depth = int(inference_depth)
 
 
+def _record_startup_failure(
+    config: 'TrainingConfig',
+    reason: str,
+    *,
+    detail: Optional[str] = None,
+    traceback_text: Optional[str] = None,
+) -> None:
+    """Record a terminal reason for a failure that predates Trainer.train()."""
+    try:
+        run_status.record_terminal_reason(
+            config.log_dir,
+            reason,
+            detail=detail,
+            traceback_text=traceback_text,
+            context={'phase': 'startup', 'resume': str(config.resume or '')},
+        )
+        print(f"Trainer terminal reason recorded: {reason}"
+              + (f" ({detail})" if detail else ""))
+        sys.stdout.flush()
+    except (OSError, ValueError) as exc:
+        print(f"Warning: could not record terminal reason: {exc}")
+
+
 def main():
     """Main entry point for command-line training."""
     proc_title = os.environ.get('PROCESS_TITLE')
@@ -7677,7 +7837,25 @@ def main():
         config,
         resume_latest_requested=bool(args.resume_latest),
     )
-    trainer = Trainer(config)
+    # Trainer.train() opens the run marker, so until here nothing records an
+    # exit. A failure while constructing the Trainer -- loading the resume
+    # checkpoint, opening the corpus, reaching the GPU -- therefore left no
+    # run_status.json at all, which reads exactly like a launch that never
+    # happened. That is the "it just stopped with no reason" case the marker
+    # exists to eliminate, so cover startup with the same declared reasons.
+    try:
+        trainer = Trainer(config)
+    except KeyboardInterrupt:
+        _record_startup_failure(config, run_status.REASON_INTERRUPTED)
+        raise
+    except BaseException as exc:
+        _record_startup_failure(
+            config,
+            run_status.REASON_EXCEPTION,
+            detail=f"{type(exc).__name__}: {exc}",
+            traceback_text=traceback.format_exc(),
+        )
+        raise
     trainer.train()
 
 
