@@ -6,19 +6,43 @@ import plot_training
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_BASELINE = "model_step_134000.pt"
+# The active anchor is the approved 2026-08-24 continuation: the best durable
+# checkpoint at 49.30% frozen-suite teacher agreement.
+ACTIVE_CONFIG = "config/training_config_policy_distillation_c174k.yaml"
+EXPECTED_BASELINE = "model_step_174000.pt"
 EXPECTED_SHA256 = (
-    "7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
+    "6230777F09927C0794FD97116AB1C6B54887BBE432187EE5961BD86507C908B3"
 )
 
 
-def test_policy_recovery_launchers_pin_path_and_hash():
+def test_active_recovery_config_pins_the_anchor_path_and_hash():
+    """The pin moved out of the launchers and into the config they select.
+
+    It used to be copied into local_train.sh, train_server.sh, and
+    local_train.ps1 as well as the config, so moving the anchor from step
+    134000 to step 174000 needed four edits with nothing detecting a miss.
+    """
+    import yaml
+
+    raw = yaml.safe_load(
+        (PROJECT_ROOT / ACTIVE_CONFIG).read_text(encoding="utf-8"))
+    recovery = raw["recovery_experiment"]
+    assert recovery["enabled"] is True
+    assert recovery["baseline_checkpoint"].endswith(EXPECTED_BASELINE)
+    assert recovery["baseline_sha256"].upper() == EXPECTED_SHA256
+    assert raw["resume"]["checkpoint_path"] == recovery["baseline_checkpoint"]
+
+
+def test_policy_recovery_launchers_read_the_pin_from_the_selected_config():
     powershell = (PROJECT_ROOT / "local_train.ps1").read_text(encoding="utf-8")
     shell = (PROJECT_ROOT / "local_train.sh").read_text(encoding="utf-8")
+    server = (PROJECT_ROOT / "train_server.sh").read_text(encoding="utf-8")
 
-    for launcher in (powershell, shell):
-        assert EXPECTED_BASELINE in launcher
-        assert EXPECTED_SHA256 in launcher
+    for launcher in (powershell, shell, server):
+        assert "recovery_experiment" in launcher
+        assert "baseline_sha256" in launcher
+        assert "baseline_checkpoint" in launcher
+        assert ACTIVE_CONFIG.replace("/", "\\") in launcher or ACTIVE_CONFIG in launcher
 
     assert "FreshStart is disabled" in powershell
     assert "--resume-latest is disabled" in shell
