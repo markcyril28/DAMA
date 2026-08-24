@@ -349,6 +349,311 @@ def test_validation_holdout_growth_can_be_disabled(tmp_path: Path) -> None:
     assert manifest["split"]["realized_file_fraction"] == pytest.approx(1 / len(files))
 
 
+def test_windows_written_relative_paths_still_resolve(tmp_path: Path) -> None:
+    """Finding F5: a backslash-separated pointer must not reset the lineage.
+
+    The native-Windows launcher wrote `..\\validation\\manifest.json` into
+    snapshot v11. On WSL that path does not resolve, current_manifest_path()
+    returns None, and consider_snapshot takes the no-previous-corpus branch --
+    skipping the >=50% freshness floor, which is how v12 was admitted.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir), str(snapshot_root),
+        validation_fraction=0.25, split_seed=5,
+        min_fresh_fraction=0.50, grow_holdout=False,
+    )
+    settings = {"difficulty": "hard"}
+    noise = {"played_action_probability": 0.10, "label_is_teacher": True}
+    generation = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+    first = manager.consider_snapshot(settings, noise, generation)
+    assert first.admitted
+
+    # Everything written must be POSIX-separated.
+    pointer = (snapshot_root / "CURRENT").read_text(encoding="utf-8").strip()
+    assert "\\" not in pointer
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    assert "\\" not in manifest["validation_manifest"]
+
+    # A pointer left behind by Windows must still resolve on this host.
+    (snapshot_root / "CURRENT").write_text(
+        pointer.replace("/", "\\") + "\n", encoding="utf-8")
+    assert manager.current_manifest_path() is not None, (
+        "backslash pointer did not resolve -- the lineage would silently reset")
+
+    # And the freshness gate must therefore still be enforced.
+    _write_replay(replay_dir / "replay_new.jsonl", [_entry(950)])
+    decision = manager.consider_snapshot(settings, noise, generation)
+    assert not decision.admitted
+    assert "below" in decision.reason
+
+
+def test_lost_current_pointer_fails_closed_instead_of_skipping_freshness_gate(
+    tmp_path: Path,
+) -> None:
+    """A vanished CURRENT pointer must not silently disable the freshness gate.
+
+    The gate reads ``current_path is not None``, so before this a lost pointer
+    made every candidate admissible and recorded a 100% fresh rate that is only
+    an artifact of an empty previous-key set -- which is how snapshot_v000012
+    entered the policy-distillation namespace ungated.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.50,
+        grow_holdout=False,
+    )
+    settings = {"difficulty": "hard"}
+    noise = {"played_action_probability": 0.10, "label_is_teacher": True}
+    generation = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+
+    first = manager.consider_snapshot(settings, noise, generation)
+    assert first.admitted
+
+    # Simulate the pointer loss observed in production.
+    (snapshot_root / "CURRENT").unlink()
+    (snapshot_root / "current.json").unlink()
+
+    _write_replay(replay_dir / "replay_new.jsonl", [_entry(900)])
+    with pytest.raises(RuntimeError, match="pointer is missing"):
+        manager.consider_snapshot(settings, noise, generation)
+
+    # Restoring the pointer restores normal gated behaviour.
+    (snapshot_root / "CURRENT").write_text(
+        "snapshot_v000001/manifest.json\n", encoding="utf-8")
+    decision = manager.consider_snapshot(settings, noise, generation)
+    assert not decision.admitted
+    assert "below" in decision.reason
+
+
+def test_first_ever_admission_still_allowed_without_a_pointer(
+    tmp_path: Path,
+) -> None:
+    """The fail-closed check must not break a genuinely empty namespace."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.50,
+        grow_holdout=False,
+    )
+    assert manager.current_manifest_path() is None
+    assert manager._snapshot_dirs() == []
+    decision = manager.consider_snapshot(
+        {"difficulty": "hard"},
+        {"played_action_probability": 0.10, "label_is_teacher": True},
+        {"algorithm_fraction": 0.70, "model_fraction": 0.30},
+    )
+    assert decision.admitted
+
+
+def test_growth_never_absorbs_a_shard_an_admitted_snapshot_trained_on(
+    tmp_path: Path,
+) -> None:
+    """A hold-out built from already-trained shards measures memorisation.
+
+    The 2026-08-22 growth absorbed 8 shards that were training files in the
+    active snapshot, leaving 87.93% of the hold-out already fit by the model.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(6):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.50,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+    )
+    _admit_series(manager, replay_dir, 1)
+    trained = manager._trained_shard_names()
+    assert trained, "the admitted snapshot must report its training shards"
+
+    # Offer fresh, never-trained shards alongside the trained ones.
+    for index in range(6):
+        _write_replay(
+            replay_dir / f"replay_fresh_{index}.jsonl", [_entry(400 + index)])
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    manifest, _keys = manager._ensure_validation(files)
+
+    added = {
+        name
+        for event in manifest.get("growth_history", [])
+        for name in event["added_files"]
+    }
+    assert added, "growth should still absorb the untrained shards"
+    assert not (added & trained), (
+        f"growth absorbed trained shards: {sorted(added & trained)}")
+
+
+def test_holdout_reports_how_much_of_it_is_still_in_the_corpus(
+    tmp_path: Path,
+) -> None:
+    """A hold-out whose shards rotated out must not advertise its target share."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+    )
+    _admit_series(manager, replay_dir, 1)
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    manifest, _keys = manager._ensure_validation(files)
+    held = {record["name"] for record in manifest["files"]}
+    assert held
+
+    # Rotate every held shard out of the replay window.
+    for path in list(replay_dir.glob("replay_*.jsonl")):
+        if path.name in held:
+            path.unlink()
+    for index in range(8):
+        _write_replay(replay_dir / f"replay_after_{index}.jsonl", [_entry(700 + index)])
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    manifest, _keys = manager._ensure_validation(files)
+    split = manifest["split"]
+
+    assert split["validation_files_in_corpus"] < split["validation_file_count"]
+    assert split["realized_in_corpus_fraction"] < split["realized_file_fraction"]
+    # Both ratios stay in range even when held shards outlive the window.
+    assert 0.0 <= split["realized_file_fraction"] <= 1.0
+    assert 0.0 <= split["realized_in_corpus_fraction"] <= 1.0
+
+
+def test_growth_resumes_after_the_holdout_rotates_out_of_the_window(
+    tmp_path: Path,
+) -> None:
+    """End-to-end wiring: _grow_validation must pass the *present* count.
+
+    Sized so the two accountings disagree absolutely: all-time accounting sees
+    the target already met and grows nothing, present accounting sees a
+    hold-out that covers none of the live corpus and reopens every slot.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(8):
+        _write_replay(replay_dir / f"replay_a{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+    )
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    manifest, _keys = manager._ensure_validation(files)
+    held = {record["name"] for record in manifest["files"]}
+    assert len(held) == 2, "target for 8 files at 25% is 2"
+
+    # Every held shard leaves the window; the corpus size is unchanged.
+    for name in held:
+        (replay_dir / name).unlink()
+    for index in range(len(held)):
+        _write_replay(replay_dir / f"replay_b{index}.jsonl", [_entry(900 + index)])
+
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    assert len(files) == 8
+    manifest, _keys = manager._ensure_validation(files)
+
+    history = manifest.get("growth_history", [])
+    assert history, (
+        "hold-out covers none of the live corpus but growth did not reopen -- "
+        "the quota is counting all-time held shards")
+    assert manifest["split"]["validation_files_in_corpus"] >= 1
+
+
+def test_growth_quota_measures_against_holdout_files_still_present(
+    tmp_path: Path,
+) -> None:
+    """The quota must count present hold-out shards, not all-time ones.
+
+    Counting all-time held shards lets a hold-out whose files have rotated out
+    of the replay window report its target share while covering none of the
+    live corpus -- F3 recurring at 15% magnitude instead of 1.7%.
+    """
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    # 20 files -> target 5. Nine shards were absorbed all-time, but only one
+    # still exists in the window, so eight slots must reopen.
+    assert manager._validation_growth_quota(
+        total_files=20, held=1, candidates=10, all_time_held=9) == 4
+    # With every held shard still present the quota is satisfied and closed.
+    assert manager._validation_growth_quota(
+        total_files=20, held=5, candidates=10, all_time_held=5) == 0
+    # The survivor guard still applies.
+    assert manager._validation_growth_quota(
+        total_files=20, held=0, candidates=1, all_time_held=0) == 0
+
+
+def test_holdout_growth_is_bounded_by_the_file_ceiling(tmp_path: Path) -> None:
+    """Present-held accounting must not grow the manifest once per rotation."""
+    from dama.ai.ml.corpus import HOLDOUT_FILE_CEILING
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_seed_{index}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+    )
+    _admit_series(manager, replay_dir, 1)
+
+    # Repeatedly rotate the whole window so the quota keeps reopening.
+    for cycle in range(12):
+        for path in list(replay_dir.glob("replay_*.jsonl")):
+            path.unlink()
+        for index in range(4):
+            _write_replay(
+                replay_dir / f"replay_c{cycle}_{index}.jsonl",
+                [_entry(5000 + cycle * 50 + index)],
+            )
+        files = sorted(replay_dir.glob("replay_*.jsonl"))
+        manifest, _keys = manager._ensure_validation(files)
+
+    target = max(1, round(4 * 0.25))
+    assert len(manifest["files"]) <= HOLDOUT_FILE_CEILING * target
+
+
 def test_snapshot_load_removes_validation_overlap(tmp_path: Path) -> None:
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir()
@@ -833,3 +1138,43 @@ def test_partial_cycle_replay_file_is_rejected_by_per_file_split(
     assert decision.metrics["source_game_counts"] == {
         "algorithm": 7, "current_model": 3,
     }
+
+
+def test_snapshot_load_accepts_windows_written_manifest_paths(tmp_path: Path) -> None:
+    """A manifest written by the native-Windows launcher must load on WSL.
+
+    ``str(Path("files") / name)`` emits the *host* separator, so a snapshot or
+    hold-out grown on native Windows records ``files\\replay_*.jsonl``.  Read
+    back on Linux that is a single filename containing a backslash: every stored
+    shard "fails integrity verification" while sitting untouched on disk.  Both
+    the training snapshot and the frozen validation manifest are rewritten here
+    because ``_grow_validation`` carries old records forward verbatim, so a
+    single Windows run leaves the two manifests permanently mixed.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=29,
+        min_fresh_fraction=0.50,
+    )
+    decision = manager.consider_snapshot({}, {}, {})
+
+    for manifest_path in (
+        decision.manifest_path,
+        manager.validation_manifest_path,
+    ):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["files"], manifest_path
+        for record in manifest["files"]:
+            record["path"] = record["path"].replace("/", "\\")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    train_entries, validation_entries, _ = manager.load_split(
+        decision.manifest_path)
+    assert train_entries
+    assert validation_entries
