@@ -1599,6 +1599,72 @@ def _enhanced_stage_acceptance_fixture(tmp_path: Path) -> dict:
     }
 
 
+def test_opening_suite_identity_reproduces_what_a_real_run_stamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run both paths: the gate's recomputation against the tester's own stamp.
+
+    The gate refuses any acceptance report whose ``opening_suite_id`` differs
+    from ``opening_suite_identity()``.  That protects nothing unless the value
+    a genuine ``ModelVsAlgoTester`` run writes is the same function of the
+    declared seed, plies, and suite size -- and no test exercised that: every
+    fixture compared the public helper against itself, so the equivalence was
+    asserted only by inspection.  Here ``run_tests`` builds and stamps its own
+    id through its own code path, with only game execution stubbed out.
+    """
+    from dama.ai.ml import model_vs_algo
+
+    def _fake_batch(batch):
+        (_model, _difficulty, opponent, ml_player_values,
+         _max_moves, openings, depth) = batch
+        return [
+            {
+                "result": "draw",
+                "ml_player": player_value,
+                "winner": None,
+                "num_moves": 12,
+                "ml_moves": 6,
+                "algo_moves": 6,
+                "game_time_ms": 1.0,
+                "opponent_type": opponent,
+                "opening_plies": opening[0],
+                "opening_seed": opening[1],
+                "ml_inference_depth": depth,
+            }
+            for player_value, opening in zip(ml_player_values, openings)
+        ]
+
+    class _UnavailablePool:
+        """Force the in-process sequential path so the stub is the one used."""
+
+        def __init__(self, *args, **kwargs):
+            raise OSError("no process pool in test")
+
+    monkeypatch.setattr(model_vs_algo, "_play_test_games_batch", _fake_batch)
+    monkeypatch.setattr(model_vs_algo, "ProcessPoolExecutor", _UnavailablePool)
+
+    stats_dir = tmp_path / "stats"
+    tester = model_vs_algo.ModelVsAlgoTester(
+        model_path=str(tmp_path / "model.pt"),
+        algo_difficulty="easy",
+        num_workers=1,
+        stats_dir=str(stats_dir),
+        opening_plies=(4, 6, 8),
+        opening_seed=20260824,
+    )
+    stats = tester.run_tests(num_games=4)
+
+    assert stats.opening_suite_size == 2
+    assert stats.opening_suite_id == opening_suite_identity(
+        20260824, (4, 6, 8), 2)
+    assert stats.opening_suite_id != opening_suite_identity(
+        20260824, (4, 6, 8), 50)
+
+    persisted = json.loads(
+        (stats_dir / "latest_test.json").read_text(encoding="utf-8"))
+    assert persisted["opening_suite_id"] == stats.opening_suite_id
+
+
 def test_acceptance_gate_recomputes_the_opening_suite_identity(
     tmp_path: Path,
 ) -> None:
@@ -1930,7 +1996,10 @@ def test_policy_yaml_resolves_all_recovery_controls(
     expected_algorithm_games: int,
 ) -> None:
     root = Path(__file__).resolve().parents[2]
-    path = root / "config" / "training_config_policy_distillation.yaml"
+    # Retired to config/superseded/ on 2026-08-24; still the audited
+    # record of what the wd1e4 run resolved.
+    path = (root / "config" / "superseded"
+            / "training_config_policy_distillation.yaml")
     config = config_from_yaml(load_config_from_yaml(str(path), profile))
 
     validate_recovery_experiment_config(config)
@@ -1944,3 +2013,161 @@ def test_policy_yaml_resolves_all_recovery_controls(
     assert config.test_games == 100
     assert config.policy_output_namespace == "policy_distillation_recovery_wd1e4"
     assert config.enhanced_output_namespace == "policy_distillation_enhanced_p5_wd1e4"
+
+
+def _rng_state_holder():
+    """A minimal Trainer stand-in for the RNG-restore paths."""
+    holder = object.__new__(Trainer)
+    holder.device = None
+    return holder
+
+
+def test_cuda_rng_states_reach_the_setters_as_cpu_byte_tensors(monkeypatch) -> None:
+    """The regression that aborted every CUDA resume during ``__init__``.
+
+    ``_load_checkpoint`` loads with ``map_location=self.device``, so a saved
+    RNG state -- which torch always writes on the CPU -- comes back on the GPU.
+    ``set_rng_state_all`` rejects that with "RNG state must be a
+    torch.ByteTensor", and the branch that called it was the one branch that
+    did not move its state back. Assert the contract at the setter boundary so
+    the check holds on a CPU-only runner too.
+    """
+    import torch
+
+    received: dict = {}
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda states: received.__setitem__("all", list(states)))
+    monkeypatch.setattr(torch, "set_rng_state", lambda state: received.__setitem__("torch", state))
+
+    # float64 stands in for "not what the setter accepts" without needing a GPU.
+    saved = torch.arange(16, dtype=torch.float64)
+    _rng_state_holder()._restore_rng_state({
+        "torch": torch.arange(8, dtype=torch.float64),
+        "cuda_all": [saved],
+    })
+
+    assert received["torch"].dtype is torch.uint8
+    assert received["torch"].device.type == "cpu"
+    (cuda_state,) = received["all"]
+    assert cuda_state.dtype is torch.uint8
+    assert cuda_state.device.type == "cpu"
+    # The state itself must survive the conversion unchanged.
+    assert torch.equal(cuda_state, saved.to(torch.uint8))
+
+
+def test_as_cpu_byte_state_moves_off_the_device_it_was_mapped_onto() -> None:
+    """Pin the device move itself, which a CPU-only runner cannot observe."""
+    import torch
+
+    calls: list = []
+
+    class _Recorder:
+        def detach(self):
+            return self
+
+        def to(self, **kwargs):
+            calls.append(kwargs)
+            return torch.zeros(4, dtype=torch.uint8)
+
+    Trainer._as_cpu_byte_state(_Recorder())
+    assert calls == [{"device": "cpu", "dtype": torch.uint8}]
+
+
+def test_rng_restore_seeds_the_overlap_when_the_gpu_count_differs(monkeypatch) -> None:
+    """``set_rng_state_all`` indexes devices positionally.
+
+    A checkpoint carrying more states than this host has devices would target a
+    device that does not exist; fewer would silently leave the trailing ones
+    unseeded. Seed the overlap per device instead.
+    """
+    import torch
+
+    seeded: list = []
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", lambda states: seeded.append("all"))
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state",
+        lambda state, index=None: seeded.append((index, state.dtype, state.device.type)))
+
+    _rng_state_holder()._restore_rng_state({
+        "cuda_all": [
+            torch.zeros(16, dtype=torch.uint8),
+            torch.ones(16, dtype=torch.uint8),
+        ],
+    })
+
+    assert seeded == [(0, torch.uint8, "cpu")]
+
+
+def test_a_bad_rng_state_warns_instead_of_losing_the_resume(
+    tmp_path: Path, capsys
+) -> None:
+    """Reproducibility is never worth aborting a resume for."""
+    import torch
+
+    checkpoint = tmp_path / "model_step_5.pt"
+    torch.save({
+        "model_state_dict": {},
+        "optimizer_state_dict": {},
+        "step": 5,
+        "epoch": 1,
+        "rng_state": {"python": "not-a-valid-python-rng-state"},
+    }, checkpoint)
+
+    class _Model:
+        def load_state_dict(self, *_args, **_kwargs):
+            return [], []
+
+    class _Optimizer:
+        param_groups = [{"lr": 1e-3}]
+
+        def load_state_dict(self, _state):
+            return None
+
+    holder = object.__new__(Trainer)
+    holder.device = torch.device("cpu")
+    holder.config = TrainingConfig(learning_rate=1e-3)
+    holder.model = _Model()
+    holder.optimizer = _Optimizer()
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats = TrainingStats()
+    holder.step = 0
+    holder.epoch = 0
+    holder.best_loss = float("inf")
+    holder._has_non_finite_tensors = lambda: False
+
+    Trainer._load_checkpoint(holder, str(checkpoint))
+
+    assert holder.step == 5
+    assert "Could not restore RNG state" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="requires CUDA")
+def test_cuda_resume_restores_rng_from_a_gpu_mapped_checkpoint(tmp_path: Path) -> None:
+    """End-to-end on real hardware: save on CUDA, reload mapped to CUDA."""
+    import torch
+
+    checkpoint = tmp_path / "model_step_7.pt"
+    torch.save({
+        "rng_state": {
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state(),
+            "cuda_all": torch.cuda.get_rng_state_all(),
+        },
+    }, checkpoint)
+
+    saved = torch.load(checkpoint, map_location="cuda", weights_only=True)
+    assert saved["rng_state"]["cuda_all"][0].device.type == "cuda"
+
+    _rng_state_holder()._restore_rng_state(saved["rng_state"])
+
+    assert torch.equal(
+        torch.cuda.get_rng_state(), saved["rng_state"]["cuda_all"][0].cpu())
