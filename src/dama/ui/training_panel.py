@@ -255,14 +255,31 @@ def _load_training_preset_metadata(config_path: Optional[str]) -> dict:
     }
 
 
+# Policy-distillation presets in preference order, most current first. The
+# 2026-08-24 continuation moved the approved anchor to step 174000 in its own
+# namespace; the superseded preset stays selectable, but must not be the one
+# the GUI offers by default.
+_PREFERRED_TRAINING_PRESETS = (
+    'training_config_policy_distillation_c174k.yaml',
+    'training_config_policy_distillation.yaml',
+)
+
+
+def _training_preset_rank(name: str) -> int:
+    try:
+        return _PREFERRED_TRAINING_PRESETS.index(name)
+    except ValueError:
+        return len(_PREFERRED_TRAINING_PRESETS)
+
+
 def _training_preset_paths() -> list[Path]:
     """Return available YAML training presets in stable display order."""
     config_dir = Path('config')
     if not config_dir.exists():
         return []
     paths = list(config_dir.glob('training_config*.yaml'))
-    policy = config_dir / 'training_config_policy_distillation.yaml'
-    return sorted(paths, key=lambda path: (path != policy, path.name))
+    return sorted(
+        paths, key=lambda path: (_training_preset_rank(path.name), path.name))
 
 
 def _training_preset_label(path: Path) -> str:
@@ -1650,13 +1667,24 @@ class TrainingPanel(QWidget):
         self.training_config_combo.addItem(CUSTOM_TRAINING_LABEL, None)
 
         preferred_index = 0
+        preferred_rank = len(_PREFERRED_TRAINING_PRESETS)
         for path in _training_preset_paths():
             metadata = _load_training_preset_metadata(str(path))
             self.training_config_combo.addItem(_training_preset_label(path), str(path))
+            rank = _training_preset_rank(path.name)
+            if rank >= preferred_rank:
+                continue
+            # The current continuation preset resumes an anchor that lives in
+            # another namespace, so its own checkpoint directory is empty until
+            # the first run; requiring a checkpoint there would silently fall
+            # back to the superseded preset. Accept either its own checkpoints
+            # or a resolvable resume anchor.
             checkpoint_dir = Path(metadata['checkpoint_dir'])
-            if (path.name == 'training_config_policy_distillation.yaml'
-                    and any(checkpoint_dir.glob('model_step_*.pt'))):
+            anchor = metadata.get('recovery_baseline') or ''
+            if any(checkpoint_dir.glob('model_step_*.pt')) or (
+                    anchor and Path(anchor).is_file()):
                 preferred_index = self.training_config_combo.count() - 1
+                preferred_rank = rank
 
         self.training_config_combo.setCurrentIndex(preferred_index)
         self.training_config_combo.blockSignals(False)
