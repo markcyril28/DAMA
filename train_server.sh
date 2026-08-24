@@ -22,7 +22,8 @@ set -euo pipefail
 # Config file to use (comment/uncomment to switch)
 # Note: These are relative to PROJECT_DIR, resolved after SCRIPT_DIR is set
 #_CONFIG_FILE="config/training_config_server_retrain.yaml"
-_CONFIG_FILE="config/training_config_policy_distillation.yaml"
+# _CONFIG_FILE="config/training_config_policy_distillation.yaml"   # superseded: pinned to step 134000
+_CONFIG_FILE="config/training_config_policy_distillation_c174k.yaml"
 # _CONFIG_FILE="config/training_config_server.yaml"
 # _CONFIG_FILE="config/training_config.yaml"
 
@@ -61,13 +62,46 @@ CONFIG_FILE="${PROJECT_DIR}/${_CONFIG_FILE}"
 [ -f "$CONFIG_FILE" ] || { echo "ERROR: Config file not found: $CONFIG_FILE"; exit 1; }
 CONFIG_FILE="$(readlink -f "$CONFIG_FILE")"
 
-# The approved recovery has one immutable anchor and no fresh/latest arm.
-POLICY_RECOVERY_CONFIG="$(readlink -f "${PROJECT_DIR}/config/training_config_policy_distillation.yaml")"
-POLICY_RECOVERY_BASELINE="${PROJECT_DIR}/models/checkpoints_policy_distillation/model_step_134000.pt"
-POLICY_RECOVERY_SHA256="7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
-POLICY_RECOVERY_LEGACY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation.json"
-POLICY_RECOVERY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation_recovery_wd1e4.json"
-if [ "$CONFIG_FILE" = "$POLICY_RECOVERY_CONFIG" ]; then
+# The approved recovery has one immutable anchor and no fresh/latest arm. The
+# anchor is read from the selected config rather than hardcoded here: the
+# 2026-08-24 continuation moved it from step 134000 to step 174000, and a
+# second hardcoded copy is just a second thing to forget.
+_yaml_scalar() {
+    # _yaml_scalar <file> <top-level-section> <key>
+    awk -v section="$2" -v key="$3" '
+        /^[^[:space:]#]/ { in_section = ($0 ~ "^"section":[[:space:]]*$"); next }
+        in_section && $0 ~ "^[[:space:]]+"key":[[:space:]]*" {
+            line = $0
+            sub("^[[:space:]]+"key":[[:space:]]*", "", line)
+            sub(/[[:space:]]*#.*$/, "", line)
+            gsub(/^"|"$|^'"'"'|'"'"'$/, "", line)
+            print line
+            exit
+        }
+    ' "$1"
+}
+_abs_project_path() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PROJECT_DIR" "$1" ;; esac; }
+
+IS_POLICY_RECOVERY=false
+POLICY_RECOVERY_BASELINE=""
+POLICY_RECOVERY_SHA256=""
+POLICY_RECOVERY_LEGACY_STATS=""
+POLICY_RECOVERY_STATS=""
+if [ "$(_yaml_scalar "$CONFIG_FILE" recovery_experiment enabled)" = true ]; then
+    IS_POLICY_RECOVERY=true
+    _baseline_rel="$(_yaml_scalar "$CONFIG_FILE" recovery_experiment baseline_checkpoint)"
+    POLICY_RECOVERY_SHA256="$(_yaml_scalar "$CONFIG_FILE" recovery_experiment baseline_sha256 | tr 'a-f' 'A-F')"
+    if [ -z "$_baseline_rel" ] || [ -z "$POLICY_RECOVERY_SHA256" ]; then
+        echo "ERROR: recovery_experiment needs baseline_checkpoint and baseline_sha256 in $CONFIG_FILE" >&2
+        exit 1
+    fi
+    POLICY_RECOVERY_BASELINE="$(_abs_project_path "$_baseline_rel")"
+    _stats_rel="$(_yaml_scalar "$CONFIG_FILE" paths stats_file)"
+    _seed_stats_rel="$(_yaml_scalar "$CONFIG_FILE" paths seed_stats_from)"
+    [ -n "$_stats_rel" ] && POLICY_RECOVERY_STATS="$(_abs_project_path "$_stats_rel")"
+    [ -n "$_seed_stats_rel" ] && POLICY_RECOVERY_LEGACY_STATS="$(_abs_project_path "$_seed_stats_rel")"
+fi
+if [ "$IS_POLICY_RECOVERY" = true ]; then
     if [ "$RESUME_LATEST" = true ]; then
         echo "ERROR: --resume-latest is disabled for policy recovery." >&2
         exit 1
@@ -174,6 +208,11 @@ fi
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
+# Trainer stdout goes through the tee pipe below, so Python block-buffers it.
+# A hard kill (OOM, SIGHUP on terminal close) then discards the buffer and the
+# console log ends at the last shell echo with no trainer output at all --
+# which is exactly how two server-side runs ended with no terminal reason.
+export PYTHONUNBUFFERED=1
 
 # Increase file descriptor limit (best-effort, may fail on some systems)
 ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
@@ -193,9 +232,11 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "=== Dama - ML Training ==="
 echo ""
-if [ "$CONFIG_FILE" = "$POLICY_RECOVERY_CONFIG" ] &&
+if [ "$IS_POLICY_RECOVERY" = true ] &&
    [ "$ENHANCED_STAGE" = false ] &&
+   [ -n "$POLICY_RECOVERY_STATS" ] &&
    [ ! -e "$POLICY_RECOVERY_STATS" ] &&
+   [ -n "$POLICY_RECOVERY_LEGACY_STATS" ] &&
    [ -f "$POLICY_RECOVERY_LEGACY_STATS" ]; then
     cp -- "$POLICY_RECOVERY_LEGACY_STATS" "$POLICY_RECOVERY_STATS"
     echo "Recovery stats seeded without modifying the legacy stats file: ${POLICY_RECOVERY_STATS}"
