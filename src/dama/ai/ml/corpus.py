@@ -32,6 +32,42 @@ from .replay import ReplayEntry
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
+# Upper bound on hold-out shards as a multiple of the configured target.
+# The hold-out never releases a shard, so a quota measured against the
+# still-present count would otherwise grow it once per corpus rotation.
+HOLDOUT_FILE_CEILING = 3
+
+# The hold-out artifact is versioned independently of the snapshot schema so a
+# contaminated split can be *replaced* rather than repaired.  Version 1 keeps
+# the historical ``validation/`` directory; every later version gets its own
+# ``validation_v<N>/`` directory, so the superseded split survives untouched as
+# evidence and can never be silently reused by a rebuilt lineage.
+VALIDATION_SPLIT_VERSION_DEFAULT = 1
+
+# Append-only record of every replay shard and canonical state this namespace
+# has ever served as *training* data.  Snapshot retention prunes old snapshot
+# directories, so manifests alone are only a lower bound on the all-time
+# trained set; the ledger is what makes "never hold out something the model has
+# already fit" checkable across pruning, renaming, and process restarts.
+TRAINED_LEDGER_SCHEMA_VERSION = 1
+
+
+def _posix_relpath(target: Path, start: Path) -> str:
+    """Store relative paths with POSIX separators regardless of host.
+
+    ``os.path.relpath``/``str(Path(...))`` emit the *host* separator, so a
+    snapshot written by the native-Windows launcher records
+    ``..\\validation\\manifest.json``.  Read back on WSL that path does not
+    resolve, ``current_manifest_path()`` returns ``None``, and
+    ``consider_snapshot`` takes the no-previous-corpus branch -- which is how
+    snapshot_v000012 was admitted with the >=50% freshness floor skipped.
+    """
+    return Path(os.path.relpath(target, start)).as_posix()
+
+
+def _read_relpath(value: str) -> str:
+    """Accept either separator when reading a stored relative path."""
+    return str(value).replace("\\", "/")
 POLICY_REPLAY_CONTRACT_VERSION = 1
 CANONICAL_RULES_ID = "filipino-dama-default-v1"
 
@@ -570,6 +606,64 @@ def _read_state_keys(path: Path) -> Set[str]:
         return {line.strip() for line in handle if line.strip()}
 
 
+def _iter_state_keys(path: Path) -> Iterator[str]:
+    """Stream a sorted key file without materialising the whole set."""
+    with gzip.open(path, "rt", encoding="ascii") as handle:
+        for line in handle:
+            key = line.strip()
+            if key:
+                yield key
+
+
+def _state_key_fingerprint(key: str) -> int:
+    """64-bit membership fingerprint of a canonical state key.
+
+    The all-time trained ledger reaches millions of keys, and holding them as
+    64-character strings costs roughly 600 MB resident on a box with 24 GB
+    total -- meaningful next to a trainer whose suspected silent deaths are
+    OOM kills.  The keys are already SHA-256 digests, so their leading 64 bits
+    are uniformly distributed: at ~4M keys the chance of any collision is about
+    8e-7, and a collision can only *drop* one hold-out entry that was not in
+    fact trained on.  That direction is conservative -- it can never admit a
+    contaminated state into validation, only discard a clean one.
+    """
+    return int(key[:16], 16)
+
+
+def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
+    """Union ``new_keys`` into a sorted key file, streaming; return added count.
+
+    Reading the existing file into a set to take the union would reintroduce
+    the whole-set memory cost this representation exists to avoid, so the two
+    sorted streams are merged directly into a replacement file.
+    """
+    additions = sorted(set(new_keys))
+    if not additions:
+        return 0
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    added = 0
+    existing = _iter_state_keys(path) if path.is_file() else iter(())
+    pending = next(existing, None)
+    with gzip.open(temporary, "wt", encoding="ascii", newline="\n") as handle:
+        index = 0
+        while pending is not None or index < len(additions):
+            if pending is not None and (
+                index >= len(additions) or pending <= additions[index]
+            ):
+                handle.write(pending)
+                handle.write("\n")
+                if index < len(additions) and pending == additions[index]:
+                    index += 1
+                pending = next(existing, None)
+            else:
+                handle.write(additions[index])
+                handle.write("\n")
+                added += 1
+                index += 1
+    os.replace(temporary, path)
+    return added
+
+
 def _link_or_copy(source: Path, destination: Path) -> str:
     # Snapshot shards must be independent immutable files.  Hardlinks make a
     # later replay append/truncate mutate an already-admitted snapshot in
@@ -600,6 +694,12 @@ class CorpusSnapshotManager:
         allowed_opening_plies: Sequence[int] = (),
         max_retained_snapshots: int = 0,
         grow_holdout: bool = True,
+        validation_split_version: int = VALIDATION_SPLIT_VERSION_DEFAULT,
+        lineage_base_manifest: Optional[str] = None,
+        lineage_base_fingerprint: Optional[str] = None,
+        lineage_excluded_fingerprints: Sequence[str] = (),
+        trained_ledger_enabled: bool = False,
+        trained_ledger_seed_roots: Sequence[str] = (),
     ) -> None:
         if not 0.0 < validation_fraction < 1.0:
             raise ValueError("validation_fraction must be between 0 and 1")
@@ -607,6 +707,13 @@ class CorpusSnapshotManager:
             raise ValueError("min_fresh_fraction must be between 0 and 1")
         if int(max_retained_snapshots) < 0:
             raise ValueError("max_retained_snapshots must be zero or positive")
+        if int(validation_split_version) < 1:
+            raise ValueError("validation_split_version must be 1 or greater")
+        if bool(lineage_base_manifest) != bool(lineage_base_fingerprint):
+            raise ValueError(
+                "lineage_base_manifest and lineage_base_fingerprint must be "
+                "configured together"
+            )
         self.replay_dir = Path(replay_dir)
         self.snapshot_root = Path(snapshot_root)
         self.validation_fraction = float(validation_fraction)
@@ -628,6 +735,29 @@ class CorpusSnapshotManager:
         self.enforce_policy_contract = bool(enforce_policy_contract)
         self.allowed_opening_plies = tuple(int(value) for value in allowed_opening_plies)
         self.external_validation_state_keys: Set[str] = set()
+        self.validation_split_version = int(validation_split_version)
+        # An explicit external predecessor.  snapshot_v000012 was admitted with
+        # a lost CURRENT pointer, so its recorded 100% freshness was an artifact
+        # of an empty previous-key set and v13-v16 all descend from it.  Rather
+        # than accept that chain, a rebuilt lineage names its last *valid*
+        # predecessor here: the first admission in the new namespace is then
+        # gated against that corpus instead of against nothing, and every
+        # manifest records which base it descends from.
+        self.lineage_base_manifest = (
+            Path(lineage_base_manifest) if lineage_base_manifest else None)
+        self.lineage_base_fingerprint = (
+            str(lineage_base_fingerprint).lower() if lineage_base_fingerprint else None)
+        self.lineage_excluded_fingerprints = frozenset(
+            str(value).lower() for value in lineage_excluded_fingerprints if value)
+        if (self.lineage_base_fingerprint
+                and self.lineage_base_fingerprint in self.lineage_excluded_fingerprints):
+            raise ValueError(
+                "lineage_base_fingerprint cannot also be excluded from the lineage")
+        self.trained_ledger_enabled = bool(trained_ledger_enabled)
+        self.trained_ledger_seed_roots = tuple(
+            Path(value) for value in trained_ledger_seed_roots)
+        self._lineage_base_cache: Optional[Tuple[Path, dict, Set[str]]] = None
+        self._trained_ledger_cache: Optional[Tuple[Set[str], Set[int]]] = None
 
     def set_external_validation_state_keys(self, state_keys: Iterable[str]) -> None:
         """Exclude a frozen external validation suite from every train snapshot."""
@@ -638,8 +768,25 @@ class CorpusSnapshotManager:
         return self.snapshot_root / "CURRENT"
 
     @property
+    def validation_dir_name(self) -> str:
+        """Directory holding the active hold-out generation.
+
+        Version 1 keeps the historical ``validation`` name so existing
+        namespaces load unchanged; a rebuilt split lands beside it under
+        ``validation_v<N>`` so the superseded artifact stays readable evidence
+        and cannot be mistaken for the active one.
+        """
+        if self.validation_split_version <= 1:
+            return "validation"
+        return f"validation_v{self.validation_split_version}"
+
+    @property
     def validation_manifest_path(self) -> Path:
-        return self.snapshot_root / "validation" / "manifest.json"
+        return self.snapshot_root / self.validation_dir_name / "manifest.json"
+
+    @property
+    def trained_ledger_dir(self) -> Path:
+        return self.snapshot_root / "ledger"
 
     def replay_files(self) -> List[Path]:
         return sorted(
@@ -668,7 +815,7 @@ class CorpusSnapshotManager:
         relative = self.current_pointer.read_text(encoding="utf-8").strip()
         if not relative:
             return None
-        path = self.snapshot_root / relative
+        path = self.snapshot_root / _read_relpath(relative)
         return path if path.is_file() else None
 
     def _load_manifest(self, path: Path) -> dict:
@@ -713,9 +860,14 @@ class CorpusSnapshotManager:
                     f"expected {value!r}: {manifest_path}"
                 )
 
+        # ``record["path"]`` is read through ``_read_relpath`` for the same
+        # reason the CURRENT pointer is: a snapshot written by the native-Windows
+        # launcher stores ``files\\replay_*.jsonl``.  On WSL that is one filename
+        # containing a backslash, so every stored shard "fails integrity
+        # verification" while sitting untouched on disk right next to the manifest.
         for record in manifest.get("files", []):
             try:
-                stored = manifest_path.parent / record["path"]
+                stored = manifest_path.parent / _read_relpath(record["path"])
                 expected_size = int(record["size_bytes"])
                 expected_sha256 = str(record["sha256"])
             except (KeyError, TypeError, ValueError) as exc:
@@ -751,24 +903,368 @@ class CorpusSnapshotManager:
             )
         return state_keys
 
+    # ------------------------------------------------------------------
+    # Rebuilt lineage: an explicit, verified external predecessor
+    # ------------------------------------------------------------------
+
+    def _lineage_base(self) -> Optional[Tuple[Path, dict, Set[str]]]:
+        """Load and verify the pinned external predecessor snapshot.
+
+        Returns ``None`` when no lineage base is configured, which is the
+        historical behaviour.  When one *is* configured it is treated as a
+        read-only input: its integrity is verified and its recorded
+        fingerprint must equal the configured pin, so a rebuilt lineage cannot
+        silently branch from a different (or defective) corpus.
+        """
+        if self.lineage_base_manifest is None:
+            return None
+        if self._lineage_base_cache is not None:
+            return self._lineage_base_cache
+        manifest_path = self.lineage_base_manifest
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                f"Configured corpus lineage base manifest is missing: {manifest_path}"
+            )
+        manifest = self._load_manifest(manifest_path)
+        state_keys = self._verify_manifest_integrity(
+            manifest_path, manifest, "training_snapshot"
+        )
+        recorded = str(manifest.get("fingerprint", "")).lower()
+        if recorded != self.lineage_base_fingerprint:
+            raise RuntimeError(
+                "Corpus lineage base fingerprint mismatch at "
+                f"{manifest_path}: expected {self.lineage_base_fingerprint}, "
+                f"got {recorded or None}"
+            )
+        self._lineage_base_cache = (manifest_path, manifest, state_keys)
+        return self._lineage_base_cache
+
+    def _lineage_base_record(self) -> Optional[dict]:
+        """Provenance block stamped into every snapshot of a rebuilt lineage.
+
+        Recorded on *each* manifest rather than only the first, because
+        retention prunes the oldest directories: after the first admission is
+        pruned, a chain walk can no longer reach the base, and this record is
+        what keeps the ancestry claim verifiable for the whole namespace.
+        """
+        base = self._lineage_base()
+        if base is None:
+            return None
+        manifest_path, manifest, _keys = base
+        return {
+            "manifest": str(manifest_path.resolve()),
+            "fingerprint": str(manifest.get("fingerprint", "")).lower(),
+            "version": manifest.get("version"),
+            "excluded_fingerprints": sorted(self.lineage_excluded_fingerprints),
+        }
+
+    def verify_lineage(self, manifest: Mapping[str, Any], manifest_path: Path) -> dict:
+        """Fail closed unless this snapshot descends from the approved base.
+
+        Three independent claims are checked, none of which depends on an
+        unpruned chain:
+
+        1. the snapshot records the configured base and excluded set;
+        2. neither its own fingerprint nor its recorded predecessor is an
+           excluded (defective or superseded) corpus;
+        3. every retained ancestor link inside the namespace is contiguous and
+           equally free of excluded fingerprints.
+        """
+        base = self._lineage_base()
+        if base is None:
+            return {"enforced": False}
+        _base_path, base_manifest, _base_keys = base
+        base_fingerprint = str(base_manifest.get("fingerprint", "")).lower()
+
+        recorded = manifest.get("lineage_base")
+        if not isinstance(recorded, Mapping):
+            raise RuntimeError(
+                "Corpus snapshot records no lineage base but one is required: "
+                f"{manifest_path}"
+            )
+        if str(recorded.get("fingerprint", "")).lower() != base_fingerprint:
+            raise RuntimeError(
+                f"Corpus snapshot descends from an unapproved lineage base: "
+                f"{manifest_path}"
+            )
+        chain: List[str] = []
+        for value in (manifest.get("fingerprint"), manifest.get("previous_fingerprint")):
+            if isinstance(value, str) and value:
+                chain.append(value.lower())
+        for _version, path in self._snapshot_dirs():
+            candidate = path / "manifest.json"
+            if not candidate.is_file():
+                continue
+            try:
+                other = self._load_manifest(candidate)
+            except (OSError, ValueError):
+                continue
+            for value in (other.get("fingerprint"), other.get("previous_fingerprint")):
+                if isinstance(value, str) and value:
+                    chain.append(value.lower())
+        contaminated = sorted(set(chain) & set(self.lineage_excluded_fingerprints))
+        if contaminated:
+            raise RuntimeError(
+                "Corpus lineage contains excluded snapshot fingerprint(s) "
+                f"{contaminated}: {manifest_path}"
+            )
+
+        # The configured exclusions are enforced live by the chain check above,
+        # so a *newly* discovered defective ancestor does not need to have been
+        # known at admission time.  What must never happen is the reverse: a
+        # snapshot admitted under a stricter policy being loaded by a run that
+        # has since dropped one of those exclusions.
+        recorded_excluded = {
+            str(value).lower() for value in recorded.get("excluded_fingerprints", [])
+        }
+        relaxed = sorted(recorded_excluded - set(self.lineage_excluded_fingerprints))
+        if relaxed:
+            raise RuntimeError(
+                "Corpus snapshot was admitted excluding fingerprint(s) "
+                f"{relaxed}, which this run no longer excludes: {manifest_path}"
+            )
+        return {
+            "enforced": True,
+            "base_fingerprint": base_fingerprint,
+            "base_version": base_manifest.get("version"),
+            "excluded_fingerprints": sorted(self.lineage_excluded_fingerprints),
+            "checked_fingerprints": len(set(chain)),
+        }
+
+    # ------------------------------------------------------------------
+    # All-time trained ledger
+    # ------------------------------------------------------------------
+
+    @property
+    def _ledger_shards_path(self) -> Path:
+        return self.trained_ledger_dir / "trained_shards.jsonl"
+
+    @property
+    def _ledger_state_keys_path(self) -> Path:
+        return self.trained_ledger_dir / "trained_state_keys.txt.gz"
+
+    @property
+    def _ledger_seed_path(self) -> Path:
+        return self.trained_ledger_dir / "seed.json"
+
+    def _seed_trained_ledger(self) -> None:
+        """Recover the all-time trained set from preserved historical roots.
+
+        Reads only; every write lands under this namespace's ledger directory.
+        Retention has already pruned some historical snapshots, so the result
+        is a *lower bound* on the all-time trained set -- which is recorded
+        explicitly in ``seed.json`` rather than being implied to be complete.
+        Both prior training snapshots and prior hold-out generations are
+        seeded: a shard that sat in a contaminated hold-out was demonstrably
+        trained on, so re-holding it would reproduce the original defect.
+        """
+        shard_records: Dict[str, dict] = {}
+        state_keys: Set[str] = set()
+        sources: List[dict] = []
+        for root in self.trained_ledger_seed_roots:
+            if not root.is_dir():
+                sources.append({"root": str(root), "status": "missing"})
+                continue
+            manifests = sorted(root.glob("snapshot_v*/manifest.json"))
+            manifests.extend(sorted(root.glob("validation*/manifest.json")))
+            seeded = 0
+            for manifest_path in manifests:
+                try:
+                    manifest = self._load_manifest(manifest_path)
+                except (OSError, ValueError):
+                    continue
+                for record in manifest.get("files", []):
+                    name = record.get("name")
+                    if not isinstance(name, str):
+                        continue
+                    shard_records.setdefault(name, {
+                        "name": name,
+                        "sha256": record.get("sha256"),
+                        "origin": str(manifest_path),
+                    })
+                keys_file = manifest.get("state_keys_file")
+                if isinstance(keys_file, str) and keys_file:
+                    keys_path = manifest_path.parent / keys_file
+                    if keys_path.is_file():
+                        state_keys |= _read_state_keys(keys_path)
+                seeded += 1
+            sources.append({
+                "root": str(root),
+                "status": "read",
+                "manifests": seeded,
+            })
+
+        self.trained_ledger_dir.mkdir(parents=True, exist_ok=True)
+        with self._ledger_shards_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for name in sorted(shard_records):
+                handle.write(json.dumps(
+                    {**shard_records[name], "recorded_by": "seed"},
+                    sort_keys=True, separators=(",", ":")) + "\n")
+        self._ledger_state_keys_path.unlink(missing_ok=True)
+        _merge_state_keys_file(self._ledger_state_keys_path, state_keys)
+        _write_json_atomic(self._ledger_seed_path, {
+            "schema_version": TRAINED_LEDGER_SCHEMA_VERSION,
+            "seeded_at": datetime.now(timezone.utc).isoformat(),
+            "sources": sources,
+            "shard_count": len(shard_records),
+            "state_key_count": len(state_keys),
+            "completeness": (
+                "lower_bound: snapshot retention may already have pruned older "
+                "generations, so states trained before the oldest retained "
+                "manifest cannot be recovered"
+            ),
+        })
+        print(
+            f"Trained-shard ledger seeded: {len(shard_records)} shard(s), "
+            f"{len(state_keys)} canonical state(s) from "
+            f"{len(self.trained_ledger_seed_roots)} historical root(s)"
+        )
+
+    def _ensure_trained_ledger(self) -> None:
+        if not self.trained_ledger_enabled:
+            return
+        if self._ledger_seed_path.is_file():
+            return
+        self._seed_trained_ledger()
+
+    def _load_trained_ledger(self) -> Tuple[Set[str], Set[int]]:
+        """Return (shard names, state fingerprints) known to have been trained.
+
+        States are held as 64-bit fingerprints rather than full keys; see
+        :func:`_state_key_fingerprint` for why, and for why the failure
+        direction is safe.
+        """
+        if not self.trained_ledger_enabled:
+            return set(), set()
+        if self._trained_ledger_cache is not None:
+            return self._trained_ledger_cache
+        self._ensure_trained_ledger()
+        names: Set[str] = set()
+        if self._ledger_shards_path.is_file():
+            with self._ledger_shards_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    name = record.get("name")
+                    if isinstance(name, str):
+                        names.add(name)
+        fingerprints: Set[int] = set()
+        if self._ledger_state_keys_path.is_file():
+            for key in _iter_state_keys(self._ledger_state_keys_path):
+                fingerprints.add(_state_key_fingerprint(key))
+        self._trained_ledger_cache = (names, fingerprints)
+        return self._trained_ledger_cache
+
+    def trained_ledger_shard_names(self) -> Set[str]:
+        return set(self._load_trained_ledger()[0])
+
+    def trained_ledger_state_fingerprints(self) -> Set[int]:
+        """Membership set used to reject historically trained hold-out states."""
+        return set(self._load_trained_ledger()[1])
+
+    def trained_ledger_state_keys(self) -> Set[str]:
+        """Full canonical keys, read from disk for auditing.
+
+        Deliberately uncached: the whole point of the fingerprint set is not to
+        keep this in memory for the life of a run.
+        """
+        if not self.trained_ledger_enabled:
+            return set()
+        self._ensure_trained_ledger()
+        if not self._ledger_state_keys_path.is_file():
+            return set()
+        return _read_state_keys(self._ledger_state_keys_path)
+
+    def _record_trained_ledger(
+        self,
+        *,
+        version: int,
+        file_records: Sequence[Mapping[str, Any]],
+        state_keys: Set[str],
+    ) -> None:
+        """Append one admission to the append-only all-time trained ledger.
+
+        Called only after the snapshot is durable, so the ledger never claims a
+        shard that no admission used.  Shard rows are appended; the state set is
+        rewritten as the union, which is the only representation that stays
+        answerable in one read after arbitrary pruning.
+        """
+        if not self.trained_ledger_enabled:
+            return
+        self._ensure_trained_ledger()
+        known_names, known_fingerprints = self._load_trained_ledger()
+        self.trained_ledger_dir.mkdir(parents=True, exist_ok=True)
+        recorded_at = datetime.now(timezone.utc).isoformat()
+        new_rows = []
+        for record in file_records:
+            name = record.get("name")
+            if not isinstance(name, str) or name in known_names:
+                continue
+            known_names.add(name)
+            new_rows.append({
+                "name": name,
+                "sha256": record.get("sha256"),
+                "origin": f"snapshot_v{int(version):06d}",
+                "recorded_at": recorded_at,
+                "recorded_by": "admission",
+            })
+        if new_rows:
+            with self._ledger_shards_path.open(
+                "a", encoding="utf-8", newline="\n"
+            ) as handle:
+                for row in new_rows:
+                    handle.write(json.dumps(
+                        row, sort_keys=True, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        added_states = _merge_state_keys_file(
+            self._ledger_state_keys_path, state_keys)
+        known_fingerprints |= {
+            _state_key_fingerprint(key) for key in state_keys}
+        self._trained_ledger_cache = (known_names, known_fingerprints)
+        if new_rows or added_states:
+            print(
+                f"  Trained ledger: +{len(new_rows)} shard(s), "
+                f"+{added_states} canonical state(s) "
+                f"({len(known_names)} shard(s) all-time)"
+            )
+
     @staticmethod
     def _realized_split_share(
-        *, validation_files: int, total_files: int,
+        *, validation_files: int, total_files: int, present_files: int = -1,
     ) -> dict:
-        """Describe the share a frozen validation split actually holds.
+        """Describe the share the validation split actually holds.
 
-        ``split.fraction`` records the *requested* hold-out.  The validation
-        set is frozen once and never grows, so as the rolling corpus expands
-        the realized share falls well below it -- reporting only the requested
-        value lets the manifest assert a hold-out it does not deliver.  These
-        additive fields keep the realized share checkable.
+        ``split.fraction`` records the *requested* hold-out.  Reporting only
+        that value lets the manifest assert a hold-out it does not deliver,
+        which is exactly how an approved 15% decayed to 1.7%: the split was
+        created once and never grew while the rolling corpus expanded.
+        ``_grow_validation`` now tracks the requested share append-only, and
+        these additive fields keep the realized share checkable either way --
+        including under ``grow_holdout=False``, where the split stays frozen
+        at creation size and the realized share still decays.
         """
         total = max(0, int(total_files))
         held = max(0, int(validation_files))
+        # ``held`` counts every shard the hold-out has ever absorbed, including
+        # ones the rolling replay window has since dropped.  Reporting only that
+        # ratio lets a decayed hold-out keep advertising its target share, which
+        # is the same class of lie the fields were added to prevent -- so the
+        # still-in-corpus count is reported alongside it.  Both are clamped:
+        # held shards outliving the window can otherwise exceed 100%.
+        present = held if present_files < 0 else max(0, min(int(present_files), held))
         return {
             "validation_file_count": held,
             "source_file_count": total,
-            "realized_file_fraction": (held / total) if total else 0.0,
+            "realized_file_fraction": min(1.0, held / total) if total else 0.0,
+            "validation_files_in_corpus": present,
+            "realized_in_corpus_fraction": (
+                min(1.0, present / total) if total else 0.0),
         }
 
     def _validation_rank_key(self, name: str) -> str:
@@ -779,6 +1275,7 @@ class CorpusSnapshotManager:
 
     def _validation_growth_quota(
         self, *, total_files: int, held: int, candidates: int,
+        all_time_held: int = 0,
     ) -> int:
         """How many unheld files the hold-out may absorb on this pass."""
         if total_files <= 0 or candidates <= 0:
@@ -789,11 +1286,50 @@ class CorpusSnapshotManager:
         # starving training; this settles at the configured share and stops.
         target = max(1, int(round(total_files * self.validation_fraction)))
         need = target - held
+        # ``held`` is now the still-present count, so shards rotating out of the
+        # replay window reopen the quota.  Without a ceiling that is unbounded
+        # over a long run: the manifest never releases a shard, so it would
+        # accumulate one per rotation.  Cap the manifest at HOLDOUT_FILE_CEILING
+        # times the target -- enough headroom to track the live corpus, bounded
+        # like the snapshot root now is.
+        ceiling = HOLDOUT_FILE_CEILING * target
+        if all_time_held >= ceiling:
+            return 0
+        need = min(need, ceiling - all_time_held)
         if need <= 0:
             return 0
         # consider_snapshot fails closed when the split leaves no training
         # file, so growth must always leave at least one behind.
         return max(0, min(need, candidates - 1))
+
+    def _trained_shard_names(self) -> Set[str]:
+        """Names of replay shards any retained snapshot has served as training data.
+
+        Promoting such a shard into the hold-out produces a set the model has
+        already fit, so measurements on it read as memorisation rather than
+        generalisation -- the exact failure this document's F3 fix must not
+        reintroduce.  Retention can prune older snapshots, so this is a lower
+        bound on the all-time trained set; it always includes the active
+        corpus, which is what matters for the run in progress.
+
+        When the append-only trained ledger is enabled it is unioned in, which
+        is what closes that gap: the ledger outlives the directories retention
+        deletes, so a shard trained on months ago is still refused here.
+        """
+        trained: Set[str] = set(self.trained_ledger_shard_names())
+        for _version, path in self._snapshot_dirs():
+            manifest_path = path / "manifest.json"
+            if not manifest_path.is_file():
+                continue
+            try:
+                manifest = self._load_manifest(manifest_path)
+            except (OSError, ValueError):
+                continue
+            for record in manifest.get("files", []):
+                name = record.get("name")
+                if isinstance(name, str):
+                    trained.add(name)
+        return trained
 
     def _grow_validation(
         self, manifest: dict, files: Sequence[Path],
@@ -812,14 +1348,21 @@ class CorpusSnapshotManager:
         manifest_path = self.validation_manifest_path
         validation_dir = manifest_path.parent
         held_names = {str(record["name"]) for record in manifest.get("files", [])}
+        trained_names = self._trained_shard_names()
         candidates = sorted(
-            (path for path in files if path.name not in held_names),
+            (path for path in files
+             if path.name not in held_names and path.name not in trained_names),
             key=lambda path: self._validation_rank_key(path.name),
         )
+        # The quota is measured against still-present held shards, so a hold-out
+        # whose files have rotated out of the replay window is not counted as if
+        # it still covered the live corpus.
+        present_held = sum(1 for path in files if path.name in held_names)
         add_count = self._validation_growth_quota(
             total_files=len(files),
-            held=len(held_names),
+            held=present_held,
             candidates=len(candidates),
+            all_time_held=len(held_names),
         )
         if add_count <= 0:
             return None
@@ -832,7 +1375,7 @@ class CorpusSnapshotManager:
             link_mode = _link_or_copy(source, destination)
             added_records.append({
                 "name": source.name,
-                "path": str(Path("files") / source.name),
+                "path": (Path("files") / source.name).as_posix(),
                 "sha256": replay_file_sha256(source),
                 "size_bytes": source.stat().st_size,
                 "storage": link_mode,
@@ -840,7 +1383,8 @@ class CorpusSnapshotManager:
 
         file_records = list(manifest.get("files", [])) + added_records
         metrics, state_keys = analyze_replay_files(
-            [validation_dir / record["path"] for record in file_records]
+            [validation_dir / _read_relpath(record["path"])
+             for record in file_records]
         )
 
         history = list(manifest.get("growth_history", []))
@@ -861,10 +1405,12 @@ class CorpusSnapshotManager:
         grown["state_keys_file"] = state_keys_file
         grown["metrics"] = metrics
         grown["growth_history"] = history
+        grown_names = {str(record["name"]) for record in file_records}
         grown["split"] = dict(
             manifest.get("split", {}),
             **self._realized_split_share(
                 validation_files=len(file_records), total_files=len(files),
+                present_files=sum(1 for p in files if p.name in grown_names),
             ),
         )
         _write_json_atomic(manifest_path, grown)
@@ -902,23 +1448,47 @@ class CorpusSnapshotManager:
                     "Frozen validation manifest does not match the configured "
                     "whole-file split fraction and seed"
                 )
+            # A rebuilt split must never be satisfied by the artifact it
+            # replaces.  Version 1 manifests predate the field, so an absent
+            # version reads as 1 rather than as "unknown, accept anything".
+            stored_version = int(split.get("version", VALIDATION_SPLIT_VERSION_DEFAULT))
+            if stored_version != self.validation_split_version:
+                raise RuntimeError(
+                    f"Frozen validation manifest is generation {stored_version}, "
+                    f"but generation {self.validation_split_version} is configured: "
+                    f"{manifest_path}"
+                )
             grown = self._grow_validation(manifest, files)
             if grown is not None:
                 manifest, state_keys = grown
                 split = manifest.get("split", {})
+            held_now = {str(r["name"]) for r in manifest.get("files", [])}
             realized = self._realized_split_share(
-                validation_files=len(manifest.get("files", [])),
+                validation_files=len(held_now),
                 total_files=len(files),
+                present_files=sum(1 for p in files if p.name in held_now),
             )
             manifest["split"] = dict(split, **realized)
+            # Persist the recalculation, not just print it.  A decay-only pass
+            # (no growth) used to leave the manifest advertising the share it
+            # had at its last *growth*, so an on-disk audit read 9/58 while the
+            # live run was at 3/60.  The manifest must state what it is worth
+            # today even when nothing was added.
+            if any(split.get(key) != value for key, value in realized.items()):
+                _write_json_atomic(manifest_path, manifest)
             # Report what the hold-out is actually worth against today's
             # corpus, not only the fraction the manifest requests.
+            _stale = (realized['validation_file_count']
+                      - realized['validation_files_in_corpus'])
             print(
                 f"Validation hold-out: "
                 f"{realized['validation_file_count']} of "
                 f"{realized['source_file_count']} replay file(s) = "
                 f"{realized['realized_file_fraction'] * 100.0:.2f}% realized "
                 f"(target {self.validation_fraction * 100.0:.2f}%)"
+                + (f"; {realized['validation_files_in_corpus']} still in corpus "
+                   f"= {realized['realized_in_corpus_fraction'] * 100.0:.2f}% "
+                   f"({_stale} rotated out)" if _stale else "")
             )
             return manifest, state_keys
 
@@ -927,8 +1497,25 @@ class CorpusSnapshotManager:
 
         desired = max(1, int(round(len(files) * self.validation_fraction)))
         desired = min(desired, len(files) - 1)
+        # Growth already refuses shards any snapshot has trained on; creation
+        # must apply the same rule or a rebuilt split starts contaminated on
+        # its very first generation.
+        trained_names = self._trained_shard_names()
+        eligible = [path for path in files if path.name not in trained_names]
+        if not eligible:
+            raise RuntimeError(
+                "Every replay file has already been used as training data, so "
+                "no leakage-resistant validation split can be created under "
+                f"{self.snapshot_root}"
+            )
+        if len(eligible) < desired:
+            print(
+                f"[warn] Validation split reduced from {desired} to "
+                f"{len(eligible)} file(s): the remainder were already trained on"
+            )
+            desired = len(eligible)
         ranked = sorted(
-            files,
+            eligible,
             key=lambda path: hashlib.sha256(
                 f"{self.split_seed}:{path.name}".encode("utf-8")
             ).hexdigest(),
@@ -944,7 +1531,7 @@ class CorpusSnapshotManager:
             link_mode = _link_or_copy(source, destination)
             file_records.append({
                 "name": source.name,
-                "path": str(Path("files") / source.name),
+                "path": (Path("files") / source.name).as_posix(),
                 "sha256": replay_file_sha256(source),
                 "size_bytes": source.stat().st_size,
                 "storage": link_mode,
@@ -959,11 +1546,13 @@ class CorpusSnapshotManager:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "split": {
                 "unit": "replay_file",
+                "version": self.validation_split_version,
                 "fraction": self.validation_fraction,
                 "seed": self.split_seed,
                 **self._realized_split_share(
                     validation_files=len(file_records),
                     total_files=len(files),
+                    present_files=len(file_records),
                 ),
             },
             "encoding_version": ENCODING_VERSION,
@@ -1064,10 +1653,24 @@ class CorpusSnapshotManager:
         current_path = self.current_manifest_path()
         previous_keys: Set[str] = set()
         previous_fingerprint = None
+        previous_source = None
         if current_path is not None:
             current = self._load_manifest(current_path)
             previous_keys = _read_state_keys(current_path.parent / current["state_keys_file"])
             previous_fingerprint = current.get("fingerprint")
+            previous_source = "current_snapshot"
+        else:
+            # First admission of a rebuilt lineage.  Without a base this branch
+            # is a genuine cold start and the freshness gate cannot apply; with
+            # one, the approved external predecessor supplies the previous
+            # corpus, so the very first snapshot is gated exactly like every
+            # later one instead of being admitted at a meaningless 100%.
+            base = self._lineage_base()
+            if base is not None:
+                _base_path, base_manifest, base_keys = base
+                previous_keys = base_keys
+                previous_fingerprint = base_manifest.get("fingerprint")
+                previous_source = "lineage_base"
 
         metrics, all_train_keys = analyze_replay_files(train_files, previous_keys)
         leakage_keys = all_train_keys.intersection(validation_keys)
@@ -1127,7 +1730,24 @@ class CorpusSnapshotManager:
 
         if previous_fingerprint == fingerprint:
             return SnapshotDecision(False, "unchanged", current_path, metrics)
-        if current_path is not None and fresh_rate < self.min_fresh_fraction:
+        # A missing CURRENT pointer used to disable the freshness gate silently:
+        # the guard below reads ``current_path is not None``, so a lost pointer
+        # made every candidate admissible and reported a 100% fresh rate that is
+        # only an artifact of an empty previous-key set.  snapshot_v000012 in the
+        # policy-distillation namespace was admitted exactly that way.  A genuine
+        # first admission has no snapshots at all and must still be allowed;
+        # a pointer that vanished while snapshots exist is corruption, and this
+        # gate fails closed like every other integrity check in this module.
+        if current_path is None and previous_source is None and self._snapshot_dirs():
+            raise RuntimeError(
+                "Corpus snapshot pointer is missing while "
+                f"{len(self._snapshot_dirs())} snapshot(s) exist under "
+                f"{self.snapshot_root}. The minimum-fresh-state gate cannot be "
+                "evaluated without the previous corpus, so no admission is "
+                "possible until CURRENT/current.json is restored to the "
+                "intended snapshot."
+            )
+        if previous_source is not None and fresh_rate < self.min_fresh_fraction:
             return SnapshotDecision(
                 False,
                 f"fresh_unique_state_rate {fresh_rate:.6f} is below {self.min_fresh_fraction:.6f}",
@@ -1148,7 +1768,7 @@ class CorpusSnapshotManager:
                 link_mode = _link_or_copy(source, destination)
                 stored_files.append({
                     **record,
-                    "path": str(Path("files") / source.name),
+                    "path": (Path("files") / source.name).as_posix(),
                     "storage": link_mode,
                 })
 
@@ -1165,7 +1785,7 @@ class CorpusSnapshotManager:
                 "rules_id": CANONICAL_RULES_ID,
                 "files": stored_files,
                 "state_keys_file": state_keys_file,
-                "validation_manifest": os.path.relpath(
+                "validation_manifest": _posix_relpath(
                     self.validation_manifest_path, staging
                 ),
                 "teacher_settings": dict(teacher_settings),
@@ -1175,22 +1795,31 @@ class CorpusSnapshotManager:
                     "minimum_fresh_unique_state_rate": self.min_fresh_fraction,
                     "observed_fresh_unique_state_rate": fresh_rate,
                     "passed": True,
+                    "previous_corpus_source": previous_source,
                 },
                 "metrics": metrics,
             }
+            lineage_base_record = self._lineage_base_record()
+            if lineage_base_record is not None:
+                manifest["lineage_base"] = lineage_base_record
             _write_json_atomic(staging / "manifest.json", manifest)
             os.replace(staging, final_dir)
             _write_json_atomic(
                 self.snapshot_root / "current.json",
-                {"manifest": str(Path(final_dir.name) / "manifest.json"), "fingerprint": fingerprint},
+                {"manifest": (Path(final_dir.name) / "manifest.json").as_posix(), "fingerprint": fingerprint},
             )
             pointer_temp = self.snapshot_root / "CURRENT.tmp"
-            pointer_temp.write_text(str(Path(final_dir.name) / "manifest.json") + "\n", encoding="utf-8")
+            pointer_temp.write_text((Path(final_dir.name) / "manifest.json").as_posix() + "\n", encoding="utf-8")
             os.replace(pointer_temp, self.current_pointer)
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging)
             raise
+
+        # Only now that the snapshot is durable and current may the all-time
+        # ledger claim these shards and states as trained.
+        self._record_trained_ledger(
+            version=version, file_records=stored_files, state_keys=train_keys)
 
         # Reclaim disk only after the new snapshot is durable and current.
         pruned = self._prune_old_snapshots(final_dir)
@@ -1214,8 +1843,10 @@ class CorpusSnapshotManager:
             raise RuntimeError("No corpus snapshot is active")
         manifest = self._load_manifest(path)
         self._verify_manifest_integrity(path, manifest, "training_snapshot")
+        manifest["lineage_verification"] = self.verify_lineage(manifest, path)
         manifest["manifest_path"] = str(path.resolve())
-        validation_path = (path.parent / manifest["validation_manifest"]).resolve()
+        validation_path = (
+            path.parent / _read_relpath(manifest["validation_manifest"])).resolve()
         if validation_path != self.validation_manifest_path.resolve():
             raise RuntimeError(
                 "Training snapshot references an unexpected validation manifest"
@@ -1225,6 +1856,14 @@ class CorpusSnapshotManager:
             validation_path, validation_manifest, "immutable_validation"
         )
         validation_split = validation_manifest.get("split", {})
+        stored_split_version = int(
+            validation_split.get("version", VALIDATION_SPLIT_VERSION_DEFAULT))
+        if stored_split_version != self.validation_split_version:
+            raise RuntimeError(
+                f"Training snapshot references validation generation "
+                f"{stored_split_version}, but generation "
+                f"{self.validation_split_version} is configured"
+            )
         if (
             validation_split.get("unit") != "replay_file"
             or abs(
@@ -1240,19 +1879,49 @@ class CorpusSnapshotManager:
             )
         manifest["validation_manifest_path"] = str(validation_path)
 
+        # Whole-file hold-out is necessary but not sufficient: an individual
+        # state can recur across shards, so a held shard can still contain
+        # states an earlier snapshot trained on.  Measuring generalisation on
+        # those reads as memorisation, which is the exact defect F3 records.
+        # The all-time ledger is what makes the check answerable after
+        # retention has pruned the snapshots that did the training.
+        historically_trained = self.trained_ledger_state_fingerprints()
+
         validation_entries: List[ReplayEntry] = []
         validation_keys: Set[str] = set(stored_validation_keys)
         validation_keys.update(self.external_validation_state_keys)
+        leaked_validation_states: Set[str] = set()
+        leaked_validation_entries = 0
         for record in validation_manifest["files"]:
-            file_path = validation_path.parent / record["path"]
+            file_path = validation_path.parent / _read_relpath(record["path"])
             for entry_dict in _iter_entry_dicts(file_path):
                 key = canonical_state_key(entry_dict["state"])
+                # The key stays in ``validation_keys`` either way, so a state
+                # dropped here is never quietly handed back to training.
                 validation_keys.add(key)
+                if _state_key_fingerprint(key) in historically_trained:
+                    leaked_validation_states.add(key)
+                    leaked_validation_entries += 1
+                    continue
                 validation_entries.append(ReplayEntry.from_dict(entry_dict))
+        manifest["validation_leakage"] = {
+            "ledger_enabled": self.trained_ledger_enabled,
+            "all_time_trained_state_count": len(historically_trained),
+            "removed_validation_entry_count": leaked_validation_entries,
+            "removed_validation_state_count": len(leaked_validation_states),
+            "retained_validation_entry_count": len(validation_entries),
+        }
+        if leaked_validation_entries:
+            print(
+                f"Validation hold-out: removed {leaked_validation_entries} "
+                f"entry/entries covering {len(leaked_validation_states)} "
+                "canonical state(s) already present in the all-time trained "
+                f"ledger; {len(validation_entries)} entry/entries remain"
+            )
 
         train_entries: List[ReplayEntry] = []
         for record in manifest["files"]:
-            file_path = path.parent / record["path"]
+            file_path = path.parent / _read_relpath(record["path"])
             for entry_dict in _iter_entry_dicts(file_path):
                 if canonical_state_key(entry_dict["state"]) in validation_keys:
                     continue
