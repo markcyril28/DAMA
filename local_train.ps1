@@ -1,4 +1,4 @@
-# HOW TO RUN (PowerShell, from the DAMA repository)
+﻿# HOW TO RUN (PowerShell, from the DAMA repository)
 #   Validate without training: .\local_train.ps1 -ValidateOnly
 #   Policy recovery baseline: .\local_train.ps1
 #   Enhanced stage after promotion:
@@ -64,7 +64,7 @@ starting training.
 .\local_train.ps1 -Config config\training_config.yaml -FreshStart -TrainDuration 4h
 
 .EXAMPLE
-.\local_train.ps1 -Resume .\models\checkpoints_policy_distillation\model_step_134000.pt
+.\local_train.ps1 -Resume .\models\checkpoints_policy_distillation_recovery_wd1e4\model_step_174000.pt
 #>
 
 [CmdletBinding()]
@@ -73,7 +73,8 @@ param(
     [string] $CondaEnvironment = 'dama',
 
     [ValidateNotNullOrEmpty()]
-    [string] $Config = 'config\training_config_policy_distillation.yaml',
+    # Superseded: 'config\training_config_policy_distillation.yaml' pins step 134000.
+    [string] $Config = 'config\training_config_policy_distillation_c174k.yaml',
 
     [string] $Resume = '',
 
@@ -117,25 +118,64 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Training config not found: $ConfigPath"
 }
 
-$PolicyRecoveryConfigPath = [System.IO.Path]::GetFullPath(
-    (Join-Path $ProjectDirectory 'config\training_config_policy_distillation.yaml')
-)
-$PolicyRecoveryBaselinePath = [System.IO.Path]::GetFullPath(
-    (Join-Path $ProjectDirectory 'models\checkpoints_policy_distillation\model_step_134000.pt')
-)
-$PolicyRecoveryBaselineSha256 = '7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27'
-$PolicyRecoveryLegacyStatsPath = [System.IO.Path]::GetFullPath(
-    (Join-Path $ProjectDirectory 'models\training_stats_policy_distillation.json')
-)
-$PolicyRecoveryStatsPath = [System.IO.Path]::GetFullPath(
-    (Join-Path $ProjectDirectory 'models\training_stats_policy_distillation_recovery_wd1e4.json')
-)
-$IsPolicyRecovery = $ConfigPath.Equals(
-    $PolicyRecoveryConfigPath,
-    [System.StringComparison]::OrdinalIgnoreCase
-)
+# The recovery anchor used to be hardcoded here as step 134000, in a third
+# copy alongside local_train.sh and train_server.sh. The approved 2026-08-24
+# continuation resumes step 174000 in a new namespace, so all three now read
+# the anchor out of the selected config -- the trainer validates the same
+# fields, so they can no longer disagree.
+function Get-YamlScalar {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string] $Section,
+        [Parameter(Mandatory = $true)] [string] $Key
+    )
+    $inSection = $false
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^[^\s#]') {
+            $inSection = ($line -match ('^' + [regex]::Escape($Section) + ':\s*$'))
+            continue
+        }
+        if ($inSection -and
+            ($line -match ('^\s+' + [regex]::Escape($Key) + ':\s*(.*)$'))) {
+            $value = ($Matches[1] -replace '\s*#.*$', '').Trim()
+            return $value.Trim("`"'")
+        }
+    }
+    return ''
+}
+function Resolve-ProjectPath {
+    param([string] $Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $candidate = if ([System.IO.Path]::IsPathRooted($Value)) {
+        $Value
+    } else {
+        Join-Path $ProjectDirectory $Value
+    }
+    return [System.IO.Path]::GetFullPath($candidate)
+}
+
+$IsPolicyRecovery = (Get-YamlScalar -Path $ConfigPath -Section 'recovery_experiment' -Key 'enabled') -eq 'true'
+$PolicyRecoveryBaselinePath = ''
+$PolicyRecoveryBaselineSha256 = ''
+$PolicyRecoveryLegacyStatsPath = ''
+$PolicyRecoveryStatsPath = ''
+if ($IsPolicyRecovery) {
+    $PolicyRecoveryBaselinePath = Resolve-ProjectPath (
+        Get-YamlScalar -Path $ConfigPath -Section 'recovery_experiment' -Key 'baseline_checkpoint')
+    $PolicyRecoveryBaselineSha256 = (
+        Get-YamlScalar -Path $ConfigPath -Section 'recovery_experiment' -Key 'baseline_sha256'
+    ).ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($PolicyRecoveryBaselinePath) -or
+        [string]::IsNullOrWhiteSpace($PolicyRecoveryBaselineSha256)) {
+        throw "recovery_experiment needs baseline_checkpoint and baseline_sha256 in $ConfigPath"
+    }
+    $PolicyRecoveryStatsPath = Resolve-ProjectPath (
+        Get-YamlScalar -Path $ConfigPath -Section 'paths' -Key 'stats_file')
+    $PolicyRecoveryLegacyStatsPath = Resolve-ProjectPath (
+        Get-YamlScalar -Path $ConfigPath -Section 'paths' -Key 'seed_stats_from')
+}
 if ($EnhancedStage -and -not $IsPolicyRecovery) {
-    throw '-EnhancedStage is available only with training_config_policy_distillation.yaml.'
+    throw '-EnhancedStage is available only with a recovery_experiment config.'
 }
 
 $ResumePath = ''
@@ -150,7 +190,7 @@ if (-not [string]::IsNullOrWhiteSpace($Resume)) {
 
 if ($IsPolicyRecovery) {
     if ($FreshStart) {
-        throw 'FreshStart is disabled for the policy-distillation recovery experiment. Resume only from model_step_134000.pt.'
+        throw "FreshStart is disabled for the policy-distillation recovery experiment. Resume only from $PolicyRecoveryBaselinePath."
     }
     if (-not (Test-Path -LiteralPath $PolicyRecoveryBaselinePath -PathType Leaf)) {
         throw "Policy recovery baseline not found: $PolicyRecoveryBaselinePath"
@@ -228,7 +268,8 @@ $EnvironmentNames = @(
     'PROCESS_TITLE',
     'OMP_NUM_THREADS',
     'MKL_NUM_THREADS',
-    'NUMEXPR_MAX_THREADS'
+    'NUMEXPR_MAX_THREADS',
+    'PYTHONUNBUFFERED'
 )
 $SavedEnvironment = @{}
 foreach ($Name in $EnvironmentNames) {
@@ -326,6 +367,10 @@ try {
     $env:OMP_NUM_THREADS = '1'
     $env:MKL_NUM_THREADS = '1'
     $env:NUMEXPR_MAX_THREADS = '1'
+    # Trainer stdout is piped to the transcript below, so Python block-buffers
+    # it and a hard kill discards the buffer -- the log then ends at the last
+    # launcher line with no trainer output at all. Matches local_train.sh.
+    $env:PYTHONUNBUFFERED = '1'
 
     Push-Location -LiteralPath $ProjectDirectory
     $LocationPushed = $true
@@ -387,6 +432,8 @@ print("DAMA trainer import: OK")
     }
 
     if ($IsPolicyRecovery -and -not $EnhancedStage -and
+        -not [string]::IsNullOrWhiteSpace($PolicyRecoveryStatsPath) -and
+        -not [string]::IsNullOrWhiteSpace($PolicyRecoveryLegacyStatsPath) -and
         -not (Test-Path -LiteralPath $PolicyRecoveryStatsPath) -and
         (Test-Path -LiteralPath $PolicyRecoveryLegacyStatsPath -PathType Leaf)) {
         Copy-Item -LiteralPath $PolicyRecoveryLegacyStatsPath `
