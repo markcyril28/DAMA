@@ -164,6 +164,9 @@ paths:
   replay_dir: "data/replay_policy_distillation_recovery_wd1e4"
   log_dir: "logs/policy_distillation_recovery_wd1e4"
   stats_file: "models/training_stats_policy_distillation_recovery_wd1e4.json"
+  # One-time continuity seed: copied to stats_file only when that file
+  # does not yet exist, so the source is never modified.
+  seed_stats_from: "models/training_stats_policy_distillation.json"
   promotion_registry: "logs/policy_distillation_recovery_wd1e4/promotions.jsonl"
   acceptance_dir: "logs/policy_distillation_recovery_wd1e4/acceptance"
 
