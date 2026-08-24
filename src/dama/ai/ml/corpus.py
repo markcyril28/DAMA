@@ -969,14 +969,31 @@ class CorpusSnapshotManager:
            excluded (defective or superseded) corpus;
         3. every retained ancestor link inside the namespace is contiguous and
            equally free of excluded fingerprints.
+
+        Enforcement is opt-in per config, but opting *out* is not: a snapshot
+        that records a lineage policy is refused by a run that declares none.
         """
         base = self._lineage_base()
+        recorded = manifest.get("lineage_base")
         if base is None:
+            # Opting out is not an escape hatch.  A snapshot that *records* a
+            # lineage policy was admitted under one, and every refusal below --
+            # including the relaxed-exclusion refusal, whose whole purpose is to
+            # stop a weaker run from loading strictly-admitted data -- is only
+            # reachable while a base is configured.  Without this branch a run
+            # that dropped the entire ``lineage:`` block, rather than merely one
+            # excluded fingerprint, would load that same data with no base
+            # check, no exclusion check, and no chain check at all.  Legacy
+            # namespaces stamp no such record and stay unenforced.
+            if isinstance(recorded, Mapping):
+                raise RuntimeError(
+                    "Corpus snapshot was admitted under a lineage policy that "
+                    f"this run does not declare: {manifest_path}"
+                )
             return {"enforced": False}
         _base_path, base_manifest, _base_keys = base
         base_fingerprint = str(base_manifest.get("fingerprint", "")).lower()
 
-        recorded = manifest.get("lineage_base")
         if not isinstance(recorded, Mapping):
             raise RuntimeError(
                 "Corpus snapshot records no lineage base but one is required: "
