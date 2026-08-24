@@ -86,6 +86,10 @@ validation:
   frozen_suite_seed: 20260819
   auto_create_suite: false
   teacher_agreement_threshold: 0.50
+  # Kept explicit and identical to the local policy config: both write the same
+  # validation manifest under the shared snapshot root, so they must agree on
+  # whether the hold-out grows. See audit finding F3.
+  grow_holdout: true
 
 corpus_snapshots:
   enabled: true
@@ -93,6 +97,12 @@ corpus_snapshots:
   # remain preserved under data/corpus_snapshots/policy_distillation.
   root: "data/corpus_snapshots/policy_distillation_recovery_wd1e4"
   minimum_fresh_state_fraction: 0.50
+  # This config shares the snapshot root above with
+  # training_config_policy_distillation.yaml, so the retention cap must match
+  # it: otherwise a server run lets the same root grow without bound while a
+  # local run prunes it to 10. Each admission copies the whole replay corpus,
+  # so an uncapped root exhausts the volume mid-run. 0 keeps every snapshot.
+  max_retained_snapshots: 10
 
 dataloader:
   num_workers: 0
