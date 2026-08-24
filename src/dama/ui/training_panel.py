@@ -257,11 +257,11 @@ def _load_training_preset_metadata(config_path: Optional[str]) -> dict:
 
 # Policy-distillation presets in preference order, most current first. The
 # 2026-08-24 continuation moved the approved anchor to step 174000 in its own
-# namespace; the superseded preset stays selectable, but must not be the one
-# the GUI offers by default.
+# namespace. The superseded step-134000 presets were then retired to
+# config/superseded/, and _training_preset_paths() does not recurse, so they
+# can no longer be offered at all and no longer need a demoted rank here.
 _PREFERRED_TRAINING_PRESETS = (
     'training_config_policy_distillation_c174k.yaml',
-    'training_config_policy_distillation.yaml',
 )
 
 
