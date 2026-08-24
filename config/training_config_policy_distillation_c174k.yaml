@@ -1,0 +1,306 @@
+# Policy-distillation durable continuation configuration (approved 2026-08-24).
+#
+# Merged audit Suggestion 1, Option 1: resume the verified step-174000
+# checkpoint -- the best durable result at 49.30% frozen-suite teacher
+# agreement -- in a NEW isolated namespace, so the occupied 136000-196000
+# range is never rewritten and every existing artifact stays immutable.
+# Suggestion 3, Option 1: the corpus lineage is rebuilt from v11, the last
+# valid predecessor; v12 (recorded 100% freshness, actually 19.9636%) and its
+# descendants v13-v16 are preserved as evidence but excluded from the chain.
+# Suggestion 2: the hold-out is rebuilt as generation 2 and gated by an
+# append-only all-time trained ledger.
+#
+# The superseded run's configuration is preserved verbatim at
+# config/training_config_policy_distillation.yaml. This file must not be
+# pointed back at the wd1e4 namespace.
+
+device:
+  type: "cuda"
+  amp:
+    enabled: true
+    dtype: "bfloat16"
+  compile:
+    enabled: false
+    mode: "reduce-overhead"
+  matmul_precision: "medium"
+
+model:
+  channels: 128
+  num_blocks: 8
+  embedding_size: 256
+  hidden_size: 128
+
+selfplay:
+  cpu_workers: 12
+
+  # Exactly 72 of 240 trajectories come from the frozen current model.
+  games_per_epoch: 72
+  difficulties: ["easy", "medium", "hard"]
+  focus_side: "both"
+  opponent_focus: "algorithm"
+
+  # Exploration changes the played action only. Every stored label is from hard.
+  noise_prob: 0.10
+  teacher_difficulty: "hard"
+  opening_plies: [2, 4, 6, 8]
+  opening_seed: 20260819
+  max_moves_per_game: 200
+  pipeline_mode: "simultaneous"
+  max_stale_epochs: 100
+  persist_selfplay: true
+
+  generation_mix:
+    total_games_per_cycle: 240
+    algorithm_fraction: 0.70
+    model_fraction: 0.30
+
+  # Exactly 168 of 240 trajectories use diverse algorithm behavior.
+  # Hard teacher relabeling is independent of these behavior difficulties.
+  algo_vs_algo:
+    enabled: true
+    games_per_epoch: 168
+    difficulties: ["easy", "medium", "hard"]
+
+# No useful nontrivial symmetry is available. The rules-valid 180 degree
+# rotation with player swap is already identical after side-to-move encoding.
+augmentation:
+  symmetry: "none"
+
+training:
+  stage: "policy_only"
+  batch_size: 2048
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  train_steps: 100000000000
+  checkpoint_every: 2000
+  gradient_accumulation_steps: 1
+  reward_mode: "none"
+  lr_scheduler:
+    enabled: false
+    type: "cosine_warm_restarts"
+    T_0: 5000
+    T_mult: 2
+    eta_min: 5.0e-5
+    warmup_steps: 200
+
+# The active recovery stage remains one-hot policy-only. The enhanced settings
+# are implemented but cannot activate until a policy-only promotion is recorded.
+teacher_policy:
+  target_type: "hard"
+  teacher_difficulty: "hard"
+  temperature: 1.0
+  score_depth: 3
+  value_scale: 1000.0
+  hard_label_blend: 0.25
+  require_policy_gate: true
+
+value_head:
+  enabled: false
+  hidden_size: 128
+  value_weight: 0.15
+
+validation:
+  enabled: true
+  split_fraction: 0.15
+  split_seed: 20260819
+  every_checkpoints: 1
+  # Read-only input; identical suite as the durable run, so every agreement
+  # figure stays comparable with the 49.30% anchor.
+  frozen_suite_path: "data/validation_policy_distillation/frozen_hard_5000.jsonl"
+  frozen_suite_size: 5000
+  frozen_suite_seed: 20260819
+  auto_create_suite: false
+  teacher_agreement_threshold: 0.50
+  # Audit finding F3: the hold-out was frozen when the namespace held 2 files
+  # and never grew, so the approved 15% decayed to 1.7% against a 60-file
+  # corpus. Growth is append-only -- a held file is never released, so states
+  # only ever move train -> validation. false restores the frozen behaviour.
+  grow_holdout: true
+  # Audit Suggestion 2: the generation-1 hold-out is historically contaminated,
+  # ceiling-bound at 27 append-only files, and was down to 3 of 60 live files.
+  # Generation 2 is a versioned replacement written to validation_v2/; the
+  # superseded artifact is never loaded by this namespace.
+  split_version: 2
+
+corpus_snapshots:
+  enabled: true
+  # New continuation namespace. Every prior snapshot root is preserved and
+  # read-only; nothing here writes into them.
+  root: "data/corpus_snapshots/policy_distillation_recovery_c174k"
+  minimum_fresh_state_fraction: 0.50
+  # Every admission copies the whole replay corpus (~0.9 GB at
+  # replay_max_files: 60) and nothing reclaimed it, so the 48h run exhausted
+  # the volume around the 24h mark. Keep a rolling audit window instead.
+  # 0 restores the old keep-everything behaviour.
+  max_retained_snapshots: 10
+
+  # Audit Suggestion 3 / F5: v11 is the last valid predecessor. v12 was
+  # admitted with a lost CURRENT pointer -- its recorded 100% freshness was an
+  # artifact of an empty previous-key set -- and v13-v16 all descend from it.
+  # Naming v11 here gates this namespace's FIRST admission against a real
+  # corpus instead of against nothing, and stamps the ancestry claim into every
+  # manifest so it survives snapshot pruning.
+  lineage:
+    base_manifest: "data/corpus_snapshots/policy_distillation_recovery_wd1e4/snapshot_v000011/manifest.json"
+    base_fingerprint: "b6fd92b1974bfe848a21b2ea9f6e71e75e50b7072a66f6d87ce967caf78d7880"
+    excluded_fingerprints:
+      # v12 -- defective admission
+      - "2724b002e291a2aa9207c548a2de5951ec51046f2727b0768986b8e6b3adaa34"
+      # v13-v16 -- valid artifacts, but all descend from v12
+      - "47c155a10f9bac53155f34e71bf5662ca1bbf9043c322f6bf860a2e22009a2e9"
+      - "4ff7aa2972837fb8745cb325cdb90a060afcec27cc889ba4f6d28ffa1f51f4c5"
+      - "d18ceef2aa8389d669a69c2681609fae9316c902e1be0e90b7456285fa1ed100"
+      - "e5193336e37ddf1a0da1c84661b97d54a41c8ebcf434182abfa60daffb9f3744"
+
+  # Audit Suggestion 2: snapshot retention deletes the manifests that record
+  # what was trained on, so manifests alone are only a lower bound. This
+  # append-only ledger outlives pruning and is what keeps "never hold out a
+  # state the model already fit" answerable. Seeding reads the preserved roots
+  # and writes only under this namespace.
+  trained_ledger:
+    enabled: true
+    seed_from_roots:
+      - "data/corpus_snapshots/policy_distillation_recovery_wd1e4"
+      - "data/corpus_snapshots/policy_distillation"
+
+dataloader:
+  num_workers: 0
+  pin_memory: true
+  prefetch_factor: 2
+  replay_max_entries: 1000000
+  replay_max_files: 60
+  clear_replay_after_load: false
+  max_moves_per_sample: 32
+  ram_cache:
+    enabled: true
+    threshold_gb: 16.0
+    cache_file: "data/replay_cache/policy_distillation_recovery_c174k_cache.pt"
+
+# Game strength is evaluated only after held-out teacher-agreement promotion.
+# Each opponent receives 100 games, exactly 50 on each player side.
+testing:
+  enabled: true
+  promoted_only: true
+  every_n_steps: 2000
+  num_games: 100
+  opponents: ["random", "easy"]
+  difficulty: "easy"
+  opening_plies: [2, 4, 6, 8]
+  opening_seed: 20260819
+  confidence_method: "wilson_score"
+  confidence_level: 0.95
+  random_match_score_threshold: 0.80
+  random_lower_confidence_bound: 0.70
+  easy_lower_confidence_bound: 0.50
+  easy_side_score_floor: 0.50
+  inference_depth: 1
+
+paths:
+  # P5 derives every mutable output path by replacing this exact policy token
+  # with the disjoint enhanced token. The frozen suite and exact accepted
+  # policy checkpoint remain read-only inputs.
+  policy_output_namespace: "policy_distillation_recovery_c174k"
+  enhanced_output_namespace: "policy_distillation_enhanced_p5_c174k"
+  # Continuation writes are isolated from every preserved namespace
+  # (policy_distillation, policy_distillation_recovery, and the wd1e4 run whose
+  # step-174000 checkpoint is the read-only anchor).
+  checkpoint_dir: "models/checkpoints_policy_distillation_recovery_c174k"
+  runtime_model_root: "logs/policy_distillation_recovery_c174k/runtime_models"
+  latest_model: "models/latest_policy_distillation_recovery_c174k.pt"
+  promoted_model: "models/promoted_policy_distillation_recovery_c174k.pt"
+  accepted_model: "models/accepted_policy_distillation_recovery_c174k.pt"
+  replay_dir: "data/replay_policy_distillation_recovery_c174k"
+  log_dir: "logs/policy_distillation_recovery_c174k"
+  stats_file: "models/training_stats_policy_distillation_recovery_c174k.json"
+  # One-time continuity seed: copied to stats_file only when that file
+  # does not yet exist, so the source is never modified.
+  seed_stats_from: "models/training_stats_policy_distillation_recovery_wd1e4.json"
+  promotion_registry: "logs/policy_distillation_recovery_c174k/promotions.jsonl"
+  acceptance_dir: "logs/policy_distillation_recovery_c174k/acceptance"
+
+statistics:
+  enabled: true
+  record_every: 200
+  progress_report_every_seconds: 300
+  system_every: 5000
+  model_health_every: 5000
+  score_dist_every: 500
+  buffer_size: 50000
+  flush_every: 500
+  output_dir: "logs/policy_distillation_recovery_c174k/stats"
+
+thermal_protection:
+  enabled: true
+  temp_limit_c: 89
+  rest_duration: "10m"
+  check_every: 30
+
+resume:
+  enabled: true
+  # Best durable result: 49.30% (2,465/5,000) frozen-suite teacher agreement.
+  # Read-only input from the preserved wd1e4 namespace; nothing is written back
+  # to that directory.
+  checkpoint_path: "models/checkpoints_policy_distillation_recovery_wd1e4/model_step_174000.pt"
+  skip_corrupted: false
+
+recovery_experiment:
+  enabled: true
+  baseline_checkpoint: "models/checkpoints_policy_distillation_recovery_wd1e4/model_step_174000.pt"
+  baseline_sha256: "6230777F09927C0794FD97116AB1C6B54887BBE432187EE5961BD86507C908B3"
+
+time_limit:
+  enabled: true
+  duration: "48h"
+
+profiles:
+  server:
+    device:
+      type: "cuda"
+      amp:
+        enabled: true
+        dtype: "bfloat16"
+      compile:
+        enabled: true
+        mode: "reduce-overhead"
+      matmul_precision: "medium"
+
+    selfplay:
+      cpu_workers: 64
+      games_per_epoch: 360
+      max_stale_epochs: 500
+      generation_mix:
+        total_games_per_cycle: 1200
+        algorithm_fraction: 0.70
+        model_fraction: 0.30
+      algo_vs_algo:
+        enabled: true
+        games_per_epoch: 840
+        difficulties: ["easy", "medium", "hard", "super_hard"]
+
+    training:
+      batch_size: 65536
+      learning_rate: 4.2e-4
+      weight_decay: 1.0e-4
+      checkpoint_every: 2000
+      lr_scheduler:
+        enabled: true
+        type: "cosine_warm_restarts"
+        T_0: 5000
+        T_mult: 2
+        eta_min: 4.2e-5
+        warmup_steps: 500
+
+    dataloader:
+      replay_max_entries: 5000000
+      ram_cache:
+        enabled: true
+        threshold_gb: 64.0
+        cache_file: "data/replay_cache/policy_distillation_recovery_c174k_server_cache.pt"
+
+    thermal_protection:
+      enabled: false
+
+    time_limit:
+      enabled: true
+      duration: "10h"
