@@ -1,3 +1,22 @@
+# ---------------------------------------------------------------------------
+# RETIRED 2026-08-24 -- do not launch.
+#
+# Superseded by config/training_config_policy_distillation_c174k.yaml, which
+# resumes step 174,000 (the best durable result) in its own namespace.  This
+# file still resumes step 134,000 and, more importantly, directs every mutable
+# output -- checkpoints, promoted/accepted aliases, acceptance directory,
+# replay, snapshots -- into `policy_distillation_recovery_wd1e4`, which the
+# merged audit designates preserved read-only evidence and which supplies the
+# c174k anchor, its lineage base (snapshot_v000011), and its ledger seed.  A
+# run from here would overwrite that evidence, could mint the promoted/accepted
+# aliases the audit records as absent, and after five admissions would prune
+# snapshot_v000011 out from under the c174k lineage base.
+#
+# It lives under config/superseded/ so the GUI preset glob
+# (config/training_config*.yaml) can no longer offer it.  Kept, not deleted,
+# because the merged audit's status register cites its exact contents; the
+# isolation tests still read it from here.
+# ---------------------------------------------------------------------------
 # Compatibility entry point for the audited server recovery profile.
 # New launches use training_config_policy_distillation.yaml with --profile server;
 # this file remains fail-closed and equivalent for direct legacy invocations.
