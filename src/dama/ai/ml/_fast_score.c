@@ -4,11 +4,6 @@
 {
     "distutils": {
         "depends": [],
-        "extra_compile_args": [
-            "-O3",
-            "-ffast-math",
-            "-march=native"
-        ],
         "name": "dama.ai.ml._fast_score",
         "sources": [
             "dama/ai/ml/_fast_score.pyx"
