@@ -1,0 +1,26 @@
+# Line-ending policy.
+#
+# This tree is edited from both native Windows and WSL. Without a policy, a
+# Windows-side save rewrites a whole file as CRLF: on 2026-08-24 six untouched
+# files (_fast_search.pyx, three generated .c files, replay.py, setup_cython.py)
+# showed 56,677 insertions against 56,677 deletions with no source change,
+# which masks real diffs and triggers a spurious Cython rebuild because the
+# .pyx mtime moves. Shell scripts must be LF to run under WSL at all.
+#
+# text=auto lets git detect binaries; eol=lf normalizes every text file to LF
+# in the index and in the working tree.
+* text=auto eol=lf
+
+# Never touch these, whatever the content sniffer decides.
+*.pt   binary
+*.pth  binary
+*.onnx binary
+*.so   binary
+*.pyd  binary
+*.zip  binary
+*.gz   binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.pdf  binary
