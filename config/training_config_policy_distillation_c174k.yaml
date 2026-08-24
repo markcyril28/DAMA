@@ -11,7 +11,8 @@
 # append-only all-time trained ledger.
 #
 # The superseded run's configuration is preserved verbatim at
-# config/training_config_policy_distillation.yaml. This file must not be
+# config/superseded/training_config_policy_distillation.yaml, retired there on
+# 2026-08-24 so no launcher or GUI preset can select it. This file must not be
 # pointed back at the wd1e4 namespace.
 
 device:
