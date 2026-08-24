@@ -28,40 +28,57 @@ else:
     if platform.machine() in ("x86_64", "AMD64"):
         _compile_args.append("-march=native")
 
+# Only the .pyx sources are handed to cythonize(). Everything that depends on
+# the machine doing the build -- the compiler flags chosen above, and numpy's
+# absolute include path -- is attached to the Extension objects afterwards.
+#
+# Cython copies whatever it is given into a metadata block at the top of the
+# generated .c, and those .c files ARE tracked (only the .so/.pyd are ignored).
+# Passing the build settings in up front therefore made the generated source
+# machine-specific: the committed _fast_encode.c carried a contributor's
+# "C:\Users\...\site-packages\numpy" paths, and _fast_search.c flipped
+# between the MSVC and GCC flag spellings every time the platform that last
+# built it changed -- so simply running local_train.sh, whose staleness guard
+# rebuilds in place, dirtied a tracked file. Attaching them after cythonize
+# keeps the compile line identical while taking all of that back out of the
+# generated source.
+#
+# This does not make _fast_encode.c fully machine-independent: `cimport numpy`
+# makes Cython emit source-reference comments naming numpy's __init__.pxd by
+# path, and suppressing those means turning off code comments in the generated
+# C altogether, which is a worse trade. That one file still differs per
+# machine; the other two no longer do.
 extensions = [
-    Extension(
-        "dama.ai.ml._fast_encode",
-        sources=["dama/ai/ml/_fast_encode.pyx"],
-        include_dirs=[np.get_include()],
-        define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
-        extra_compile_args=_compile_args,
-        extra_link_args=_link_args,
-    ),
-    Extension(
-        "dama.ai.ml._fast_score",
-        sources=["dama/ai/ml/_fast_score.pyx"],
-        extra_compile_args=_compile_args,
-        extra_link_args=_link_args,
-    ),
+    Extension("dama.ai.ml._fast_encode", sources=["dama/ai/ml/_fast_encode.pyx"]),
+    Extension("dama.ai.ml._fast_score", sources=["dama/ai/ml/_fast_score.pyx"]),
     Extension(
         "dama.ai.algorithmic._fast_search",
         sources=["dama/ai/algorithmic/_fast_search.pyx"],
-        extra_compile_args=_compile_args,
-        extra_link_args=_link_args,
     ),
 ]
 
-setup(
-    ext_modules=cythonize(
-        extensions,
-        compiler_directives={
-            "boundscheck": False,
-            "wraparound": False,
-            "cdivision": True,
-            "language_level": "3",
-            "profile": False,
-            "linetrace": False,
-        },
-    ),
+ext_modules = cythonize(
+    extensions,
+    compiler_directives={
+        "boundscheck": False,
+        "wraparound": False,
+        "cdivision": True,
+        "language_level": "3",
+        "profile": False,
+        "linetrace": False,
+    },
 )
+
+for _ext in ext_modules:
+    _ext.extra_compile_args = list(_compile_args)
+    _ext.extra_link_args = list(_link_args)
+
+# _fast_encode is the only one that uses the numpy C API.
+for _ext in ext_modules:
+    if _ext.name.endswith("_fast_encode"):
+        _ext.include_dirs = [np.get_include()]
+        _ext.define_macros = [
+            ("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
+
+setup(ext_modules=ext_modules)
 
