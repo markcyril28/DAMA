@@ -4,11 +4,6 @@
 {
     "distutils": {
         "depends": [],
-        "extra_compile_args": [
-            "/O2",
-            "/fp:fast",
-            "/arch:AVX2"
-        ],
         "name": "dama.ai.algorithmic._fast_search",
         "sources": [
             "dama/ai/algorithmic/_fast_search.pyx"
