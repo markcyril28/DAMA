@@ -20,34 +20,53 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BASELINE = Path(
     "models/checkpoints_policy_distillation/model_step_134000.pt"
 )
+# The approved 2026-08-24 continuation resumes the best durable checkpoint --
+# step 174000 at 49.30% frozen-suite teacher agreement -- in a namespace of its
+# own, so the occupied 136000-196000 range is never rewritten.
+CONTINUATION_BASELINE = Path(
+    "models/checkpoints_policy_distillation_recovery_wd1e4/model_step_174000.pt"
+)
 # The prior recovery namespace contains the preserved 136k-144k artifacts.
 # Corrected 1e-4 runs must never reuse or overwrite it.
 PRESERVED_PRIOR_RECOVERY_NAMESPACE = "policy_distillation_recovery"
 RECOVERY_NAMESPACE = "policy_distillation_recovery_wd1e4"
+CONTINUATION_NAMESPACE = "policy_distillation_recovery_c174k"
 RECOVERY_CHECKPOINT_DIR = Path(
     f"models/checkpoints_{RECOVERY_NAMESPACE}"
 )
 
 
 @pytest.mark.parametrize(
-    ("relative_config", "profile"),
+    ("relative_config", "profile", "expected_baseline", "expected_namespace"),
     [
-        ("config/training_config_policy_distillation.yaml", None),
-        ("config/training_config_policy_distillation.yaml", "server"),
-        ("config/training_config_server_policy_distillation.yaml", None),
+        ("config/training_config_policy_distillation.yaml", None,
+         BASELINE, RECOVERY_NAMESPACE),
+        ("config/training_config_policy_distillation.yaml", "server",
+         BASELINE, RECOVERY_NAMESPACE),
+        ("config/training_config_server_policy_distillation.yaml", None,
+         BASELINE, RECOVERY_NAMESPACE),
+        ("config/training_config_policy_distillation_c174k.yaml", None,
+         CONTINUATION_BASELINE, CONTINUATION_NAMESPACE),
+        ("config/training_config_policy_distillation_c174k.yaml", "server",
+         CONTINUATION_BASELINE, CONTINUATION_NAMESPACE),
     ],
 )
 def test_recovery_configs_isolate_all_mutable_model_outputs(
     relative_config: str,
     profile: str | None,
+    expected_baseline: Path,
+    expected_namespace: str,
 ) -> None:
     path = PROJECT_ROOT / relative_config
     config = config_from_yaml(load_config_from_yaml(str(path), profile))
+    RECOVERY_NAMESPACE = expected_namespace
 
     validate_recovery_experiment_config(config)
-    assert Path(config.recovery_baseline_path or "") == BASELINE
-    assert Path(config.resume or "") == BASELINE
-    assert Path(config.checkpoint_dir) == RECOVERY_CHECKPOINT_DIR
+    assert Path(config.recovery_baseline_path or "") == expected_baseline
+    assert Path(config.resume or "") == expected_baseline
+    assert Path(config.checkpoint_dir) == Path(
+        f"models/checkpoints_{RECOVERY_NAMESPACE}"
+    )
     assert Path(config.runtime_model_root) == Path(
         f"logs/{RECOVERY_NAMESPACE}/runtime_models"
     )
@@ -90,7 +109,7 @@ def test_recovery_configs_isolate_all_mutable_model_outputs(
     assert len(aliases) == 3
     assert all(RECOVERY_NAMESPACE in alias.stem for alias in aliases)
     assert all(alias.parent == Path("models") for alias in aliases)
-    assert BASELINE.parent != Path(config.checkpoint_dir)
+    assert expected_baseline.parent != Path(config.checkpoint_dir)
     assert Path(config.checkpoint_dir) != Path(
         f"models/checkpoints_{PRESERVED_PRIOR_RECOVERY_NAMESPACE}"
     )
@@ -103,11 +122,44 @@ def test_recovery_configs_isolate_all_mutable_model_outputs(
 def test_recovery_launchers_seed_isolated_stats_without_overwriting_legacy(
     launcher: str,
 ) -> None:
+    """The seed is config-driven now, so no launcher may hardcode an anchor.
+
+    All three used to carry their own copy of the step-134000 path, digest, and
+    stats filenames.  Moving the anchor to step 174000 would then require four
+    edits (three launchers plus the config) with nothing detecting a miss.
+    """
     text = (PROJECT_ROOT / launcher).read_text(encoding="utf-8")
 
-    assert "training_stats_policy_distillation.json" in text
-    assert "training_stats_policy_distillation_recovery_wd1e4.json" in text
+    assert "seed_stats_from" in text
     assert "without modifying the legacy stats file" in text
+    assert "model_step_134000.pt" not in text, (
+        f"{launcher} still hardcodes the superseded step-134000 anchor")
+    assert "7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27" not in text, (
+        f"{launcher} still hardcodes an anchor digest")
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    ["local_train.sh", "train_server.sh", "local_train.ps1"],
+)
+def test_recovery_launchers_select_the_continuation_config(launcher: str) -> None:
+    text = (PROJECT_ROOT / launcher).read_text(encoding="utf-8")
+    assert "training_config_policy_distillation_c174k.yaml" in text
+
+
+def test_every_recovery_config_seeds_its_stats_from_a_readable_source() -> None:
+    import yaml
+
+    for relative in (
+        "config/training_config_policy_distillation.yaml",
+        "config/training_config_policy_distillation_c174k.yaml",
+    ):
+        raw = yaml.safe_load(
+            (PROJECT_ROOT / relative).read_text(encoding="utf-8"))
+        paths = raw["paths"]
+        assert paths["seed_stats_from"]
+        assert paths["seed_stats_from"] != paths["stats_file"], (
+            f"{relative} would seed its stats file from itself")
 
 
 def test_recovery_updates_progress_report_to_recovery_log_dir(
@@ -192,3 +244,25 @@ def test_non_recovery_updates_progress_report_to_stats_parent(
     assert fake_outputs, "Expected progress report writer to be invoked"
     _, _, html_output_path, _ = fake_outputs[0]
     assert Path(html_output_path) == path.parent / "training_progress.html"
+
+
+def test_gui_offers_the_continuation_preset_before_the_superseded_one() -> None:
+    """The GUI preset list is a fourth place the active config is chosen.
+
+    Its preference used to require checkpoints in the preset's own checkpoint
+    directory. The continuation namespace is empty until its first run, so that
+    rule would have quietly offered the superseded step-134000 preset instead.
+    """
+    from dama.ui.training_panel import (
+        _PREFERRED_TRAINING_PRESETS,
+        _training_preset_rank,
+    )
+
+    assert _PREFERRED_TRAINING_PRESETS[0] == (
+        "training_config_policy_distillation_c174k.yaml")
+    assert _training_preset_rank(
+        "training_config_policy_distillation_c174k.yaml"
+    ) < _training_preset_rank("training_config_policy_distillation.yaml")
+    assert _training_preset_rank(
+        "training_config_policy_distillation.yaml"
+    ) < _training_preset_rank("training_config_local.yaml")
