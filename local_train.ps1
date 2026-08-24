@@ -33,13 +33,13 @@ matches local_train.sh.
 
 .PARAMETER Resume
 Resume from a specific checkpoint. This cannot be combined with FreshStart.
-The policy-distillation recovery config accepts only its preserved step-134000
-baseline.
+The policy-distillation recovery config accepts only the preserved baseline
+checkpoint that the selected config pins by path and SHA-256.
 
 .PARAMETER FreshStart
 Start without a checkpoint. Without this option or Resume, the launcher uses
-the preserved step-134000 baseline for the policy-distillation recovery config
-and the latest checkpoint for other configs. FreshStart is rejected for the
+the preserved baseline named by the selected policy-distillation recovery
+config and the latest checkpoint for other configs. FreshStart is rejected for the
 policy-distillation recovery experiment.
 
 .PARAMETER EnhancedStage
@@ -73,7 +73,8 @@ param(
     [string] $CondaEnvironment = 'dama',
 
     [ValidateNotNullOrEmpty()]
-    # Superseded: 'config\training_config_policy_distillation.yaml' pins step 134000.
+    # Retired: 'config\superseded\training_config_policy_distillation.yaml' pins step
+    # 134000 and writes into the preserved wd1e4 namespace. Do not select it.
     [string] $Config = 'config\training_config_policy_distillation_c174k.yaml',
 
     [string] $Resume = '',
@@ -339,7 +340,7 @@ try {
     Write-Host "Log:       $LogFile"
     Write-Host "Trainer:   $TrainerLogFile"
     if ($IsPolicyRecovery) {
-        Write-Host "Recovery:  verified step-134000 baseline ($PolicyRecoveryBaselineSha256)"
+        Write-Host "Recovery:  verified anchor $(Split-Path -Leaf $PolicyRecoveryBaselinePath) ($PolicyRecoveryBaselineSha256)"
     }
     Write-Host ''
     Write-Host 'Source safeguard: no package installation, source build, config edit, or Git mutation is performed.'
@@ -436,12 +437,30 @@ print("DAMA trainer import: OK")
         -not [string]::IsNullOrWhiteSpace($PolicyRecoveryLegacyStatsPath) -and
         -not (Test-Path -LiteralPath $PolicyRecoveryStatsPath) -and
         (Test-Path -LiteralPath $PolicyRecoveryLegacyStatsPath -PathType Leaf)) {
-        Copy-Item -LiteralPath $PolicyRecoveryLegacyStatsPath `
-            -Destination $PolicyRecoveryStatsPath
-        Write-Host (
-            'Recovery stats seeded without modifying the legacy stats file: ' +
-            $PolicyRecoveryStatsPath
-        )
+        # Copy through a temp file and rename. A plain copy that is
+        # interrupted part way leaves a truncated stats file behind, and both
+        # seeders -- this one and the trainer's -- skip when the destination
+        # merely exists, so the run would silently start from a corrupt
+        # history. Matches local_train.sh / train_server.sh.
+        $StatsSeedTemp = $PolicyRecoveryStatsPath + '.seed.tmp'
+        try {
+            Copy-Item -LiteralPath $PolicyRecoveryLegacyStatsPath `
+                -Destination $StatsSeedTemp -Force -ErrorAction Stop
+            Move-Item -LiteralPath $StatsSeedTemp `
+                -Destination $PolicyRecoveryStatsPath -Force -ErrorAction Stop
+            Write-Host (
+                'Recovery stats seeded without modifying the legacy stats file: ' +
+                $PolicyRecoveryStatsPath
+            )
+        } catch {
+            Remove-Item -LiteralPath $StatsSeedTemp -Force `
+                -ErrorAction SilentlyContinue
+            Write-Host (
+                '[warn] Could not seed recovery stats from ' +
+                $PolicyRecoveryLegacyStatsPath +
+                '; the trainer will retry the same one-time copy.'
+            )
+        }
     }
 
     $TrainerArguments = @(
