@@ -21,7 +21,8 @@ set -euo pipefail
 # TRAINING_CONFIG="config/training_config.yaml"
 # TRAINING_CONFIG="config/training_config_server.yaml"
 # TRAINING_CONFIG="config/training_config_server_retrain.yaml"
-# TRAINING_CONFIG="config/training_config_policy_distillation.yaml"   # superseded: pinned to step 134000
+# Retired: config/superseded/training_config_policy_distillation.yaml (step 134000,
+# writes into the preserved wd1e4 namespace). Do not point TRAINING_CONFIG at it.
 TRAINING_CONFIG="config/training_config_policy_distillation_c174k.yaml"
 
 # -----------------------------------------------------------------------------
@@ -244,8 +245,19 @@ if [ "$IS_POLICY_RECOVERY" = true ]; then
        [ ! -e "$POLICY_RECOVERY_STATS" ] &&
        [ -n "$POLICY_RECOVERY_LEGACY_STATS" ] &&
        [ -f "$POLICY_RECOVERY_LEGACY_STATS" ]; then
-        cp -- "$POLICY_RECOVERY_LEGACY_STATS" "$POLICY_RECOVERY_STATS"
-        echo "Recovery stats seeded without modifying the legacy stats file: ${POLICY_RECOVERY_STATS}"
+        # Copy through a temp file and rename. A plain cp that is killed
+        # part way leaves a truncated stats file behind, and both seeders
+        # -- this one and the trainer's -- skip when the destination merely
+        # exists, so the run would silently start from a corrupt history.
+        _stats_seed_tmp="${POLICY_RECOVERY_STATS}.seed.tmp"
+        if cp -- "$POLICY_RECOVERY_LEGACY_STATS" "$_stats_seed_tmp" &&
+           mv -- "$_stats_seed_tmp" "$POLICY_RECOVERY_STATS"; then
+            echo "Recovery stats seeded without modifying the legacy stats file: ${POLICY_RECOVERY_STATS}"
+        else
+            rm -f -- "$_stats_seed_tmp"
+            echo "[warn] Could not seed recovery stats from ${POLICY_RECOVERY_LEGACY_STATS};"
+            echo "[warn] the trainer will retry the same one-time copy."
+        fi
     fi
     echo ""
 fi
