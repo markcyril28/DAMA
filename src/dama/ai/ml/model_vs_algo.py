@@ -330,6 +330,26 @@ def _opening_suite_identity(
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
+def opening_suite_identity(
+    opening_seed: int,
+    opening_plies: Sequence[int],
+    games_per_side: int,
+) -> str:
+    """Public recomputation of the identity a balanced run stamps on its stats.
+
+    The acceptance gate must derive this itself.  Comparing a report's
+    ``opening_suite_id`` only against the *other* report proves the two runs
+    agreed with each other, not that either used the declared opening suite --
+    so a hand-written pair of records with a matching invented id passed.
+    Normalization is identical to :func:`_build_balanced_game_specs`.
+    """
+    normalized_plies = tuple(int(value) for value in opening_plies) or (0,)
+    if any(value < 0 for value in normalized_plies):
+        raise ValueError("opening plies must be non-negative")
+    return _opening_suite_identity(
+        int(opening_seed), normalized_plies, int(games_per_side))
+
+
 def _build_balanced_game_specs(
     model_path: str,
     difficulty: str,
