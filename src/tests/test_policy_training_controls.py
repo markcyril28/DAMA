@@ -9,6 +9,7 @@ import pytest
 import dama.ai.ml.trainer as trainer_module
 from dama.ai.ml import checkpoint_acceptance
 from dama.ai.ml.corpus import SnapshotDecision, canonical_state_key
+from dama.ai.ml.model_vs_algo import opening_suite_identity
 from dama.ai.ml.trainer import (
     Trainer,
     TrainingConfig,
@@ -322,6 +323,142 @@ def test_promotion_metadata_records_live_optimizer_context(
     assert context["weight_decay"] == pytest.approx(
         holder.optimizer.param_groups[0]["weight_decay"])
     assert selection["promotion"]["promoted"] is True
+
+
+def test_saved_checkpoint_carries_declared_dataset_provenance(
+    tmp_path: Path,
+) -> None:
+    """P0 requires every checkpoint to record what corpus produced it.
+
+    The audit verified these keys by deserializing live artifacts only; nothing
+    asserted them, so a refactor could drop one silently and the loss-semantics
+    and promotion tests would all still pass.
+    """
+    import threading
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    manifest = {
+        "manifest_path": str(tmp_path / "snapshot_v000001" / "manifest.json"),
+        "version": 1,
+        "files": [{"name": "replay_a.jsonl", "sha256": "aa", "size_bytes": 10}],
+        "metrics": {
+            "post_dedup_unique_state_count": 4321,
+            "forced_move_rate": 0.191,
+            "forced_move_count": 825,
+        },
+        "teacher_settings": {"difficulty": "hard"},
+        "noise_settings": {"played_action_probability": 0.10,
+                           "label_is_teacher": True},
+        "generation_settings": {"algorithm_fraction": 0.70,
+                                "model_fraction": 0.30},
+    }
+
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        latest_path=str(tmp_path / "latest.pt"),
+        learning_rate=2e-4,
+        weight_decay=1e-4,
+    )
+    holder.model = SimpleNamespace(state_dict=lambda: {}, arch_params={})
+    holder.optimizer = SimpleNamespace(
+        state_dict=lambda: {"state": {}, "param_groups": []})
+    holder.stats = TrainingStats(
+        dataset_fingerprint="corpus-fingerprint",
+        dataset_metadata={"fingerprint": "corpus-fingerprint", "version": 1},
+    )
+    holder.step = 136000
+    holder.epoch = 7
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats_collector = None
+    holder.log_file = str(tmp_path / "train.jsonl")
+    holder.device = torch.device("cpu")
+    holder._checkpoint_thread = None
+    holder._active_snapshot_manifest = manifest
+    holder._evaluate_validation_loss = lambda: 0.42
+    holder._evaluate_teacher_promotion = lambda _path: None
+    holder._live_optimizer_context = lambda: {
+        "learning_rate": 2e-4, "weight_decay": 1e-4}
+    holder._snapshot_stats = lambda: {}
+    holder._save_stats = lambda **_kwargs: None
+    holder._put_status = lambda _message: None
+
+    path = Trainer._save_checkpoint(holder, loss=0.9)
+    thread = holder._checkpoint_thread
+    assert isinstance(thread, threading.Thread)
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert saved["dataset_fingerprint"] == "corpus-fingerprint"
+    assert saved["dataset_metadata"]["version"] == 1
+    assert saved["snapshot_manifest_path"] == manifest["manifest_path"]
+    assert saved["snapshot_file_list"] == manifest["files"]
+    assert saved["snapshot_unique_state_count"] == 4321
+    assert saved["snapshot_forced_move_rate"] == pytest.approx(0.191)
+    assert saved["snapshot_forced_move_count"] == 825
+    assert saved["teacher_settings"] == manifest["teacher_settings"]
+    assert saved["noise_settings"] == manifest["noise_settings"]
+    assert saved["generation_settings"] == manifest["generation_settings"]
+    # Never call a checkpoint "best" from training loss alone.
+    assert saved["selection_basis"] == "held_out_teacher_agreement"
+
+
+def test_checkpoint_collision_still_measures_without_writing(
+    tmp_path: Path,
+) -> None:
+    """A step collision must not silently skip validation and agreement.
+
+    Resuming from step 134,000 into a directory already holding checkpoints
+    136,000-196,000 made the collision path return before
+    _evaluate_validation_loss() and _evaluate_teacher_promotion(), so ~62,000
+    steps produced no measurement at all. The checkpoint, the latest alias and
+    the append-only promotion registry must still be left untouched.
+    """
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    existing = checkpoint_dir / "model_step_136000.pt"
+    torch.save({"marker": "original"}, existing)
+    original_bytes = existing.read_bytes()
+
+    calls = []
+
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        latest_path=str(tmp_path / "latest.pt"),
+    )
+    holder.step = 136000
+    holder.stats = TrainingStats()
+    holder._checkpoint_thread = None
+    holder._verify_existing_checkpoint_collision = (
+        lambda _p: calls.append("verified"))
+    holder._evaluate_validation_loss = (
+        lambda: (calls.append("val_loss"), 0.4242)[1])
+    holder._record_validation_stats = (
+        lambda v: calls.append(("recorded", v)))
+    holder._evaluate_teacher_promotion = (
+        lambda _p: (calls.append("agreement"), {"promotion": {}})[1])
+    holder._save_stats = lambda **_k: calls.append("stats_saved")
+
+    returned = Trainer._save_checkpoint(holder, loss=0.9)
+
+    assert returned == str(existing)
+    # Measured...
+    assert "val_loss" in calls, "collision path skipped validation loss"
+    assert ("recorded", 0.4242) in calls, "validation loss was not recorded"
+    assert "agreement" in calls, "collision path skipped teacher agreement"
+    assert "stats_saved" in calls, "measurements were not made durable"
+    # ...but wrote nothing.
+    assert existing.read_bytes() == original_bytes
+    assert not (tmp_path / "latest.pt").exists()
+    assert holder._checkpoint_thread is None, "collision must not start a write"
 
 
 def test_checkpoint_load_rewinds_newer_sidecar_histories(
@@ -1120,6 +1257,52 @@ def test_recovery_gate_accepts_only_exact_baseline_and_controls(tmp_path: Path) 
         validate_recovery_experiment_config(config)
 
 
+def test_recovery_gate_accepts_an_approved_numbered_anchor_other_than_134000(
+    tmp_path: Path,
+) -> None:
+    """The 2026-08-24 continuation resumes step 174000, not step 134000.
+
+    The gate used to pin the anchor by filename to model_step_134000.pt, which
+    would reject the approved continuation outright.  Identity is now carried
+    by the SHA-256 pin; the filename rule only keeps the anchor an immutable
+    numbered checkpoint rather than a moving alias.
+    """
+    checkpoint = tmp_path / "model_step_174000.pt"
+    checkpoint.write_bytes(b"approved continuation anchor")
+    config = _valid_recovery_config(checkpoint)
+
+    validate_recovery_experiment_config(config)
+
+
+@pytest.mark.parametrize(
+    "anchor_name",
+    ["latest.pt", "promoted_policy.pt", "model_step_.pt", "model_step_174000.pth"],
+)
+def test_recovery_gate_refuses_an_anchor_that_is_not_a_numbered_checkpoint(
+    tmp_path: Path,
+    anchor_name: str,
+) -> None:
+    """Aliases are republished in place, so pinning one is unverifiable."""
+    checkpoint = tmp_path / anchor_name
+    checkpoint.write_bytes(b"moving alias")
+    config = _valid_recovery_config(checkpoint)
+
+    with pytest.raises(ValueError, match="numbered checkpoint"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_refuses_an_anchor_whose_digest_does_not_match(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model_step_174000.pt"
+    checkpoint.write_bytes(b"approved continuation anchor")
+    config = _valid_recovery_config(checkpoint)
+    checkpoint.write_bytes(b"a different checkpoint entirely")
+
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        validate_recovery_experiment_config(config)
+
+
 def test_recovery_gate_accepts_another_path_to_the_same_baseline_file(
     tmp_path: Path,
 ) -> None:
@@ -1225,6 +1408,281 @@ def test_alias_publication_preserves_source_and_existing_checkpoint_is_unchanged
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
 
 
+def test_rollback_accepts_the_anchor_whose_embedded_lineage_predates_it(
+    tmp_path: Path,
+) -> None:
+    """The continuation anchor embeds the *previous* run's baseline hash.
+
+    Step 174000 was written by the wd1e4 run, so its stored
+    ``recovery_experiment.baseline_sha256`` is the step-134000 digest, while
+    the continuation config pins the 174000 *file* digest. Selecting a rollback
+    target must therefore identify the anchor by its file hash -- comparing the
+    embedded lineage instead would reject the approved anchor and leave the run
+    with no admissible checkpoint at all.
+    """
+    import torch
+
+    anchor = tmp_path / "model_step_174000.pt"
+    anchor.write_bytes(b"the approved continuation anchor")
+    anchor_digest = hashlib.sha256(anchor.read_bytes()).hexdigest().upper()
+
+    checkpoint_dir = tmp_path / "checkpoints_continuation"
+    checkpoint_dir.mkdir()
+
+    def _write(step: int, baseline: str) -> Path:
+        path = checkpoint_dir / f"model_step_{step}.pt"
+        torch.save({
+            "model_state_dict": {"w": torch.zeros(2)},
+            "step": step,
+            "recovery_experiment": {
+                "enabled": True,
+                "baseline_sha256": baseline,
+                "training_stage": "policy_only",
+            },
+        }, path)
+        return path
+
+    descendant = _write(176000, anchor_digest)
+    _write(178000, "7238CD80" + "0" * 56)  # a foreign lineage
+
+    holder = SimpleNamespace(
+        config=SimpleNamespace(
+            resume=str(anchor),
+            recovery_baseline_sha256=anchor_digest,
+            policy_stage="policy_only",
+            checkpoint_dir=str(checkpoint_dir),
+            teacher_agreement_threshold=0.50,
+            policy_gate_promotion_registry=None,
+        ),
+        step=174000,
+        _checkpoint_file_sha256=Trainer._checkpoint_file_sha256,
+    )
+    assert Trainer._verified_recovery_rollback_checkpoint(holder) == anchor.resolve()
+
+    # A descendant that embeds the new baseline is preferred once passed.
+    holder.step = 176000
+    assert (Trainer._verified_recovery_rollback_checkpoint(holder)
+            == descendant.resolve())
+
+    # A descendant of a foreign lineage never qualifies, even when it is newest.
+    holder.step = 178000
+    assert (Trainer._verified_recovery_rollback_checkpoint(holder)
+            == descendant.resolve())
+
+    # If the anchor file itself changes, it stops being the approved anchor.
+    anchor.write_bytes(b"tampered")
+    holder.step = 174000
+    with pytest.raises(RuntimeError, match="No verified checkpoint remains"):
+        Trainer._verified_recovery_rollback_checkpoint(holder)
+
+
+def _enhanced_stage_acceptance_fixture(tmp_path: Path) -> dict:
+    """Build a complete, genuinely passing enhanced-stage unlock on disk.
+
+    Returns the durable inputs so a caller can corrupt exactly one of them and
+    assert the gate fails closed. Audit Suggestion 4 named the previous fixture
+    directly: it used opening_suite_id "sha256:test-suite" and 55/100 teacher
+    counts, so it demonstrated a gate that could not tell a real acceptance
+    report from an invented one.
+    """
+    baseline = tmp_path / "model_step_134000.pt"
+    baseline.write_bytes(b"immutable baseline")
+    config = _valid_recovery_config(baseline)
+    policy_checkpoint_dir = Path(config.checkpoint_dir)
+    policy_checkpoint_dir.mkdir(parents=True)
+    promoted = policy_checkpoint_dir / "model_step_140000.pt"
+    promoted.write_bytes(b"promoted policy")
+    promoted_sha256 = hashlib.sha256(promoted.read_bytes()).hexdigest()
+    suite = tmp_path / "frozen.jsonl"
+    suite.write_bytes(b"frozen suite")
+    suite_sha256 = hashlib.sha256(suite.read_bytes()).hexdigest()
+    suite.with_suffix(".jsonl.manifest.json").write_text(
+        json.dumps({"suite_sha256": suite_sha256}), encoding="utf-8")
+
+    registry = Path(config.promotion_registry)
+    registry.parent.mkdir(parents=True)
+    registry_record = {
+        "promoted": True,
+        "step": 140000,
+        "training_stage": "policy_only",
+        "teacher_agreement": 0.55,
+        "teacher_agreement_threshold": 0.50,
+        "teacher_correct_states": 2750,
+        "teacher_total_states": 5000,
+        "checkpoint_path": str(promoted),
+        "checkpoint_sha256": promoted_sha256,
+        "suite_fingerprint": suite_sha256,
+    }
+
+    def _write_registry() -> None:
+        registry.write_text(
+            json.dumps(registry_record) + "\n", encoding="utf-8")
+
+    _write_registry()
+
+    config.resume = str(promoted)
+    config.frozen_suite_path = str(suite)
+    activate_enhanced_stage(config, inference_depth=3)
+
+    accepted_alias = Path(config.policy_output_paths["accepted_path"])
+    accepted_alias.write_bytes(promoted.read_bytes())
+    acceptance_dir = Path(config.policy_output_paths["acceptance_dir"])
+    acceptance_dir.mkdir(parents=True)
+    suite_id = opening_suite_identity(
+        config.test_opening_seed, config.test_opening_plies, 50)
+    common = {
+        "model_path": str(promoted),
+        "algo_difficulty": "easy",
+        "opening_seed": config.test_opening_seed,
+        "opening_plies": list(config.test_opening_plies),
+        "opening_suite_id": suite_id,
+        "opening_suite_size": 50,
+        "ml_inference_depth": 1,
+    }
+    random_result = {
+        "ml_wins": 90, "draws": 0, "algo_wins": 10,
+        "ml_as_p1_wins": 45, "ml_as_p1_draws": 0, "ml_as_p1_losses": 5,
+        "ml_as_p2_wins": 45, "ml_as_p2_draws": 0, "ml_as_p2_losses": 5,
+        "opponent_type": "random", **common,
+    }
+    easy_result = {
+        "ml_wins": 65, "draws": 10, "algo_wins": 25,
+        "ml_as_p1_wins": 32, "ml_as_p1_draws": 5, "ml_as_p1_losses": 13,
+        "ml_as_p2_wins": 33, "ml_as_p2_draws": 5, "ml_as_p2_losses": 12,
+        "opponent_type": "algorithm", **common,
+    }
+    decision = checkpoint_acceptance.evaluate_acceptance_gates(
+        0.55, random_result, easy_result)
+    report = {
+        "passed": True,
+        "step": 140000,
+        "training_stage": "policy_only",
+        "checkpoint_path": str(promoted),
+        "checkpoint_sha256": promoted_sha256,
+        "frozen_suite_fingerprint": suite_sha256,
+        "task_id": checkpoint_acceptance.acceptance_task_id(
+            str(promoted), 140000),
+        "teacher_agreement_counts": {
+            "correct_states": 2750, "total_states": 5000},
+        "selection_sequence": [
+            "held_out_teacher_agreement",
+            "random_game_strength",
+            "easy_game_strength",
+        ],
+        "opening_seed": config.test_opening_seed,
+        "opening_plies": list(config.test_opening_plies),
+        "opening_suite_id": suite_id,
+        "inference_depth": 1,
+        "max_moves": config.selfplay_max_moves,
+        "num_workers": 4,
+        "ci_method": decision.to_dict()["ci_method"],
+        "checks": decision.checks,
+        "thresholds": decision.thresholds,
+        "metrics": decision.metrics,
+        "random": random_result,
+        "easy": easy_result,
+    }
+    report_path = acceptance_dir / "acceptance_step_140000.json"
+
+    def _write_report() -> None:
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    _write_report()
+    validate_recovery_experiment_config(config)
+    return {
+        "config": config,
+        "registry_record": registry_record,
+        "write_registry": _write_registry,
+        "report": report,
+        "write_report": _write_report,
+        "suite_id": suite_id,
+    }
+
+
+def test_acceptance_gate_recomputes_the_opening_suite_identity(
+    tmp_path: Path,
+) -> None:
+    """A matching-but-invented suite id no longer proves the declared protocol."""
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    report = fixture["report"]
+
+    # The exact value the superseded fixture used, applied consistently to
+    # every field the gate previously compared against.
+    report["opening_suite_id"] = "sha256:test-suite"
+    report["random"]["opening_suite_id"] = "sha256:test-suite"
+    report["easy"]["opening_suite_id"] = "sha256:test-suite"
+    fixture["write_report"]()
+    with pytest.raises(ValueError, match="declared opening suite"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
+def test_acceptance_gate_rejects_a_suite_id_only_one_record_carries(
+    tmp_path: Path,
+) -> None:
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    report = fixture["report"]
+    report["easy"]["opening_suite_id"] = "sha256:" + "0" * 64
+    fixture["write_report"]()
+    with pytest.raises(ValueError, match="declared opening suite"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
+def test_acceptance_gate_requires_exactly_the_frozen_suite_size(
+    tmp_path: Path,
+) -> None:
+    """55/100 satisfied every provenance comparison the gate used to make."""
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    fixture["registry_record"]["teacher_correct_states"] = 55
+    fixture["registry_record"]["teacher_total_states"] = 100
+    fixture["write_registry"]()
+    fixture["report"]["teacher_agreement_counts"] = {
+        "correct_states": 55, "total_states": 100}
+    fixture["write_report"]()
+    with pytest.raises(ValueError, match="not the required 5000"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
+def test_acceptance_gate_requires_counts_to_reproduce_the_agreement(
+    tmp_path: Path,
+) -> None:
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    # Correct suite size, but the counts do not divide to the promoted 0.55.
+    fixture["registry_record"]["teacher_correct_states"] = 2751
+    fixture["write_registry"]()
+    fixture["report"]["teacher_agreement_counts"] = {
+        "correct_states": 2751, "total_states": 5000}
+    fixture["write_report"]()
+    with pytest.raises(ValueError, match="quotient of its recorded counts"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
+def test_acceptance_gate_rejects_impossible_teacher_counts(
+    tmp_path: Path,
+) -> None:
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    fixture["registry_record"]["teacher_correct_states"] = 5001
+    fixture["write_registry"]()
+    fixture["report"]["teacher_agreement_counts"] = {
+        "correct_states": 5001, "total_states": 5000}
+    fixture["write_report"]()
+    with pytest.raises(ValueError, match="teacher_correct_states exceeds"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
+def test_acceptance_gate_rejects_missing_teacher_counts(
+    tmp_path: Path,
+) -> None:
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    fixture["registry_record"].pop("teacher_correct_states")
+    fixture["registry_record"].pop("teacher_total_states")
+    fixture["write_registry"]()
+    fixture["report"]["teacher_agreement_counts"] = {
+        "correct_states": None, "total_states": None}
+    fixture["write_report"]()
+    with pytest.raises(ValueError, match="no held-out teacher-agreement counts"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
 def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     tmp_path: Path,
 ) -> None:
@@ -1250,8 +1708,11 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "training_stage": "policy_only",
         "teacher_agreement": 0.55,
         "teacher_agreement_threshold": 0.50,
-        "teacher_correct_states": 55,
-        "teacher_total_states": 100,
+        # A real frozen-suite measurement: 2750/5000 = 0.55. The former
+        # 55/100 fixture asserted a gate that could pass on a suite fifty
+        # times smaller than the approved one.
+        "teacher_correct_states": 2750,
+        "teacher_total_states": 5000,
         "checkpoint_path": str(promoted),
         "checkpoint_sha256": promoted_sha256,
         "suite_fingerprint": suite_sha256,
@@ -1278,6 +1739,10 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     accepted_alias.write_bytes(promoted.read_bytes())
     acceptance_dir = Path(config.policy_output_paths["acceptance_dir"])
     acceptance_dir.mkdir(parents=True)
+    # Derived exactly as ModelVsAlgoTester derives it, so the gate's own
+    # recomputation is checked against the real identity rather than a token.
+    expected_suite_id = opening_suite_identity(
+        config.test_opening_seed, config.test_opening_plies, 50)
     random_result = {
         "ml_wins": 90,
         "draws": 0,
@@ -1293,7 +1758,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "algo_difficulty": "easy",
         "opening_seed": config.test_opening_seed,
         "opening_plies": list(config.test_opening_plies),
-        "opening_suite_id": "sha256:test-suite",
+        "opening_suite_id": expected_suite_id,
         "opening_suite_size": 50,
         "ml_inference_depth": 1,
     }
@@ -1312,7 +1777,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "algo_difficulty": "easy",
         "opening_seed": config.test_opening_seed,
         "opening_plies": list(config.test_opening_plies),
-        "opening_suite_id": "sha256:test-suite",
+        "opening_suite_id": expected_suite_id,
         "opening_suite_size": 50,
         "ml_inference_depth": 1,
     }
@@ -1330,8 +1795,8 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "frozen_suite_fingerprint": suite_sha256,
         "task_id": expected_task_id,
         "teacher_agreement_counts": {
-            "correct_states": 55,
-            "total_states": 100,
+            "correct_states": 2750,
+            "total_states": 5000,
         },
         "selection_sequence": [
             "held_out_teacher_agreement",
@@ -1340,6 +1805,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         ],
         "opening_seed": config.test_opening_seed,
         "opening_plies": list(config.test_opening_plies),
+        "opening_suite_id": expected_suite_id,
         "inference_depth": 1,
         "max_moves": config.selfplay_max_moves,
         "num_workers": 4,
@@ -1390,8 +1856,8 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         training_stage="policy_only",
         checkpoint_sha256=promoted_sha256,
         suite_fingerprint=suite_sha256,
-        teacher_correct_states=55,
-        teacher_total_states=100,
+        teacher_correct_states=2750,
+        teacher_total_states=5000,
     )
     pending_path = checkpoint_acceptance.persist_pending_acceptance_task(
         acceptance_dir, pending_task)
