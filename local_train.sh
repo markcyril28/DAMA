@@ -6,7 +6,7 @@ set -euo pipefail
 # =============================================================================
 # LOCAL SPECS:
 #   GPU: NVIDIA RTX 5050 (8GB VRAM)
-#   RAM: 32 GB
+#   RAM: 24 GB visible to WSL
 #   CPU Cores: 12
 #
 # All training parameters are in the selected config below.
@@ -21,7 +21,8 @@ set -euo pipefail
 # TRAINING_CONFIG="config/training_config.yaml"
 # TRAINING_CONFIG="config/training_config_server.yaml"
 # TRAINING_CONFIG="config/training_config_server_retrain.yaml"
-TRAINING_CONFIG="config/training_config_policy_distillation.yaml"
+# TRAINING_CONFIG="config/training_config_policy_distillation.yaml"   # superseded: pinned to step 134000
+TRAINING_CONFIG="config/training_config_policy_distillation_c174k.yaml"
 
 # -----------------------------------------------------------------------------
 # SESSION SETTINGS — Edit these per-run
@@ -58,12 +59,48 @@ if [ ! -f "$SELECTED_CONFIG_PATH" ]; then
 fi
 SELECTED_CONFIG_PATH="$(readlink -f "$SELECTED_CONFIG_PATH")"
 
-POLICY_RECOVERY_CONFIG="$(readlink -f "${PROJECT_DIR}/config/training_config_policy_distillation.yaml")"
-POLICY_RECOVERY_BASELINE="${PROJECT_DIR}/models/checkpoints_policy_distillation/model_step_134000.pt"
-POLICY_RECOVERY_SHA256="7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27"
-POLICY_RECOVERY_LEGACY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation.json"
-POLICY_RECOVERY_STATS="${PROJECT_DIR}/models/training_stats_policy_distillation_recovery_wd1e4.json"
+# The recovery anchor used to be hardcoded here as step 134000. The approved
+# 2026-08-24 continuation resumes step 174000 in a new namespace, so a second
+# hardcoded copy would simply be a second thing to forget to update. Read the
+# anchor, its pinned digest, and the output stats path out of the selected
+# config instead -- the trainer validates the same fields, so the two can no
+# longer disagree.
+_yaml_scalar() {
+    # _yaml_scalar <file> <top-level-section> <key>
+    awk -v section="$2" -v key="$3" '
+        /^[^[:space:]#]/ { in_section = ($0 ~ "^"section":[[:space:]]*$"); next }
+        in_section && $0 ~ "^[[:space:]]+"key":[[:space:]]*" {
+            line = $0
+            sub("^[[:space:]]+"key":[[:space:]]*", "", line)
+            sub(/[[:space:]]*#.*$/, "", line)
+            gsub(/^"|"$|^'"'"'|'"'"'$/, "", line)
+            print line
+            exit
+        }
+    ' "$1"
+}
+_abs_project_path() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PROJECT_DIR" "$1" ;; esac; }
+
+POLICY_RECOVERY_ENABLED="$(_yaml_scalar "$SELECTED_CONFIG_PATH" recovery_experiment enabled)"
+POLICY_RECOVERY_BASELINE=""
+POLICY_RECOVERY_SHA256=""
+POLICY_RECOVERY_LEGACY_STATS=""
+POLICY_RECOVERY_STATS=""
 IS_POLICY_RECOVERY=false
+if [ "$POLICY_RECOVERY_ENABLED" = true ]; then
+    IS_POLICY_RECOVERY=true
+    _baseline_rel="$(_yaml_scalar "$SELECTED_CONFIG_PATH" recovery_experiment baseline_checkpoint)"
+    POLICY_RECOVERY_SHA256="$(_yaml_scalar "$SELECTED_CONFIG_PATH" recovery_experiment baseline_sha256 | tr 'a-f' 'A-F')"
+    _stats_rel="$(_yaml_scalar "$SELECTED_CONFIG_PATH" paths stats_file)"
+    _seed_stats_rel="$(_yaml_scalar "$SELECTED_CONFIG_PATH" paths seed_stats_from)"
+    if [ -z "$_baseline_rel" ] || [ -z "$POLICY_RECOVERY_SHA256" ]; then
+        echo "ERROR: recovery_experiment needs baseline_checkpoint and baseline_sha256 in $SELECTED_CONFIG_PATH" >&2
+        exit 1
+    fi
+    POLICY_RECOVERY_BASELINE="$(_abs_project_path "$_baseline_rel")"
+    [ -n "$_stats_rel" ] && POLICY_RECOVERY_STATS="$(_abs_project_path "$_stats_rel")"
+    [ -n "$_seed_stats_rel" ] && POLICY_RECOVERY_LEGACY_STATS="$(_abs_project_path "$_seed_stats_rel")"
+fi
 
 case "$RESUME_LATEST" in
     auto|true|false) ;;
@@ -79,8 +116,8 @@ case "$ENHANCED_STAGE" in
         exit 1
         ;;
 esac
-if [ "$ENHANCED_STAGE" = true ] && [ "$SELECTED_CONFIG_PATH" != "$POLICY_RECOVERY_CONFIG" ]; then
-    echo "ERROR: ENHANCED_STAGE is available only with training_config_policy_distillation.yaml." >&2
+if [ "$ENHANCED_STAGE" = true ] && [ "$IS_POLICY_RECOVERY" = false ]; then
+    echo "ERROR: ENHANCED_STAGE is available only with a recovery_experiment config." >&2
     exit 1
 fi
 if [ "$ENHANCED_STAGE" = true ] &&
@@ -90,8 +127,7 @@ if [ "$ENHANCED_STAGE" = true ] &&
     exit 1
 fi
 
-if [ "$SELECTED_CONFIG_PATH" = "$POLICY_RECOVERY_CONFIG" ]; then
-    IS_POLICY_RECOVERY=true
+if [ "$IS_POLICY_RECOVERY" = true ]; then
     if [ "$RESUME_LATEST" = true ]; then
         echo "ERROR: --resume-latest is disabled for the policy-distillation recovery experiment." >&2
         exit 1
@@ -119,7 +155,7 @@ if [ "$SELECTED_CONFIG_PATH" = "$POLICY_RECOVERY_CONFIG" ]; then
     else
         if [ -z "$RESUME" ]; then
             if [ "$RESUME_LATEST" != auto ]; then
-                echo "ERROR: Fresh start is disabled for policy recovery. Resume from model_step_134000.pt." >&2
+                echo "ERROR: Fresh start is disabled for policy recovery. Resume from ${POLICY_RECOVERY_BASELINE}." >&2
                 exit 1
             fi
             RESUME="$POLICY_RECOVERY_BASELINE"
@@ -152,13 +188,37 @@ if [ "$SELECTED_CONFIG_PATH" = "$POLICY_RECOVERY_CONFIG" ]; then
     fi
 fi
 
+# Every other config skipped this entirely: a mistyped RESUME reached the
+# trainer unchecked and only failed after CUDA init, and a relative RESUME was
+# forwarded verbatim -- so it resolved against the caller's working directory
+# instead of the project root and broke when launched from anywhere else.
+# Resolve it the same way the recovery branch already does.
+if [ "$IS_POLICY_RECOVERY" = false ] && [ -n "$RESUME" ]; then
+    if [[ "$RESUME" = /* ]]; then
+        _resume_candidate="$RESUME"
+    else
+        _resume_candidate="${PROJECT_DIR}/${RESUME}"
+    fi
+    if [ ! -f "$_resume_candidate" ]; then
+        echo "ERROR: Resume checkpoint not found: $_resume_candidate" >&2
+        exit 1
+    fi
+    RESUME="$(readlink -f "$_resume_candidate")"
+fi
+
 # Add src to PYTHONPATH
 export PYTHONPATH="${PROJECT_DIR}/src:${PYTHONPATH:-}"
 
+# Process title shown in htop (stop_training.sh pattern-matches it). The false
+# branch unsets rather than just skipping the export: the trainer reads
+# PROCESS_TITLE from the environment, so a value inherited from the parent shell
+# would otherwise survive and quietly ignore this toggle.
+if [ "$SET_PROCESS_TITLE" = true ]; then export PROCESS_TITLE; else unset PROCESS_TITLE; fi
+
 # Minimize CPU threads for numpy/MKL/OpenMP — self-play workers need the cores.
 # The training thread uses GPU for all compute; these libraries would otherwise
-# spawn threads that compete with the 6 self-play worker processes.
-if [ "$SET_PROCESS_TITLE" = true ]; then export PROCESS_TITLE; fi
+# spawn threads that compete with the self-play worker processes
+# (`selfplay.cpu_workers` in the config).
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
@@ -180,7 +240,9 @@ if [ "$IS_POLICY_RECOVERY" = true ]; then
     echo "Recovery baseline verified: ${POLICY_RECOVERY_BASELINE}"
     echo "Recovery SHA-256: ${POLICY_RECOVERY_SHA256}"
     if [ "$ENHANCED_STAGE" = false ] &&
+       [ -n "$POLICY_RECOVERY_STATS" ] &&
        [ ! -e "$POLICY_RECOVERY_STATS" ] &&
+       [ -n "$POLICY_RECOVERY_LEGACY_STATS" ] &&
        [ -f "$POLICY_RECOVERY_LEGACY_STATS" ]; then
         cp -- "$POLICY_RECOVERY_LEGACY_STATS" "$POLICY_RECOVERY_STATS"
         echo "Recovery stats seeded without modifying the legacy stats file: ${POLICY_RECOVERY_STATS}"
@@ -207,7 +269,10 @@ else
     [ -x "$_conda_bin" ] || _conda_bin="$(command -v conda 2>/dev/null || true)"
     CONDA_BASE=""
     [ -x "$_conda_bin" ] && CONDA_BASE="$(dirname "$(dirname "$_conda_bin")")"
-    if [ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+    # Guard on the empty case: with CONDA_BASE="" the test below reads
+    # /etc/profile.d/conda.sh, which a system-wide conda install provides --
+    # the fallback search would then be skipped and CONDA_BASE left empty.
+    if [ -z "$CONDA_BASE" ] || [ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
         CONDA_BASE=""
         for _b in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" \
                   "$HOME/mambaforge" "$HOME/conda" "/opt/conda"; do
@@ -233,13 +298,28 @@ else
 fi
 echo ""
 
-# Cython staleness guard (fail-safe). The compiled .so files are committed but
-# can lag their .pyx sources (a stale committed _fast_search.so silently ran
-# the old alpha-beta search in Jun 2026). Rebuild in-place if any .pyx is newer
-# than its .so. No-op when fresh; never blocks training on a build failure.
+# Cython staleness guard (fail-safe). The .so files are NOT tracked (commit
+# 2f85ac6 untracked them; .gitignore carries *.so), so a fresh clone has none
+# at all and a local .pyx edit or a pull that changes a .pyx leaves the built
+# one behind. Rebuild in-place when a .pyx is newer than its extension, or when
+# the extension is missing. No-op when fresh; never blocks training on failure.
+#
+# The artifact is resolved by the running interpreter's EXT_SUFFIX rather than
+# by `ls -t ... | head -1`: that glob matched every ABI tag and kept the newest
+# by mtime, so a stray extension built for another Python version could mask a
+# genuinely stale one. EXT_SUFFIX names exactly the file this interpreter will
+# import -- including when conda activation failed and `python` is not the env.
+_ext_suffix="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
 _cython_stale=false
 while IFS= read -r _pyx; do
-    _so="$(ls -t "${_pyx%.pyx}".*.so 2>/dev/null | head -1 || true)"
+    if [ -n "$_ext_suffix" ]; then
+        _so="${_pyx%.pyx}${_ext_suffix}"
+        [ -f "$_so" ] || _so=""
+    else
+        # EXT_SUFFIX unavailable (no working interpreter yet): fall back to the
+        # any-ABI glob rather than forcing a rebuild on every launch.
+        _so="$(ls -t "${_pyx%.pyx}".*.so 2>/dev/null | head -1 || true)"
+    fi
     if [ -z "$_so" ] || [ "$_pyx" -nt "$_so" ]; then _cython_stale=true; fi
 done < <(find "${PROJECT_DIR}/src" -name '*.pyx' -not -path '*/build/*' 2>/dev/null)
 if [ "$_cython_stale" = true ]; then
@@ -249,8 +329,38 @@ if [ "$_cython_stale" = true ]; then
     echo ""
 fi
 
-# Verify CUDA is available
-python -W ignore::FutureWarning -c "import torch; assert torch.cuda.is_available(), 'CUDA not available. Training requires GPU.'" || {
+# Verify CUDA is available, and report whether the Cython accelerators loaded.
+# An unbuilt or broken extension is otherwise completely silent: search.py falls
+# back to the ~100-200x slower pure-Python alpha-beta with no error, no warning
+# and no failing test, and the only symptom is low self-play throughput. Only
+# the CUDA result gates the launch -- a missing extension warns and continues.
+python -W ignore::FutureWarning - <<'PYCHECK' || {
+import importlib
+import sys
+
+import torch
+
+if not torch.cuda.is_available():
+    sys.exit(1)
+
+missing = []
+for name in (
+    "dama.ai.algorithmic._fast_search",
+    "dama.ai.ml._fast_encode",
+    "dama.ai.ml._fast_score",
+):
+    try:
+        importlib.import_module(name)
+    except Exception as exc:  # noqa: BLE001 - a broken .so must not gate CUDA
+        missing.append(f"{name} ({type(exc).__name__}: {exc})")
+
+if missing:
+    print("[warn] Cython accelerator(s) unavailable — falling back to pure Python:")
+    for item in missing:
+        print(f"[warn]   {item}")
+    print("[warn] Self-play will be far slower. Rebuild with:")
+    print("[warn]   cd src && python setup_cython.py build_ext --inplace")
+PYCHECK
     echo ""
     echo "ERROR: CUDA is not available."
     echo ""
@@ -259,13 +369,14 @@ python -W ignore::FutureWarning -c "import torch; assert torch.cuda.is_available
     echo "  1. Ensure NVIDIA GPU driver is installed on Windows (not inside WSL)"
     echo "  2. Run 'nvidia-smi' to verify GPU access"
     echo "  3. Update WSL: 'wsl --update'"
-    echo "  4. Reinstall PyTorch: pip install torch --index-url https://download.pytorch.org/whl/cu121"
+    echo "  4. Reinstall PyTorch via 'bash setup_conda.sh' — it pins the CUDA wheel"
+    echo "     index (cu128) that this Blackwell GPU needs; older cu12x wheels do"
+    echo "     not support it."
     exit 1
 }
 
 echo "CUDA verified. Starting training..."
 echo "Config: ${SELECTED_CONFIG_PATH}"
-echo ""
 
 # Build command arguments — only session-level overrides
 ARGS=(--config "$SELECTED_CONFIG_PATH")
@@ -284,5 +395,10 @@ fi
 if [ -n "$TRAIN_DURATION" ]; then
     ARGS+=(--train-duration "$TRAIN_DURATION")
 fi
+
+# The console log is the only record of what a session was actually launched
+# with; the resolved resume target in particular is not recoverable afterwards.
+echo "Trainer args: ${ARGS[*]}"
+echo ""
 
 exec python -W ignore::FutureWarning -m dama.ai.ml.trainer "${ARGS[@]}"
