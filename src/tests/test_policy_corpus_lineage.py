@@ -65,13 +65,20 @@ def _manager(replay_dir: Path, root: Path, **kwargs) -> CorpusSnapshotManager:
     return CorpusSnapshotManager(str(replay_dir), str(root), **options)
 
 
-def _build_base(tmp_path: Path) -> tuple[Path, dict]:
-    """Admit one snapshot in a preserved namespace and return its manifest."""
-    replay_dir = tmp_path / "base_replay"
+def _build_base(
+    tmp_path: Path, name: str = "base", first_index: int = 0
+) -> tuple[Path, dict]:
+    """Admit one snapshot in a preserved namespace and return its manifest.
+
+    ``name``/``first_index`` exist so a test can build a *second*, genuinely
+    different base whose fingerprint cannot collide with the first.
+    """
+    replay_dir = tmp_path / f"{name}_replay"
     replay_dir.mkdir()
     for index in range(4):
-        _write_replay(replay_dir / f"replay_base_{index}.jsonl", [index])
-    manager = _manager(replay_dir, tmp_path / "base_root")
+        _write_replay(
+            replay_dir / f"replay_{name}_{index}.jsonl", [first_index + index])
+    manager = _manager(replay_dir, tmp_path / f"{name}_root")
     decision = manager.consider_snapshot(TEACHER, NOISE, GENERATION)
     assert decision.admitted and decision.manifest_path is not None
     return decision.manifest_path, json.loads(
@@ -240,9 +247,10 @@ def test_load_split_refuses_a_run_that_relaxed_a_recorded_exclusion(
         relaxed.load_split()
 
 
-def test_load_split_refuses_a_snapshot_from_a_different_base(
+def test_load_split_refuses_a_snapshot_that_records_no_lineage_base(
     tmp_path: Path,
 ) -> None:
+    """Historical, unstamped data cannot be adopted by an enforcing run."""
     base_manifest_path, base_manifest = _build_base(tmp_path)
     replay_dir = tmp_path / "new_replay"
     replay_dir.mkdir()
@@ -261,6 +269,100 @@ def test_load_split_refuses_a_snapshot_from_a_different_base(
     )
     with pytest.raises(RuntimeError, match="records no lineage base"):
         enforcing.load_split()
+
+
+def test_load_split_refuses_a_snapshot_from_a_different_base(
+    tmp_path: Path,
+) -> None:
+    """The foreign-base branch, distinct from the missing-record branch above.
+
+    A snapshot stamped with base A must not load under a run that pins base B.
+    Both bases are real, integrity-verified snapshots, so the refusal comes
+    from the fingerprint comparison and not from a malformed record.
+    """
+    base_a_path, base_a = _build_base(tmp_path, "base_a")
+    base_b_path, base_b = _build_base(tmp_path, "base_b", first_index=100)
+    assert base_a["fingerprint"] != base_b["fingerprint"]
+
+    replay_dir = tmp_path / "new_replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_new_{index}.jsonl", [500 + index])
+    root = tmp_path / "new_root"
+    admitting = _manager(
+        replay_dir,
+        root,
+        lineage_base_manifest=str(base_a_path),
+        lineage_base_fingerprint=base_a["fingerprint"],
+    )
+    decision = admitting.consider_snapshot(TEACHER, NOISE, GENERATION)
+    assert decision.admitted
+    stamped = json.loads(decision.manifest_path.read_text(encoding="utf-8"))
+    assert stamped["lineage_base"]["fingerprint"] == base_a["fingerprint"]
+
+    foreign = _manager(
+        replay_dir,
+        root,
+        lineage_base_manifest=str(base_b_path),
+        lineage_base_fingerprint=base_b["fingerprint"],
+    )
+    with pytest.raises(RuntimeError, match="unapproved lineage base"):
+        foreign.load_split()
+
+
+def test_load_split_refuses_a_run_that_declares_no_lineage_at_all(
+    tmp_path: Path,
+) -> None:
+    """Dropping the whole ``lineage:`` block must not be an escape hatch.
+
+    Enforcement is opt-in, so a config with no lineage block is unenforced --
+    but that has to mean *unstamped* data.  Otherwise the neighbouring
+    relaxed-exclusion refusal is trivially evaded: a run cannot load a
+    strictly-admitted snapshot by dropping one excluded fingerprint, so it
+    would simply drop the base as well and skip every check at once.
+    """
+    base_manifest_path, base_manifest = _build_base(tmp_path)
+    replay_dir = tmp_path / "new_replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_new_{index}.jsonl", [500 + index])
+    root = tmp_path / "new_root"
+    strict = _manager(
+        replay_dir,
+        root,
+        lineage_base_manifest=str(base_manifest_path),
+        lineage_base_fingerprint=base_manifest["fingerprint"],
+        lineage_excluded_fingerprints=["dead" * 16],
+    )
+    assert strict.consider_snapshot(TEACHER, NOISE, GENERATION).admitted
+
+    unenforced = _manager(replay_dir, root)
+    with pytest.raises(RuntimeError, match="does not declare"):
+        unenforced.load_split()
+
+
+def test_load_split_stays_unenforced_for_unstamped_legacy_snapshots(
+    tmp_path: Path,
+) -> None:
+    """The preserved wd1e4/policy_distillation roots record no lineage base.
+
+    Refusing stamped data under an unenforced run must not turn into refusing
+    the historical namespaces those runs still legitimately read.
+    """
+    replay_dir = tmp_path / "legacy_replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_legacy_{index}.jsonl", [700 + index])
+    root = tmp_path / "legacy_root"
+    legacy = _manager(replay_dir, root)
+    decision = legacy.consider_snapshot(TEACHER, NOISE, GENERATION)
+    assert decision.admitted
+    assert "lineage_base" not in json.loads(
+        decision.manifest_path.read_text(encoding="utf-8"))
+
+    train, _validation, manifest = legacy.load_split()
+    assert train
+    assert manifest["lineage_verification"] == {"enforced": False}
 
 
 def test_lineage_base_is_stamped_on_every_snapshot_so_pruning_cannot_erase_it(
