@@ -3348,14 +3348,140 @@ class Trainer:
             int(stat.st_mtime_ns),
         )
 
+    # Journal Pass 119: the newest shard grows every self-play cycle, so the
+    # tail window below must comfortably cover the last complete record even
+    # when that record is long (legal_moves dominates record length).
+    _GENERATION_CYCLE_TAIL_BYTES = 262144
+
+    @classmethod
+    def _generation_cycle_tail_max(cls, path: Path) -> Optional[int]:
+        """Return the highest durable cycle id visible in a file's last record.
+
+        Replay shards are write-once per generation cycle (``ReplayWriter``
+        opens a fresh timestamped file 'w', appends for that cycle only), and
+        ``generation_cycle_id`` never decreases within a file (measured across
+        all 862,170 records of the live c174k corpus), so the maximum lives on
+        the final non-empty line.  Reading only the tail turns the cold-start
+        rescan of a 60-file corpus from ~110 s of whole-corpus JSON parsing
+        into sub-second work.  Returns None whenever the tail cannot prove a
+        cycle id (malformed or torn final record, absent field, unreadable
+        file); a file smaller than the window is simply read whole.  The
+        caller falls back to the exact full scan.
+        """
+        try:
+            with path.open('rb') as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                if size <= 0:
+                    return None
+                window = min(size, cls._GENERATION_CYCLE_TAIL_BYTES)
+                handle.seek(size - window)
+                tail = handle.read(window).decode('utf-8', errors='replace')
+        except OSError:
+            return None
+        for line in reversed(tail.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            if not isinstance(entry, Mapping):
+                return None
+            # The last complete record carries the file maximum under the
+            # monotonicity invariant; anything else is proven only by a scan.
+            return cls._generation_cycle_id_from_replay_entry(entry)
+        return None
+
+    def _generation_cycle_sidecar_path(self, replay_dir: Path) -> Path:
+        """Sidecar location for the durable per-file cycle-id cache."""
+        return replay_dir / 'generation_cycle_cache.json'
+
+    def _load_generation_cycle_sidecar(
+        self, replay_dir: Path,
+    ) -> Dict[str, tuple]:
+        """Load persisted (size, mtime_ns, cycle_id) triples per shard name.
+
+        Best-effort by contract: any read/parse problem simply yields an empty
+        mapping and the scan re-derives everything from the files themselves.
+        Keys are shard basenames inside ``replay_dir``; identities are
+        deliberately name+size+mtime (no inode) so a corpus relocated across
+        mounts or machines stays warm.
+        """
+        sidecar = self._generation_cycle_sidecar_path(replay_dir)
+        try:
+            raw = json.loads(sidecar.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return {}
+        if not isinstance(raw, dict) or raw.get('schema') != 1:
+            return {}
+        entries = raw.get('entries')
+        if not isinstance(entries, dict):
+            return {}
+        loaded: Dict[str, tuple] = {}
+        for name, record in entries.items():
+            if not isinstance(name, str) or not isinstance(record, list):
+                continue
+            if len(record) != 3:
+                continue
+            size, mtime_ns, cycle_id = record
+            if not all(isinstance(v, int) and not isinstance(v, bool)
+                       for v in (size, mtime_ns, cycle_id)):
+                continue
+            if cycle_id < 0:
+                continue
+            loaded[name] = (size, mtime_ns, cycle_id)
+        return loaded
+
+    def _save_generation_cycle_sidecar(
+        self, replay_dir: Path, entries: Dict[str, tuple],
+    ) -> bool:
+        """Persist per-shard cycle ids atomically; report whether written."""
+        payload = {
+            'schema': 1,
+            'entries': {
+                name: [size, mtime_ns, cycle_id]
+                for name, (size, mtime_ns, cycle_id) in sorted(entries.items())
+            },
+        }
+        sidecar = self._generation_cycle_sidecar_path(replay_dir)
+        temp_name = ''
+        try:
+            fd, temp_name = tempfile.mkstemp(
+                dir=str(replay_dir), prefix='.generation_cycle_cache.',
+                suffix='.tmp')
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, sidecar)
+            temp_name = ''
+            return True
+        except OSError:
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+            return False
+
     def _durable_generation_cycle_max(self) -> int:
         """Read the highest cycle id already durable in replay JSONL files.
 
-        The scan is intentionally read-only and exact: every non-empty JSONL
-        record is inspected, including legacy records whose cycle is carried
-        only by ``game_id``.  Malformed lines are ignored because corpus
-        loading already treats them as invalid records; an unreadable replay
-        file fails closed so a new cycle cannot accidentally reuse its id.
+        Replay shards themselves are treated read-only and answered exactly:
+        every non-empty JSONL record is inspected for any file whose stored
+        cycle maximum cannot be proven cheaply, including legacy records whose
+        cycle is carried only by ``game_id``.  Malformed lines are ignored
+        because corpus loading already treats them as invalid records; an
+        unreadable replay file fails closed so a new cycle cannot
+        accidentally reuse its id.
+
+        Journal Pass 119: unchanged shards are answered from a persistent
+        name+(size, mtime_ns)-keyed sidecar next to the corpus, and shards
+        that do change are re-read from their tail only (the per-cycle cycle
+        id is monotonic within a write-once shard).  Both fast paths degrade
+        to the original whole-file scan the moment they cannot prove their
+        answer, so allocation stays exact in every case.
         """
         replay_dir = Path(self.config.replay_dir)
         cache = getattr(self, '_generation_cycle_file_cache', None)
@@ -3374,11 +3500,15 @@ class Trainer:
                 f"{replay_dir}: {exc}"
             ) from exc
 
+        sidecar_loaded = self._load_generation_cycle_sidecar(replay_dir)
+
         # Canonicalize keys so equivalent relative/absolute config paths do
         # not create duplicate cache entries.  A file disappearing between
         # glob and stat is simply evicted on this pass.
         current_paths = set()
         highest = -1
+        sidecar_entries: Dict[str, tuple] = {}
+        sidecar_dirty = False
         for replay_path in replay_files:
             try:
                 replay_path = replay_path.resolve()
@@ -3393,36 +3523,76 @@ class Trainer:
             current_paths.add(replay_path)
             cached = cache.get(replay_path)
             if cached is not None and cached[0] == identity:
-                highest = max(highest, int(cached[1]))
-                continue
-
-            file_highest = -1
-            try:
-                with replay_path.open('r', encoding='utf-8') as handle:
-                    for line in handle:
-                        if not line.strip():
-                            continue
-                        try:
-                            entry = json.loads(line)
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            continue
-                        if not isinstance(entry, Mapping):
-                            continue
-                        cycle_id = self._generation_cycle_id_from_replay_entry(entry)
-                        if cycle_id is not None:
-                            file_highest = max(file_highest, cycle_id)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Cannot read replay file for generation-cycle allocation: "
-                    f"{replay_path}: {exc}"
-                ) from exc
-            cache[replay_path] = (identity, file_highest)
+                file_highest = int(cached[1])
+            else:
+                # identity[3]/[4] are this file's size/mtime_ns from the
+                # already-guarded _generation_cycle_file_identity stat; reuse
+                # them instead of a second stat() that could race a deletion.
+                _, _, _, size, mtime_ns = identity
+                persisted = sidecar_loaded.get(replay_path.name)
+                file_highest = None
+                if (persisted is not None
+                        and persisted[0] == size
+                        and persisted[1] == mtime_ns):
+                    file_highest = int(persisted[2])
+                if file_highest is None:
+                    file_highest = self._generation_cycle_tail_max(replay_path)
+                if file_highest is None:
+                    # Exact fallback: inspect every record of this shard.
+                    file_highest = -1
+                    try:
+                        with replay_path.open('r', encoding='utf-8') as handle:
+                            for line in handle:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    entry = json.loads(line)
+                                except (json.JSONDecodeError, TypeError,
+                                        ValueError):
+                                    continue
+                                if not isinstance(entry, Mapping):
+                                    continue
+                                cycle_id = (
+                                    self._generation_cycle_id_from_replay_entry(
+                                        entry))
+                                if cycle_id is not None:
+                                    file_highest = max(file_highest, cycle_id)
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot read replay file for generation-cycle "
+                            f"allocation: {replay_path}: {exc}"
+                        ) from exc
+                cache[replay_path] = (identity, file_highest)
+                sidecar_entries[replay_path.name] = (
+                    size, mtime_ns, int(file_highest))
+                if sidecar_entries[replay_path.name] != persisted:
+                    # Re-derived answer differs from (or extends) what the
+                    # sidecar stored for this shard: repersist it.
+                    sidecar_dirty = True
             highest = max(highest, file_highest)
 
         # Do not retain cache records for replay shards removed since the last
         # allocation scan.
         for stale_path in set(cache) - current_paths:
             cache.pop(stale_path, None)
+            stale_name = Path(stale_path).name
+            if stale_name in sidecar_entries:
+                del sidecar_entries[stale_name]
+                sidecar_dirty = True
+
+        # Merge untouched sidecar records for shards that vanished from the
+        # process cache but still exist on disk (identity-hit files above are
+        # recorded in sidecar_entries only when re-derived, so re-add them).
+        for replay_path in current_paths:
+            name = Path(replay_path).name
+            if name not in sidecar_entries:
+                cached = cache.get(replay_path)
+                if cached is not None:
+                    _, _, _, size, mtime_ns = cached[0]
+                    sidecar_entries[name] = (size, mtime_ns, int(cached[1]))
+        if sidecar_entries and (
+                sidecar_dirty or len(sidecar_entries) != len(sidecar_loaded)):
+            self._save_generation_cycle_sidecar(replay_dir, sidecar_entries)
         return highest
 
     def _allocate_generation_cycle_id(self) -> int:
