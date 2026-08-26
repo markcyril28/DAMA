@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Seque
 
 from .move_encoder import ENCODING_VERSION
 from .replay import ReplayEntry
+from . import run_status
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
@@ -577,14 +578,35 @@ def analyze_replay_files(
 
 
 def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
+    # Thin delegate: one atomic-JSON implementation project-wide (see
+    # run_status._write_json_atomic for the temp+fsync+replace contract).
+    run_status._write_json_atomic(path, value)
+
+
+def _write_state_keys(path: Path, state_keys: Iterable[str]) -> None:
+    # Proofread 2026-08-25 C2: this file is part of the committed snapshot --
+    # ``manifest.json`` names it and is treated as "the single commit point",
+    # so a truncated gz here is a permanent, unrecoverable split failure.
+    # Follow the project-wide durability contract (see
+    # run_status._write_json_atomic): temp file in the destination directory,
+    # flush + fsync, then one atomic os.replace.  A mid-write failure leaves
+    # the previous key file untouched instead of truncating it in place.
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        # Wrap the mkstemp fd instead of letting gzip.open(path-name) open a
+        # second handle: the reserved fd must be consumed here or it leaks
+        # (one per growth/admission cycle until process exit).
+        with os.fdopen(fd, "wb") as raw_handle:
+            with gzip.open(raw_handle, "wt", encoding="ascii", newline="\n") as handle:
+                for key in sorted(state_keys):
+                    handle.write(key)
+                    handle.write("\n")
+                handle.flush()
+            # The gzip CRC/size trailer is appended on close(), so fsync only
+            # afterwards: the committed file must be durable in full.
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
         os.replace(temp_name, path)
     except Exception:
         try:
@@ -592,13 +614,6 @@ def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
         except OSError:
             pass
         raise
-
-
-def _write_state_keys(path: Path, state_keys: Iterable[str]) -> None:
-    with gzip.open(path, "wt", encoding="ascii", newline="\n") as handle:
-        for key in sorted(state_keys):
-            handle.write(key)
-            handle.write("\n")
 
 
 def _read_state_keys(path: Path) -> Set[str]:
@@ -664,10 +679,38 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     return added
 
 
-def _link_or_copy(source: Path, destination: Path) -> str:
-    # Snapshot shards must be independent immutable files.  Hardlinks make a
-    # later replay append/truncate mutate an already-admitted snapshot in
-    # place, defeating the integrity manifest and recovery contract.
+def _store_shard(
+    source: Path,
+    destination: Path,
+    previous_files_dir: Optional[Path] = None,
+) -> str:
+    """Store one replay shard into a snapshot; return the storage mode used.
+
+    ``previous_files_dir`` enables shard reuse: when the previous snapshot
+    already holds a byte-identical copy of ``source``, hardlink it instead of
+    paying another full corpus copy per admission (~0.9 GB on a 60-file
+    window, against a volume that runs 99% full).  This is safe because replay
+    shards are write-once -- ReplayWriter opens a fresh timestamped file 'w'
+    and never reopens it, and cleanup rotates files out by unlink -- so the
+    predecessor's stored copy is the same immutable object.  Fail-closed in
+    both directions: the candidate must match BOTH size and sha256 before the
+    link is made, and load-time integrity verification re-hashes every stored
+    shard afterwards, so a corrupted or mutated candidate degrades to a plain
+    copy rather than ever admitting wrong bytes.  Any filesystem refusal
+    (cross-device, permission, link exhaustion) also falls back to copy.
+    """
+    if previous_files_dir is not None:
+        candidate = previous_files_dir / source.name
+        try:
+            if (
+                candidate.is_file()
+                and candidate.stat().st_size == source.stat().st_size
+                and replay_file_sha256(candidate) == replay_file_sha256(source)
+            ):
+                os.link(str(candidate), str(destination))
+                return "hardlink"
+        except OSError:
+            pass
     shutil.copy2(source, destination)
     return "copy"
 
@@ -700,6 +743,7 @@ class CorpusSnapshotManager:
         lineage_excluded_fingerprints: Sequence[str] = (),
         trained_ledger_enabled: bool = False,
         trained_ledger_seed_roots: Sequence[str] = (),
+        reuse_previous_shards: bool = True,
     ) -> None:
         if not 0.0 < validation_fraction < 1.0:
             raise ValueError("validation_fraction must be between 0 and 1")
@@ -726,6 +770,15 @@ class CorpusSnapshotManager:
         # the newest N admissions and drop older ones; 0 keeps every snapshot,
         # which is the historical behaviour.
         self.max_retained_snapshots = int(max_retained_snapshots)
+        # Hardlink unchanged shards from the previous snapshot at admission
+        # instead of copying the whole corpus again.  Digest-verified before
+        # linking and re-verified by every load (see _store_shard); disable to
+        # restore the copy-everything behaviour.
+        self.reuse_previous_shards = bool(reuse_previous_shards)
+        # Audit Suggestion 9: the most recent hold-out growth event, so the
+        # freshness it cost this cycle is attributable from the artifacts
+        # instead of by correlating two independent log lines.
+        self._last_holdout_growth: Optional[Dict[str, Any]] = None
         # The hold-out is created once from whatever files existed then and,
         # historically, never grew -- so an approved 15% share decayed to 1.7%
         # as the rolling corpus expanded, and the manifest asserted a hold-out
@@ -1389,7 +1442,9 @@ class CorpusSnapshotManager:
         added_records = []
         for source in candidates[:add_count]:
             destination = files_dir / source.name
-            link_mode = _link_or_copy(source, destination)
+            # The hold-out is append-only and never re-stores a held shard, so
+            # it has no predecessor to reuse from; always copy here.
+            link_mode = _store_shard(source, destination)
             added_records.append({
                 "name": source.name,
                 "path": (Path("files") / source.name).as_posix(),
@@ -1397,6 +1452,13 @@ class CorpusSnapshotManager:
                 "size_bytes": source.stat().st_size,
                 "storage": link_mode,
             })
+
+        # Audit Suggestion 9: the canonical states this growth event moved from
+        # training into the hold-out.  Analysis is per-file cached, so this is
+        # a dictionary lookup for shards the caller has already measured.
+        _added_metrics, added_state_keys = analyze_replay_files(
+            [files_dir / record["name"] for record in added_records]
+        )
 
         file_records = list(manifest.get("files", [])) + added_records
         metrics, state_keys = analyze_replay_files(
@@ -1441,6 +1503,11 @@ class CorpusSnapshotManager:
             except OSError:
                 pass
 
+        self._last_holdout_growth = {
+            "added_files": [record["name"] for record in added_records],
+            "added_state_keys": added_state_keys,
+        }
+
         print(
             f"Validation hold-out grew by {len(added_records)} file(s): "
             f"{len(file_records)} of {len(files)} = "
@@ -1450,6 +1517,10 @@ class CorpusSnapshotManager:
         return grown, state_keys
 
     def _ensure_validation(self, files: Sequence[Path]) -> Tuple[dict, Set[str]]:
+        # Audit Suggestion 9: one cycle, one growth event.  Reset before the
+        # split is resolved so an unchanged hold-out reports no cost rather
+        # than repeating the previous cycle's.
+        self._last_holdout_growth = None
         manifest_path = self.validation_manifest_path
         if manifest_path.exists():
             manifest = self._load_manifest(manifest_path)
@@ -1545,7 +1616,7 @@ class CorpusSnapshotManager:
         file_records = []
         for source in selected:
             destination = files_dir / source.name
-            link_mode = _link_or_copy(source, destination)
+            link_mode = _store_shard(source, destination)
             file_records.append({
                 "name": source.name,
                 "path": (Path("files") / source.name).as_posix(),
@@ -1694,7 +1765,28 @@ class CorpusSnapshotManager:
         train_keys = all_train_keys.difference(validation_keys)
         new_keys = train_keys.difference(previous_keys)
         fresh_rate = (len(new_keys) / len(train_keys)) if train_keys else 0.0
+        # Audit Suggestion 9.  A growth event moves a whole *fresh* shard out of
+        # training -- _grow_validation can only choose never-trained shards, by
+        # design, because a trained one would measure memorisation.  The
+        # consequence is that the cycle's entire freshness gain is cancelled,
+        # which looked from the logs exactly like generator saturation.  Price
+        # it here, where the previous corpus is in hand, and record it in the
+        # manifest so a stalled admission is explainable from artifacts alone.
+        growth = self._last_holdout_growth or {}
+        withheld = set(growth.get("added_state_keys", ())).difference(train_keys)
+        withheld_fresh = withheld.difference(previous_keys)
+        counterfactual_denominator = len(train_keys) + len(withheld)
+        counterfactual_fresh_rate = (
+            (len(new_keys) + len(withheld_fresh)) / counterfactual_denominator
+            if counterfactual_denominator else 0.0
+        )
+
         metrics.update({
+            "holdout_growth_files": list(growth.get("added_files", ())),
+            "states_transferred_to_holdout": len(withheld),
+            "fresh_states_transferred_to_holdout": len(withheld_fresh),
+            "fresh_unique_state_rate_without_holdout_growth": (
+                counterfactual_fresh_rate),
             "validation_overlap_state_count_removed": len(leakage_keys),
             "external_validation_state_count": len(
                 self.external_validation_state_keys),
@@ -1764,6 +1856,15 @@ class CorpusSnapshotManager:
                 "possible until CURRENT/current.json is restored to the "
                 "intended snapshot."
             )
+        if withheld_fresh:
+            print(
+                "  Hold-out growth cost this cycle: "
+                f"{len(withheld_fresh)} fresh state(s) of "
+                f"{len(withheld)} moved into validation "
+                f"({', '.join(growth.get('added_files', ())) or 'unknown file'}). "
+                f"Freshness reads {fresh_rate:.2%}; without the transfer it "
+                f"would read {counterfactual_fresh_rate:.2%}."
+            )
         if previous_source is not None and fresh_rate < self.min_fresh_fraction:
             return SnapshotDecision(
                 False,
@@ -1775,14 +1876,47 @@ class CorpusSnapshotManager:
         self.snapshot_root.mkdir(parents=True, exist_ok=True)
         version = self._next_version()
         final_dir = self.snapshot_root / f"snapshot_v{version:06d}"
+        if final_dir.exists():
+            # Proofread 2026-08-25 C1.  os.replace(staging, final_dir) has no
+            # atomic guard against an existing target: a half-written earlier
+            # snapshot_vNNNNNN fails admission with errno 39, and an *empty*
+            # leftover is silently adopted under a lineage that belongs to
+            # nothing.  Fail closed like every other integrity check here;
+            # the leftover is preserved as evidence for manual inspection.
+            raise RuntimeError(
+                f"Corpus snapshot directory {final_dir.name} already exists "
+                f"under {self.snapshot_root}; a previous admission may have "
+                "crashed or a concurrent writer holds this version number. "
+                "Refusing to overwrite; inspect and remove the leftover "
+                "snapshot directory manually."
+            )
         staging = Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.", dir=self.snapshot_root))
         try:
             files_dir = staging / "files"
             files_dir.mkdir()
+            # Shard reuse: shards unchanged since the previous snapshot are
+            # hardlinked from it instead of copied, cutting the per-admission
+            # cost from another full corpus to only the new/rotated shards.
+            # See _store_shard for why this is fail-closed (digest match before
+            # linking; load-time integrity re-verification afterwards).
+            previous_files_dir: Optional[Path] = None
+            if self.reuse_previous_shards and current_path is not None:
+                candidate_root = current_path.parent / "files"
+                if candidate_root.is_dir():
+                    previous_files_dir = candidate_root
+                    print(
+                        f"  Corpus: reusing unchanged shard(s) from "
+                        f"{current_path.parent.name}/files when possible"
+                    )
             stored_files = []
+            reused_count = 0
+            reused_bytes = 0
             for source, record in zip(train_files, file_records):
                 destination = files_dir / source.name
-                link_mode = _link_or_copy(source, destination)
+                link_mode = _store_shard(source, destination, previous_files_dir)
+                if link_mode == "hardlink":
+                    reused_count += 1
+                    reused_bytes += int(record["size_bytes"])
                 stored_files.append({
                     **record,
                     "path": (Path("files") / source.name).as_posix(),
@@ -1813,6 +1947,13 @@ class CorpusSnapshotManager:
                     "observed_fresh_unique_state_rate": fresh_rate,
                     "passed": True,
                     "previous_corpus_source": previous_source,
+                    # Shard-reuse accounting: how much of this admission's
+                    # storage came from hardlinks into the previous snapshot
+                    # instead of fresh copies.  The bytes are also shared with
+                    # the predecessor, so they cost no additional disk.
+                    "reused_shard_count": reused_count,
+                    "reused_shard_bytes": reused_bytes,
+                    "copied_shard_count": len(stored_files) - reused_count,
                 },
                 "metrics": metrics,
             }
