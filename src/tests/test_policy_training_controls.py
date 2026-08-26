@@ -787,6 +787,115 @@ def test_generation_cycle_allocator_caches_unchanged_replay_files(
     assert second.resolve() not in holder._generation_cycle_file_cache
 
 
+def _text_replay_opens(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Count whole-file ('r') replay reads, i.e. exact-fallback scans."""
+    real_open = Path.open
+    scanned = []
+
+    def counting_open(path, mode="r", *args, **kwargs):
+        if Path(path).name.startswith("replay_") and "r" in mode and "b" not in mode:
+            scanned.append(Path(path))
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    return scanned
+
+
+def test_generation_cycle_scan_reads_only_shard_tails(tmp_path, monkeypatch):
+    """Cold start answers from tails/sidecar, never whole-corpus scans."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    lines = "\n".join(
+        json.dumps({"generation_cycle_id": cycle}) + "\n" for cycle in range(20)
+    )
+    (replay_dir / "replay_a.jsonl").write_text(lines, encoding="utf-8")
+    (replay_dir / "replay_b.jsonl").write_text(
+        json.dumps({"game_id": "cycle-000031-model-000001"}) + "\n",
+        encoding="utf-8",
+    )
+    scanned = _text_replay_opens(monkeypatch)
+
+    first = _cycle_allocator_holder(tmp_path, 0)
+    assert first._durable_generation_cycle_max() == 31
+    assert scanned == [], "cold start must not run the exact whole-file scan"
+    sidecar = json.loads(
+        (replay_dir / "generation_cycle_cache.json").read_text(encoding="utf-8"))
+    assert sidecar["schema"] == 1
+    assert sidecar["entries"]["replay_b.jsonl"][2] == 31
+
+    # A brand-new process (empty in-memory cache) is answered entirely from
+    # the persisted sidecar identities.
+    second = _cycle_allocator_holder(tmp_path, 0)
+    scanned.clear()
+    assert second._durable_generation_cycle_max() == 31
+    assert scanned == []
+
+
+def test_generation_cycle_sidecar_rescans_only_grown_shards(tmp_path, monkeypatch):
+    """Appending new records invalidates just the grown shard's entry."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    (replay_dir / "replay_a.jsonl").write_text(
+        json.dumps({"generation_cycle_id": 7}) + "\n", encoding="utf-8")
+    holder = _cycle_allocator_holder(tmp_path, 0)
+    assert holder._durable_generation_cycle_max() == 7
+
+    # Simulate the next self-play cycle appending to the newest shard.
+    with (replay_dir / "replay_a.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"generation_cycle_id": 12}) + "\n")
+
+    next_holder = _cycle_allocator_holder(tmp_path, 0)
+    scanned = _text_replay_opens(monkeypatch)
+    assert next_holder._durable_generation_cycle_max() == 12
+    assert scanned == []
+    sidecar = json.loads(
+        (replay_dir / "generation_cycle_cache.json").read_text(encoding="utf-8"))
+    assert sidecar["entries"]["replay_a.jsonl"][2] == 12
+
+
+def test_generation_cycle_corrupt_sidecar_self_heals(tmp_path, monkeypatch):
+    """A corrupt sidecar is ignored and rebuilt from re-derived answers."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    (replay_dir / "replay_a.jsonl").write_text(
+        json.dumps({"generation_cycle_id": 9}) + "\n", encoding="utf-8")
+    (replay_dir / "generation_cycle_cache.json").write_text(
+        "{not json", encoding="utf-8")
+
+    scanned = _text_replay_opens(monkeypatch)
+    holder = _cycle_allocator_holder(tmp_path, 0)
+    assert holder._durable_generation_cycle_max() == 9
+    assert scanned == [], "tail proof makes the corrupt sidecar irrelevant"
+    sidecar = json.loads(
+        (replay_dir / "generation_cycle_cache.json").read_text(encoding="utf-8"))
+    assert sidecar["entries"]["replay_a.jsonl"][2] == 9
+
+    scanned.clear()
+    healed = _cycle_allocator_holder(tmp_path, 0)
+    assert healed._durable_generation_cycle_max() == 9
+    assert scanned == [], "healed sidecar answers future launches outright"
+
+
+def test_generation_cycle_truncated_tail_uses_exact_scan(tmp_path, monkeypatch):
+    """A torn final write cannot be proven from the tail; scan decides."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    torn = json.dumps({"generation_cycle_id": 15}) + "\n"
+    torn += '{"generation_cycle_id": 16, "state": {"unfinis'
+    (replay_dir / "replay_a.jsonl").write_text(torn, encoding="utf-8")
+
+    assert Trainer._generation_cycle_tail_max(
+        replay_dir / "replay_a.jsonl") is None
+    scanned = _text_replay_opens(monkeypatch)
+    holder = _cycle_allocator_holder(tmp_path, 0)
+    assert holder._durable_generation_cycle_max() == 15
+    assert len(scanned) == 1
+    # The exact answer is then persisted for future launches.
+    sidecar = json.loads(
+        (replay_dir / "generation_cycle_cache.json").read_text(encoding="utf-8"))
+    assert sidecar["entries"]["replay_a.jsonl"][2] == 15
+
+
 def test_selfplay_entries_record_cycle_and_behavior_provenance() -> None:
     entries = [{"game_id": "cycle-000028-model-000001"}, "not-a-dict"]
 
