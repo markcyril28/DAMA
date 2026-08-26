@@ -2824,3 +2824,94 @@ def test_recovery_enforced_race_fallback_skips_unstamped_files(
     Trainer._rollback_after_dead_epoch(holder, reason="test")
 
     assert loaded == [str(stamped)]
+
+
+def _tiny_replay_entries(count: int = 3):
+    """Minimal real replay entries so tensorization runs on the CPU path."""
+    from dama.game_state import GameState
+    from dama.ai.ml.replay import ReplayEntry
+
+    state = GameState.initial()
+    moves = state.legal_moves()
+    return [
+        ReplayEntry(
+            state=state.to_compact(),
+            legal_moves=[m.to_dict() for m in moves[:5]],
+            chosen_index=0,
+            result=1,
+            score=2.5,
+        )
+        for _ in range(count)
+    ]
+
+
+def test_prelaunch_free_ram_is_captured_onto_the_trainer():
+    """Pass 117: the pre-load reading must land on the trainer instance.
+
+    The RAM-cache gate measures free RAM only after the corpus inflates RSS,
+    so it needs this earlier reading to judge host headroom honestly.
+    """
+    import psutil
+
+    holder = object.__new__(Trainer)
+    assert not hasattr(holder, "_prelaunch_free_ram_gb")
+
+    Trainer._capture_prelaunch_free_ram(holder)
+
+    expected = psutil.virtual_memory().available / (1024 ** 3)
+    assert holder._prelaunch_free_ram_gb == pytest.approx(expected, abs=0.5)
+
+
+def test_ram_cache_gate_falls_back_to_the_prelaunch_reading(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Pass 117: corpus growth must not silently demote launches.
+
+    At the 60-file steady state the post-load reading sits below the 16 GB
+    gate (~14.1 GB measured 2026-08-25) while the host still had ~20 GB free
+    before the load.  With no fallback the gate declines the cache and every
+    later launch trains on the slow standard path; with the pre-load reading
+    the intended GPU-resident fast path engages again.
+    """
+    from dama.ai.ml import dataset as dataset_module
+    from dama.ai.ml.dataset import FastBatchIterator, create_dataloader
+
+    monkeypatch.setattr(dataset_module, "get_available_ram_gb", lambda: 14.0)
+    monkeypatch.setattr(dataset_module, "get_total_ram_gb", lambda: 24.5)
+
+    entries = _tiny_replay_entries()
+    common = dict(
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        use_ram_cache=True,
+        ram_threshold_gb=16.0,
+        cache_file=str(tmp_path / "cache.pt"),
+        device=None,
+        capacity=0,
+        max_moves_per_sample=8,
+        amp_enabled=False,
+    )
+
+    declined = create_dataloader(entries, **common)
+    assert not isinstance(declined, FastBatchIterator)
+
+    accepted = create_dataloader(
+        entries, prelaunch_free_ram_gb=19.6, **common)
+    assert isinstance(accepted, FastBatchIterator)
+
+    out = capsys.readouterr().out
+    assert "gate satisfied by pre-load (19.6GB)" in out
+
+
+def test_free_entry_lists_after_tensorize_clears_validation_mirror() -> None:
+    """Pass 117: the release helper drops lists and the validation mirror."""
+    holder = object.__new__(Trainer)
+    holder._validation_entries = [object(), object()]
+
+    first, second = Trainer._free_entry_lists_after_tensorize(
+        holder, ["a"], ["b"])
+
+    assert first is None and second is None
+    assert holder._validation_entries == []
