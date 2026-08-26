@@ -11,6 +11,7 @@ import re
 import argparse
 import hashlib
 import hmac
+import gc
 import shutil
 import tempfile
 import traceback
@@ -598,6 +599,105 @@ _OUTPUT_NAMESPACE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
 _RECOVERY_ANCHOR_NAME_RE = re.compile(r'^model_step_\d+\.pt$')
 
 
+def _recovery_lineage_payload_matches(
+    checkpoint: Any,
+    baseline_sha256: str,
+    training_stage: str,
+) -> bool:
+    """True when a loaded checkpoint carries the approved recovery lineage stamp.
+
+    Audit Suggestion 7.  Every checkpoint this experiment writes records the
+    anchor it descends from (``recovery_experiment``), so descent from the
+    pinned baseline is a property of the artifact rather than of who launched
+    it.  Finiteness is checked here too: a checkpoint holding NaN weights is
+    not a valid continuation point even when its lineage is impeccable.
+    """
+    if not isinstance(checkpoint, dict):
+        return False
+    lineage = checkpoint.get('recovery_experiment')
+    if not isinstance(lineage, dict) or not lineage.get('enabled'):
+        return False
+    if (
+        str(lineage.get('baseline_sha256') or '').upper()
+        != str(baseline_sha256 or '').upper()
+    ):
+        return False
+    if lineage.get('training_stage') != training_stage:
+        return False
+    state_dict = checkpoint.get('model_state_dict')
+    if not isinstance(state_dict, dict) or not state_dict:
+        return False
+    tensors = [
+        value for value in state_dict.values()
+        if isinstance(value, torch.Tensor)
+    ]
+    # A payload with no weights proves nothing about finiteness: a
+    # metadata-only state dict must not pass as a continuation point.
+    if not tensors:
+        return False
+    return all(torch.isfinite(value).all() for value in tensors)
+
+
+def recovery_checkpoint_continues_lineage(
+    path: Path,
+    baseline_sha256: str,
+    training_stage: str,
+) -> bool:
+    """True when ``path`` is a checkpoint proven to descend from the pinned anchor."""
+    try:
+        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    except Exception:
+        # Deliberately broad: a corrupt file raises arbitrary unpickler errors
+        # (pickle.UnpicklingError and EOFError are not subclasses of the
+        # ValueError/RuntimeError family), and every caller treats "cannot
+        # load" as "not a verified continuation point". Never let one
+        # truncated file crash the resume scan or dead-epoch rollback.
+        return False
+    return _recovery_lineage_payload_matches(
+        checkpoint, baseline_sha256, training_stage)
+
+
+def _checkpoint_step_number(path: Path) -> int:
+    try:
+        return int(path.stem.rsplit('_', 1)[-1])
+    except ValueError:
+        return -1
+
+
+def newest_verified_recovery_continuation(
+    checkpoint_dir: str | Path,
+    baseline_sha256: str,
+    training_stage: str,
+    *,
+    max_step: Optional[int] = None,
+) -> Optional[Path]:
+    """Newest numbered checkpoint in ``checkpoint_dir`` that continues the lineage.
+
+    Audit Suggestion 7.  Deliberately scoped to one directory: a stamped
+    checkpoint sitting in a foreign namespace is still refused, because the
+    isolation guarantee the continuation namespace exists to provide is
+    per-directory.  Returns ``None`` when the namespace holds no verified
+    checkpoint, which is the normal state on the very first launch.
+    """
+    directory = Path(checkpoint_dir)
+    if not directory.is_dir():
+        return None
+    candidates = sorted(
+        directory.glob('model_step_*.pt'),
+        key=_checkpoint_step_number,
+        reverse=True,
+    )
+    for candidate in candidates:
+        step = _checkpoint_step_number(candidate)
+        if step < 0 or (max_step is not None and step > max_step):
+            continue
+        if recovery_checkpoint_continues_lineage(
+            candidate, baseline_sha256, training_stage
+        ):
+            return candidate.resolve()
+    return None
+
+
 @dataclass
 class TrainingConfig:
     """Training configuration."""
@@ -702,6 +802,19 @@ class TrainingConfig:
     # copies the whole replay corpus, so an unbounded root fills the volume on
     # a long run; a positive value keeps only that many newest snapshots.
     snapshot_max_retained: int = 0
+    # Hardlink shards unchanged since the previous snapshot instead of copying
+    # the whole corpus at every admission (digest-verified both before linking
+    # and on every load; see corpus._store_shard).  Cuts steady-state snapshot
+    # growth to only the new/rotated shards per cycle.
+    snapshot_reuse_previous_shards: bool = True
+    # Audit Suggestion 10. The identical lesson as snapshot_max_retained, never
+    # applied to checkpoints: ~52 MB every checkpoint_every steps is ~13 GB/day
+    # here, so a multi-day run exhausts the volume long before its time limit.
+    # 0 keeps every checkpoint (historical behaviour). A positive value keeps
+    # that many newest, plus -- unconditionally -- every checkpoint a promotion
+    # record marks as promoted and the checkpoint this run resumed from, so
+    # retention can never delete the artifact an acceptance claim rests on.
+    max_retained_checkpoints: int = 0
     # Append-only growth of the whole-file validation hold-out so its realized
     # share tracks validation_fraction as the rolling corpus expands. Held
     # files are never released, so states only move train -> validation.
@@ -1207,6 +1320,7 @@ class Trainer:
                 enforce_policy_contract=config.recovery_enforced,
                 allowed_opening_plies=config.selfplay_opening_plies,
                 max_retained_snapshots=config.snapshot_max_retained,
+                reuse_previous_shards=config.snapshot_reuse_previous_shards,
                 grow_holdout=config.validation_grow_holdout,
                 validation_split_version=config.validation_split_version,
                 lineage_base_manifest=config.snapshot_lineage_base_manifest,
@@ -1222,6 +1336,10 @@ class Trainer:
             config.promotion_registry,
             agreement_threshold=config.teacher_agreement_threshold,
         )
+        # Audit Suggestion 8: which run wrote a given artifact was not
+        # recoverable from the artifact.  Populated when the run marker opens;
+        # empty only for a Trainer that never reached train().
+        self._run_identity: Dict[str, Any] = {}
         
         # Timing for step tracking
         self._last_step_time = None
@@ -2061,11 +2179,7 @@ class Trainer:
         if anchor.is_file() and anchor not in candidates:
             candidates.append(anchor)
 
-        def _step(path: Path) -> int:
-            try:
-                return int(path.stem.rsplit('_', 1)[-1])
-            except ValueError:
-                return -1
+        _step = _checkpoint_step_number
 
         for candidate in sorted(candidates, key=_step, reverse=True):
             if _step(candidate) > self.step:
@@ -2079,29 +2193,88 @@ class Trainer:
                 ):
                     return resolved
                 continue
-            try:
-                checkpoint = torch.load(
-                    candidate, map_location='cpu', weights_only=True)
-                lineage = checkpoint.get('recovery_experiment', {})
-                if not lineage.get('enabled'):
-                    continue
-                if str(lineage.get('baseline_sha256', '')).upper() != baseline_sha256:
-                    continue
-                if lineage.get('training_stage') != self.config.policy_stage:
-                    continue
-                state_dict = checkpoint.get('model_state_dict', {})
-                if not state_dict or not all(
-                    torch.isfinite(value).all()
-                    for value in state_dict.values()
-                    if isinstance(value, torch.Tensor)
-                ):
-                    continue
+            # Audit Suggestion 7: the lineage test is shared with the startup
+            # continuation gate, so rollback and resume can never disagree
+            # about what counts as a checkpoint in this recovery arm.
+            if recovery_checkpoint_continues_lineage(
+                candidate, baseline_sha256, self.config.policy_stage
+            ):
                 return resolved
-            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
-                continue
         raise RuntimeError(
             "No verified checkpoint remains in the approved recovery lineage; "
             "fresh-weight reset is forbidden")
+
+    def _rollback_checkpoint_candidates(self, pattern: str) -> list:
+        """Snapshot the current rollback candidates (newest last).
+
+        Proofread 2026-08-25 B2: retention prunes from the background
+        checkpoint-writer thread while dead-epoch rollback runs on the main
+        thread, so a glob hit can be unlinked milliseconds after selection.
+        The snapshot is taken once per attempt so the retry loop below sees a
+        consistent view; vanishing entries are tolerated by the caller.
+        """
+        return sorted(Path(self.config.checkpoint_dir).glob(pattern))
+
+    def _rollback_after_dead_epoch(self, reason: str) -> None:
+        """Load the newest usable checkpoint after repeated dead epochs.
+
+        Extracted from the training loop and hardened for the prune-vs-
+        rollback race: each candidate is re-checked for existence right before
+        ``_load_checkpoint``, and a vanished pick falls back to the next
+        candidate -- or, under recovery enforcement, to the verified recovery
+        lineage resolver -- instead of aborting the run inside
+        ``_load_checkpoint``.
+        """
+        ckpts = self._rollback_checkpoint_candidates("model_step_*.pt")
+        print(f"  Dead-epoch rollback triggered ({reason}).")
+        if self.config.recovery_enforced:
+            try:
+                last_ckpt = str(self._verified_recovery_rollback_checkpoint())
+                print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
+                self._load_checkpoint(last_ckpt)
+                if self.scaler is not None:
+                    self.scaler = GradScaler(init_scale=2**10)
+                    print(
+                        "  GradScaler reset to conservative "
+                        f"scale={self.scaler.get_scale():.0f}")
+                return
+            except FileNotFoundError as exc:
+                # The verified pick was pruned between selection and load;
+                # fall through to whatever files remain on disk.
+                print(f"  [warn] Verified rollback pick vanished ({exc}); "
+                      f"falling back to remaining checkpoints")
+        baseline_sha256 = str(
+            getattr(self.config, 'recovery_baseline_sha256', '') or '')
+        policy_stage = getattr(self.config, 'policy_stage', None)
+        for candidate in reversed(ckpts):
+            if not candidate.is_file():
+                continue
+            if self.config.recovery_enforced and not (
+                baseline_sha256
+                and policy_stage is not None
+                and recovery_checkpoint_continues_lineage(
+                    candidate, baseline_sha256, policy_stage)
+            ):
+                # Same invariant as the startup gate and the verified resolver:
+                # a file without the pinned lineage stamp must never become a
+                # rollback point, even as a prune-race fallback.
+                print(f"  [warn] Skipping unstamped rollback candidate "
+                      f"{candidate.name} (recovery lineage enforced)")
+                continue
+            last_ckpt = str(candidate)
+            print(f"  Rolling back to checkpoint: {last_ckpt}")
+            self._load_checkpoint(last_ckpt)
+            # Reset GradScaler with conservative scale to prevent
+            # re-triggering the same overflow.  Default init_scale=65536
+            # is too aggressive for trained models — use 1024 (same as
+            # the resume-without-scaler-state path).
+            if self.scaler is not None:
+                self.scaler = GradScaler(init_scale=2**10)
+                print(f"  GradScaler reset to conservative scale={self.scaler.get_scale():.0f}")
+            return
+        if not self.config.recovery_enforced:
+            print("  No checkpoints found — resetting model from scratch")
+            self._reset_model_state("No checkpoint for recovery")
 
     def _seed_stats_file(self) -> None:
         """Copy ``paths.seed_stats_from`` into a not-yet-existing stats file.
@@ -3461,6 +3634,141 @@ class Trainer:
                 f"durable promotion record: {checkpoint_path}"
             )
 
+    def _protected_checkpoint_paths(self) -> set:
+        """Checkpoints retention must never delete, whatever their age.
+
+        Audit Suggestion 10.  Three classes, all of them artifacts something
+        durable already points at:
+
+        * every checkpoint a promotion record marks ``promoted`` -- the
+          acceptance trail and the promoted alias both rest on those files --
+          and the best recorded teacher agreement even when it never cleared
+          the promotion gate;
+        * the checkpoint this run resumed from, so a session can never delete
+          its own starting point;
+        * the pinned recovery anchor, if it happens to live in this directory
+          (the path validator keeps it out, but retention must not depend on
+          another control holding).
+        """
+        protected = set()
+        for source in (
+            self.config.resume,
+            self.config.recovery_baseline_path,
+        ):
+            if source:
+                try:
+                    protected.add(Path(str(source)).resolve())
+                except OSError:
+                    continue
+        try:
+            records = self._promotion_registry.records()
+        except (OSError, ValueError):
+            # A registry that cannot be read is not evidence that nothing is
+            # promoted; fail closed by protecting everything.
+            return None
+
+        directory = Path(self.config.checkpoint_dir)
+
+        def _protect(raw_path) -> None:
+            if not raw_path:
+                return
+            candidate = Path(str(raw_path))
+            # Registry paths are recorded project-relative, so resolve them
+            # against the checkpoint directory by name as well: retention must
+            # not depend on the working directory a session was launched from.
+            for form in (candidate, directory / candidate.name):
+                try:
+                    protected.add(form.resolve())
+                except OSError:
+                    continue
+
+        best_agreement = float('-inf')
+        for record in records:
+            try:
+                agreement = float(record.get('teacher_agreement'))
+            except (TypeError, ValueError):
+                agreement = float('-inf')
+            if agreement > best_agreement:
+                best_agreement = agreement
+            if record.get('promoted'):
+                _protect(record.get('checkpoint_path'))
+        # The registry high-water mark, promoted or not.  Nothing has cleared
+        # the 0.50 gate on this arm, so protecting only promotions would leave
+        # the whole agreement series prunable and discard the best result the
+        # run has actually produced.
+        if best_agreement > float('-inf'):
+            for record in records:
+                try:
+                    if float(record.get('teacher_agreement')) == best_agreement:
+                        _protect(record.get('checkpoint_path'))
+                except (TypeError, ValueError):
+                    continue
+        return protected
+
+    def _prune_old_checkpoints(self, keep_path: Path) -> list:
+        """Delete all but the newest ``max_retained_checkpoints`` checkpoints.
+
+        Audit Suggestion 10.  Mirrors ``_prune_old_snapshots``: best-effort, so
+        a file held open elsewhere (common on drvfs) never turns a successful
+        checkpoint write into a failure, and the next write retries it.
+
+        Proofread 2026-08-25 B1: candidates are walked oldest-first until the
+        budget is met among unprotected files.  A fixed window sized before
+        protection is known would skip a protected entry without replacement,
+        letting every promotion record and registry best-agreement entry add
+        permanent protection and grow the live checkpoint count without bound.
+        Skipped protected entries therefore extend the deletion window, and an
+        overage above ``max_retained_checkpoints`` that only protection can
+        explain is reported instead of silently accepted.
+        """
+        keep_count = int(getattr(self.config, 'max_retained_checkpoints', 0) or 0)
+        if keep_count <= 0:
+            return []
+        directory = Path(self.config.checkpoint_dir)
+        if not directory.is_dir():
+            return []
+        protected = self._protected_checkpoint_paths()
+        if protected is None:
+            return []
+        try:
+            protected.add(Path(keep_path).resolve())
+        except OSError:
+            pass
+        candidates = sorted(
+            directory.glob('model_step_*.pt'),
+            key=_checkpoint_step_number,
+        )
+        candidates = [
+            path for path in candidates if _checkpoint_step_number(path) >= 0
+        ]
+        if len(candidates) <= keep_count:
+            return []
+        removed = []
+        skipped_protected = 0
+        # Oldest-first; budget counts only unprotected deletions, so each
+        # protected entry encountered extends the window by one file.
+        for path in candidates:
+            if len(candidates) - len(removed) <= keep_count:
+                break
+            try:
+                if path.resolve() in protected:
+                    skipped_protected += 1
+                    continue
+                path.unlink()
+            except OSError as exc:
+                print(f"  [warn] Could not prune checkpoint {path.name}: {exc}")
+                continue
+            removed.append(path.name)
+        live_count = len(candidates) - len(removed)
+        if live_count > keep_count and skipped_protected > 0:
+            print(
+                f"  [warn] {live_count} checkpoints are live but "
+                f"max_retained_checkpoints is {keep_count}: promoted, "
+                f"best-agreement and resume protection pins "
+                f"{skipped_protected} file(s). Retention cannot reclaim them."
+            )
+        return removed
+
     def _save_checkpoint(self, loss: float, log_entry: Optional[dict] = None) -> str:
         """Save a checkpoint atomically.
 
@@ -3618,6 +3926,10 @@ class Trainer:
                 'training_stage': self.config.policy_stage,
                 'resume_anchor': self.config.resume,
             },
+            # Audit Suggestion 8: names the session that wrote this file, so a
+            # numbered range can be read for what it is rather than assumed
+            # continuous.
+            'run_identity': dict(getattr(self, '_run_identity', {}) or {}),
             'rng_state': {
                 'python': random.getstate(),
                 'numpy': {
@@ -3680,6 +3992,8 @@ class Trainer:
 
                 if selection:
                     promotion_record = dict(selection.get('promotion', {}))
+                    promotion_record['run_identity'] = dict(
+                        getattr(self, '_run_identity', {}) or {})
                     checkpoint_digest = hashlib.sha256()
                     with checkpoint_path.open('rb') as checkpoint_handle:
                         for chunk in iter(
@@ -3710,6 +4024,14 @@ class Trainer:
                     _log_entry['timestamp'] = datetime.now().isoformat()
                     with open(_log_file, 'a') as f:
                         f.write(json.dumps(_log_entry) + '\n')
+
+                pruned = self._prune_old_checkpoints(checkpoint_path)
+                if pruned:
+                    print(
+                        f"  Retention: pruned {len(pruned)} checkpoint(s) "
+                        f"(keeping newest {self.config.max_retained_checkpoints}"
+                        f", plus promoted and resumed)"
+                    )
 
                 if _stats_collector:
                     ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
@@ -5692,6 +6014,174 @@ class Trainer:
                 # without this signal. Never block training on it.
                 pass
 
+    def _capture_run_identity(self, log_dir: str) -> None:
+        """Record which run this is, from the marker that was just opened.
+
+        Audit Suggestion 8.  ``dataset_fingerprint`` already distinguishes
+        corpora, but two runs sharing a corpus are indistinguishable by it, so
+        it cannot answer "which session wrote this file?".  The marker's
+        ``pid`` + ``started_at`` pair is already generated, already unique on
+        this host, and already durable, so it is the identity rather than a
+        second scheme invented alongside it.
+        """
+        try:
+            record = run_status.read_run_status(log_dir) or {}
+            pid = record.get('pid', os.getpid())
+            started_at = record.get('started_at')
+            pid = int(pid) if pid is not None else None
+        except (OSError, TypeError, ValueError):
+            # A corrupt or hand-edited marker is diagnostics input, not a
+            # startup gate: fall back to the live process identity rather
+            # than crash before the termination handler is installed.
+            pid = os.getpid()
+            started_at = None
+        self._run_identity = {
+            'pid': pid,
+            'started_at': started_at,
+            'run_id': f"{pid}@{started_at}" if started_at else str(pid),
+            'resume': str(self.config.resume or ''),
+            'resume_step': int(self.step),
+        }
+
+    def _free_entry_lists_after_tensorize(self, *entry_lists):
+        """Drop parsed entry lists once tensors hold the data (Pass 117).
+
+        ``CachedTensorDataset.from_entries`` copies every field of every entry
+        into contiguous tensors; afterwards the ``ReplayEntry`` objects are
+        unreachable dead weight worth roughly the size of the corpus (~5-6 GB
+        locally).  Callers rebind their locals to the returned handles (all
+        ``None``), which releases the lists by refcount; the explicit
+        ``gc.collect()`` stays at the call site so it runs AFTER the rebind.
+        Also clears ``self._validation_entries``, which mirrors one of the
+        released lists purely for logging and is never read again.
+        """
+        self._validation_entries = []
+        return tuple(None for _ in entry_lists)
+
+    def _capture_prelaunch_free_ram(self) -> None:
+        """Snapshot free RAM before the corpus loads into entry objects.
+
+        Journal Pass 117.  ``create_dataloader``'s RAM-cache gate measures free
+        RAM *after* every replay file has been parsed into Python entry
+        objects, which on this box inflates trainer RSS by roughly the size of
+        the whole corpus (~5-6 GB at the 60-file steady state).  A gate sized
+        when the rolling window was still filling therefore starts declining
+        the cache purely through corpus growth, silently demoting every later
+        launch to the slow standard batch path.  The pre-load reading is what
+        the operator's headroom budget was written against, so it is captured
+        here and used as the fallback comparison by that gate.
+        """
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            self._prelaunch_free_ram_gb = memory.available / (1024 ** 3)
+        except Exception:
+            return
+        print(
+            f"Pre-launch free RAM captured: "
+            f"{self._prelaunch_free_ram_gb:.1f}GB available before replay load."
+        )
+
+    def _warn_about_memory_headroom(self) -> None:
+        """Report a RAM-cache threshold this host cannot satisfy.
+
+        Audit Suggestion 11.  ``ram_cache.threshold_gb`` is a *minimum free
+        RAM* gate, not a budget, so setting it above what the box ever has free
+        silently disables caching -- and setting it just under makes caching
+        fire exactly when headroom is thinnest.  Neither is visible from the
+        config.  This reports the relationship and does not clamp: quietly
+        enabling a cache the operator's threshold declined would be worse than
+        saying so.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return
+        try:
+            memory = psutil.virtual_memory()
+            total_gb = memory.total / (1024 ** 3)
+            available_gb = memory.available / (1024 ** 3)
+            rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+        except Exception:
+            return
+        threshold_gb = float(getattr(self.config, 'ram_cache_threshold_gb', 0.0) or 0.0)
+        if threshold_gb <= 0.0:
+            return
+        if threshold_gb < available_gb and threshold_gb < total_gb * 0.5:
+            return
+        # Not a defect either way: a threshold above free RAM declines the
+        # cache, which is the conservative outcome on a small box.  It is
+        # reported because the config alone does not reveal which way it fell.
+        print("")
+        print("=" * 72)
+        print(
+            f"Memory headroom: ram_cache.threshold_gb is {threshold_gb:.1f}GB; "
+            f"this host has {total_gb:.1f}GB total, {available_gb:.1f}GB "
+            f"available, trainer RSS {rss_gb:.1f}GB."
+        )
+        if threshold_gb >= available_gb:
+            print(
+                "  The threshold is at or above free RAM, so the RAM cache "
+                "will not engage on this launch. That is the conservative "
+                "outcome; lowering the threshold would engage the cache when "
+                "headroom is thinnest."
+            )
+        else:
+            print(
+                "  The threshold is above half of total RAM, so the cache "
+                "engages only when headroom is already thin."
+            )
+        print(
+            "  Peak trainer RSS is recorded as process_rss_gb in "
+            "logs/.../stats/system_metrics_*.csv; size this from that "
+            "measurement rather than from the default."
+        )
+        print("=" * 72)
+        print("")
+        sys.stdout.flush()
+
+    def _warn_about_checkpoints_above_resume_point(self) -> None:
+        """Report checkpoints that this run is about to re-walk past.
+
+        Audit Suggestion 8.  The occupied-step guard already refuses to
+        overwrite them, which is correct -- but the resulting numbered range
+        then asserts a continuous trajectory it does not have: a checkpoint
+        written by an earlier run is not the ancestor of the one this run
+        writes two steps later.  The collision is only reported when the
+        trainer reaches that step, which can be hours in.  Say it at startup,
+        while the operator can still choose a different resume target.
+        """
+        try:
+            directory = Path(self.config.checkpoint_dir)
+            if not directory.is_dir():
+                return
+            ahead = sorted(
+                (
+                    _checkpoint_step_number(path)
+                    for path in directory.glob('model_step_*.pt')
+                ),
+            )
+            ahead = [step for step in ahead if step > self.step]
+        except OSError:
+            return
+        if not ahead:
+            return
+        print("")
+        print("=" * 72)
+        print(
+            f"Note: {len(ahead)} checkpoint(s) in {directory} are above this "
+            f"run's resume point (step {self.step}): "
+            f"{ahead[0]} .. {ahead[-1]}."
+        )
+        print(
+            "  They were written by an earlier run and will not be "
+            "overwritten. The numbered sequence across that range therefore "
+            "spans more than one lineage."
+        )
+        print("=" * 72)
+        print("")
+        sys.stdout.flush()
+
     def train(self) -> None:
         """Run training and record exactly one durable terminal reason.
 
@@ -5716,6 +6206,10 @@ class Trainer:
             # Never let bookkeeping prevent training from starting.
             print(f"Warning: could not open run status marker: {exc}")
             unterminated = None
+        self._capture_run_identity(log_dir)
+        self._warn_about_checkpoints_above_resume_point()
+        self._capture_prelaunch_free_ram()
+        self._warn_about_memory_headroom()
         self._install_termination_handler(log_dir)
         if unterminated is not None:
             print("")
@@ -5900,7 +6394,22 @@ class Trainer:
                 capacity=self.config.replay_max_entries if _simultaneous else 0,
                 max_moves_per_sample=self.config.max_moves_per_sample,
                 amp_enabled=self.config.amp,
+                prelaunch_free_ram_gb=getattr(
+                    self, '_prelaunch_free_ram_gb', None),
             )
+            # Journal Pass 117: on the cached path every entry has been copied
+            # into tensors, so the parsed entry lists are dead weight from
+            # here on.  Their growth is exactly what depressed the RAM-cache
+            # gate above (~5-6 GB at the 60-file steady state); keeping them
+            # alive would hold that cost for the whole session.  Only the
+            # tensor-backed paths release: the standard-Dataset path still
+            # reads the entries lazily.  These names are not read again in
+            # train() after this point.
+            if isinstance(dataloader, FastBatchIterator):
+                train_entries, validation_entries, train_balance = (
+                    self._free_entry_lists_after_tensorize(
+                        train_entries, validation_entries, train_balance))
+                gc.collect()
         _is_fast = isinstance(dataloader, FastBatchIterator)
         self._use_padded = (
             _is_fast
@@ -6066,33 +6575,8 @@ class Trainer:
                     else:
                         print("  Cause: FP16 overflow (weights finite in FP32, "
                               "but intermediate values overflow float16)")
-                    # Find and load the most recent checkpoint
-                    ckpt_dir = Path(self.config.checkpoint_dir)
-                    ckpts = sorted(ckpt_dir.glob("model_step_*.pt"))
-                    if self.config.recovery_enforced:
-                        last_ckpt = str(
-                            self._verified_recovery_rollback_checkpoint())
-                        print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
-                        self._load_checkpoint(last_ckpt)
-                        if self.scaler is not None:
-                            self.scaler = GradScaler(init_scale=2**10)
-                            print(
-                                "  GradScaler reset to conservative "
-                                f"scale={self.scaler.get_scale():.0f}")
-                    elif ckpts:
-                        last_ckpt = str(ckpts[-1])
-                        print(f"  Rolling back to checkpoint: {last_ckpt}")
-                        self._load_checkpoint(last_ckpt)
-                        # Reset GradScaler with conservative scale to prevent
-                        # re-triggering the same overflow.  Default init_scale=65536
-                        # is too aggressive for trained models — use 1024 (same as
-                        # the resume-without-scaler-state path).
-                        if self.scaler is not None:
-                            self.scaler = GradScaler(init_scale=2**10)
-                            print(f"  GradScaler reset to conservative scale={self.scaler.get_scale():.0f}")
-                    else:
-                        print("  No checkpoints found — resetting model from scratch")
-                        self._reset_model_state("No checkpoint for recovery")
+                    self._rollback_after_dead_epoch(
+                        reason=f"{_consecutive_dead_epochs} consecutive dead epochs")
                     print(f"{'='*60}\n")
                     sys.stdout.flush()
                     _consecutive_dead_epochs = 0
@@ -6220,6 +6704,15 @@ class Trainer:
                         max_moves_per_sample=self.config.max_moves_per_sample,
                         show_progress=True,
                     )
+                    # Journal Pass 117: entries are fully copied into tensors
+                    # here too; free them so the next cycle's preprocessing has
+                    # the headroom (measured mid-run lows were 3.4-4.1 GB on
+                    # this box).  Standard-Dataset paths keep lazy access.
+                    if isinstance(dataloader, FastBatchIterator):
+                        train_entries, = (
+                            self._free_entry_lists_after_tensorize(
+                                train_entries))
+                        gc.collect()
                     # Free old GPU tensors before allocating new ones
                     _was_gpu = getattr(dataloader, 'on_gpu', False)
                     if _was_gpu:
@@ -6471,15 +6964,14 @@ def list_checkpoints(checkpoint_dir: str = 'models/checkpoints') -> list:
     
     checkpoints = []
     for f in checkpoint_path.glob('model_step_*.pt'):
-        try:
-            step = int(f.stem.split('_')[-1])
-            checkpoints.append({
-                'path': str(f),
-                'step': step,
-                'name': f.name,
-            })
-        except ValueError:
+        step = _checkpoint_step_number(f)
+        if step < 0:
             continue
+        checkpoints.append({
+            'path': str(f),
+            'step': step,
+            'name': f.name,
+        })
     
     # Sort by step
     checkpoints.sort(key=lambda x: x['step'])
@@ -6685,6 +7177,8 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         gradient_accumulation_steps=training_cfg.get('gradient_accumulation_steps', 1),
         train_steps=training_cfg.get('train_steps', 999999999),
         checkpoint_every=training_cfg.get('checkpoint_every', 1000),
+        max_retained_checkpoints=int(
+            training_cfg.get('max_retained_checkpoints', 0) or 0),
         reward_mode=training_cfg.get('reward_mode', 'cycle'),
         # LR scheduler settings
         lr_scheduler_enabled=lr_sched_cfg.get('enabled', False),
@@ -6734,6 +7228,8 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
             snapshot_cfg.get('minimum_fresh_state_fraction', 0.50)),
         snapshot_max_retained=int(
             snapshot_cfg.get('max_retained_snapshots', 0) or 0),
+        snapshot_reuse_previous_shards=bool(
+            snapshot_cfg.get('reuse_previous_shards', True)),
         validation_grow_holdout=bool(
             validation_cfg.get('grow_holdout', True)),
         validation_split_version=int(
@@ -6822,6 +7318,72 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     )
 
 
+def _is_verified_continuation_resume(
+    config: TrainingConfig,
+    resume: Optional[Path],
+    baseline: Path,
+) -> bool:
+    """True when ``resume`` is this namespace's own verified continuation point.
+
+    Audit Suggestion 7.  P4 forbids a *fresh-weight* arm, not a second session:
+    a checkpoint this experiment itself wrote is a descendant of the pinned
+    anchor and says so in its own metadata.  Without this, every relaunch
+    re-walked from the anchor and the frozen-suite series restarted, so the
+    experiment's practical ceiling was one uninterrupted session.
+
+    Three conditions, all required:
+
+    * the file is an immutable *numbered* checkpoint -- never an alias such as
+      latest/promoted/accepted, which are republished in place;
+    * it lives in this run's own ``checkpoint_dir`` -- a stamped checkpoint in
+      a foreign namespace is still refused, because output isolation is what
+      the continuation namespace exists to provide;
+    * it carries the pinned ``baseline_sha256`` for the active training stage
+      and holds finite weights.
+    """
+    if resume is None or not resume.is_file():
+        return False
+    if resume == baseline:
+        return False
+    if not _RECOVERY_ANCHOR_NAME_RE.match(resume.name):
+        return False
+    checkpoint_dir = Path(config.checkpoint_dir)
+    if not checkpoint_dir.is_dir():
+        return False
+    try:
+        if not os.path.samefile(resume.parent, checkpoint_dir):
+            return False
+    except OSError:
+        return False
+    return recovery_checkpoint_continues_lineage(
+        resume,
+        str(config.recovery_baseline_sha256 or ''),
+        config.policy_stage,
+    )
+
+
+def resolve_recovery_continuation_resume(config: TrainingConfig) -> Optional[Path]:
+    """Newest verified continuation checkpoint for ``config``, or ``None``.
+
+    Audit Suggestion 7.  ``None`` means "no verified checkpoint exists yet",
+    which is the normal state of a namespace on its first launch; the caller
+    keeps the pinned anchor in that case.  This never falls back to an
+    unverified file, so it cannot become a back door around the anchor pin the
+    way ``--resume-latest`` would.
+    """
+    if not config.recovery_enforced:
+        raise ValueError(
+            "--resume-continuation requires a recovery_experiment config")
+    if not config.recovery_baseline_sha256:
+        raise ValueError(
+            "--resume-continuation requires a pinned recovery baseline SHA-256")
+    return newest_verified_recovery_continuation(
+        config.checkpoint_dir,
+        str(config.recovery_baseline_sha256),
+        config.policy_stage,
+    )
+
+
 def validate_recovery_experiment_config(
     config: TrainingConfig,
     *,
@@ -6864,9 +7426,13 @@ def validate_recovery_experiment_config(
             )
         except OSError:
             resume_is_baseline = False
-        if not resume_is_baseline:
+        if not resume_is_baseline and not _is_verified_continuation_resume(
+            config, resume, baseline
+        ):
             raise ValueError(
-                f"Recovery must resume only from {baseline}; received {resume}"
+                f"Recovery must resume from {baseline}, or from a numbered "
+                f"checkpoint in {Path(config.checkpoint_dir)} that carries the "
+                f"pinned lineage stamp; received {resume}"
             )
     elif config.policy_stage == 'enhanced':
         isolation_failures = _enhanced_output_isolation_failures(config)
@@ -7666,6 +8232,10 @@ def main():
                        help='Path to checkpoint to resume from')
     parser.add_argument('--resume-latest', action='store_true',
                        help='Resume from the latest checkpoint in models/checkpoints/')
+    parser.add_argument('--resume-continuation', action='store_true',
+                       help='Recovery experiment only: resume the newest checkpoint '
+                            'in this run\'s own checkpoint_dir that carries the pinned '
+                            'lineage stamp, falling back to the anchor when none exists')
     parser.add_argument('--train-duration', type=str, default=None,
                        help='Train for this duration (e.g., 2d, 4h, 30m, 1d12h)')
     parser.add_argument('--enhanced-stage', action='store_true',
@@ -7754,7 +8324,7 @@ def main():
             config.stop_time = parse_duration(args.train_duration)
 
         if explicit:
-            print(f"CLI overrides: {', '.join(sorted(explicit - {'config', 'profile', 'resume', 'resume_latest', 'train_duration'}))}")
+            print(f"CLI overrides: {', '.join(sorted(explicit - {'config', 'profile', 'resume', 'resume_latest', 'resume_continuation', 'train_duration'}))}")
 
         # Print loaded config summary
         print(f"Config loaded: batch_size={config.batch_size}, lr={config.learning_rate}, "
@@ -7832,6 +8402,30 @@ def main():
         activate_enhanced_stage(config, args.inference_depth or 2)
     elif args.inference_depth is not None:
         config.inference_depth = args.inference_depth
+
+    # Audit Suggestion 7.  Resolved after every other resume path has settled
+    # and before the gate runs, so the gate still validates whatever will
+    # actually be loaded.  --resume-latest stays forbidden under recovery: it
+    # would also match aliases and foreign namespaces, which is exactly the
+    # looseness the lineage stamp replaces.
+    if args.resume_continuation:
+        if args.resume_latest:
+            raise ValueError(
+                "--resume-continuation and --resume-latest are mutually exclusive")
+        if args.resume:
+            raise ValueError(
+                "--resume-continuation and an explicit --resume are mutually "
+                "exclusive")
+        continuation = resolve_recovery_continuation_resume(config)
+        if continuation is None:
+            print(
+                "No verified continuation checkpoint in "
+                f"{config.checkpoint_dir}; resuming the pinned anchor "
+                f"{config.resume}"
+            )
+        else:
+            print(f"Resuming verified continuation checkpoint: {continuation}")
+            config.resume = str(continuation)
 
     validate_recovery_experiment_config(
         config,
