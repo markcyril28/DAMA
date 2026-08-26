@@ -1250,10 +1250,12 @@ def test_recovery_gate_accepts_only_exact_baseline_and_controls(tmp_path: Path) 
     with pytest.raises(ValueError, match="resume-latest"):
         validate_recovery_experiment_config(config, resume_latest_requested=True)
 
+    # Audit Suggestion 7 widened the gate to admit this namespace's own
+    # lineage-verified checkpoints; a bare file outside it is still refused.
     other = tmp_path / "model_step_136000.pt"
     other.write_bytes(b"other")
     config.resume = str(other)
-    with pytest.raises(ValueError, match="resume only"):
+    with pytest.raises(ValueError, match="Recovery must resume from"):
         validate_recovery_experiment_config(config)
 
 
@@ -2171,3 +2173,654 @@ def test_cuda_resume_restores_rng_from_a_gpu_mapped_checkpoint(tmp_path: Path) -
 
     assert torch.equal(
         torch.cuda.get_rng_state(), saved["rng_state"]["cuda_all"][0].cpu())
+
+
+# ---------------------------------------------------------------------------
+# Audit Suggestion 7: lineage-verified continuation resume
+# ---------------------------------------------------------------------------
+
+def _stamped_checkpoint(
+    path: Path,
+    *,
+    baseline_sha256: str,
+    training_stage: str = "policy_only",
+    enabled: bool = True,
+    finite: bool = True,
+) -> Path:
+    """Write a checkpoint carrying the recovery lineage stamp this arm writes."""
+    import torch
+
+    weight = torch.ones(2, 2)
+    if not finite:
+        weight = weight * float("nan")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": {"w": weight},
+            "step": int(path.stem.rsplit("_", 1)[-1]),
+            "recovery_experiment": {
+                "enabled": enabled,
+                "baseline_sha256": baseline_sha256,
+                "training_stage": training_stage,
+                "resume_anchor": "anchor",
+            },
+        },
+        path,
+    )
+    return path
+
+
+def _recovery_config_with_namespace(tmp_path: Path):
+    """A valid recovery config whose checkpoint directory exists."""
+    baseline = tmp_path / "model_step_174000.pt"
+    baseline.write_bytes(b"approved continuation anchor")
+    config = _valid_recovery_config(baseline)
+    Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    return config, baseline
+
+
+def test_recovery_gate_accepts_a_lineage_verified_continuation(tmp_path: Path) -> None:
+    """A relaunch may resume its own newest verified checkpoint.
+
+    Without this the experiment's ceiling was one uninterrupted session: every
+    relaunch re-walked from the anchor, discarding the steps already trained
+    and restarting the frozen-suite agreement series.
+    """
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    continuation = _stamped_checkpoint(
+        Path(config.checkpoint_dir) / "model_step_202000.pt",
+        baseline_sha256=config.recovery_baseline_sha256,
+    )
+    config.resume = str(continuation)
+
+    validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_refuses_a_stamped_checkpoint_from_another_namespace(
+    tmp_path: Path,
+) -> None:
+    """Output isolation is per-directory, so the stamp alone is not enough."""
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    foreign = _stamped_checkpoint(
+        tmp_path / "foreign_namespace" / "model_step_202000.pt",
+        baseline_sha256=config.recovery_baseline_sha256,
+    )
+    config.resume = str(foreign)
+
+    with pytest.raises(ValueError, match="Recovery must resume from"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_refuses_an_unstamped_checkpoint_in_the_namespace(
+    tmp_path: Path,
+) -> None:
+    """A file merely sitting in the directory proves no ancestry."""
+    import torch
+
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    unstamped = Path(config.checkpoint_dir) / "model_step_202000.pt"
+    torch.save({"model_state_dict": {"w": torch.ones(2, 2)}}, unstamped)
+    config.resume = str(unstamped)
+
+    with pytest.raises(ValueError, match="Recovery must resume from"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_refuses_a_continuation_from_a_different_baseline(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint from a different recovery arm is not this arm's descendant."""
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    wrong = _stamped_checkpoint(
+        Path(config.checkpoint_dir) / "model_step_202000.pt",
+        baseline_sha256="0" * 64,
+    )
+    config.resume = str(wrong)
+
+    with pytest.raises(ValueError, match="Recovery must resume from"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_refuses_a_continuation_from_another_training_stage(
+    tmp_path: Path,
+) -> None:
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    wrong_stage = _stamped_checkpoint(
+        Path(config.checkpoint_dir) / "model_step_202000.pt",
+        baseline_sha256=config.recovery_baseline_sha256,
+        training_stage="enhanced",
+    )
+    config.resume = str(wrong_stage)
+
+    with pytest.raises(ValueError, match="Recovery must resume from"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_refuses_a_continuation_holding_non_finite_weights(
+    tmp_path: Path,
+) -> None:
+    """Impeccable lineage does not make NaN weights a valid resume point."""
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    broken = _stamped_checkpoint(
+        Path(config.checkpoint_dir) / "model_step_202000.pt",
+        baseline_sha256=config.recovery_baseline_sha256,
+        finite=False,
+    )
+    config.resume = str(broken)
+
+    with pytest.raises(ValueError, match="Recovery must resume from"):
+        validate_recovery_experiment_config(config)
+
+
+def test_recovery_gate_refuses_a_stamped_alias_in_the_namespace(
+    tmp_path: Path,
+) -> None:
+    """Aliases are republished in place, so resuming one is unverifiable."""
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    alias = _stamped_checkpoint(
+        Path(config.checkpoint_dir) / "model_step_202000.pt",
+        baseline_sha256=config.recovery_baseline_sha256,
+    )
+    moving = Path(config.checkpoint_dir) / "latest_alias.pt"
+    moving.write_bytes(alias.read_bytes())
+    config.resume = str(moving)
+
+    with pytest.raises(ValueError, match="Recovery must resume from"):
+        validate_recovery_experiment_config(config)
+
+
+def test_continuation_resolver_picks_the_newest_verified_checkpoint(
+    tmp_path: Path,
+) -> None:
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    directory = Path(config.checkpoint_dir)
+    for step in (176000, 202000, 178000):
+        _stamped_checkpoint(
+            directory / f"model_step_{step:06d}.pt",
+            baseline_sha256=config.recovery_baseline_sha256,
+        )
+    # A later but unverifiable file must not win the selection.
+    _stamped_checkpoint(
+        directory / "model_step_204000.pt",
+        baseline_sha256="0" * 64,
+    )
+
+    resolved = trainer_module.resolve_recovery_continuation_resume(config)
+
+    assert resolved is not None
+    assert resolved.name == "model_step_202000.pt"
+
+
+def test_continuation_resolver_returns_none_on_an_empty_namespace(
+    tmp_path: Path,
+) -> None:
+    """First launch of a namespace: the caller keeps the pinned anchor."""
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+
+    assert trainer_module.resolve_recovery_continuation_resume(config) is None
+
+
+def test_continuation_resolver_requires_a_recovery_config(tmp_path: Path) -> None:
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    config.recovery_enforced = False
+
+    with pytest.raises(ValueError, match="recovery_experiment config"):
+        trainer_module.resolve_recovery_continuation_resume(config)
+
+
+def test_continuation_resolver_rejects_a_tensor_free_state_dict(
+    tmp_path: Path,
+) -> None:
+    """A lineage stamp without any weight tensor proves nothing about finiteness."""
+    import torch
+
+    config, _baseline = _recovery_config_with_namespace(tmp_path)
+    path = Path(config.checkpoint_dir) / "model_step_176000.pt"
+    torch.save(
+        {
+            "model_state_dict": {"step": 176000},
+            "recovery_experiment": {
+                "enabled": True,
+                "baseline_sha256": config.recovery_baseline_sha256,
+                "training_stage": "policy_only",
+                "resume_anchor": "anchor",
+            },
+        },
+        path,
+    )
+
+    assert trainer_module.resolve_recovery_continuation_resume(config) is None
+
+
+# ---------------------------------------------------------------------------
+# Audit Suggestion 8: run provenance
+# ---------------------------------------------------------------------------
+
+def test_run_identity_names_the_session_and_its_resume_point(tmp_path: Path) -> None:
+    """Two runs sharing a corpus were previously indistinguishable.
+
+    ``dataset_fingerprint`` discriminates corpora, not sessions, so a numbered
+    range spanning two runs read as one continuous trajectory.
+    """
+    from dama.ai.ml import run_status
+
+    log_dir = tmp_path / "logs"
+    run_status.begin_run(log_dir, pid=4321)
+    holder = SimpleNamespace(
+        config=SimpleNamespace(resume=str(tmp_path / "model_step_174000.pt")),
+        step=174000,
+    )
+
+    Trainer._capture_run_identity(holder, str(log_dir))
+
+    assert holder._run_identity["pid"] == 4321
+    assert holder._run_identity["resume_step"] == 174000
+    assert holder._run_identity["started_at"]
+    assert holder._run_identity["run_id"].startswith("4321@")
+
+
+def test_startup_reports_checkpoints_above_the_resume_point(
+    tmp_path: Path, capsys
+) -> None:
+    """The mixed-lineage range is announced while the operator can still act."""
+    directory = tmp_path / "checkpoints"
+    directory.mkdir()
+    for step in (176000, 178000):
+        (directory / f"model_step_{step:06d}.pt").write_bytes(b"x")
+    holder = SimpleNamespace(
+        config=SimpleNamespace(checkpoint_dir=str(directory)),
+        step=174000,
+    )
+
+    Trainer._warn_about_checkpoints_above_resume_point(holder)
+
+    captured = capsys.readouterr().out
+    assert "above this run's resume point (step 174000)" in captured
+    assert "176000 .. 178000" in captured
+    assert "more than one lineage" in captured
+
+
+def test_startup_is_quiet_when_no_checkpoint_is_ahead(tmp_path: Path, capsys) -> None:
+    directory = tmp_path / "checkpoints"
+    directory.mkdir()
+    (directory / "model_step_174000.pt").write_bytes(b"x")
+    holder = SimpleNamespace(
+        config=SimpleNamespace(checkpoint_dir=str(directory)),
+        step=174000,
+    )
+
+    Trainer._warn_about_checkpoints_above_resume_point(holder)
+
+    assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# Audit Suggestion 10: checkpoint retention
+# ---------------------------------------------------------------------------
+
+def _retention_holder(tmp_path: Path, keep: int, records=()) -> SimpleNamespace:
+    from dama.ai.ml.teacher_validation import PromotionRegistry
+
+    directory = tmp_path / "checkpoints"
+    directory.mkdir(exist_ok=True)
+    registry_path = tmp_path / "promotions.jsonl"
+    if records:
+        registry_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+    holder = SimpleNamespace(
+        config=SimpleNamespace(
+            checkpoint_dir=str(directory),
+            max_retained_checkpoints=keep,
+            resume=None,
+            recovery_baseline_path=None,
+        ),
+        _promotion_registry=PromotionRegistry(str(registry_path)),
+    )
+    holder._protected_checkpoint_paths = (
+        Trainer._protected_checkpoint_paths.__get__(holder))
+    return holder
+
+
+def _write_steps(directory: Path, steps) -> None:
+    for step in steps:
+        (directory / f"model_step_{step:06d}.pt").write_bytes(b"checkpoint")
+
+
+def test_checkpoint_retention_is_off_by_default(tmp_path: Path) -> None:
+    """0 must preserve the historical keep-everything behaviour exactly."""
+    holder = _retention_holder(tmp_path, keep=0)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000])
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_006000.pt")
+
+    assert removed == []
+    assert len(list(directory.glob("model_step_*.pt"))) == 3
+
+
+def test_checkpoint_retention_keeps_only_the_newest_n(tmp_path: Path) -> None:
+    holder = _retention_holder(tmp_path, keep=2)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000, 8000])
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_008000.pt")
+
+    assert sorted(removed) == ["model_step_002000.pt", "model_step_004000.pt"]
+    assert sorted(p.name for p in directory.glob("model_step_*.pt")) == [
+        "model_step_006000.pt",
+        "model_step_008000.pt",
+    ]
+
+
+def test_checkpoint_retention_never_deletes_a_promoted_checkpoint(
+    tmp_path: Path,
+) -> None:
+    holder = _retention_holder(
+        tmp_path,
+        keep=1,
+        records=[
+            {
+                "checkpoint_path": "checkpoints/model_step_002000.pt",
+                "step": 2000,
+                "teacher_agreement": 0.55,
+                "promoted": True,
+            },
+        ],
+    )
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000])
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_006000.pt")
+
+    assert removed == ["model_step_004000.pt"]
+    assert (directory / "model_step_002000.pt").exists()
+
+
+def test_checkpoint_retention_never_deletes_the_registry_best(tmp_path: Path) -> None:
+    """Nothing has cleared the 0.50 gate on this arm.
+
+    Protecting only promotions would therefore leave the entire agreement
+    series prunable and discard the best result the run has produced.
+    """
+    holder = _retention_holder(
+        tmp_path,
+        keep=1,
+        records=[
+            {
+                "checkpoint_path": "checkpoints/model_step_002000.pt",
+                "step": 2000,
+                "teacher_agreement": 0.4898,
+                "promoted": False,
+            },
+            {
+                "checkpoint_path": "checkpoints/model_step_004000.pt",
+                "step": 4000,
+                "teacher_agreement": 0.4744,
+                "promoted": False,
+            },
+        ],
+    )
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000])
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_006000.pt")
+
+    assert removed == ["model_step_004000.pt"]
+    assert (directory / "model_step_002000.pt").exists()
+
+
+def test_checkpoint_retention_never_deletes_the_resume_source(tmp_path: Path) -> None:
+    holder = _retention_holder(tmp_path, keep=1)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000])
+    holder.config.resume = str(directory / "model_step_002000.pt")
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_006000.pt")
+
+    assert removed == ["model_step_004000.pt"]
+    assert (directory / "model_step_002000.pt").exists()
+
+
+def test_checkpoint_retention_fails_closed_on_an_unreadable_registry(
+    tmp_path: Path,
+) -> None:
+    """An unreadable registry is not evidence that nothing is promoted."""
+    holder = _retention_holder(tmp_path, keep=1)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000])
+    Path(holder._promotion_registry.path).write_text("{not json\n", encoding="utf-8")
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_006000.pt")
+
+    assert removed == []
+    assert len(list(directory.glob("model_step_*.pt"))) == 3
+
+
+# ---------------------------------------------------------------------------
+# Proofread 2026-08-25 B1: protection must consume the retention budget
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_retention_budget_is_met_despite_protected_files(
+    tmp_path: Path,
+) -> None:
+    """Proofread 2026-08-25 B1.
+
+    The old window slice (``candidates[:len(candidates)-keep_count]``) only
+    ever examined the oldest few files, so protected entries inside that
+    window were skipped without replacement and the live count crept above
+    ``max_retained_checkpoints`` with every promotion.  With keep=2 and
+    candidates [1000P, 2000, 3000, 4000] it deleted only 2000 and left three
+    files on disk; the walk must instead delete both 2000 and 3000.
+    """
+    holder = _retention_holder(
+        tmp_path,
+        keep=2,
+        records=[
+            {
+                "checkpoint_path": "checkpoints/model_step_001000.pt",
+                "step": 1000,
+                "teacher_agreement": 0.55,
+                "promoted": True,
+            },
+        ],
+    )
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [1000, 2000, 3000, 4000])
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_004000.pt")
+
+    assert sorted(removed) == [
+        "model_step_002000.pt",
+        "model_step_003000.pt",
+    ]
+    assert sorted(p.name for p in directory.glob("model_step_*.pt")) == [
+        "model_step_001000.pt",
+        "model_step_004000.pt",
+    ]
+
+
+def test_checkpoint_retention_walk_extends_past_protected_files(
+    tmp_path: Path,
+) -> None:
+    """A protected entry in the middle of the walk extends the deletion window.
+
+    With keep=1 and candidates [2000, 4000P, 6000, 8000], the old fixed
+    window ``candidates[:3]`` deleted only 2000 (it stopped before 8000 and
+    skipped 4000 without replacement), leaving three files on disk.  The
+    oldest-first walk must continue past the protected 4000 and delete 6000
+    too, meeting the budget among unprotected files.
+    """
+    holder = _retention_holder(
+        tmp_path,
+        keep=1,
+        records=[
+            {
+                "checkpoint_path": "checkpoints/model_step_004000.pt",
+                "step": 4000,
+                "teacher_agreement": 0.55,
+                "promoted": True,
+            },
+        ],
+    )
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000, 8000])
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_008000.pt")
+
+    assert sorted(removed) == [
+        "model_step_002000.pt",
+        "model_step_006000.pt",
+    ]
+    assert sorted(p.name for p in directory.glob("model_step_*.pt")) == [
+        "model_step_004000.pt",
+        "model_step_008000.pt",
+    ]
+
+
+def test_checkpoint_retention_warns_when_protection_exceeds_the_budget(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """When protection alone pushes the live count over the budget, say so.
+
+    Silence here is what let the unbounded growth go unnoticed: an operator
+    watching the log must see that ``max_retained_checkpoints`` is not the
+    number of checkpoints on disk.
+    """
+    records = [
+        {
+            "checkpoint_path": f"checkpoints/model_step_{step:06d}.pt",
+            "step": step,
+            "teacher_agreement": 0.55,
+            "promoted": True,
+        }
+        for step in (2000, 4000)
+    ]
+    holder = _retention_holder(tmp_path, keep=1, records=records)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000])
+
+    removed = Trainer._prune_old_checkpoints(holder, directory / "model_step_006000.pt")
+
+    assert removed == []
+    output = capsys.readouterr().out
+    assert "[warn]" in output
+    assert "max_retained_checkpoints" in output
+    assert len(list(directory.glob("model_step_*.pt"))) == 3
+
+
+# ---------------------------------------------------------------------------
+# Proofread 2026-08-25 B2: prune-vs-rollback deletion race
+# ---------------------------------------------------------------------------
+
+def test_dead_epoch_rollback_tolerates_a_vanishing_pick(tmp_path: Path) -> None:
+    """Proofread 2026-08-25 B2.
+
+    Retention prunes inside the background checkpoint-writer thread while
+    dead-epoch rollback globs ``model_step_*.pt`` on the main thread, so the
+    newest glob hit can be unlinked milliseconds after selection.  Under
+    recovery enforcement a vanished pick must fall back to the verified
+    recovery rollback path instead of failing the run with "No verified
+    checkpoint remains"; without enforcement it must fall back to the next
+    remaining file.
+    """
+    directory = tmp_path / "checkpoints"
+    directory.mkdir()
+    _write_steps(directory, [2000, 4000])
+    holder = SimpleNamespace(
+        config=SimpleNamespace(
+            checkpoint_dir=str(directory),
+            recovery_enforced=False,
+        ),
+        scaler=None,
+    )
+    loaded = []
+    holder._load_checkpoint = lambda path: loaded.append(path)
+
+    # Simulate the race: the pruner removes the picked file between the glob
+    # and the load.  The rollback must retry with what is still on disk.
+    def vanishing_pick(pattern):
+        assert pattern == "model_step_*.pt"
+        picks = sorted(directory.glob("model_step_*.pt"))
+        target = picks[-1]
+        target.unlink()  # background writer's prune wins the race
+        return picks
+
+    holder._rollback_checkpoint_candidates = vanishing_pick
+
+    Trainer._rollback_after_dead_epoch(holder, reason="test")
+
+    assert loaded == [str(directory / "model_step_002000.pt")]
+
+
+def test_recovery_enforced_rollback_delegates_to_verified_lineage(
+    tmp_path: Path,
+) -> None:
+    """Under recovery enforcement the fallback is the verified-lineage pick."""
+    directory = tmp_path / "checkpoints"
+    directory.mkdir()
+    _write_steps(directory, [2000, 4000])
+    holder = SimpleNamespace(
+        config=SimpleNamespace(
+            checkpoint_dir=str(directory),
+            recovery_enforced=True,
+        ),
+        scaler=None,
+    )
+    loaded = []
+    holder._load_checkpoint = lambda path: loaded.append(path)
+    verified = directory / "model_step_002000.pt"
+    holder._verified_recovery_rollback_checkpoint = lambda: verified
+    holder._rollback_checkpoint_candidates = (
+        lambda pattern: sorted(directory.glob(pattern)))
+
+    Trainer._rollback_after_dead_epoch(holder, reason="test")
+
+    assert loaded == [str(verified)]
+
+
+def test_recovery_enforced_race_fallback_skips_unstamped_files(
+    tmp_path: Path,
+) -> None:
+    """A vanished verified pick must not let an unstamped file load.
+
+    When the verified pick is pruned between selection and load (the
+    prune-vs-rollback race), the fallback loop walks whatever files remain.
+    Every other recovery path refuses checkpoints without the pinned lineage
+    stamp; the race fallback must enforce the same invariant instead of
+    silently loading a foreign-lineage state.
+    """
+    import torch
+
+    directory = tmp_path / "checkpoints"
+    directory.mkdir()
+    stamped = _stamped_checkpoint(
+        directory / "model_step_002000.pt",
+        baseline_sha256="a" * 64,
+    )
+    # Newest file on disk carries no lineage stamp at all.
+    (directory / "model_step_004000.pt").write_bytes(b"unstamped")
+    holder = SimpleNamespace(
+        config=SimpleNamespace(
+            checkpoint_dir=str(directory),
+            recovery_enforced=True,
+            recovery_baseline_sha256="a" * 64,
+            policy_stage="policy_only",
+        ),
+        scaler=None,
+    )
+    loaded = []
+    holder._load_checkpoint = lambda path: loaded.append(path)
+
+    def vanishing_verified_pick():
+        raise FileNotFoundError(str(directory / "model_step_999999.pt"))
+
+    holder._verified_recovery_rollback_checkpoint = vanishing_verified_pick
+    holder._rollback_checkpoint_candidates = (
+        lambda pattern: sorted(directory.glob(pattern)))
+
+    Trainer._rollback_after_dead_epoch(holder, reason="test")
+
+    assert loaded == [str(stamped)]
