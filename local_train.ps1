@@ -36,6 +36,11 @@ Resume from a specific checkpoint. This cannot be combined with FreshStart.
 The policy-distillation recovery config accepts only the preserved baseline
 checkpoint that the selected config pins by path and SHA-256.
 
+.PARAMETER NoResumeContinuation
+Recovery only: re-walk from the pinned anchor on every launch instead of
+continuing this namespace's newest lineage-verified checkpoint (audit
+Suggestion 7). Without this switch a relaunch continues where it left off.
+
 .PARAMETER FreshStart
 Start without a checkpoint. Without this option or Resume, the launcher uses
 the preserved baseline named by the selected policy-distillation recovery
@@ -80,6 +85,7 @@ param(
     [string] $Resume = '',
 
     [switch] $FreshStart,
+    [switch] $NoResumeContinuation,
 
     [switch] $EnhancedStage,
 
@@ -180,6 +186,7 @@ if ($EnhancedStage -and -not $IsPolicyRecovery) {
 }
 
 $ResumePath = ''
+$UseResumeContinuation = $false
 if (-not [string]::IsNullOrWhiteSpace($Resume)) {
     $ResumeCandidate = if ([System.IO.Path]::IsPathRooted($Resume)) {
         $Resume
@@ -205,6 +212,11 @@ if ($IsPolicyRecovery) {
             throw "Promoted policy checkpoint not found: $ResumePath"
         }
     } else {
+        # Audit Suggestion 7: only the implicit path opts in. Naming a
+        # checkpoint with -Resume still resumes exactly that checkpoint.
+        if ([string]::IsNullOrWhiteSpace($ResumePath) -and -not $NoResumeContinuation) {
+            $UseResumeContinuation = $true
+        }
         if (-not [string]::IsNullOrWhiteSpace($ResumePath) -and
             -not $ResumePath.Equals(
                 $PolicyRecoveryBaselinePath,
@@ -471,7 +483,13 @@ print("DAMA trainer import: OK")
     )
 
     if ($IsPolicyRecovery) {
-        $TrainerArguments += @('--resume', $ResumePath)
+        if ($UseResumeContinuation) {
+            # The trainer resolves and verifies the target; --resume is
+            # omitted so the config's pinned anchor remains the fallback.
+            $TrainerArguments += '--resume-continuation'
+        } else {
+            $TrainerArguments += @('--resume', $ResumePath)
+        }
         if ($EnhancedStage) {
             $TrainerArguments += @(
                 '--enhanced-stage',
@@ -480,7 +498,11 @@ print("DAMA trainer import: OK")
             )
             Write-Host "Resume policy: gated promoted policy checkpoint $ResumePath"
         } else {
-            Write-Host "Resume policy: locked recovery baseline $PolicyRecoveryBaselinePath"
+            if ($UseResumeContinuation) {
+                Write-Host "Resume policy: newest verified continuation, else $PolicyRecoveryBaselinePath"
+            } else {
+                Write-Host "Resume policy: locked recovery baseline $PolicyRecoveryBaselinePath"
+            }
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($ResumePath)) {
         $TrainerArguments += @('--resume', $ResumePath)
