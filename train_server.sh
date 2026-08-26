@@ -41,6 +41,9 @@ SET_PROCESS_TITLE=true           # Set to false to disable custom process title 
 PROCESS_TITLE="micro_trainer"            # Process name shown in htop or btop (requires 'setproctitle' package)
 RESUME=""                        # Path to checkpoint to resume from
 RESUME_LATEST=false             # Forbidden for the resume-only recovery experiment.
+RESUME_CONTINUATION=true        # Recovery only: a relaunch continues this namespace's newest
+                                # lineage-verified checkpoint instead of re-walking from the anchor
+                                # (audit Suggestion 7). false restores anchor-only restarts.
 ENHANCED_STAGE=false            # true only after a policy-only checkpoint is promoted.
 ENHANCED_INFERENCE_DEPTH=2      # Enhanced stage only: 2 or 3.
 
@@ -88,8 +91,21 @@ POLICY_RECOVERY_BASELINE=""
 POLICY_RECOVERY_SHA256=""
 POLICY_RECOVERY_LEGACY_STATS=""
 POLICY_RECOVERY_STATS=""
-if [ "$(_yaml_scalar "$CONFIG_FILE" recovery_experiment enabled)" = true ]; then
-    IS_POLICY_RECOVERY=true
+# PyYAML resolves True/yes/on (any case) as booleans, and the trainer reads this
+# same key through yaml.safe_load -- so the launcher must accept the same spellings
+# or it silently skips every recovery guard below on a config that says `enabled: Yes`.
+# (Matches the hardened check in local_train.sh; see Journal Pass 118.)
+case "$(_yaml_scalar "$CONFIG_FILE" recovery_experiment enabled)" in
+    true|True|TRUE|yes|Yes|YES|on|On|ON)
+        IS_POLICY_RECOVERY=true
+        ;;
+    false|False|FALSE|no|No|NO|off|Off|OFF|"") ;;
+    *)
+        echo "ERROR: recovery_experiment.enabled is not a YAML boolean in $CONFIG_FILE" >&2
+        exit 1
+        ;;
+esac
+if [ "$IS_POLICY_RECOVERY" = true ]; then
     _baseline_rel="$(_yaml_scalar "$CONFIG_FILE" recovery_experiment baseline_checkpoint)"
     POLICY_RECOVERY_SHA256="$(_yaml_scalar "$CONFIG_FILE" recovery_experiment baseline_sha256 | tr 'a-f' 'A-F')"
     if [ -z "$_baseline_rel" ] || [ -z "$POLICY_RECOVERY_SHA256" ]; then
@@ -102,6 +118,16 @@ if [ "$(_yaml_scalar "$CONFIG_FILE" recovery_experiment enabled)" = true ]; then
     [ -n "$_stats_rel" ] && POLICY_RECOVERY_STATS="$(_abs_project_path "$_stats_rel")"
     [ -n "$_seed_stats_rel" ] && POLICY_RECOVERY_LEGACY_STATS="$(_abs_project_path "$_seed_stats_rel")"
 fi
+USE_RESUME_CONTINUATION=false
+
+case "$RESUME_CONTINUATION" in
+    true|false) ;;
+    *)
+        echo "ERROR: RESUME_CONTINUATION must be true or false." >&2
+        exit 1
+        ;;
+esac
+
 if [ "$IS_POLICY_RECOVERY" = true ]; then
     if [ "$RESUME_LATEST" = true ]; then
         echo "ERROR: --resume-latest is disabled for policy recovery." >&2
@@ -134,6 +160,9 @@ if [ "$IS_POLICY_RECOVERY" = true ]; then
     else
         if [ -z "$RESUME" ]; then
             RESUME="$POLICY_RECOVERY_BASELINE"
+            # Audit Suggestion 7. Only the implicit path opts in; naming a
+            # checkpoint explicitly still resumes exactly that checkpoint.
+            [ "$RESUME_CONTINUATION" = true ] && USE_RESUME_CONTINUATION=true
         else
             [[ "$RESUME" = /* ]] || RESUME="${PROJECT_DIR}/${RESUME}"
             RESUME="$(readlink -f "$RESUME")"
@@ -255,13 +284,35 @@ if [ "$IS_POLICY_RECOVERY" = true ] &&
     echo ""
 fi
 
-# Cython staleness guard (fail-safe). The compiled .so files are committed but
-# can lag their .pyx sources (a stale committed _fast_search.so silently ran
-# the old alpha-beta search in Jun 2026). Rebuild in-place if any .pyx is newer
-# than its .so. No-op when fresh; never blocks training on a build failure.
+# Cython staleness guard (fail-safe). The .so files are NOT tracked (commit
+# 2f85ac6 untracked them; .gitignore carries *.so), so a fresh clone has none
+# at all and a local .pyx edit or a pull that changes a .pyx leaves the built
+# one behind. Rebuild in-place when a .pyx is newer than its extension, or
+# when the extension is missing. No-op when fresh; never blocks training on
+# a build failure.
+#
+# The artifact is resolved by the running interpreter's EXT_SUFFIX rather than
+# by `ls -t ... | head -1`: that glob matched every ABI tag and kept the newest
+# by mtime, so a stray extension built for another Python version could mask a
+# genuinely stale one. EXT_SUFFIX names exactly the file the *resolved*
+# interpreter will import -- so this guard is only ABI-precise when `python`
+# already IS the training env. When conda activation failed and `python` is
+# some other env (e.g. base), the suffix names that other env's ABI, the
+# existing .so reads as missing, and every launch force-rebuilds with the
+# wrong interpreter; the rebuild then fails or produces an unusable .so and
+# the CUDA/import check below is what actually catches it. The cron entry
+# point (scripts/script.sh) activates dama before exec'ing this script.
+_ext_suffix="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
 _cython_stale=false
 while IFS= read -r _pyx; do
-    _so="$(ls -t "${_pyx%.pyx}".*.so 2>/dev/null | head -1 || true)"
+    if [ -n "$_ext_suffix" ]; then
+        _so="${_pyx%.pyx}${_ext_suffix}"
+        [ -f "$_so" ] || _so=""
+    else
+        # EXT_SUFFIX unavailable (no working interpreter yet): fall back to the
+        # any-ABI glob rather than forcing a rebuild on every launch.
+        _so="$(ls -t "${_pyx%.pyx}".*.so 2>/dev/null | head -1 || true)"
+    fi
     if [ -z "$_so" ] || [ "$_pyx" -nt "$_so" ]; then _cython_stale=true; fi
 done < <(find "${PROJECT_DIR}/src" -name '*.pyx' -not -path '*/build/*' 2>/dev/null)
 if [ "$_cython_stale" = true ]; then
@@ -341,7 +392,11 @@ if [ -n "$CONFIG_PROFILE" ]; then
 fi
 
 # Resume settings (override config if specified)
-if [ -n "$RESUME" ]; then
+if [ "$USE_RESUME_CONTINUATION" = true ]; then
+    # The trainer resolves and verifies the target; --resume is omitted so the
+    # config's pinned anchor remains the fallback.
+    ARGS+=(--resume-continuation)
+elif [ -n "$RESUME" ]; then
     ARGS+=(--resume "$RESUME")
 elif [ "$RESUME_LATEST" = true ]; then
     ARGS+=(--resume-latest)
@@ -368,7 +423,9 @@ if [ -n "$TRAIN_DURATION" ]; then
 else
     echo "    Train Duration:    (from config file)"
 fi
-if [ -n "$RESUME" ]; then
+if [ "$USE_RESUME_CONTINUATION" = true ]; then
+    echo "    Resume from:       newest verified continuation, else ${RESUME}"
+elif [ -n "$RESUME" ]; then
     echo "    Resume from:       ${RESUME}"
 elif [ "$RESUME_LATEST" = true ]; then
     echo "    Resume from:       latest checkpoint"
