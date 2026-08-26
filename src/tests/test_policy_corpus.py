@@ -235,6 +235,99 @@ def test_snapshot_retention_rejects_negative_cap(tmp_path: Path) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Proofread 2026-08-25 C1: leftover version directory must not break admission
+# ---------------------------------------------------------------------------
+
+def test_admission_fails_closed_on_a_leftover_version_directory(
+    tmp_path: Path,
+) -> None:
+    """Proofread 2026-08-25 C1.
+
+    ``os.replace(staging, final_dir)`` has no guard for ``final_dir`` already
+    existing: a half-written earlier ``snapshot_vNNNNNN`` makes admission fail
+    with errno 39, and an *empty* leftover is silently adopted under a
+    lineage that belongs to nothing.  A leftover target must fail closed.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_00_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.50,
+    )
+    settings = {"difficulty": "hard"}
+    noise = {"played_action_probability": 0.10, "label_is_teacher": True}
+    generation = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+
+    # Simulate a concurrent/littered admission: while this manager is
+    # building its staging tree, a half-written earlier attempt appears at
+    # the same version number it is about to claim.
+    real_next_version = manager._next_version
+
+    def colliding_next_version() -> int:
+        version = real_next_version()
+        leftover = snapshot_root / f"snapshot_v{version:06d}"
+        leftover.mkdir(parents=True, exist_ok=True)
+        (leftover / "manifest.json").write_text("{ truncated", encoding="utf-8")
+        return version
+
+    manager._next_version = colliding_next_version
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        manager.consider_snapshot(settings, noise, generation)
+
+    # The leftover itself is untouched evidence; nothing was admitted.
+    assert (snapshot_root / "snapshot_v000001" / "manifest.json").read_text(
+        encoding="utf-8"
+    ) == "{ truncated"
+    assert manager.current_manifest_path() is None
+    # The staging tree of the refused attempt did not leak either.
+    assert not list(snapshot_root.glob(".snapshot_v*"))
+
+
+def test_empty_leftover_version_directory_also_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """An empty leftover must not be silently adopted as the new snapshot."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_00_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.50,
+    )
+    settings = {"difficulty": "hard"}
+    noise = {"played_action_probability": 0.10, "label_is_teacher": True}
+    generation = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+
+    real_next_version = manager._next_version
+
+    def colliding_next_version() -> int:
+        version = real_next_version()
+        (snapshot_root / f"snapshot_v{version:06d}").mkdir(parents=True, exist_ok=True)
+        return version
+
+    manager._next_version = colliding_next_version
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        manager.consider_snapshot(settings, noise, generation)
+
+    assert manager.current_manifest_path() is None
+
+
 def _validation_manifest(snapshot_root: Path) -> dict:
     return json.loads(
         (snapshot_root / "validation" / "manifest.json").read_text(encoding="utf-8")
@@ -1178,3 +1271,296 @@ def test_snapshot_load_accepts_windows_written_manifest_paths(tmp_path: Path) ->
         decision.manifest_path)
     assert train_entries
     assert validation_entries
+
+
+# ---------------------------------------------------------------------------
+# Audit Suggestion 9: the hold-out's freshness tax must be attributable
+# ---------------------------------------------------------------------------
+
+def test_holdout_growth_records_the_freshness_it_cost(tmp_path: Path) -> None:
+    """A growth event cancels a cycle's freshness gain; the manifest must say so.
+
+    ``_grow_validation`` can only choose never-trained shards -- a trained one
+    would measure memorisation, not generalisation -- so the shards eligible
+    for the hold-out are exactly the fresh ones.  Each growth event therefore
+    moves a whole fresh shard out of training and flattens that cycle's
+    freshness reading, which from the logs is indistinguishable from the
+    generator having saturated.
+    """
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_00_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+        grow_holdout=True,
+    )
+    settings = {"difficulty": "hard"}
+    noise = {"played_action_probability": 0.10, "label_is_teacher": True}
+    generation = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+
+    first = manager.consider_snapshot(settings, noise, generation)
+    assert first.admitted
+
+    # Enough new shards that the 25% quota reopens and growth takes one.
+    for offset in range(8):
+        _write_replay(
+            replay_dir / f"replay_01_{offset}.jsonl",
+            [_entry(100 + offset)],
+        )
+
+    second = manager.consider_snapshot(settings, noise, generation)
+
+    assert second.metrics["holdout_growth_files"], (
+        "the quota should have reopened and moved at least one shard")
+    assert second.metrics["fresh_states_transferred_to_holdout"] > 0
+    assert (
+        second.metrics["fresh_states_transferred_to_holdout"]
+        <= second.metrics["states_transferred_to_holdout"]
+    )
+    # The counterfactual is what the cycle would have read without the
+    # transfer, so it can never be the lower of the two.
+    assert (
+        second.metrics["fresh_unique_state_rate_without_holdout_growth"]
+        >= second.metrics["fresh_unique_state_rate"]
+    )
+
+
+def test_a_cycle_without_holdout_growth_reports_no_freshness_cost(
+    tmp_path: Path,
+) -> None:
+    """No growth event, no cost -- and never last cycle's cost repeated."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_00_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.0,
+        grow_holdout=False,
+    )
+    settings = {"difficulty": "hard"}
+    noise = {"played_action_probability": 0.10, "label_is_teacher": True}
+    generation = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+
+    decision = manager.consider_snapshot(settings, noise, generation)
+
+    assert decision.admitted
+    assert decision.metrics["holdout_growth_files"] == []
+    assert decision.metrics["fresh_states_transferred_to_holdout"] == 0
+    assert decision.metrics["states_transferred_to_holdout"] == 0
+    assert (
+        decision.metrics["fresh_unique_state_rate_without_holdout_growth"]
+        == pytest.approx(decision.metrics["fresh_unique_state_rate"])
+    )
+
+
+def _shard_reuse_manager(tmp_path: Path, **kwargs) -> CorpusSnapshotManager:
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir(exist_ok=True)
+    snapshot_root = tmp_path / "snapshots"
+    base = dict(
+        validation_fraction=0.25,
+        split_seed=5,
+        min_fresh_fraction=0.50,
+        grow_holdout=False,
+    )
+    base.update(kwargs)
+    return CorpusSnapshotManager(str(replay_dir), str(snapshot_root), **base)
+
+
+_SETTINGS = {"difficulty": "hard"}
+_NOISE = {"played_action_probability": 0.10, "label_is_teacher": True}
+_GENERATION = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
+
+
+def test_snapshot_reuses_unchanged_shards_via_hardlink(tmp_path: Path) -> None:
+    """Unchanged shards hardlink from the previous snapshot; new ones copy.
+
+    The steady-state corpus rotates one shard per cycle, so per-admission
+    growth falls from the whole corpus to only that shard.  Reused entries are
+    byte-identical by construction (same inode), which is what makes this a
+    pure storage optimization rather than a semantic change.
+    """
+    manager = _shard_reuse_manager(tmp_path)
+    replay_dir = tmp_path / "replay"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_00_{index}.jsonl", [_entry(index)])
+
+    first = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert first.admitted
+    first_manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    assert all(
+        record["storage"] == "copy" for record in first_manifest["files"]
+    )
+    assert first_manifest["admission"]["reused_shard_count"] == 0
+
+    # Cycle 2 keeps three shards byte-identical and adds one new file.
+    for offset in range(4):
+        _write_replay(
+            replay_dir / f"replay_01_{offset}.jsonl",
+            [_entry(100 + offset)],
+        )
+    second = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert second.admitted
+    second_manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    storage_by_name = {
+        record["name"]: record["storage"] for record in second_manifest["files"]
+    }
+    # Shards present in both admissions' train splits survived unchanged and
+    # must be linked, not copied.  (Some seed shards may live in the hold-out
+    # instead of the train split, depending on the hash-ranked selection.)
+    first_names = {
+        record["name"] for record in first_manifest["files"]
+    }
+    second_names = set(storage_by_name)
+    survivors = first_names & second_names
+    assert survivors, "test setup expected at least one surviving train shard"
+    for name in survivors:
+        assert storage_by_name[name] == "hardlink", (
+            f"{name} survived unchanged but was stored as {storage_by_name[name]}"
+        )
+    rotated = {n for n in second_names if n.startswith("replay_01")}
+    assert rotated
+    for name in rotated:
+        assert storage_by_name[name] == "copy"
+    admission = second_manifest["admission"]
+    assert admission["reused_shard_count"] == len(survivors)
+    assert admission["copied_shard_count"] == len(second_names) - len(survivors)
+    assert admission["reused_shard_bytes"] > 0
+
+    # Inode identity: reuse shares data instead of duplicating it.
+    prev_dir = first.manifest_path.parent / "files"
+    curr_dir = second.manifest_path.parent / "files"
+    for name in survivors:
+        assert (
+            prev_dir.joinpath(name).stat().st_ino
+            == curr_dir.joinpath(name).stat().st_ino
+        ), f"{name} was copied, not hardlinked"
+
+    # The reused snapshot still loads through full integrity verification.
+    train_entries, _validation, _manifest = manager.load_split()
+    assert train_entries
+
+
+def test_snapshot_reuse_disabled_copies_everything(tmp_path: Path) -> None:
+    """reuse_previous_shards=False restores the copy-everything behaviour."""
+    manager = _shard_reuse_manager(tmp_path, reuse_previous_shards=False)
+    replay_dir = tmp_path / "replay"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_00_{index}.jsonl", [_entry(index)])
+    first = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert first.admitted
+
+    for offset in range(4):
+        _write_replay(
+            replay_dir / f"replay_01_{offset}.jsonl",
+            [_entry(100 + offset)],
+        )
+    second = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert second.admitted
+    manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    assert all(record["storage"] == "copy" for record in manifest["files"])
+    assert manifest["admission"]["reused_shard_count"] == 0
+
+
+def test_snapshot_reuse_falls_back_to_copy_when_link_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filesystem refusal (cross-device, permissions) degrades to copy."""
+    manager = _shard_reuse_manager(tmp_path)
+    replay_dir = tmp_path / "replay"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_00_{index}.jsonl", [_entry(index)])
+    first = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert first.admitted
+
+    def refuse_link(src, dst):
+        raise OSError("simulated cross-device link")
+
+    monkeypatch.setattr(
+        "dama.ai.ml.corpus.os.link", lambda s, d: refuse_link(s, d)
+    )
+
+    for offset in range(4):
+        _write_replay(
+            replay_dir / f"replay_01_{offset}.jsonl",
+            [_entry(100 + offset)],
+        )
+    second = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert second.admitted
+    manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    assert all(record["storage"] == "copy" for record in manifest["files"])
+    assert manifest["admission"]["reused_shard_count"] == 0
+    train_entries, _validation, _manifest = manager.load_split()
+    assert train_entries
+
+
+def test_snapshot_reuse_detects_corrupted_predecessor_and_copies(
+    tmp_path: Path,
+) -> None:
+    """A mutated predecessor shard must never be linked: digest mismatch -> copy.
+
+    This is the fail-closed half of the contract.  Deliberately corrupts the
+    OLD snapshot's stored shard (same size) to prove the digest gate notices;
+    the old snapshot's integrity is intentionally sacrificed by the scenario.
+    """
+    manager = _shard_reuse_manager(tmp_path)
+    replay_dir = tmp_path / "replay"
+    sources = {}
+    for index in range(4):
+        path = replay_dir / f"replay_00_{index}.jsonl"
+        _write_replay(path, [_entry(index)])
+        sources[path.name] = path.read_bytes()
+
+    first = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert first.admitted
+    prev_files = first.manifest_path.parent / "files"
+
+    # Corrupt one predecessor shard in place at equal size.
+    victim = prev_files / "replay_00_0.jsonl"
+    original = bytearray(victim.read_bytes())
+    original[0] = original[0] ^ 0xFF
+    victim.write_bytes(bytes(original))
+
+    # Live corpus keeps the pristine bytes.
+    for name, payload in sources.items():
+        (replay_dir / name).write_bytes(payload)
+
+    for offset in range(4):
+        _write_replay(
+            replay_dir / f"replay_01_{offset}.jsonl",
+            [_entry(100 + offset)],
+        )
+    second = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert second.admitted
+    manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    storage = {r["name"]: r["storage"] for r in manifest["files"]}
+    first_names = {
+        r["name"] for r in
+        json.loads(first.manifest_path.read_text(encoding="utf-8"))["files"]
+    }
+    survivors = first_names & set(storage)
+    assert "replay_00_0.jsonl" not in survivors or (
+        storage.get("replay_00_0.jsonl") == "copy"
+    )
+    # The corrupted shard must never be linked; any surviving intact sibling
+    # from the previous snapshot should be.
+    for name in survivors:
+        if name == "replay_00_0.jsonl":
+            continue
+        assert storage[name] == "hardlink", (
+            f"{name} was {storage[name]}, expected hardlink for intact shard"
+        )
