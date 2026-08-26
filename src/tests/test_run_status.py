@@ -112,6 +112,7 @@ def _holder(tmp_path: Path, **overrides) -> SimpleNamespace:
     # exercised rather than stubbed past.
     for _name in (
         "_capture_run_identity",
+        "_capture_prelaunch_free_ram",
         "_warn_about_checkpoints_above_resume_point",
         "_warn_about_memory_headroom",
     ):
