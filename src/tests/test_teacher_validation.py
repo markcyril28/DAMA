@@ -112,3 +112,88 @@ def test_promotion_can_be_persisted_only_after_checkpoint_write(tmp_path: Path) 
     saved = json.loads(path.read_text(encoding="utf-8").strip())
     assert saved["checkpoint_path"] == "step_2.pt"
     assert saved["promoted"] is True
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ACTIVE_CONFIG = "config/training_config_policy_distillation_c174k.yaml"
+
+
+def _active_selfplay_and_validation() -> tuple[dict, dict]:
+    import yaml
+
+    raw = yaml.safe_load((PROJECT_ROOT / ACTIVE_CONFIG).read_text(encoding="utf-8"))
+    return raw["selfplay"], raw["validation"]
+
+
+def test_active_config_matches_the_frozen_suite_manifest():
+    """Catch suite-contract drift at test time instead of first launch.
+
+    ``Trainer._ensure_frozen_teacher_suite`` runs before any training and
+    raises via ``create_frozen_teacher_suite`` when the active config's
+    self-play settings disagree with the immutable suite manifest -- correct
+    behaviour, but it costs a whole failed launch cycle to discover. This
+    asserts the same equality here, where it fails in seconds. Mirrors the
+    exact key set that creator validates (seed, teacher_difficulty,
+    opening_plies, played_action_noise, max_moves_per_game, state_count).
+    """
+
+    suite_rel = "data/validation_policy_distillation/frozen_hard_5000.jsonl"
+    suite_path = PROJECT_ROOT / suite_rel
+    manifest_path = suite_path.with_suffix(suite_path.suffix + ".manifest.json")
+    if not manifest_path.is_file():
+        pytest.skip(f"frozen teacher suite not present on this machine: {suite_rel}")
+
+    selfplay_cfg, validation_cfg = _active_selfplay_and_validation()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    expected = {
+        "seed": int(validation_cfg["frozen_suite_seed"]),
+        "teacher_difficulty": str(selfplay_cfg["teacher_difficulty"]),
+        "opening_plies": list(selfplay_cfg["opening_plies"]),
+        "played_action_noise": float(selfplay_cfg["noise_prob"]),
+        "max_moves_per_game": int(selfplay_cfg["max_moves_per_game"]),
+        "state_count": int(validation_cfg["frozen_suite_size"]),
+    }
+    for key, value in expected.items():
+        assert manifest.get(key) == value, (
+            f"{ACTIVE_CONFIG} {key}={value!r} disagrees with the frozen suite "
+            f"manifest {key}={manifest.get(key)!r}; the trainer would refuse "
+            "to start (create_frozen_teacher_suite fails closed)"
+        )
+    # The configured path must be the suite the manifest belongs to, and the
+    # suite bytes must still hash to the pinned fingerprint (immutability).
+    assert str(validation_cfg["frozen_suite_path"]).replace("\\", "/") == suite_rel
+    digest = hashlib.sha256(suite_path.read_bytes()).hexdigest()
+    assert manifest.get("suite_sha256") == digest
+
+
+def test_current_snapshot_generation_matches_active_config():
+    """The admitted corpus must share the active generation contract.
+
+    A drift here does not wedge admissions (snapshot_matches_settings
+    compares against each freshly written manifest), but it silently splits
+    the lineage: new cycles admit under different opening/noise settings than
+    every retained shard. Reading the CURRENT pointer also guards the
+    missing-pointer corruption that consider_snapshot refuses to admit
+    through (corpus.py fails closed when snapshots exist without one).
+    """
+
+    root = PROJECT_ROOT / "data/corpus_snapshots/policy_distillation_recovery_c174k"
+    if not (root / "CURRENT").is_file():
+        pytest.skip("c174k corpus snapshots not present on this machine")
+
+    relative = (root / "CURRENT").read_text(encoding="utf-8").strip()
+    assert relative, "CURRENT pointer exists but is empty"
+    current_manifest = root / relative
+    assert current_manifest.is_file(), (
+        f"CURRENT points at {relative}, which does not resolve"
+    )
+
+    selfplay_cfg, _ = _active_selfplay_and_validation()
+    manifest = json.loads(current_manifest.read_text(encoding="utf-8"))
+    generation = manifest.get("generation_settings", {})
+    noise = manifest.get("noise_settings", {})
+    assert list(generation.get("opening_plies", [])) == list(
+        selfplay_cfg["opening_plies"])
+    assert float(noise.get("played_action_probability", -1)) == pytest.approx(
+        float(selfplay_cfg["noise_prob"]))
