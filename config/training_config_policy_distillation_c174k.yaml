@@ -43,6 +43,9 @@ selfplay:
   # Exploration changes the played action only. Every stored label is from hard.
   noise_prob: 0.10
   teacher_difficulty: "hard"
+  # MUST stay [2, 4, 6, 8]: the frozen teacher suite manifest and every admitted
+  # snapshot's generation_settings pin this exact list; create_frozen_teacher_suite
+  # fail-closes on any drift. See Journal Pass 115.
   opening_plies: [2, 4, 6, 8]
   opening_seed: 20260819
   max_moves_per_game: 200
@@ -75,6 +78,12 @@ training:
   grad_clip_norm: 1.0
   train_steps: 100000000000
   checkpoint_every: 2000
+  # Audit Suggestion 10: ~52 MB per checkpoint every ~6 min is ~13 GB/day, and
+  # nothing reclaimed it -- the configured 48h run needs more space than the
+  # volume has. Keep a rolling window; every promoted checkpoint and the
+  # registry's best-agreement checkpoint are retained regardless of age, as is
+  # the checkpoint this run resumed from. 0 restores keep-everything.
+  max_retained_checkpoints: 10
   gradient_accumulation_steps: 1
   reward_mode: "none"
   lr_scheduler:
@@ -135,6 +144,9 @@ corpus_snapshots:
   # the volume around the 24h mark. Keep a rolling audit window instead.
   # 0 restores the old keep-everything behaviour.
   max_retained_snapshots: 10
+  # Hardlink unchanged shards from the previous snapshot instead of copying
+  # ~0.9 GB per admission (digest-verified before linking and on every load).
+  reuse_previous_shards: true  # Cuts per-admission snapshot growth to only new/rotated shards. See Journal Pass 114.
 
   # Audit Suggestion 3 / F5: v11 is the last valid predecessor. v12 was
   # admitted with a lost CURRENT pointer -- its recorded 100% freshness was an
@@ -175,6 +187,13 @@ dataloader:
   max_moves_per_sample: 32
   ram_cache:
     enabled: true
+    # Audit Suggestion 11: this is a minimum-FREE-RAM gate, not a cache budget
+    # -- the cache is skipped unless at least this much RAM is free, and the
+    # cache itself then adds to RSS. On this 24 GB box, where the trainer alone
+    # held 14.8 GB, 16.0 is the conservative setting and usually declines the
+    # cache; lowering it would make caching engage exactly when headroom is
+    # thinnest. Raise it, never lower it, if preprocessing is the OOM site. The
+    # trainer prints the threshold against measured free RAM at startup.
     threshold_gb: 16.0
     cache_file: "data/replay_cache/policy_distillation_recovery_c174k_cache.pt"
 
