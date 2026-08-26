@@ -58,6 +58,52 @@ def get_total_ram_gb() -> float:
         return 0.0
 
 
+# Audit Suggestion 11.  The preprocessing fan-out sized itself from core count
+# alone.  On the local box that is 6 workers forked from a trainer already
+# holding ~14.8 GB of a 24 GB machine -- and CPython touches every object
+# header it iterates, so copy-on-write does not keep the children cheap.  A run
+# died in exactly that window, leaving an open run marker.  Cap the fan-out by
+# measured free RAM as well: on a large-memory host the cap never binds, so the
+# server profile is unchanged.
+_MIN_GB_PER_PREPROCESS_WORKER = 1.0
+_MIN_GB_FOR_PARALLEL_PREPROCESS = 2.0
+
+
+def _ram_limited_worker_count(num_workers: int, show_progress: bool = True) -> int:
+    """Reduce a core-count-derived fan-out to what free RAM can actually hold."""
+    if num_workers <= 1:
+        return num_workers
+    available_gb = get_available_ram_gb()
+    if available_gb <= 0.0:
+        # No measurement is not evidence of headroom, but refusing to
+        # pre-process at all would be worse; leave the fan-out unchanged.
+        return num_workers
+    if available_gb < _MIN_GB_FOR_PARALLEL_PREPROCESS:
+        limited = 1
+    else:
+        limited = max(1, int(available_gb / _MIN_GB_PER_PREPROCESS_WORKER))
+    if limited >= num_workers:
+        return num_workers
+    if show_progress:
+        print(
+            f"  Pre-processing fan-out reduced {num_workers} -> {limited} "
+            f"worker(s): {available_gb:.1f}GB RAM available "
+            f"({_MIN_GB_PER_PREPROCESS_WORKER:.1f}GB assumed per worker)"
+        )
+    return limited
+
+
+def _default_preprocess_workers() -> int:
+    """Core-count fan-out for preprocessing: tiered caps avoid IPC overhead.
+
+    Single definition for every parallel preprocessing entry point so the
+    core ladder and the RAM cap can never drift apart.
+    """
+    _cores = os.cpu_count() or 1
+    _worker_cap = 64 if _cores >= 128 else (48 if _cores >= 96 else (24 if _cores >= 48 else 16))
+    return max(1, min(_worker_cap, _cores // 2))
+
+
 def _sanitize_sample_weight(value: Any) -> float:
     try:
         weight = float(value)
@@ -613,9 +659,7 @@ def preprocess_entries_to_tensors(
     # Fork+SharedMemory path has near-zero IPC: workers read from inherited
     # globals and write directly to shared memory — no pickle serialization
     # of input OR output. Higher worker counts pay off on high-core machines.
-    _cores = os.cpu_count() or 1
-    _worker_cap = 64 if _cores >= 128 else (48 if _cores >= 96 else (24 if _cores >= 48 else 16))
-    num_workers = max(1, min(_worker_cap, _cores // 2))
+    num_workers = _ram_limited_worker_count(_default_preprocess_workers(), show_progress)
 
     # Fork path (Linux) has near-zero serialization cost — lower threshold.
     # Spawn path (Windows/macOS) has pickle overhead — keep higher threshold.
@@ -942,9 +986,8 @@ class CachedTensorDataset(Dataset):
         _parallel_threshold = 2000 if _use_fork else 5000
 
         if n >= _parallel_threshold:
-            _cores = os.cpu_count() or 1
-            _worker_cap = 64 if _cores >= 128 else (48 if _cores >= 96 else (24 if _cores >= 48 else 16))
-            num_workers = max(1, min(_worker_cap, _cores // 2))
+            num_workers = _ram_limited_worker_count(
+                _default_preprocess_workers(), show_progress)
             _MIN_CHUNK = 500
             chunk_size = max(_MIN_CHUNK, (n + num_workers - 1) // num_workers)
             num_workers = min(num_workers, (n + chunk_size - 1) // chunk_size)
@@ -1187,6 +1230,14 @@ class CUDAPrefetcher:
         return len(self.dataloader)
 
 
+def _batch_count(n: int, batch_size: int, drop_last: bool) -> int:
+    """Number of batches for ``n`` samples: floor when dropping the remainder,
+    ceiling otherwise. Single definition shared by every batch iterator."""
+    if drop_last:
+        return n // batch_size
+    return (n + batch_size - 1) // batch_size
+
+
 class FastBatchIterator:
     """Direct tensor-indexing batch iterator for CachedTensorDataset.
 
@@ -1362,9 +1413,7 @@ class FastBatchIterator:
         return _data_bytes < _free * 0.4
 
     def __len__(self) -> int:
-        if self.drop_last:
-            return self.n // self.batch_size
-        return (self.n + self.batch_size - 1) // self.batch_size
+        return _batch_count(self.n, self.batch_size, self.drop_last)
 
     def __iter__(self):
         # Generate indices on the same device as data — GPU randperm is faster
@@ -1649,6 +1698,7 @@ def create_dataloader(
     capacity: int = 0,
     max_moves_per_sample: int = 32,
     amp_enabled: bool = False,
+    prelaunch_free_ram_gb: Optional[float] = None,
 ) -> DataLoader:
     """
     Create a DataLoader from replay entries.
@@ -1662,31 +1712,54 @@ def create_dataloader(
         use_ram_cache: If True and sufficient RAM available, pre-process to tensors
         ram_threshold_gb: Minimum available RAM (GB) required for caching
         device: Target device — when CUDA, tries GPU-resident caching for zero H2D overhead
+        prelaunch_free_ram_gb: Free-RAM reading captured before the replay corpus
+            was parsed into entry objects.  The post-load reading is depressed by
+            roughly the size of the whole corpus (Journal Pass 117), so when the
+            caller supplies a pre-load figure it is used as the fallback gate
+            comparison; tensorizing frees the entries, so the cache only costs
+            headroom if preprocessing fails mid-way.
 
     Returns:
         DataLoader instance
     """
     available_ram = get_available_ram_gb()
     total_ram = get_total_ram_gb()
-    
+
+    # Journal Pass 117.  ``available_ram`` is measured after every replay file
+    # has been parsed into entry objects, so it is depressed by roughly the
+    # size of the whole corpus.  A threshold sized against pre-load headroom
+    # therefore silently declines the cache once the rolling corpus reaches
+    # steady state, demoting launches to the slow standard batch path.  When
+    # the caller captured a pre-load reading, use it as the fallback: tensorizing
+    # FREES those entry objects, so the cache costs headroom only if it fails.
+
+    _prelaunch_free_gb = prelaunch_free_ram_gb
+
     # Estimate memory needed for cached dataset (RAM: always float32; GPU may use float16)
     # Each entry: ~5*8*8*B (board) + M*8*B (moves) + 16 (counts/targets/weights)
     # B=4 (fp32): M=32→~1.9KB. B=2 (fp16 on GPU w/ AMP): M=32→~1.2KB
     _per_entry_kb = (5 * 8 * 8 * 4 + max_moves_per_sample * 8 * 4 + 16) / 1024
     estimated_size_gb = len(entries) * _per_entry_kb / (1024 ** 2)
-    
+
     # Use RAM caching if:
     # 1. Explicitly enabled
     # 2. Sufficient RAM available (with safety margin)
     # 3. Total RAM is high (e.g., server with 1TB RAM)
     should_cache = (
-        use_ram_cache 
-        and available_ram > ram_threshold_gb 
+        use_ram_cache
+        and (
+            available_ram > ram_threshold_gb
+            or (_prelaunch_free_gb is not None
+                and _prelaunch_free_gb > ram_threshold_gb)
+        )
         and (available_ram > estimated_size_gb * 2 or total_ram > 64)
     )
-    
+
     if should_cache:
-        print(f"RAM Caching enabled ({available_ram:.1f}GB available, {estimated_size_gb:.2f}GB needed)")
+        _ram_source = "post-load" if available_ram > ram_threshold_gb else \
+            f"pre-load ({_prelaunch_free_gb:.1f}GB)"
+        print(f"RAM Caching enabled ({available_ram:.1f}GB available, "
+              f"{estimated_size_gb:.2f}GB needed; gate satisfied by {_ram_source} reading)")
         print("Pre-processing entries to tensors...")
 
         from .move_encoder import ENCODING_VERSION
