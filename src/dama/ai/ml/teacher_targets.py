@@ -11,7 +11,7 @@ import torch
 from ...game_state import GameState
 from ...types import Move
 from ..algorithmic.eval import evaluate
-from .dataset import CachedTensorDataset
+from .dataset import CachedTensorDataset, _batch_count
 from .replay import ReplayEntry
 
 
@@ -134,6 +134,17 @@ class EnhancedTensorDataset:
                 value_scale=value_scale,
                 hard_label_blend=hard_label_blend,
             )
+            if len(target.policy) > max_moves_per_sample:
+                # Proofread 2026-08-25 C4: a sliced soft policy no longer sums
+                # to one and the chosen-index clip disagrees with it, so any
+                # sample that hits the cap is silently corrupted training data.
+                # Latent at cap 32, but raise now so a lowered cap can never
+                # poison labels quietly.
+                raise RuntimeError(
+                    f"entry {index} has {len(target.policy)} legal moves, "
+                    f"exceeding max_moves_per_sample={max_moves_per_sample}; "
+                    "teacher policy would be truncated and denormalized"
+                )
             count = min(len(target.policy), max_moves_per_sample)
             if count:
                 self.teacher_probabilities[index, :count] = torch.tensor(
@@ -165,9 +176,7 @@ class EnhancedBatchIterator:
         self.n = len(dataset)
 
     def __len__(self) -> int:
-        if self.drop_last:
-            return self.n // self.batch_size
-        return (self.n + self.batch_size - 1) // self.batch_size
+        return _batch_count(self.n, self.batch_size, self.drop_last)
 
     def __iter__(self) -> Iterable[tuple[torch.Tensor, ...]]:
         order = torch.randperm(self.n) if self.shuffle else torch.arange(self.n)
