@@ -212,6 +212,12 @@ class StatsCollector:
         self.gpu_utilization_pct = MetricBuffer(buffer_size)
         self.cpu_percent = MetricBuffer(buffer_size)
         self.ram_used_gb = MetricBuffer(buffer_size)
+        # Audit Suggestion 11.  System-wide used RAM cannot answer "how much
+        # was this trainer holding?", which is the number that decides the
+        # preprocessing fan-out and the RAM-cache threshold.  Recording the
+        # trainer's own RSS makes the peak recoverable from the CSV after the
+        # fact, so the measurement never has to be taken during a live run.
+        self.process_rss_gb = MetricBuffer(buffer_size)
 
         # --- GPU throttle diagnostics (NVML only) ---
         # util % alone CANNOT distinguish a power/thermal-capped GPU from a
@@ -435,6 +441,13 @@ class StatsCollector:
                 self.ram_used_gb.append(ram_used_gb, step)
                 metrics['cpu_percent'] = cpu_pct
                 metrics['ram_used_gb'] = ram_used_gb
+                try:
+                    rss_gb = psutil.Process().memory_info().rss / 1e9
+                except Exception:
+                    rss_gb = None
+                if rss_gb is not None:
+                    self.process_rss_gb.append(rss_gb, step)
+                    metrics['process_rss_gb'] = rss_gb
 
             return metrics
 
@@ -1337,6 +1350,7 @@ class StatsCollector:
                     'gpu_utilization': self.gpu_utilization_pct.summary(100),
                     'cpu_percent': self.cpu_percent.summary(100),
                     'ram_used_gb': self.ram_used_gb.summary(100),
+                    'process_rss_gb': self.process_rss_gb.summary(100),
                     # Throttle diagnostics (NVML; empty on ROCm/no-NVML).
                     'gpu_power_w': self.gpu_power_w.summary(100),
                     'gpu_sm_clock_mhz': self.gpu_sm_clock_mhz.summary(100),
@@ -1510,6 +1524,7 @@ class StatsCollector:
             gpu_entries = {e['step']: e for e in self.gpu_mem_allocated_mb.all_entries()}
             cpu_entries = {e['step']: e for e in self.cpu_percent.all_entries()}
             ram_entries = {e['step']: e for e in self.ram_used_gb.all_entries()}
+            rss_entries = {e['step']: e for e in self.process_rss_gb.all_entries()}
             gpu_util_entries = {e['step']: e for e in self.gpu_utilization_pct.all_entries()}
             gpu_reserved = {e['step']: e for e in self.gpu_mem_reserved_mb.all_entries()}
             gpu_power = {e['step']: e for e in self.gpu_power_w.all_entries()}
@@ -1519,7 +1534,8 @@ class StatsCollector:
 
             all_steps = sorted(set(
                 list(gpu_entries.keys()) + list(cpu_entries.keys()) +
-                list(ram_entries.keys()) + list(gpu_util_entries.keys()) +
+                list(ram_entries.keys()) + list(rss_entries.keys()) +
+                list(gpu_util_entries.keys()) +
                 list(gpu_reserved.keys()) + list(gpu_power.keys()) +
                 list(gpu_clock.keys()) + list(gpu_temp.keys()) +
                 list(gpu_throttle.keys())
@@ -1533,6 +1549,7 @@ class StatsCollector:
                 writer.writerow([
                     'step', 'gpu_mem_allocated_mb', 'gpu_mem_reserved_mb',
                     'gpu_utilization_pct', 'cpu_percent', 'ram_used_gb',
+                    'process_rss_gb',
                     'gpu_power_w', 'gpu_sm_clock_mhz', 'gpu_temp_c',
                     'gpu_throttle_reasons',
                 ])
@@ -1544,6 +1561,7 @@ class StatsCollector:
                         gpu_util_entries.get(step, {}).get('value', ''),
                         cpu_entries.get(step, {}).get('value', ''),
                         ram_entries.get(step, {}).get('value', ''),
+                        rss_entries.get(step, {}).get('value', ''),
                         gpu_power.get(step, {}).get('value', ''),
                         gpu_clock.get(step, {}).get('value', ''),
                         gpu_temp.get(step, {}).get('value', ''),
