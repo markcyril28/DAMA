@@ -107,6 +107,15 @@ def _holder(tmp_path: Path, **overrides) -> SimpleNamespace:
         # the signal tests at the bottom of this file.
         _install_termination_handler=lambda _log_dir: None,
     )
+    # Real implementations, not stubs: these startup helpers only read config
+    # and write diagnostics, so binding them keeps train()'s startup sequence
+    # exercised rather than stubbed past.
+    for _name in (
+        "_capture_run_identity",
+        "_warn_about_checkpoints_above_resume_point",
+        "_warn_about_memory_headroom",
+    ):
+        setattr(holder, _name, getattr(Trainer, _name).__get__(holder))
     for key, value in overrides.items():
         setattr(holder, key, value)
     return holder
