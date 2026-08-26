@@ -162,18 +162,25 @@ def describe_unterminated(record: Mapping[str, Any]) -> str:
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    """Atomically replace ``path`` with ``payload`` as pretty-printed JSON.
+
+    Shared implementation for every durable JSON artifact this project writes
+    (run markers, acceptance reports, corpus manifests): temp file in the
+    destination directory, fsync, then ``os.replace``.  On failure the temp
+    file is removed and the destination is left untouched.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        newline="\n",
-        delete=False,
-        dir=path.parent,
-        suffix=".tmp",
-    ) as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    os.replace(temporary, path)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
