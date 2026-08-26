@@ -150,3 +150,30 @@ def test_recovery_summary_labels_acceptance_opponents_and_ignores_stale_score():
     stale_metrics = plot_training._recovery_summary_metrics(stale, [])
     assert stale_metrics["match_score"] == "N/A"
     assert stale_metrics["confidence_interval"] == "N/A"
+
+
+def test_every_launcher_exposes_the_lineage_verified_continuation_opt_in():
+    """Audit Suggestion 7: a relaunch must be able to continue, from any entry point.
+
+    The bash launchers hard-errored on any RESUME other than the anchor and the
+    PowerShell one did the same, so no entry point could resume a checkpoint the
+    experiment itself had written -- every relaunch re-walked from step 174000.
+    """
+    powershell = (PROJECT_ROOT / "local_train.ps1").read_text(encoding="utf-8")
+    shell = (PROJECT_ROOT / "local_train.sh").read_text(encoding="utf-8")
+    server = (PROJECT_ROOT / "train_server.sh").read_text(encoding="utf-8")
+
+    for launcher in (powershell, shell, server):
+        assert "--resume-continuation" in launcher
+
+    for launcher in (shell, server):
+        assert "RESUME_CONTINUATION" in launcher
+        # The toggle has to reach the argument list, not just be declared.
+        assert "USE_RESUME_CONTINUATION" in launcher
+    assert "NoResumeContinuation" in powershell
+
+    # --resume-latest must stay forbidden: it would also match aliases and
+    # foreign namespaces, which is exactly the looseness the lineage stamp
+    # replaces.
+    assert "--resume-latest is disabled" in shell
+    assert "--resume-latest is disabled" in server
