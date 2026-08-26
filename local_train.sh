@@ -33,10 +33,15 @@ SET_PROCESS_TITLE=true           # Set to false to disable custom process title 
 PROCESS_TITLE="micro-trainer"            # Process name shown in htop (requires 'setproctitle' package)
 RESUME_LATEST="auto"          # auto = policy baseline, latest for other configs; true/false remain supported.
 RESUME=""                     # Optional checkpoint. Enhanced stage requires the recorded promoted checkpoint.
+RESUME_CONTINUATION=true      # Recovery only: a relaunch continues this namespace's newest lineage-verified
+                              # checkpoint instead of re-walking from the anchor (audit Suggestion 7).
+                              # false restores anchor-only restarts. Ignored unless the config pins a recovery baseline.
 ENHANCED_STAGE=false          # true only after policy-only promotion; trainer verifies registry, hash, and suite.
 ENHANCED_INFERENCE_DEPTH=2    # Enhanced stage only: supported values are 2 or 3.
 TRAIN_DURATION=""                # Train for this duration (empty = use config's time_limit)
                                  # Examples: "2d", "4h", "30m", "1d12h"
+MIN_FREE_DISK_GB=10              # Refuse to launch below this much free space on the project
+                                 # volume (checkpoints + snapshots grow several GB/day). 0 disables.
 
 # =============================================================================
 # END OF PARAMETERS - Do not edit below this line
@@ -87,9 +92,22 @@ POLICY_RECOVERY_BASELINE=""
 POLICY_RECOVERY_SHA256=""
 POLICY_RECOVERY_LEGACY_STATS=""
 POLICY_RECOVERY_STATS=""
+# PyYAML resolves True/yes/on (any case) as booleans, and the trainer reads
+# this same key through yaml.safe_load -- so the launcher must accept the same
+# spellings or it would silently skip every recovery guard below on a config
+# that says `enabled: Yes`.
 IS_POLICY_RECOVERY=false
-if [ "$POLICY_RECOVERY_ENABLED" = true ]; then
-    IS_POLICY_RECOVERY=true
+case "$POLICY_RECOVERY_ENABLED" in
+    true|True|TRUE|yes|Yes|YES|on|On|ON)
+        IS_POLICY_RECOVERY=true
+        ;;
+    false|False|FALSE|no|No|NO|off|Off|OFF|"") ;;
+    *)
+        echo "ERROR: recovery_experiment.enabled is not a YAML boolean: '$POLICY_RECOVERY_ENABLED'" >&2
+        exit 1
+        ;;
+esac
+if [ "$IS_POLICY_RECOVERY" = true ]; then
     _baseline_rel="$(_yaml_scalar "$SELECTED_CONFIG_PATH" recovery_experiment baseline_checkpoint)"
     POLICY_RECOVERY_SHA256="$(_yaml_scalar "$SELECTED_CONFIG_PATH" recovery_experiment baseline_sha256 | tr 'a-f' 'A-F')"
     _stats_rel="$(_yaml_scalar "$SELECTED_CONFIG_PATH" paths stats_file)"
@@ -117,6 +135,54 @@ case "$ENHANCED_STAGE" in
         exit 1
         ;;
 esac
+case "$RESUME_CONTINUATION" in
+    true|false) ;;
+    *)
+        echo "ERROR: RESUME_CONTINUATION must be true or false." >&2
+        exit 1
+        ;;
+esac
+
+case "$MIN_FREE_DISK_GB" in
+    ''|*[!0-9]*)
+        echo "ERROR: MIN_FREE_DISK_GB must be a non-negative integer (GB)." >&2
+        exit 1
+        ;;
+esac
+
+# Approximation of the trainer's parse_duration() grammar, so a mistyped
+# duration fails in preflight instead of as a traceback after conda setup,
+# the Cython scan, and CUDA init. parse_duration() is deliberately lenient:
+# a bare number is hours, a unit word anywhere after digits counts ("2d4x",
+# "1.5d", "-4h" all parse), and only strings with no digit+unit pair and no
+# numeric reading are rejected. This gate mirrors exactly that accept set;
+# the only divergence is "0h", which the trainer rejects for being zero but
+# this gate accepts (the trainer raises on it at startup either way).
+if [ -n "$TRAIN_DURATION" ]; then
+    if ! printf '%s' "$TRAIN_DURATION" | \
+         grep -Eq '[0-9]+[[:space:]]*(d(ays?)?|h(ours?)?|m(in(utes?)?)?|s(ec(onds?)?)?)' \
+         && ! [[ "$TRAIN_DURATION" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+         && ! [[ "$TRAIN_DURATION" =~ ^[.][0-9]+$ ]] \
+         && ! [[ "$TRAIN_DURATION" =~ ^[0-9]+[.]$ ]]; then
+        echo "ERROR: TRAIN_DURATION '$TRAIN_DURATION' is not parseable. Use e.g. \"2d\", \"4h\", \"30m\", \"1d12h\"." >&2
+        exit 1
+    fi
+fi
+
+# Local runs write several GB/day of checkpoints and corpus snapshots (the
+# audited 48h run exhausted its volume near the 24h mark), so refuse to launch
+# below the floor instead of dying mid-run with a partial checkpoint set.
+if [ "$MIN_FREE_DISK_GB" -gt 0 ]; then
+    _free_kb="$(df -Pk -- "$PROJECT_DIR" 2>/dev/null | awk 'NR==2 {print $4}')" || _free_kb=""
+    if [ -n "$_free_kb" ] && [ "$_free_kb" -lt $((MIN_FREE_DISK_GB * 1024 * 1024)) ]; then
+        echo "ERROR: Only $(( _free_kb / 1024 / 1024 )) GB free on ${PROJECT_DIR}'s volume;" >&2
+        echo "       MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB} required before launching training." >&2
+        echo "       Free up space, or lower the floor if this run writes less than usual." >&2
+        exit 1
+    elif [ -z "$_free_kb" ]; then
+        echo "[warn] Could not measure free disk space; skipping the MIN_FREE_DISK_GB gate."
+    fi
+fi
 if [ "$ENHANCED_STAGE" = true ] && [ "$IS_POLICY_RECOVERY" = false ]; then
     echo "ERROR: ENHANCED_STAGE is available only with a recovery_experiment config." >&2
     exit 1
@@ -127,6 +193,8 @@ if [ "$ENHANCED_STAGE" = true ] &&
     echo "ERROR: ENHANCED_INFERENCE_DEPTH must be 2 or 3." >&2
     exit 1
 fi
+
+USE_RESUME_CONTINUATION=false
 
 if [ "$IS_POLICY_RECOVERY" = true ]; then
     if [ "$RESUME_LATEST" = true ]; then
@@ -160,6 +228,12 @@ if [ "$IS_POLICY_RECOVERY" = true ]; then
                 exit 1
             fi
             RESUME="$POLICY_RECOVERY_BASELINE"
+            # Audit Suggestion 7. Only the implicit path opts in: an operator
+            # who names a checkpoint explicitly gets exactly that checkpoint.
+            # The trainer re-verifies the lineage stamp and falls back to this
+            # anchor when the namespace holds no verified checkpoint yet, so
+            # the first launch of a namespace is unaffected.
+            [ "$RESUME_CONTINUATION" = true ] && USE_RESUME_CONTINUATION=true
         else
             if [[ "$RESUME" = /* ]]; then
                 _resume_candidate="$RESUME"
@@ -319,8 +393,12 @@ echo ""
 # The artifact is resolved by the running interpreter's EXT_SUFFIX rather than
 # by `ls -t ... | head -1`: that glob matched every ABI tag and kept the newest
 # by mtime, so a stray extension built for another Python version could mask a
-# genuinely stale one. EXT_SUFFIX names exactly the file this interpreter will
-# import -- including when conda activation failed and `python` is not the env.
+# genuinely stale one. EXT_SUFFIX names exactly the file the *resolved*
+# interpreter will import -- so this guard is only ABI-precise when `python`
+# already IS the training env (the conda guard above normally guarantees it).
+# If activation failed and `python` is another env, its ABI suffix makes the
+# existing .so read as missing and every launch force-rebuilds with the wrong
+# interpreter; the CUDA/import check below is what actually catches that.
 _ext_suffix="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
 _cython_stale=false
 while IFS= read -r _pyx; do
@@ -394,7 +472,11 @@ echo "Config: ${SELECTED_CONFIG_PATH}"
 ARGS=(--config "$SELECTED_CONFIG_PATH")
 
 # Resume settings
-if [ -n "$RESUME" ]; then
+if [ "$USE_RESUME_CONTINUATION" = true ]; then
+    # The trainer resolves and verifies the target; --resume is omitted so the
+    # config's pinned anchor remains the fallback.
+    ARGS+=(--resume-continuation)
+elif [ -n "$RESUME" ]; then
     ARGS+=(--resume "$RESUME")
 elif [ "$RESUME_LATEST" = true ] || [ "$RESUME_LATEST" = auto ]; then
     ARGS+=(--resume-latest)
