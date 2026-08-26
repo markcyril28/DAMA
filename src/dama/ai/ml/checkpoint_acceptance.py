@@ -6,7 +6,6 @@ import json
 import hashlib
 import hmac
 import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -422,17 +421,8 @@ def run_checkpoint_acceptance(
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        newline="\n",
-        delete=False,
-        dir=path.parent,
-        suffix=".tmp",
-    ) as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    os.replace(temporary, path)
+    # Thin delegate: one atomic-JSON implementation project-wide (see
+    # run_status._write_json_atomic for the temp+fsync+replace contract).
+    # The module-level name stays importable for tests and callers.
+    from .run_status import _write_json_atomic as _shared
+    _shared(path, payload)
