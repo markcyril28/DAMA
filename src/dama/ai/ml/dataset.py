@@ -3,13 +3,15 @@
 import hashlib
 import json
 import gc
+import math
 import time
 import os
 import random
+from numbers import Real
 import psutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Mapping
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -1134,9 +1136,30 @@ class CachedTensorDataset(Dataset):
         print(f"Saved cached dataset to {path}")
     
     @classmethod
-    def load(cls, path: str) -> 'CachedTensorDataset':
-        """Load cached tensors from a .pt file."""
-        data = torch.load(path, weights_only=True)
+    def load(
+        cls,
+        path: str,
+        *,
+        require_complete: bool = False,
+    ) -> 'CachedTensorDataset':
+        """Load cached tensors from a .pt file.
+
+        ``require_complete`` keeps the legacy defaults for ordinary callers,
+        while letting a source-verified cache reject a payload missing any
+        tensor it needs for the training loss.
+        """
+        data = torch.load(path, weights_only=True, map_location='cpu')
+        if require_complete:
+            required = {
+                'boards', 'move_features', 'move_counts', 'targets',
+                'reward_weights', 'value_targets',
+            }
+            missing = required.difference(data)
+            if missing:
+                raise ValueError(
+                    "Cached dataset is missing required tensor field(s): "
+                    f"{', '.join(sorted(missing))}"
+                )
         return cls(
             data['boards'],
             data['move_features'],
@@ -1685,6 +1708,142 @@ def collate_batch(
     )
 
 
+def _cache_metadata_matches(
+    cached_metadata: Mapping[str, Any], expected_metadata: Mapping[str, Any],
+) -> bool:
+    """Return whether a tensor cache carries every required source identity."""
+
+    return all(
+        cached_metadata.get(key) == value
+        for key, value in expected_metadata.items()
+    )
+
+
+_SIDE_WEIGHT_BALANCE_FIELDS = (
+    "p1_count",
+    "p2_count",
+    "p1_weight_before",
+    "p2_weight_before",
+    "p1_weight_after",
+    "p2_weight_after",
+)
+
+
+def _has_valid_side_weight_balance(value: Any) -> bool:
+    """Return whether persisted side-balance metadata can describe tensors."""
+
+    if value is None:
+        return True
+    if not isinstance(value, Mapping):
+        return False
+    for field in _SIDE_WEIGHT_BALANCE_FIELDS:
+        raw_value = value.get(field)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, Real):
+            return False
+        if not math.isfinite(float(raw_value)):
+            return False
+    return True
+
+
+def _cached_tensor_dataset_is_consistent(
+    dataset: CachedTensorDataset,
+    expected_metadata: Mapping[str, Any],
+) -> bool:
+    """Check the fixed tensor schema before trusting a tensor cache."""
+
+    try:
+        entry_count = len(dataset)
+        max_moves = expected_metadata.get("max_moves_per_sample")
+        boards = dataset.boards
+        move_features = dataset.move_features
+        move_counts = dataset.move_counts
+        targets = dataset.targets
+        reward_weights = dataset.reward_weights
+        value_targets = dataset.value_targets
+    except (AttributeError, TypeError):
+        return False
+    if (
+        isinstance(max_moves, bool)
+        or not isinstance(max_moves, int)
+        or max_moves <= 0
+        or entry_count <= 0
+    ):
+        return False
+    return (
+        isinstance(boards, torch.Tensor)
+        and boards.shape == (entry_count, BOARD_PLANES, 8, 8)
+        and boards.dtype == torch.float32
+        and isinstance(move_features, torch.Tensor)
+        and move_features.shape == (
+            entry_count, max_moves, MOVE_FEATURE_SIZE)
+        and move_features.dtype == torch.float32
+        and isinstance(move_counts, torch.Tensor)
+        and move_counts.shape == (entry_count,)
+        and move_counts.dtype == torch.int32
+        and isinstance(targets, torch.Tensor)
+        and targets.shape == (entry_count,)
+        and targets.dtype == torch.int32
+        and isinstance(reward_weights, torch.Tensor)
+        and reward_weights.shape == (entry_count,)
+        and reward_weights.dtype == torch.float32
+        and isinstance(value_targets, torch.Tensor)
+        and value_targets.shape == (entry_count,)
+        and value_targets.dtype == torch.float32
+    )
+
+
+def load_matching_cached_tensor_dataset(
+    cache_file: Optional[str],
+    expected_metadata: Mapping[str, Any],
+) -> Optional[CachedTensorDataset]:
+    """Load a cached tensor corpus only when its complete source key matches.
+
+    Callers that validate an immutable corpus manifest before reaching this
+    helper may use that manifest fingerprint as part of ``expected_metadata``.
+    A corrupt, partial, stale, or differently keyed cache is only a cache miss;
+    it never becomes a source of training data.
+    """
+
+    if not cache_file or not expected_metadata:
+        return None
+    cache_path = Path(cache_file).expanduser()
+    if not cache_path.is_file():
+        return None
+    print(f"RAM cache file found: {cache_path}")
+    try:
+        cached_dataset = CachedTensorDataset.load(
+            str(cache_path), require_complete=True)
+        cached_metadata = cached_dataset.metadata
+        expected_count = (
+            cached_metadata.get("entry_count")
+            if isinstance(cached_metadata, Mapping) else None
+        )
+        has_required_balance = (
+            "side_weight_balance_version" not in expected_metadata
+            or (
+                isinstance(cached_metadata, Mapping)
+                and _has_valid_side_weight_balance(
+                    cached_metadata.get("side_weight_balance"))
+            )
+        )
+        if (
+            isinstance(cached_metadata, Mapping)
+            and _cache_metadata_matches(cached_metadata, expected_metadata)
+            and has_required_balance
+            and isinstance(expected_count, int)
+            and not isinstance(expected_count, bool)
+            and expected_count == len(cached_dataset)
+            and _cached_tensor_dataset_is_consistent(
+                cached_dataset, expected_metadata)
+        ):
+            print("Loaded matching RAM cache from file.")
+            return cached_dataset
+        print("RAM cache file metadata mismatch; rebuilding cache.")
+    except Exception as exc:
+        print(f"RAM cache file invalid ({exc}); rebuilding cache.")
+    return None
+
+
 def create_dataloader(
     entries: List[ReplayEntry],
     batch_size: int = 64,
@@ -1699,6 +1858,8 @@ def create_dataloader(
     max_moves_per_sample: int = 32,
     amp_enabled: bool = False,
     prelaunch_free_ram_gb: Optional[float] = None,
+    cache_metadata: Optional[Mapping[str, Any]] = None,
+    load_existing_cache: bool = True,
 ) -> DataLoader:
     """
     Create a DataLoader from replay entries.
@@ -1718,6 +1879,11 @@ def create_dataloader(
             caller supplies a pre-load figure it is used as the fallback gate
             comparison; tensorizing frees the entries, so the cache only costs
             headroom if preprocessing fails mid-way.
+        cache_metadata: Additional immutable source identity fields persisted
+            beside the tensors.  A verified snapshot fingerprint can make a
+            warm relaunch cache hit without reconstructing every train entry.
+        load_existing_cache: Set False when a caller already performed the
+            cache lookup before deciding whether replay entries must be parsed.
 
     Returns:
         DataLoader instance
@@ -1772,36 +1938,27 @@ def create_dataloader(
             'max_moves_per_sample': max_moves_per_sample,
             'ram_threshold_gb': ram_threshold_gb,
         }
+        if cache_metadata:
+            cache_meta.update(dict(cache_metadata))
 
         cache_path = Path(cache_file).expanduser() if cache_file else None
-        if cache_path is not None:
-            if cache_path.exists():
-                print(f"RAM cache file found: {cache_path}")
-                try:
-                    cached_dataset = CachedTensorDataset.load(str(cache_path))
-                    cached_meta = cached_dataset.metadata
-                    if (
-                        cached_meta.get('cache_version') == cache_meta['cache_version']
-                        and cached_meta.get('encoding_version') == cache_meta['encoding_version']
-                        and cached_meta.get('entry_count') == cache_meta['entry_count']
-                        and cached_meta.get('entry_signature') == cache_meta['entry_signature']
-                        and cached_meta.get('max_moves_per_sample') == cache_meta['max_moves_per_sample']
-                    ):
-                        print("Loaded matching RAM cache from file.")
-                        return FastBatchIterator(
-                            cached_dataset,
-                            batch_size=batch_size,
-                            shuffle=shuffle,
-                            drop_last=len(cached_dataset) > batch_size,
-                            pin_memory=pin_memory,
-                            device=device,
-                            capacity=capacity,
-                            amp_enabled=amp_enabled,
-                        )
-                    print("RAM cache file metadata mismatch; rebuilding cache.")
-                except Exception as e:
-                    print(f"RAM cache file invalid ({e}); rebuilding cache.")
+        if cache_path is not None and load_existing_cache:
+            cached_dataset = load_matching_cached_tensor_dataset(
+                str(cache_path), cache_meta)
+            if cached_dataset is not None:
+                return FastBatchIterator(
+                    cached_dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    drop_last=len(cached_dataset) > batch_size,
+                    pin_memory=pin_memory,
+                    device=device,
+                    capacity=capacity,
+                    amp_enabled=amp_enabled,
+                )
 
+            print(f"RAM cache enabled; saving computed dataset to {cache_path}")
+        elif cache_path is not None:
             print(f"RAM cache enabled; saving computed dataset to {cache_path}")
         cached_dataset = CachedTensorDataset.from_entries(
             entries,
