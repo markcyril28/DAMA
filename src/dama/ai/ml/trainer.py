@@ -24,7 +24,7 @@ import multiprocessing as mp
 from queue import Empty, Queue
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any, Mapping
+from typing import Optional, Dict, Any, Iterable, Mapping
 from dataclasses import dataclass, field
 
 # Set multiprocessing start method before any other multiprocessing imports
@@ -90,6 +90,7 @@ from .selfplay import (
 from .dataset import (
     create_dataloader, create_dataloader_from_dataset, prepare_training_data,
     CachedTensorDataset, CUDAPrefetcher, FastBatchIterator,
+    load_matching_cached_tensor_dataset,
 )
 from .scoring import compute_reward_weight
 from .stats_collector import StatsCollector
@@ -1276,6 +1277,13 @@ class Trainer:
         self._bg_selfplay_lock = threading.Lock()
         self._last_selfplay_dicts: Optional[list] = None
         self._last_selfplay_preprocessed: Optional[CachedTensorDataset] = None
+        # A verified manifest-keyed tensor cache may satisfy the initial
+        # training window without rebuilding every ReplayEntry on a relaunch.
+        # The value is consumed immediately by _run_training and is never used
+        # for a newly admitted background snapshot.
+        self._preloaded_snapshot_dataset: Optional[CachedTensorDataset] = None
+        self._preloaded_snapshot_cache_metadata: Optional[dict] = None
+        self._preloaded_snapshot_cache_checked = False
         # Per-file durable replay-cycle maxima.  Replay shards are immutable
         # for normal operation, so avoid reparsing every line on each cycle;
         # stat identity invalidates entries after a rewrite or append.
@@ -1302,6 +1310,7 @@ class Trainer:
         # Training statistics
         self.stats = TrainingStats()
         self._load_stats()
+        self._prelaunch_free_ram_gb: Optional[float] = None
         self._runtime_model_dir: Optional[Path] = None
         self._active_snapshot_manifest: Dict[str, Any] = {}
         self._validation_entries = []
@@ -2673,7 +2682,72 @@ class Trainer:
         self._cleanup_runtime_model_file(temp_model_path)
         self._cleanup_runtime_models_dir()
 
-    def _prepare_training_split(self):
+    @staticmethod
+    def _snapshot_cache_key_digest(state_keys: Iterable[str]) -> str:
+        """Return a stable digest for the state keys excluded from training."""
+
+        digest = hashlib.sha256()
+        for key in sorted(str(value) for value in state_keys):
+            digest.update(key.encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def _snapshot_train_cache_metadata(
+        self,
+        manifest: Mapping[str, Any],
+        validation_keys: Iterable[str],
+    ) -> Optional[dict]:
+        """Return the immutable source key for a policy-stage tensor cache.
+
+        A cache is never sufficient by itself: ``prepare_split`` verifies the
+        snapshot and held-out manifests first.  This key then ties the tensors
+        to that verified train snapshot, the configured entry cap and padding,
+        and every validation exclusion that participates in train filtering.
+        """
+
+        if (
+            getattr(self.config, "policy_stage", None) != "policy_only"
+            or not getattr(self.config, "ram_cache_enabled", False)
+            or not getattr(self.config, "ram_cache_file", None)
+        ):
+            return None
+        # Preserve the cache's existing minimum-free-RAM safety gate.  On the
+        # warm path no replay entries have inflated RSS yet, so the pre-launch
+        # reading is the conservative equivalent of the normal fallback gate.
+        threshold_gb = float(
+            getattr(self.config, "ram_cache_threshold_gb", 0.0) or 0.0)
+        prelaunch_gb = getattr(self, "_prelaunch_free_ram_gb", None)
+        if prelaunch_gb is None or prelaunch_gb <= threshold_gb:
+            return None
+        fingerprint = str(manifest.get("fingerprint", "")).lower()
+        if not fingerprint:
+            return None
+        external_keys = getattr(
+            self._snapshot_manager, "external_validation_state_keys", ())
+        return {
+            # Version 3 is deliberately distinct from the sampled-entry cache
+            # metadata used before the manifest key existed.
+            "cache_version": 3,
+            "snapshot_train_cache_version": 2,
+            "snapshot_fingerprint": fingerprint,
+            "external_validation_keys_sha256": self._snapshot_cache_key_digest(
+                external_keys),
+            "validation_exclusion_keys_sha256": self._snapshot_cache_key_digest(
+                validation_keys),
+            "max_train_entries": int(self.config.replay_max_entries),
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+            "side_weight_balance_version": 1,
+        }
+
+    def _prepare_training_split(self, *, use_train_cache: bool = True):
+        # This field is consumed by the startup path immediately after this
+        # method returns.  Clear it first so an alternate-mode rebuild or a
+        # failed cache lookup can never reuse a previous window's tensors.
+        self._preloaded_snapshot_dataset = None
+        self._preloaded_snapshot_cache_metadata = None
+        self._preloaded_snapshot_cache_checked = False
         if self._snapshot_manager is not None:
             behavior_step = int(self.step)
             teacher, noise, generation = self._corpus_settings(
@@ -2761,12 +2835,42 @@ class Trainer:
                 )
             else:
                 print(f"Corpus snapshot unchanged: {decision.reason}")
-            train_entries, validation_entries, manifest = (
-                self._snapshot_manager.load_split(
+            manager = self._snapshot_manager
+            staged_split = (
+                use_train_cache
+                and all(callable(getattr(manager, name, None)) for name in (
+                    "prepare_split", "load_validation_entries", "load_train_entries",
+                ))
+            )
+            if staged_split:
+                # Integrity and leakage checks deliberately run before a cache
+                # is considered.  The cache can skip only redundant materializing
+                # of the already-verified training shards.
+                split_context = manager.prepare_split(
                     decision.manifest_path,
                     max_train_entries=self.config.replay_max_entries,
                 )
-            )
+                validation_entries = manager.load_validation_entries(split_context)
+                manifest = split_context.manifest
+                cache_metadata = self._snapshot_train_cache_metadata(
+                    manifest, split_context.validation_keys)
+                self._preloaded_snapshot_cache_metadata = cache_metadata
+                if cache_metadata is not None:
+                    self._preloaded_snapshot_cache_checked = True
+                    cached_dataset = load_matching_cached_tensor_dataset(
+                        self.config.ram_cache_file, cache_metadata)
+                    if cached_dataset is not None:
+                        self._preloaded_snapshot_dataset = cached_dataset
+                        train_entries = []
+                    else:
+                        train_entries = manager.load_train_entries(split_context)
+                else:
+                    train_entries = manager.load_train_entries(split_context)
+            else:
+                train_entries, validation_entries, manifest = manager.load_split(
+                    decision.manifest_path,
+                    max_train_entries=self.config.replay_max_entries,
+                )
             self._activate_dataset_manifest(manifest)
             return train_entries, validation_entries
 
@@ -3357,7 +3461,7 @@ class Trainer:
     def _generation_cycle_tail_max(cls, path: Path) -> Optional[int]:
         """Return the highest durable cycle id visible in a file's last record.
 
-        Replay shards are write-once per generation cycle (``ReplayWriter``
+        Replay shards are write-once per generation cycle (``ReplayBuffer``
         opens a fresh timestamped file 'w', appends for that cycle only), and
         ``generation_cycle_id`` never decreases within a file (measured across
         all 862,170 records of the live c174k corpus), so the maximum lives on
@@ -3406,7 +3510,8 @@ class Trainer:
         mapping and the scan re-derives everything from the files themselves.
         Keys are shard basenames inside ``replay_dir``; identities are
         deliberately name+size+mtime (no inode) so a corpus relocated across
-        mounts or machines stays warm.
+        mounts or machines stays warm.  A cycle id of -1 is a valid cached
+        answer for a legacy shard that contains no cycle metadata.
         """
         sidecar = self._generation_cycle_sidecar_path(replay_dir)
         try:
@@ -3428,7 +3533,7 @@ class Trainer:
             if not all(isinstance(v, int) and not isinstance(v, bool)
                        for v in (size, mtime_ns, cycle_id)):
                 continue
-            if cycle_id < 0:
+            if cycle_id < -1:
                 continue
             loaded[name] = (size, mtime_ns, cycle_id)
         return loaded
@@ -3503,12 +3608,11 @@ class Trainer:
         sidecar_loaded = self._load_generation_cycle_sidecar(replay_dir)
 
         # Canonicalize keys so equivalent relative/absolute config paths do
-        # not create duplicate cache entries.  A file disappearing between
-        # glob and stat is simply evicted on this pass.
+        # not create duplicate cache entries.  A file disappearing before its
+        # identity is read is simply evicted on this pass.
         current_paths = set()
         highest = -1
         sidecar_entries: Dict[str, tuple] = {}
-        sidecar_dirty = False
         for replay_path in replay_files:
             try:
                 replay_path = replay_path.resolve()
@@ -3557,6 +3661,13 @@ class Trainer:
                                         entry))
                                 if cycle_id is not None:
                                     file_highest = max(file_highest, cycle_id)
+                    except FileNotFoundError:
+                        # The shard disappeared after its identity check.
+                        # Rotation is allowed to do that, so drop it rather
+                        # than turning a harmless race into a startup failure.
+                        current_paths.discard(replay_path)
+                        cache.pop(replay_path, None)
+                        continue
                     except OSError as exc:
                         raise RuntimeError(
                             f"Cannot read replay file for generation-cycle "
@@ -3565,20 +3676,12 @@ class Trainer:
                 cache[replay_path] = (identity, file_highest)
                 sidecar_entries[replay_path.name] = (
                     size, mtime_ns, int(file_highest))
-                if sidecar_entries[replay_path.name] != persisted:
-                    # Re-derived answer differs from (or extends) what the
-                    # sidecar stored for this shard: repersist it.
-                    sidecar_dirty = True
             highest = max(highest, file_highest)
 
         # Do not retain cache records for replay shards removed since the last
         # allocation scan.
         for stale_path in set(cache) - current_paths:
             cache.pop(stale_path, None)
-            stale_name = Path(stale_path).name
-            if stale_name in sidecar_entries:
-                del sidecar_entries[stale_name]
-                sidecar_dirty = True
 
         # Merge untouched sidecar records for shards that vanished from the
         # process cache but still exist on disk (identity-hit files above are
@@ -3590,8 +3693,7 @@ class Trainer:
                 if cached is not None:
                     _, _, _, size, mtime_ns = cached[0]
                     sidecar_entries[name] = (size, mtime_ns, int(cached[1]))
-        if sidecar_entries and (
-                sidecar_dirty or len(sidecar_entries) != len(sidecar_loaded)):
+        if sidecar_entries != sidecar_loaded:
             self._save_generation_cycle_sidecar(replay_dir, sidecar_entries)
         return highest
 
@@ -6512,10 +6614,33 @@ class Trainer:
         print("\nPreparing training data...")
         self._ensure_frozen_teacher_suite()
         train_entries, validation_entries = self._prepare_training_split()
+        preloaded_dataset = self._preloaded_snapshot_dataset
+        preloaded_cache_metadata = self._preloaded_snapshot_cache_metadata
+        preloaded_cache_checked = self._preloaded_snapshot_cache_checked
+        # The cache belongs only to this initial window.  Clear the hand-off so
+        # alternate/background refresh paths cannot accidentally reuse it.
+        self._preloaded_snapshot_dataset = None
+        self._preloaded_snapshot_cache_metadata = None
+        self._preloaded_snapshot_cache_checked = False
         self._set_validation_entries(validation_entries)
-        print(f"Training entries: {len(train_entries)}")
-        train_balance = self._balance_side_sample_weights(train_entries)
-        if train_balance is not None:
+        train_entry_count = (
+            len(preloaded_dataset)
+            if preloaded_dataset is not None else len(train_entries)
+        )
+        print(f"Training entries: {train_entry_count}")
+        train_balance = (
+            preloaded_dataset.metadata.get("side_weight_balance")
+            if preloaded_dataset is not None
+            else self._balance_side_sample_weights(train_entries)
+        )
+        _balance_fields = (
+            "p1_weight_before", "p1_weight_after",
+            "p2_weight_before", "p2_weight_after",
+        )
+        if (
+            isinstance(train_balance, Mapping)
+            and all(field in train_balance for field in _balance_fields)
+        ):
             print(
                 "Training side weight balance: "
                 f"P1 {train_balance['p1_weight_before']:.1f} to "
@@ -6523,13 +6648,16 @@ class Trainer:
                 f"P2 {train_balance['p2_weight_before']:.1f} to "
                 f"{train_balance['p2_weight_after']:.1f}"
             )
+        elif train_balance is not None:
+            print("Warning: ignored malformed cached side-weight metadata")
+            train_balance = None
 
         if self.config.clear_replay_after_load:
             deleted = self.replay_buffer.clear_files()
             if deleted:
                 print(f"Cleared {deleted} replay files after loading")
 
-        if not train_entries:
+        if preloaded_dataset is None and not train_entries:
             print("ERROR: No training data available")
             return
 
@@ -6538,7 +6666,19 @@ class Trainer:
         
         print(f"Creating DataLoader with {effective_workers} workers...")
         sys.stdout.flush()
-        if self.config.policy_stage == 'enhanced':
+        if preloaded_dataset is not None:
+            print("Using manifest-matched RAM cache for training entries.")
+            dataloader = create_dataloader_from_dataset(
+                preloaded_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=effective_workers,
+                pin_memory=self.config.pin_memory,
+                device=self.device,
+                capacity=self.config.replay_max_entries if _simultaneous else 0,
+                amp_enabled=self.config.amp,
+            )
+        elif self.config.policy_stage == 'enhanced':
             dataloader = create_enhanced_dataloader(
                 train_entries,
                 batch_size=self.config.batch_size,
@@ -6551,6 +6691,9 @@ class Trainer:
                 show_progress=True,
             )
         else:
+            cache_metadata = dict(preloaded_cache_metadata or {})
+            if cache_metadata:
+                cache_metadata["side_weight_balance"] = train_balance
             dataloader = create_dataloader(
                 train_entries,
                 batch_size=self.config.batch_size,
@@ -6566,20 +6709,19 @@ class Trainer:
                 amp_enabled=self.config.amp,
                 prelaunch_free_ram_gb=getattr(
                     self, '_prelaunch_free_ram_gb', None),
+                cache_metadata=cache_metadata or None,
+                load_existing_cache=not preloaded_cache_checked,
             )
-            # Journal Pass 117: on the cached path every entry has been copied
-            # into tensors, so the parsed entry lists are dead weight from
-            # here on.  Their growth is exactly what depressed the RAM-cache
-            # gate above (~5-6 GB at the 60-file steady state); keeping them
-            # alive would hold that cost for the whole session.  Only the
-            # tensor-backed paths release: the standard-Dataset path still
-            # reads the entries lazily.  These names are not read again in
-            # train() after this point.
-            if isinstance(dataloader, FastBatchIterator):
-                train_entries, validation_entries, train_balance = (
-                    self._free_entry_lists_after_tensorize(
-                        train_entries, validation_entries, train_balance))
-                gc.collect()
+        # Journal Pass 117: on every FastBatchIterator path the parsed entries
+        # have already been copied into tensors, so retaining even the held-out
+        # list would spend the RAM headroom this cache path is meant to recover.
+        # The manifest-cache hit has no train list, but it still needs this to
+        # release validation ReplayEntry objects after _set_validation_entries.
+        if isinstance(dataloader, FastBatchIterator):
+            train_entries, validation_entries, train_balance = (
+                self._free_entry_lists_after_tensorize(
+                    train_entries, validation_entries, train_balance))
+            gc.collect()
         _is_fast = isinstance(dataloader, FastBatchIterator)
         self._use_padded = (
             _is_fast
@@ -6838,7 +6980,8 @@ class Trainer:
                 # Alternate mode: generate data synchronously, then rebuild dataloader
                 print("Running self-play (alternate mode)...")
                 self.run_selfplay(self.config.selfplay_games)
-                train_entries, validation_entries = self._prepare_training_split()
+                train_entries, validation_entries = self._prepare_training_split(
+                    use_train_cache=False)
                 self._set_validation_entries(validation_entries)
                 train_balance = self._balance_side_sample_weights(train_entries)
                 if train_balance is not None:
