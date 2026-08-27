@@ -876,6 +876,65 @@ def test_generation_cycle_corrupt_sidecar_self_heals(tmp_path, monkeypatch):
     assert scanned == [], "healed sidecar answers future launches outright"
 
 
+def test_generation_cycle_sidecar_caches_no_cycle_legacy_shard(tmp_path, monkeypatch):
+    """A known no-cycle shard must not force a full scan on every restart."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    (replay_dir / "replay_legacy.jsonl").write_text(
+        json.dumps({"game_id": "legacy-game-without-cycle"}) + "\n",
+        encoding="utf-8",
+    )
+
+    scanned = _text_replay_opens(monkeypatch)
+    first = _cycle_allocator_holder(tmp_path, 0)
+    assert first._durable_generation_cycle_max() == -1
+    assert len(scanned) == 1
+    sidecar = json.loads(
+        (replay_dir / "generation_cycle_cache.json").read_text(encoding="utf-8"))
+    assert sidecar["entries"]["replay_legacy.jsonl"][2] == -1
+
+    scanned.clear()
+    second = _cycle_allocator_holder(tmp_path, 0)
+    assert second._durable_generation_cycle_max() == -1
+    assert scanned == []
+
+
+def test_generation_cycle_sidecar_prunes_all_removed_shards(tmp_path):
+    """Rotation removes sidecar state even when it removes every shard."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    shard = replay_dir / "replay_a.jsonl"
+    shard.write_text(json.dumps({"generation_cycle_id": 17}) + "\n")
+    assert _cycle_allocator_holder(tmp_path, 0)._durable_generation_cycle_max() == 17
+
+    shard.unlink()
+    assert _cycle_allocator_holder(tmp_path, 0)._durable_generation_cycle_max() == -1
+    sidecar = json.loads(
+        (replay_dir / "generation_cycle_cache.json").read_text(encoding="utf-8"))
+    assert sidecar["entries"] == {}
+
+
+def test_generation_cycle_scan_skips_shard_deleted_before_exact_fallback(
+    tmp_path, monkeypatch,
+):
+    """A rotation race cannot crash allocation after the identity check."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    shard = replay_dir / "replay_a.jsonl"
+    shard.write_text(json.dumps({"generation_cycle_id": 17}) + "\n")
+
+    def delete_before_fallback(_holder, path):
+        path.unlink()
+        return None
+
+    monkeypatch.setattr(
+        Trainer, "_generation_cycle_tail_max", delete_before_fallback,
+    )
+    holder = _cycle_allocator_holder(tmp_path, 0)
+    assert holder._durable_generation_cycle_max() == -1
+    assert shard.resolve() not in holder._generation_cycle_file_cache
+
+
 def test_generation_cycle_truncated_tail_uses_exact_scan(tmp_path, monkeypatch):
     """A torn final write cannot be proven from the tail; scan decides."""
     replay_dir = tmp_path / "replay"
@@ -3012,6 +3071,289 @@ def test_ram_cache_gate_falls_back_to_the_prelaunch_reading(
 
     out = capsys.readouterr().out
     assert "gate satisfied by pre-load (19.6GB)" in out
+
+
+def test_manifest_keyed_tensor_cache_requires_the_complete_source_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A warm snapshot cache cannot cross a source-fingerprint boundary."""
+    from dama.ai.ml import dataset as dataset_module
+    from dama.ai.ml.dataset import (
+        FastBatchIterator,
+        create_dataloader,
+        load_matching_cached_tensor_dataset,
+    )
+
+    monkeypatch.setattr(dataset_module, "get_available_ram_gb", lambda: 20.0)
+    monkeypatch.setattr(dataset_module, "get_total_ram_gb", lambda: 24.5)
+    cache_file = tmp_path / "snapshot-cache.pt"
+    source_key = {
+        "cache_version": 3,
+        "snapshot_train_cache_version": 2,
+        "snapshot_fingerprint": "a" * 64,
+        "external_validation_keys_sha256": "b" * 64,
+        "validation_exclusion_keys_sha256": "c" * 64,
+        "max_train_entries": 100,
+        "max_moves_per_sample": 8,
+        "encoding_version": trainer_module.ENCODING_VERSION,
+        "policy_stage": "policy_only",
+        "side_weight_balance_version": 1,
+        "side_weight_balance": None,
+    }
+    loader = create_dataloader(
+        _tiny_replay_entries(),
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        use_ram_cache=True,
+        ram_threshold_gb=16.0,
+        cache_file=str(cache_file),
+        device=None,
+        capacity=0,
+        max_moves_per_sample=8,
+        amp_enabled=False,
+        prelaunch_free_ram_gb=20.0,
+        cache_metadata=source_key,
+        load_existing_cache=False,
+    )
+    assert isinstance(loader, FastBatchIterator)
+
+    expected_key = dict(source_key)
+    expected_key.pop("side_weight_balance")
+    cached = load_matching_cached_tensor_dataset(str(cache_file), expected_key)
+    assert cached is not None
+    assert len(cached) == 3
+
+    changed_key = dict(expected_key, snapshot_fingerprint="c" * 64)
+    assert load_matching_cached_tensor_dataset(str(cache_file), changed_key) is None
+
+    changed_holdout_key = dict(
+        expected_key, validation_exclusion_keys_sha256="d" * 64)
+    assert load_matching_cached_tensor_dataset(
+        str(cache_file), changed_holdout_key) is None
+
+
+def test_manifest_keyed_tensor_cache_rejects_malformed_cached_payload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A cache hit must fail closed on malformed tensors or balance metadata."""
+    from dama.ai.ml import dataset as dataset_module
+    from dama.ai.ml.dataset import load_matching_cached_tensor_dataset
+
+    cache_file = tmp_path / "snapshot-cache.pt"
+    cache_file.touch()
+    expected_key = {
+        "cache_version": 3,
+        "snapshot_train_cache_version": 2,
+        "snapshot_fingerprint": "a" * 64,
+        "external_validation_keys_sha256": "b" * 64,
+        "validation_exclusion_keys_sha256": "c" * 64,
+        "max_train_entries": 100,
+        "max_moves_per_sample": 8,
+        "encoding_version": trainer_module.ENCODING_VERSION,
+        "policy_stage": "policy_only",
+        "side_weight_balance_version": 1,
+    }
+    cached_dataset = trainer_module.CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    cached_dataset.metadata = {
+        **expected_key,
+        "entry_count": len(cached_dataset),
+        "side_weight_balance": None,
+    }
+
+    monkeypatch.setattr(
+        dataset_module.CachedTensorDataset,
+        "load",
+        lambda _path, **_kwargs: cached_dataset,
+    )
+    assert load_matching_cached_tensor_dataset(str(cache_file), expected_key)
+    valid_targets = cached_dataset.targets
+    cached_dataset.targets = cached_dataset.targets[:-1]
+    assert load_matching_cached_tensor_dataset(str(cache_file), expected_key) is None
+
+    cached_dataset.targets = valid_targets
+    valid_boards = cached_dataset.boards
+    cached_dataset.boards = valid_boards[:, :-1]
+    assert load_matching_cached_tensor_dataset(str(cache_file), expected_key) is None
+
+    cached_dataset.boards = valid_boards
+    cached_dataset.metadata["side_weight_balance"] = {"p1_count": 1}
+    assert load_matching_cached_tensor_dataset(str(cache_file), expected_key) is None
+
+    cached_dataset.metadata["side_weight_balance"] = {
+        "p1_count": 1,
+        "p2_count": 2,
+        "p1_weight_before": "1.0",
+        "p2_weight_before": 2.0,
+        "p1_weight_after": 1.5,
+        "p2_weight_after": 1.5,
+    }
+    assert load_matching_cached_tensor_dataset(str(cache_file), expected_key) is None
+
+    empty_dataset = trainer_module.CachedTensorDataset.from_entries(
+        [], max_moves_per_sample=8, show_progress=False)
+    empty_dataset.metadata = {
+        **expected_key,
+        "entry_count": 0,
+        "side_weight_balance": None,
+    }
+    monkeypatch.setattr(
+        dataset_module.CachedTensorDataset,
+        "load",
+        lambda _path, **_kwargs: empty_dataset,
+    )
+    assert load_matching_cached_tensor_dataset(str(cache_file), expected_key) is None
+
+
+def test_manifest_keyed_tensor_cache_rejects_missing_loss_tensors(
+    tmp_path: Path,
+) -> None:
+    """A v3 cache cannot silently replace missing loss tensors with defaults."""
+    import torch
+
+    from dama.ai.ml.dataset import load_matching_cached_tensor_dataset
+
+    cache_file = tmp_path / "snapshot-cache.pt"
+    expected_key = {
+        "cache_version": 3,
+        "snapshot_train_cache_version": 2,
+        "snapshot_fingerprint": "a" * 64,
+        "external_validation_keys_sha256": "b" * 64,
+        "validation_exclusion_keys_sha256": "c" * 64,
+        "max_train_entries": 100,
+        "max_moves_per_sample": 8,
+        "encoding_version": trainer_module.ENCODING_VERSION,
+        "policy_stage": "policy_only",
+        "side_weight_balance_version": 1,
+    }
+    dataset = trainer_module.CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    torch.save({
+        "boards": dataset.boards,
+        "move_features": dataset.move_features,
+        "move_counts": dataset.move_counts,
+        "targets": dataset.targets,
+        # Omit reward_weights and value_targets deliberately.
+        "metadata": {
+            **expected_key,
+            "entry_count": len(dataset),
+            "side_weight_balance": None,
+        },
+    }, cache_file)
+
+    assert load_matching_cached_tensor_dataset(str(cache_file), expected_key) is None
+
+
+def test_prepare_training_split_uses_verified_manifest_cache_before_train_parse(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A matching cache bypasses only train-entry materialization."""
+    cached_dataset = trainer_module.CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    cached_dataset.metadata = {
+        "side_weight_balance": None,
+    }
+    manifest_path = tmp_path / "snapshot_v000001" / "manifest.json"
+    context = SimpleNamespace(
+        manifest={"fingerprint": "d" * 64},
+        validation_keys={"held-out-state"},
+    )
+
+    class FakeSnapshotManager:
+        external_validation_state_keys = {"e" * 64}
+
+        def __init__(self) -> None:
+            self.train_loaded = False
+
+        def consider_snapshot(self, **_kwargs):
+            return SnapshotDecision(True, "admitted", manifest_path, {})
+
+        def snapshot_matches_settings(self, *_args, **_kwargs):
+            return True
+
+        def prepare_split(self, path, max_train_entries=0):
+            assert path == manifest_path
+            assert max_train_entries == 100
+            return context
+
+        def load_validation_entries(self, received):
+            assert received is context
+            return ["validation"]
+
+        def load_train_entries(self, _received):
+            self.train_loaded = True
+            raise AssertionError("matching cache must skip train replay parsing")
+
+    manager = FakeSnapshotManager()
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = manager
+    holder.config = SimpleNamespace(
+        selfplay_games=72,
+        replay_max_entries=100,
+        policy_stage="policy_only",
+        ram_cache_enabled=True,
+        ram_cache_file=str(tmp_path / "cache.pt"),
+        ram_cache_threshold_gb=16.0,
+        max_moves_per_sample=8,
+    )
+    holder._stopped = False
+    holder.step = 7
+    holder._prelaunch_free_ram_gb = 20.0
+    holder._corpus_settings = lambda *_, **__: ({}, {}, {})
+    holder._activate_dataset_manifest = lambda _manifest: None
+    holder._service_control_queue = lambda: None
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+
+    observed = {}
+    def load_cache(path, metadata):
+        observed["path"] = path
+        observed["metadata"] = metadata
+        return cached_dataset
+
+    monkeypatch.setattr(
+        trainer_module, "load_matching_cached_tensor_dataset", load_cache)
+
+    train, validation = Trainer._prepare_training_split(holder)
+
+    assert train == []
+    assert validation == ["validation"]
+    assert manager.train_loaded is False
+    assert holder._preloaded_snapshot_dataset is cached_dataset
+    assert observed["path"] == str(tmp_path / "cache.pt")
+    assert observed["metadata"]["snapshot_fingerprint"] == "d" * 64
+
+
+def test_snapshot_tensor_cache_requires_a_prelaunch_ram_measurement() -> None:
+    """A failed RAM probe must decline the warm cache just like the cold path."""
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        policy_stage="policy_only",
+        ram_cache_enabled=True,
+        ram_cache_file="cache.pt",
+        ram_cache_threshold_gb=16.0,
+        replay_max_entries=100,
+        max_moves_per_sample=8,
+    )
+    holder._snapshot_manager = SimpleNamespace(
+        external_validation_state_keys=set())
+
+    assert Trainer._snapshot_train_cache_metadata(
+        holder, {"fingerprint": "a" * 64}, {"held-out-state"}) is None
+
+    holder._prelaunch_free_ram_gb = 16.1
+    first_key = Trainer._snapshot_train_cache_metadata(
+        holder, {"fingerprint": "a" * 64}, {"held-out-state"})
+    changed_holdout_key = Trainer._snapshot_train_cache_metadata(
+        holder, {"fingerprint": "a" * 64},
+        {"held-out-state", "newly-held-out-state"})
+    assert first_key is not None
+    assert changed_holdout_key is not None
+    assert (
+        first_key["validation_exclusion_keys_sha256"]
+        != changed_holdout_key["validation_exclusion_keys_sha256"]
+    )
 
 
 def test_free_entry_lists_after_tensorize_clears_validation_mirror() -> None:
