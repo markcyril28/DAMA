@@ -1273,6 +1273,40 @@ def test_snapshot_load_accepts_windows_written_manifest_paths(tmp_path: Path) ->
     assert validation_entries
 
 
+def test_prepared_snapshot_split_matches_the_legacy_eager_load(tmp_path: Path) -> None:
+    """Deferring train materialization must preserve split membership exactly."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(
+            replay_dir / f"replay_{index}.jsonl",
+            [_entry(index), _entry(index + 20)],
+        )
+    manager = CorpusSnapshotManager(
+        str(replay_dir), str(snapshot_root), validation_fraction=0.25,
+        split_seed=29, min_fresh_fraction=0.50, grow_holdout=False,
+    )
+    decision = manager.consider_snapshot({}, {}, {})
+    assert decision.manifest_path is not None
+
+    context = manager.prepare_split(decision.manifest_path)
+    deferred_validation = manager.load_validation_entries(context)
+    deferred_train = manager.load_train_entries(context)
+    eager_train, eager_validation, eager_manifest = manager.load_split(
+        decision.manifest_path)
+
+    assert [entry.to_dict() for entry in deferred_train] == [
+        entry.to_dict() for entry in eager_train
+    ]
+    assert [entry.to_dict() for entry in deferred_validation] == [
+        entry.to_dict() for entry in eager_validation
+    ]
+    assert context.manifest["validation_leakage"] == eager_manifest[
+        "validation_leakage"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Audit Suggestion 9: the hold-out's freshness tax must be attributable
 # ---------------------------------------------------------------------------
