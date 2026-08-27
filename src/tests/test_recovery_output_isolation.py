@@ -380,6 +380,7 @@ def test_gui_cannot_offer_a_retired_policy_preset() -> None:
     Demoting it was only a tie-break; the presets were retired to
     config/superseded/ so the non-recursive glob cannot reach them at all.
     """
+    pytest.importorskip("PyQt6")
     from dama.ui.training_panel import (
         _PREFERRED_TRAINING_PRESETS,
         _training_preset_rank,
