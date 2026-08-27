@@ -122,6 +122,25 @@ class _ReplayFileAnalysis:
     game_sources: Mapping[str, str]
 
 
+@dataclass
+class _SnapshotSplitContext:
+    """Verified immutable inputs needed to materialize one train/validation split.
+
+    Keeping validation preparation separate from training-entry materialization
+    lets a caller reuse a tensor cache that is cryptographically keyed to the
+    verified snapshot.  The context is intentionally process-local: the
+    manifests and their files remain the durable source of truth.
+    """
+
+    manifest_path: Path
+    manifest: dict
+    validation_path: Path
+    validation_manifest: dict
+    validation_keys: Set[str]
+    historically_trained: Set[int]
+    max_train_entries: int
+
+
 def _replay_file_identity(path: Path) -> _ReplayFileIdentity:
     """Return an identity that changes for normal in-place/replacement edits."""
 
@@ -1989,12 +2008,18 @@ class CorpusSnapshotManager:
 
         return SnapshotDecision(True, "admitted", final_dir / "manifest.json", metrics)
 
-    def load_split(
+    def prepare_split(
         self,
         manifest_path: Optional[Path] = None,
         max_train_entries: int = 0,
-    ) -> Tuple[List[ReplayEntry], List[ReplayEntry], dict]:
-        """Load a frozen train/validation split with cross-split deduplication."""
+    ) -> _SnapshotSplitContext:
+        """Verify frozen split inputs before materializing their entry lists.
+
+        This deliberately retains every integrity, lineage, validation-version,
+        and all-time-ledger check from :meth:`load_split`.  Separating the
+        expensive train-shard parse lets the trainer use a manifest-keyed tensor
+        cache on a warm relaunch without trusting an unverified cache file.
+        """
 
         path = manifest_path or self.current_manifest_path()
         if path is None:
@@ -2044,27 +2069,42 @@ class CorpusSnapshotManager:
         # The all-time ledger is what makes the check answerable after
         # retention has pruned the snapshots that did the training.
         historically_trained = self.trained_ledger_state_fingerprints()
+        validation_keys = set(stored_validation_keys)
+        validation_keys.update(self.external_validation_state_keys)
+        return _SnapshotSplitContext(
+            manifest_path=path,
+            manifest=manifest,
+            validation_path=validation_path,
+            validation_manifest=validation_manifest,
+            validation_keys=validation_keys,
+            historically_trained=historically_trained,
+            max_train_entries=max(0, int(max_train_entries)),
+        )
+
+    def load_validation_entries(
+        self, context: _SnapshotSplitContext,
+    ) -> List[ReplayEntry]:
+        """Materialize the leakage-filtered held-out entries from a context."""
 
         validation_entries: List[ReplayEntry] = []
-        validation_keys: Set[str] = set(stored_validation_keys)
-        validation_keys.update(self.external_validation_state_keys)
         leaked_validation_states: Set[str] = set()
         leaked_validation_entries = 0
-        for record in validation_manifest["files"]:
-            file_path = validation_path.parent / _read_relpath(record["path"])
+        for record in context.validation_manifest["files"]:
+            file_path = context.validation_path.parent / _read_relpath(
+                record["path"])
             for entry_dict in _iter_entry_dicts(file_path):
                 key = canonical_state_key(entry_dict["state"])
                 # The key stays in ``validation_keys`` either way, so a state
                 # dropped here is never quietly handed back to training.
-                validation_keys.add(key)
-                if _state_key_fingerprint(key) in historically_trained:
+                context.validation_keys.add(key)
+                if _state_key_fingerprint(key) in context.historically_trained:
                     leaked_validation_states.add(key)
                     leaked_validation_entries += 1
                     continue
                 validation_entries.append(ReplayEntry.from_dict(entry_dict))
-        manifest["validation_leakage"] = {
+        context.manifest["validation_leakage"] = {
             "ledger_enabled": self.trained_ledger_enabled,
-            "all_time_trained_state_count": len(historically_trained),
+            "all_time_trained_state_count": len(context.historically_trained),
             "removed_validation_entry_count": leaked_validation_entries,
             "removed_validation_state_count": len(leaked_validation_states),
             "retained_validation_entry_count": len(validation_entries),
@@ -2076,21 +2116,43 @@ class CorpusSnapshotManager:
                 "canonical state(s) already present in the all-time trained "
                 f"ledger; {len(validation_entries)} entry/entries remain"
             )
+        return validation_entries
+
+    def load_train_entries(
+        self, context: _SnapshotSplitContext,
+    ) -> List[ReplayEntry]:
+        """Materialize the train entries after cross-split deduplication."""
 
         train_entries: List[ReplayEntry] = []
-        for record in manifest["files"]:
-            file_path = path.parent / _read_relpath(record["path"])
+        for record in context.manifest["files"]:
+            file_path = context.manifest_path.parent / _read_relpath(
+                record["path"])
             for entry_dict in _iter_entry_dicts(file_path):
-                if canonical_state_key(entry_dict["state"]) in validation_keys:
+                if canonical_state_key(entry_dict["state"]) in context.validation_keys:
                     continue
                 train_entries.append(ReplayEntry.from_dict(entry_dict))
 
-        if max_train_entries > 0 and len(train_entries) > max_train_entries:
+        if (
+            context.max_train_entries > 0
+            and len(train_entries) > context.max_train_entries
+        ):
             rng = random.Random(self.split_seed)
-            indices = sorted(rng.sample(range(len(train_entries)), max_train_entries))
+            indices = sorted(rng.sample(
+                range(len(train_entries)), context.max_train_entries))
             train_entries = [train_entries[index] for index in indices]
+        return train_entries
 
-        return train_entries, validation_entries, manifest
+    def load_split(
+        self,
+        manifest_path: Optional[Path] = None,
+        max_train_entries: int = 0,
+    ) -> Tuple[List[ReplayEntry], List[ReplayEntry], dict]:
+        """Load a frozen train/validation split with cross-split deduplication."""
+
+        context = self.prepare_split(manifest_path, max_train_entries)
+        validation_entries = self.load_validation_entries(context)
+        train_entries = self.load_train_entries(context)
+        return train_entries, validation_entries, context.manifest
 
 
 def split_replay_by_file(
