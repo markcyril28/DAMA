@@ -121,6 +121,8 @@ validation:
   frozen_suite_size: 5000
   frozen_suite_seed: 20260819
   auto_create_suite: false
+  tensor_cache_file: "/tmp/dama_policy_distillation_recovery_c174k_validation_cache.pt"  # Keeps the raw warm cache off the constrained drvfs volume. See Journal Pass 129.
+  tensor_cache_compress: false  # Raw tensors avoid the measured gzip warm-read regression. See Journal Pass 129.
   teacher_agreement_threshold: 0.50
   # Audit finding F3: the hold-out was frozen when the namespace held 2 files
   # and never grew, so the approved 15% decayed to 1.7% against a 60-file
@@ -196,6 +198,7 @@ dataloader:
     # trainer prints the threshold against measured free RAM at startup.
     threshold_gb: 16.0
     cache_file: "data/replay_cache/policy_distillation_recovery_c174k_cache.pt"
+    compress: true  # Fits the local warm cache within the disk budget. See Journal Pass 126.
 
 # Game strength is evaluated only after held-out teacher-agreement promotion.
 # Each opponent receives 100 games, exactly 50 on each player side.
@@ -317,6 +320,11 @@ profiles:
         enabled: true
         threshold_gb: 64.0
         cache_file: "data/replay_cache/policy_distillation_recovery_c174k_server_cache.pt"
+        compress: false  # Preserve unmeasured server warm-cache behavior. See Journal Pass 126.
+
+    validation:
+      tensor_cache_file: "data/replay_cache/policy_distillation_recovery_c174k_server_validation_cache.pt"  # Keeps server cache files profile-isolated. See Journal Pass 129.
+      tensor_cache_compress: false  # Preserve direct tensor loads on the server. See Journal Pass 129.
 
     thermal_protection:
       enabled: false
