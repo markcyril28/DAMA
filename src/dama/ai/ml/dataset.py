@@ -3,10 +3,12 @@
 import hashlib
 import json
 import gc
+import gzip
 import math
 import time
 import os
 import random
+import tempfile
 from numbers import Real
 import psutil
 from concurrent.futures import ProcessPoolExecutor
@@ -22,6 +24,21 @@ from ...board import Board
 from .replay import ReplayBuffer, ReplayEntry
 from .move_encoder import encode_board, encode_moves, MOVE_FEATURE_SIZE, BOARD_PLANES
 from .scoring import compute_reward_weight, compute_reward_weights_batch
+
+
+# Tensor caches are entirely derived from verified replay data.  Their payloads
+# are overwhelmingly zero-valued float tensors, so a fast outer gzip stream
+# saves substantial disk space without changing the source-validation contract.
+_TENSOR_CACHE_GZIP_MAGIC = b"\x1f\x8b"
+_TENSOR_CACHE_GZIP_COMPRESSLEVEL = 1
+
+
+def _is_gzip_tensor_cache(path: Path) -> bool:
+    """Return whether a tensor-cache file uses the optional outer gzip stream."""
+
+    with path.open('rb') as raw_file:
+        return raw_file.read(len(_TENSOR_CACHE_GZIP_MAGIC)) == _TENSOR_CACHE_GZIP_MAGIC
+
 
 # Try to import Cython-accelerated encoding functions (~6-7x faster).
 # Falls back to pure Python if the extension isn't built.
@@ -1117,8 +1134,14 @@ class CachedTensorDataset(Dataset):
             torch.from_numpy(vt),
         )
     
-    def save(self, path: str, metadata: Optional[dict] = None) -> None:
-        """Save the cached tensors to a .pt file."""
+    def save(
+        self,
+        path: str,
+        metadata: Optional[dict] = None,
+        *,
+        compress: bool = False,
+    ) -> None:
+        """Atomically save cached tensors, optionally with outer gzip compression."""
         payload = {
             'boards': self.boards,
             'move_features': self.move_features,
@@ -1132,8 +1155,41 @@ class CachedTensorDataset(Dataset):
                 'created_at': time.time(),
             },
         }
-        torch.save(payload, path)
-        print(f"Saved cached dataset to {path}")
+        cache_path = Path(path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = None
+        try:
+            # Keep the previous cache readable until the complete replacement
+            # has been serialized and flushed.  A cache is optional, but a
+            # torn write should still degrade to a safe cache miss, not consume
+            # the only usable warm-start artifact.
+            with tempfile.NamedTemporaryFile(
+                mode='wb',
+                prefix=f'.{cache_path.name}.',
+                suffix='.tmp',
+                dir=cache_path.parent,
+                delete=False,
+            ) as raw_file:
+                temp_path = Path(raw_file.name)
+                if compress:
+                    with gzip.GzipFile(
+                        fileobj=raw_file,
+                        mode='wb',
+                        compresslevel=_TENSOR_CACHE_GZIP_COMPRESSLEVEL,
+                        mtime=0,
+                    ) as compressed_file:
+                        torch.save(payload, compressed_file)
+                else:
+                    torch.save(payload, raw_file)
+                raw_file.flush()
+                os.fsync(raw_file.fileno())
+            os.replace(temp_path, cache_path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        cache_kind = "compressed " if compress else ""
+        print(f"Saved {cache_kind}cached dataset to {cache_path}")
     
     @classmethod
     def load(
@@ -1142,13 +1198,20 @@ class CachedTensorDataset(Dataset):
         *,
         require_complete: bool = False,
     ) -> 'CachedTensorDataset':
-        """Load cached tensors from a .pt file.
+        """Load cached tensors from a compressed or legacy raw .pt file.
 
         ``require_complete`` keeps the legacy defaults for ordinary callers,
         while letting a source-verified cache reject a payload missing any
         tensor it needs for the training loss.
         """
-        data = torch.load(path, weights_only=True, map_location='cpu')
+        cache_path = Path(path)
+        if _is_gzip_tensor_cache(cache_path):
+            with gzip.open(cache_path, 'rb') as compressed_file:
+                data = torch.load(
+                    compressed_file, weights_only=True, map_location='cpu')
+        else:
+            # Existing caches predate compression and remain valid inputs.
+            data = torch.load(cache_path, weights_only=True, map_location='cpu')
         if require_complete:
             required = {
                 'boards', 'move_features', 'move_counts', 'targets',
@@ -1795,13 +1858,16 @@ def _cached_tensor_dataset_is_consistent(
 def load_matching_cached_tensor_dataset(
     cache_file: Optional[str],
     expected_metadata: Mapping[str, Any],
+    *,
+    migrate_to_compressed: bool = False,
 ) -> Optional[CachedTensorDataset]:
     """Load a cached tensor corpus only when its complete source key matches.
 
     Callers that validate an immutable corpus manifest before reaching this
     helper may use that manifest fingerprint as part of ``expected_metadata``.
     A corrupt, partial, stale, or differently keyed cache is only a cache miss;
-    it never becomes a source of training data.
+    it never becomes a source of training data.  When requested, a valid legacy
+    raw cache is best-effort atomically migrated to gzip before being returned.
     """
 
     if not cache_file or not expected_metadata:
@@ -1837,6 +1903,18 @@ def load_matching_cached_tensor_dataset(
                 cached_dataset, expected_metadata)
         ):
             print("Loaded matching RAM cache from file.")
+            if migrate_to_compressed:
+                try:
+                    if not _is_gzip_tensor_cache(cache_path):
+                        cached_dataset.save(str(cache_path), compress=True)
+                        print("Migrated matching RAM cache to gzip format.")
+                except Exception as exc:
+                    # A failed migration must not discard the verified cache
+                    # already loaded into memory for this run.
+                    print(
+                        f"Warning: could not migrate RAM cache file "
+                        f"{cache_path}: {exc}"
+                    )
             return cached_dataset
         print("RAM cache file metadata mismatch; rebuilding cache.")
     except Exception as exc:
@@ -1860,6 +1938,7 @@ def create_dataloader(
     prelaunch_free_ram_gb: Optional[float] = None,
     cache_metadata: Optional[Mapping[str, Any]] = None,
     load_existing_cache: bool = True,
+    compress_cache: bool = False,
 ) -> DataLoader:
     """
     Create a DataLoader from replay entries.
@@ -1884,6 +1963,8 @@ def create_dataloader(
             warm relaunch cache hit without reconstructing every train entry.
         load_existing_cache: Set False when a caller already performed the
             cache lookup before deciding whether replay entries must be parsed.
+        compress_cache: Persist a cache through a fast gzip stream.  This is
+            useful on disk-constrained mounts; raw caches remain the default.
 
     Returns:
         DataLoader instance
@@ -1944,7 +2025,10 @@ def create_dataloader(
         cache_path = Path(cache_file).expanduser() if cache_file else None
         if cache_path is not None and load_existing_cache:
             cached_dataset = load_matching_cached_tensor_dataset(
-                str(cache_path), cache_meta)
+                str(cache_path),
+                cache_meta,
+                migrate_to_compressed=compress_cache,
+            )
             if cached_dataset is not None:
                 return FastBatchIterator(
                     cached_dataset,
@@ -1968,7 +2052,11 @@ def create_dataloader(
         if cache_path is not None:
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cached_dataset.save(str(cache_path), metadata=cache_meta)
+                cached_dataset.save(
+                    str(cache_path),
+                    metadata=cache_meta,
+                    compress=compress_cache,
+                )
             except Exception as e:
                 print(f"Warning: could not save RAM cache file {cache_path}: {e}")
 
