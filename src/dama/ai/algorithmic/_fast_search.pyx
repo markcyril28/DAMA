@@ -73,13 +73,27 @@ cdef struct CMove:
     int cap_r[MAX_CAPTURES]
     int cap_c[MAX_CAPTURES]
     int num_captures
-    bint promotion
+    int metadata              # bit 0: promotion, upper bits: captured material
     int from_sq               # path_r[0]*8 + path_c[0], precomputed at generation
     int to_sq                 # path_r[path_len-1]*8 + path_c[path_len-1]
 
 cdef struct CMoveList:
     CMove moves[MAX_MOVES]
     int count
+
+
+cdef inline bint _move_promotes(CMove *move) noexcept nogil:
+    return (move.metadata & 1) != 0
+
+
+cdef inline int _move_capture_value(CMove *move) noexcept nogil:
+    return move.metadata >> 1
+
+
+cdef inline void _set_move_metadata(
+    CMove *move, bint promotion, int capture_value
+) noexcept nogil:
+    move.metadata = (capture_value << 1) | (1 if promotion else 0)
 
 # ── Rule flags (packed into a single struct for efficient passing) ──
 cdef struct Rules:
@@ -158,6 +172,26 @@ cdef void _init_dark_sq():
                 i += 1
 
 _init_dark_sq()
+
+
+# Static evaluation is a zero-sum sum of piece-square contributions. Precompute
+# the P1-perspective value for every piece and square once, then flip the final
+# integer sum for P2. This replaces repeated piece/player/king branches at every
+# leaf without changing any material or positional term.
+cdef int EVAL_P1[5][64]
+
+cdef void _init_eval_table() noexcept nogil:
+    cdef int sq, r, center
+    for sq in range(64):
+        r = sq // 8
+        center = W_CENTER if CENTER_SQ[sq] else 0
+        EVAL_P1[EMPTY][sq] = 0
+        EVAL_P1[P1_MAN][sq] = W_MAN + r * W_ADVANCEMENT + center
+        EVAL_P1[P1_KING][sq] = W_KING + center + (W_BACK_RANK if r == 0 else 0)
+        EVAL_P1[P2_MAN][sq] = -W_MAN - (7 - r) * W_ADVANCEMENT - center
+        EVAL_P1[P2_KING][sq] = -W_KING - center - (W_BACK_RANK if r == 7 else 0)
+
+_init_eval_table()
 
 
 # ── Precomputed LMR (Late Move Reduction) table ──
@@ -456,35 +490,29 @@ cdef inline void _add_simple_move(
     m.path_r[1] = er; m.path_c[1] = ec
     m.path_len = 2
     m.num_captures = 0
-    m.promotion = promo
     m.from_sq = sr * 8 + sc
     m.to_sq = er * 8 + ec
+    _set_move_metadata(m, promo, 0)
     out.count += 1
 
 
 # ── Capture generation (recursive, in-place mutation with undo) ──
-
-ctypedef unsigned long long uint64
-
-cdef inline bint bit_test(uint64 bits, int r, int c) noexcept nogil:
-    return (bits >> (r * 8 + c)) & 1
-
-cdef inline uint64 bit_set(uint64 bits, int r, int c) noexcept nogil:
-    return bits | ((<uint64>1) << (r * 8 + c))
-
+# Every ancestor's captured piece remains removed until its recursive call
+# returns, so the mutated board is the captured-square set.  The starting
+# square is likewise path[0]; carrying either state separately only enlarges
+# this hot recursive call frame.
 
 cdef int _generate_captures_recursive(
     signed char *board, int r, int c, int piece, int player,
-    uint64 captured_bits,
+    int capture_value,
     int *path_r, int *path_c, int path_len,
     int *cap_r, int *cap_c, int num_caps,
-    int start_r, int start_c,
     Rules *rules, CMoveList *out
 ) noexcept nogil:
     """Recursively generate capture sequences. Returns count found."""
     cdef int d, cr, cc, lr, lc
     cdef int found = 0
-    cdef int captured_piece, further
+    cdef int captured_piece, further, next_capture_value
     cdef int *dirs_r
     cdef int *dirs_c
     cdef int ndirs
@@ -496,8 +524,8 @@ cdef int _generate_captures_recursive(
             found += _flying_king_capture(
                 board, r, c, piece, player,
                 dirs_r[d], dirs_c[d],
-                captured_bits, path_r, path_c, path_len,
-                cap_r, cap_c, num_caps, start_r, start_c, rules, out
+                capture_value, path_r, path_c, path_len,
+                cap_r, cap_c, num_caps, rules, out
             )
         else:
             cr = r + dirs_r[d]
@@ -507,19 +535,20 @@ cdef int _generate_captures_recursive(
 
             if not in_bounds(lr, lc):
                 continue
-            if bit_test(captured_bits, cr, cc):
-                continue
             captured_piece = cell(board, cr, cc)
             if not is_opponent(captured_piece, player):
                 continue
             if cell(board, lr, lc) != EMPTY:
-                if not (lr == start_r and lc == start_c):
+                if not (lr == path_r[0] and lc == path_c[0]):
                     continue
 
             path_r[path_len] = lr
             path_c[path_len] = lc
             cap_r[num_caps] = cr
             cap_c[num_caps] = cc
+            next_capture_value = (
+                capture_value + (W_KING if is_king(captured_piece) else W_MAN)
+            )
 
             set_cell(board, r, c, EMPTY)
             set_cell(board, cr, cc, EMPTY)
@@ -527,10 +556,10 @@ cdef int _generate_captures_recursive(
 
             further = _generate_captures_recursive(
                 board, lr, lc, piece, player,
-                bit_set(captured_bits, cr, cc),
+                next_capture_value,
                 path_r, path_c, path_len + 1,
                 cap_r, cap_c, num_caps + 1,
-                start_r, start_c, rules, out
+                rules, out
             )
 
             set_cell(board, lr, lc, EMPTY)
@@ -544,7 +573,8 @@ cdef int _generate_captures_recursive(
                     _copy_capture_move(
                         out, path_r, path_c, path_len + 1,
                         cap_r, cap_c, num_caps + 1,
-                        not is_king(piece) and lr == promotion_row(player)
+                        not is_king(piece) and lr == promotion_row(player),
+                        next_capture_value,
                     )
                     found += 1
 
@@ -554,17 +584,16 @@ cdef int _generate_captures_recursive(
 cdef int _flying_king_capture(
     signed char *board, int r, int c, int piece, int player,
     int dr, int dc,
-    uint64 captured_bits,
+    int capture_value,
     int *path_r, int *path_c, int path_len,
     int *cap_r, int *cap_c, int num_caps,
-    int start_r, int start_c,
     Rules *rules, CMoveList *out
 ) noexcept nogil:
     """Generate captures for a flying king along one diagonal."""
     cdef int sr, sc, dist, found = 0
     cdef int scan_piece
     cdef int lr, lc, land_dist, further
-    cdef int captured_piece
+    cdef int captured_piece, next_capture_value
 
     dist = 1
     while True:
@@ -576,8 +605,6 @@ cdef int _flying_king_capture(
         if scan_piece != EMPTY:
             if is_player(scan_piece, player):
                 break
-            if bit_test(captured_bits, sr, sc):
-                break
             captured_piece = scan_piece
             land_dist = 1
             while True:
@@ -586,16 +613,21 @@ cdef int _flying_king_capture(
                 if not in_bounds(lr, lc):
                     break
                 if cell(board, lr, lc) != EMPTY:
-                    if lr == start_r and lc == start_c:
+                    if lr == path_r[0] and lc == path_c[0]:
                         pass
                     else:
                         break
 
-                if cell(board, lr, lc) == EMPTY or (lr == start_r and lc == start_c):
+                if (cell(board, lr, lc) == EMPTY
+                        or (lr == path_r[0] and lc == path_c[0])):
                     path_r[path_len] = lr
                     path_c[path_len] = lc
                     cap_r[num_caps] = sr
                     cap_c[num_caps] = sc
+                    next_capture_value = (
+                        capture_value
+                        + (W_KING if is_king(captured_piece) else W_MAN)
+                    )
 
                     set_cell(board, r, c, EMPTY)
                     set_cell(board, sr, sc, EMPTY)
@@ -603,10 +635,10 @@ cdef int _flying_king_capture(
 
                     further = _generate_captures_recursive(
                         board, lr, lc, piece, player,
-                        bit_set(captured_bits, sr, sc),
+                        next_capture_value,
                         path_r, path_c, path_len + 1,
                         cap_r, cap_c, num_caps + 1,
-                        start_r, start_c, rules, out
+                        rules, out
                     )
 
                     set_cell(board, lr, lc, EMPTY)
@@ -619,7 +651,8 @@ cdef int _flying_king_capture(
                         if out.count < MAX_MOVES:
                             _copy_capture_move(
                                 out, path_r, path_c, path_len + 1,
-                                cap_r, cap_c, num_caps + 1, 0)
+                                cap_r, cap_c, num_caps + 1, 0,
+                                next_capture_value)
                             found += 1
 
                 land_dist += 1
@@ -633,7 +666,7 @@ cdef inline void _copy_capture_move(
     CMoveList *out,
     int *path_r, int *path_c, int path_len,
     int *cap_r, int *cap_c, int num_caps,
-    bint promo
+    bint promo, int capture_value
 ) noexcept nogil:
     cdef CMove *m = &out.moves[out.count]
     cdef int i
@@ -645,9 +678,9 @@ cdef inline void _copy_capture_move(
     for i in range(num_caps):
         m.cap_r[i] = cap_r[i]
         m.cap_c[i] = cap_c[i]
-    m.promotion = promo
     m.from_sq = path_r[0] * 8 + path_c[0]
     m.to_sq = path_r[path_len - 1] * 8 + path_c[path_len - 1]
+    _set_move_metadata(m, promo, capture_value)
     out.count += 1
 
 
@@ -665,7 +698,7 @@ cdef void generate_captures(
     _generate_captures_recursive(
         board, r, c, piece, player,
         0, path_r, path_c, 1, cap_r, cap_c, 0,
-        r, c, rules, out
+        rules, out
     )
 
 
@@ -684,11 +717,14 @@ cdef void generate_all_moves_c(
     involves diagonal sliding — more expensive than the extra dark-square scan.
     At 10M+ nodes per hard game, this saves significant move-gen time.
     """
-    cdef CMoveList simple_moves
-    cdef CMoveList capture_moves
-    cdef int r, c, piece, i, sq, n_simple
+    cdef int piece, i, sq
 
-    capture_moves.count = 0
+    # Append directly into the caller's list.  The previous implementation
+    # built separate ~18 KiB capture and simple lists in every search frame,
+    # then copied the retained moves into ``out``.  Captures are already
+    # generated first and every append is bounded by MAX_MOVES, so those
+    # staging buffers and copies cannot affect ordering or truncation.
+    out.count = 0
 
     # Pass 1: generate captures for all pieces
     for i in range(NUM_DARK_SQ):
@@ -696,35 +732,21 @@ cdef void generate_all_moves_c(
         piece = board[sq]
         if piece == EMPTY or not is_player(piece, player):
             continue
-        generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, &capture_moves)
+        generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
 
     # Early exit: forced capture with captures found — skip simple moves entirely
-    if rules.forced_capture and capture_moves.count > 0:
-        out.count = capture_moves.count
-        for i in range(capture_moves.count):
-            out.moves[i] = capture_moves.moves[i]
+    if rules.forced_capture and out.count > 0:
         return
 
-    # Pass 2: generate simple moves (no forced captures, or no captures found)
-    simple_moves.count = 0
+    # Pass 2: append simple moves after captures.  With forced capture enabled,
+    # reaching this point means out.count is zero.  With it disabled, the
+    # capture-first ordering is identical to the former merge step.
     for i in range(NUM_DARK_SQ):
         sq = DARK_SQ[i]
         piece = board[sq]
         if piece == EMPTY or not is_player(piece, player):
             continue
-        generate_simple_moves(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, &simple_moves)
-
-    # Merge: captures first, then as many simple moves as fit. Each source
-    # list is independently capped at MAX_MOVES, so the combined count must
-    # be clamped or the copy below writes past out.moves (boundscheck off).
-    n_simple = simple_moves.count
-    if n_simple > MAX_MOVES - capture_moves.count:
-        n_simple = MAX_MOVES - capture_moves.count
-    out.count = capture_moves.count + n_simple
-    for i in range(capture_moves.count):
-        out.moves[i] = capture_moves.moves[i]
-    for i in range(n_simple):
-        out.moves[capture_moves.count + i] = simple_moves.moves[i]
+        generate_simple_moves(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
 
 
 cdef int generate_captures_only_c(
@@ -768,7 +790,7 @@ cdef void apply_move_c(
     for i in range(move.num_captures):
         new_board[move.cap_r[i] * 8 + move.cap_c[i]] = EMPTY
     new_board[sr * 8 + sc] = EMPTY
-    if move.promotion:
+    if _move_promotes(move):
         piece = promote_piece(piece)
     new_board[er * 8 + ec] = piece
 
@@ -779,50 +801,15 @@ cdef void apply_move_c(
 
 cdef float evaluate_c(signed char *board, int player) noexcept nogil:
     """Evaluate board from perspective of `player` (material + position, no mobility)."""
-    cdef int i, r, c, piece, idx
-    cdef int cur_men = 0, cur_kings = 0, opp_men = 0, opp_kings = 0
-    cdef float score = 0.0
-    cdef int advancement
-    cdef float mult
+    cdef int i, piece, idx
+    cdef int score = 0
 
     for i in range(NUM_DARK_SQ):
         idx = DARK_SQ[i]
         piece = board[idx]
-        if piece == EMPTY:
-            continue
+        score += EVAL_P1[piece][idx]
 
-        r = DARK_SQ_R[i]
-        c = DARK_SQ_C[i]
-
-        if is_player(piece, player):
-            mult = 1.0
-            if is_king(piece):
-                cur_kings += 1
-            else:
-                cur_men += 1
-        else:
-            mult = -1.0
-            if is_king(piece):
-                opp_kings += 1
-            else:
-                opp_men += 1
-
-        if not is_king(piece):
-            advancement = r if piece == P1_MAN else 7 - r
-            score += advancement * W_ADVANCEMENT * mult
-
-        if CENTER_SQ[idx]:
-            score += W_CENTER * mult
-
-        if is_king(piece):
-            if piece == P1_KING and r == 0:
-                score += W_BACK_RANK * mult
-            elif piece == P2_KING and r == 7:
-                score += W_BACK_RANK * mult
-
-    score += (cur_men - opp_men) * W_MAN
-    score += (cur_kings - opp_kings) * W_KING
-    return score
+    return <float>(score if player == PLAYER_ONE else -score)
 
 
 # Maximum depth for quiescence capture-only search (prevents explosion)
@@ -902,7 +889,7 @@ cdef float quiescence(
             else:
                 cap_gain += W_MAN
         # Add promotion bonus if applicable
-        if captures.moves[i].promotion:
+        if _move_promotes(&captures.moves[i]):
             cap_gain += W_KING - W_MAN  # Gaining king value from promotion
         if stand_pat + cap_gain + DELTA_MARGIN <= alpha:
             continue  # This capture can't raise alpha — prune it
@@ -1030,7 +1017,7 @@ cdef inline unsigned long long _hash_after_move(
         h = h ^ ZOBRIST_PIECES[cap_piece][cap_sq]
 
     # Add piece to end square (with possible promotion)
-    end_piece = promote_piece(piece) if m.promotion else piece
+    end_piece = promote_piece(piece) if _move_promotes(m) else piece
     h = h ^ ZOBRIST_PIECES[end_piece][to_sq]
 
     # Toggle side to move
@@ -1059,10 +1046,9 @@ cdef void _order_moves_full(
     signed char *board, int prev_from, int prev_to
 ) noexcept nogil:
     """Enhanced move ordering: TT > captures (by value) > killers > countermove > history > position."""
-    cdef int i, j, best_idx
+    cdef int i, j
     cdef int scores[MAX_MOVES]
     cdef int s, from_sq, to_sq, k
-    cdef int cap_sq, cap_value
     cdef CMove temp
 
     # Defensive clamp: scores[] holds MAX_MOVES entries, so a corrupt or
@@ -1083,14 +1069,7 @@ cdef void _order_moves_full(
 
         # Captures: highest priority, scored by material value of captured pieces.
         if moves.moves[i].num_captures > 0:
-            cap_value = 0
-            for j in range(moves.moves[i].num_captures):
-                cap_sq = moves.moves[i].cap_r[j] * 8 + moves.moves[i].cap_c[j]
-                if is_king(board[cap_sq]):
-                    cap_value += W_KING
-                else:
-                    cap_value += W_MAN
-            s = 20000 + cap_value
+            s = 20000 + _move_capture_value(&moves.moves[i])
         else:
             # Killer move bonus
             if ply < MAX_PLY:
@@ -1110,7 +1089,7 @@ cdef void _order_moves_full(
                 s = ss.history[from_sq][to_sq]
 
         # Promotion bonus
-        if moves.moves[i].promotion:
+        if _move_promotes(&moves.moves[i]):
             s += 10000
 
         # Center bias (precomputed lookup — no FP math)
@@ -1245,13 +1224,13 @@ cdef float alphabeta(
         # and always search captures and promotions.
         if (futility_ok and i > 0
                 and moves.moves[i].num_captures == 0
-                and not moves.moves[i].promotion):
+                and not _move_promotes(&moves.moves[i])):
             continue
 
         # LMP: skip late quiet moves at shallow depths
         if (i >= lmp_limit
                 and moves.moves[i].num_captures == 0
-                and not moves.moves[i].promotion
+                and not _move_promotes(&moves.moves[i])
                 and best > -9000):  # Don't prune if we haven't found any good move yet
             continue
 
@@ -1273,7 +1252,7 @@ cdef float alphabeta(
             reduced = 0
             if (i >= 3 and depth >= 3
                     and moves.moves[i].num_captures == 0
-                    and not moves.moves[i].promotion):
+                    and not _move_promotes(&moves.moves[i])):
                 reduced = LMR_TABLE[depth][i] if depth < LMR_MAX_D and i < LMR_MAX_M else 1
 
             # PVS + LMR: scout with null window at (potentially reduced) depth
@@ -1306,7 +1285,7 @@ cdef float alphabeta(
             if depth >= 3:
                 for j in range(i):
                     if (moves.moves[j].num_captures == 0
-                            and not moves.moves[j].promotion):
+                            and not _move_promotes(&moves.moves[j])):
                         _update_history_malus(ss, &moves.moves[j], depth)
             break
 
@@ -1412,7 +1391,11 @@ cdef dict cmove_to_dict(CMove *m):
         path.append((m.path_r[i], m.path_c[i]))
     for i in range(m.num_captures):
         captures.append((m.cap_r[i], m.cap_c[i]))
-    return {"path": path, "captures": captures, "promotion": bool(m.promotion)}
+    return {
+        "path": path,
+        "captures": captures,
+        "promotion": bool(_move_promotes(m)),
+    }
 
 
 cdef void _load_board(object state, signed char *board):
@@ -1450,6 +1433,13 @@ cdef Rules _load_rules():
 # ═══════════════════════════════════════════════════════════════════════
 # Public Python API
 # ═══════════════════════════════════════════════════════════════════════
+
+def _fast_evaluate_static(object state) -> float:
+    """Expose the compiled static evaluator for reference-parity tests."""
+    cdef signed char board[64]
+    _load_board(state, board)
+    return evaluate_c(board, int(state.current_player))
+
 
 def fast_search(
     object state,
@@ -1701,7 +1691,7 @@ def apply_move_board(bytes board_bytes, int player, dict move_dict) -> tuple:
         cmove.cap_r[i] = captures[i][0]
         cmove.cap_c[i] = captures[i][1]
 
-    cmove.promotion = bool(move_dict['promotion'])
+    _set_move_metadata(&cmove, bool(move_dict['promotion']), 0)
 
     apply_move_c(board, new_board, &cmove, player)
 
@@ -1787,7 +1777,7 @@ cdef inline bint _same_cmove(CMove *left, CMove *right):
     cdef int i
     if (left.path_len != right.path_len
             or left.num_captures != right.num_captures
-            or left.promotion != right.promotion):
+            or _move_promotes(left) != _move_promotes(right)):
         return False
     for i in range(left.path_len):
         if (left.path_r[i] != right.path_r[i]
