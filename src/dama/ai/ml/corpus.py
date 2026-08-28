@@ -11,7 +11,9 @@ is intentionally ignored because it is not part of the policy input.
 
 from __future__ import annotations
 
+from array import array
 from collections import Counter, defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +25,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import sys
 import tempfile
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
@@ -51,6 +54,29 @@ VALIDATION_SPLIT_VERSION_DEFAULT = 1
 # trained set; the ledger is what makes "never hold out something the model has
 # already fit" checkable across pruning, renaming, and process restarts.
 TRAINED_LEDGER_SCHEMA_VERSION = 1
+
+# The canonical trained-state ledger is a gzip stream of 64-character hashes.
+# Loading millions of them just to retain their leading 64-bit membership
+# fingerprints is expensive on drvfs, so keep an optional, derived binary
+# representation beside it.  A hit still hashes the full canonical source and
+# validates the binary payload before it is trusted.
+_LEDGER_FINGERPRINT_SIDECAR_MAGIC = b"DAMA_LEDGER_FINGERPRINTS_V1\n"
+_LEDGER_FINGERPRINT_SIDECAR_VERSION = 1
+_LEDGER_FINGERPRINT_SIDECAR_HEADER_LIMIT = 4096
+_LEDGER_FINGERPRINT_BYTES = 8
+
+# SHA-256 over immutable snapshot shards is I/O-bound on drvfs.  A small,
+# bounded thread pool overlaps independent reads without multiplying the
+# canonical-state sets that dominate this process's memory footprint.  Keep
+# tiny manifests synchronous so tests and small corpora do not pay pool setup.
+_MANIFEST_HASH_WORKERS = 8
+_PARALLEL_MANIFEST_HASH_MIN_BYTES = 64 * 1024 * 1024
+
+# ``gzip.GzipFile`` text iteration pays substantial per-line overhead for the
+# fixed-width canonical-key files on drvfs.  Small key files can instead take
+# gzip's whole-member C path, while the cap keeps the much larger all-time
+# ledger and any unexpectedly large artifact on the streaming path.
+_STATE_KEYS_BULK_READ_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _posix_relpath(target: Path, start: Path) -> str:
@@ -636,6 +662,24 @@ def _write_state_keys(path: Path, state_keys: Iterable[str]) -> None:
 
 
 def _read_state_keys(path: Path) -> Set[str]:
+    # Snapshot key files are immutable single-member gzip streams written by
+    # ``_write_state_keys``.  Reading the compressed member at once lets zlib
+    # decompress it without hundreds of thousands of TextIO iteration calls.
+    # Check the opened file's size and cap the read itself so a concurrent
+    # in-place growth cannot silently bypass the memory guard.
+    with path.open("rb") as raw_handle:
+        if os.fstat(raw_handle.fileno()).st_size <= _STATE_KEYS_BULK_READ_MAX_BYTES:
+            compressed = raw_handle.read(_STATE_KEYS_BULK_READ_MAX_BYTES + 1)
+            if len(compressed) <= _STATE_KEYS_BULK_READ_MAX_BYTES:
+                text = gzip.decompress(compressed).decode("ascii")
+                return {
+                    line.strip()
+                    for line in text.splitlines()
+                    if line.strip()
+                }
+
+    # Preserve bounded-memory behavior for the multi-million-key trained
+    # ledger and for artifacts outside the normal snapshot-size envelope.
     with gzip.open(path, "rt", encoding="ascii") as handle:
         return {line.strip() for line in handle if line.strip()}
 
@@ -782,12 +826,10 @@ class CorpusSnapshotManager:
         self.validation_fraction = float(validation_fraction)
         self.split_seed = int(split_seed)
         self.min_fresh_fraction = float(min_fresh_fraction)
-        # Snapshots store whole replay shards with storage="copy" (see
-        # _link_or_copy), so each admission costs another full corpus on disk
-        # and nothing ever reclaimed it.  At the steady-state corpus size a
-        # multi-day run exhausts the volume long before its time limit.  Keep
-        # the newest N admissions and drop older ones; 0 keeps every snapshot,
-        # which is the historical behaviour.
+        # Snapshot retention predates shard reuse, so it also bounds legacy
+        # copy-only snapshots.  At steady state, an unbounded history can
+        # exhaust the volume even when new admissions hardlink unchanged
+        # shards.  Keep the newest N admissions; 0 preserves every snapshot.
         self.max_retained_snapshots = int(max_retained_snapshots)
         # Hardlink unchanged shards from the previous snapshot at admission
         # instead of copying the whole corpus again.  Digest-verified before
@@ -830,6 +872,10 @@ class CorpusSnapshotManager:
             Path(value) for value in trained_ledger_seed_roots)
         self._lineage_base_cache: Optional[Tuple[Path, dict, Set[str]]] = None
         self._trained_ledger_cache: Optional[Tuple[Set[str], Set[int]]] = None
+        # Set only after the canonical gzip ledger has been read and verified.
+        # Consumers use this as a source identity for derived caches, never as
+        # a substitute for the ledger's own verification.
+        self._trained_ledger_source_sha256: Optional[str] = None
 
     def set_external_validation_state_keys(self, state_keys: Iterable[str]) -> None:
         """Exclude a frozen external validation suite from every train snapshot."""
@@ -937,6 +983,8 @@ class CorpusSnapshotManager:
         # launcher stores ``files\\replay_*.jsonl``.  On WSL that is one filename
         # containing a backslash, so every stored shard "fails integrity
         # verification" while sitting untouched on disk right next to the manifest.
+        file_checks: List[Tuple[Path, str]] = []
+        total_size = 0
         for record in manifest.get("files", []):
             try:
                 stored = manifest_path.parent / _read_relpath(record["path"])
@@ -946,14 +994,41 @@ class CorpusSnapshotManager:
                 raise RuntimeError(
                     f"Corpus manifest has an invalid file record: {manifest_path}"
                 ) from exc
-            if (
-                not stored.is_file()
-                or stored.stat().st_size != expected_size
-                or replay_file_sha256(stored) != expected_sha256
-            ):
+            if not stored.is_file() or stored.stat().st_size != expected_size:
                 raise RuntimeError(
                     f"Corpus snapshot file failed integrity verification: {stored}"
                 )
+            file_checks.append((stored, expected_sha256))
+            total_size += expected_size
+
+        def _verify_digest(check: Tuple[Path, str]) -> Tuple[Path, bool]:
+            stored, expected_sha256 = check
+            return stored, replay_file_sha256(stored) == expected_sha256
+
+        if (
+            len(file_checks) > 1
+            and total_size >= _PARALLEL_MANIFEST_HASH_MIN_BYTES
+        ):
+            workers = min(_MANIFEST_HASH_WORKERS, len(file_checks))
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="corpus-integrity",
+            ) as pool:
+                digest_results = pool.map(_verify_digest, file_checks)
+                for stored, matches in digest_results:
+                    if not matches:
+                        raise RuntimeError(
+                            "Corpus snapshot file failed integrity "
+                            f"verification: {stored}"
+                        )
+        else:
+            for check in file_checks:
+                stored, matches = _verify_digest(check)
+                if not matches:
+                    raise RuntimeError(
+                        "Corpus snapshot file failed integrity "
+                        f"verification: {stored}"
+                    )
 
         state_keys_name = manifest.get("state_keys_file")
         if not isinstance(state_keys_name, str) or not state_keys_name:
@@ -1133,8 +1208,175 @@ class CorpusSnapshotManager:
         return self.trained_ledger_dir / "trained_state_keys.txt.gz"
 
     @property
+    def _ledger_fingerprints_path(self) -> Path:
+        """Path for the optional, source-verified fingerprint sidecar."""
+
+        return self.trained_ledger_dir / "trained_state_fingerprints.v1.bin"
+
+    @property
     def _ledger_seed_path(self) -> Path:
         return self.trained_ledger_dir / "seed.json"
+
+    @staticmethod
+    def _ledger_source_identity(identity: _ReplayFileIdentity) -> dict:
+        """Serialize the stat fields that invalidate a ledger sidecar."""
+
+        return {
+            "st_dev": identity.st_dev,
+            "st_ino": identity.st_ino,
+            "st_size": identity.st_size,
+            "st_mtime_ns": identity.st_mtime_ns,
+        }
+
+    def _load_ledger_fingerprint_sidecar(self) -> Optional[Set[int]]:
+        """Load a verified binary ledger index, or return ``None`` on a miss.
+
+        The sidecar is strictly an acceleration of the canonical gzip ledger,
+        never an independent source of training history.  Its source stat
+        identity cheaply rejects normal replacements, its recorded SHA-256
+        catches an in-place alteration, and its own payload digest catches a
+        torn or corrupt sidecar.  Every failure deliberately falls through to
+        the established gzip parser.
+        """
+
+        source_path = self._ledger_state_keys_path
+        sidecar_path = self._ledger_fingerprints_path
+        if not source_path.is_file() or not sidecar_path.is_file():
+            return None
+        try:
+            source_identity = _replay_file_identity(source_path)
+            expected_identity = self._ledger_source_identity(source_identity)
+            with sidecar_path.open("rb") as handle:
+                if handle.readline(len(_LEDGER_FINGERPRINT_SIDECAR_MAGIC) + 1) != (
+                    _LEDGER_FINGERPRINT_SIDECAR_MAGIC
+                ):
+                    return None
+                header_line = handle.readline(
+                    _LEDGER_FINGERPRINT_SIDECAR_HEADER_LIMIT + 1)
+                if (
+                    not header_line.endswith(b"\n")
+                    or len(header_line) > _LEDGER_FINGERPRINT_SIDECAR_HEADER_LIMIT
+                ):
+                    return None
+                header = json.loads(header_line)
+                if not isinstance(header, dict):
+                    return None
+                count = header.get("fingerprint_count")
+                if (
+                    header.get("version") != _LEDGER_FINGERPRINT_SIDECAR_VERSION
+                    or header.get("byteorder") != "little"
+                    or header.get("source_identity") != expected_identity
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 0
+                ):
+                    return None
+                source_sha256 = header.get("source_sha256")
+                payload_sha256 = header.get("payload_sha256")
+                if (
+                    not isinstance(source_sha256, str)
+                    or len(source_sha256) != 64
+                    or not isinstance(payload_sha256, str)
+                    or len(payload_sha256) != 64
+                ):
+                    return None
+                payload_offset = handle.tell()
+                expected_size = payload_offset + count * _LEDGER_FINGERPRINT_BYTES
+                if sidecar_path.stat().st_size != expected_size:
+                    return None
+
+                # Re-hash the canonical source before using a persisted index.
+                # An atomic source rewrite changes the stat identity above; the
+                # digest also detects the rare in-place modification case.
+                if _sha256_file_uncached(source_path) != source_sha256:
+                    return None
+                if _replay_file_identity(source_path) != source_identity:
+                    return None
+
+                payload = handle.read()
+            if hashlib.sha256(payload).hexdigest() != payload_sha256:
+                return None
+            if len(payload) != count * _LEDGER_FINGERPRINT_BYTES:
+                return None
+            values = array("Q")
+            if values.itemsize != _LEDGER_FINGERPRINT_BYTES:
+                return None
+            values.frombytes(payload)
+            if sys.byteorder != "little":
+                values.byteswap()
+            fingerprints = set(values)
+            # The source-key representation is a set, so duplicate binary
+            # values mean a malformed sidecar rather than a valid cache hit.
+            if len(fingerprints) != count:
+                return None
+            self._trained_ledger_source_sha256 = source_sha256
+            return fingerprints
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            UnicodeDecodeError,
+            OverflowError,
+        ):
+            return None
+
+    def _write_ledger_fingerprint_sidecar(self, fingerprints: Set[int]) -> None:
+        """Best-effort atomically persist a verified compact ledger index."""
+
+        source_path = self._ledger_state_keys_path
+        sidecar_path = self._ledger_fingerprints_path
+        if not source_path.is_file():
+            return
+        temp_name: Optional[str] = None
+        try:
+            source_identity = _replay_file_identity(source_path)
+            values = array("Q", fingerprints)
+            if values.itemsize != _LEDGER_FINGERPRINT_BYTES:
+                raise RuntimeError("unexpected unsigned-long-long item size")
+            if sys.byteorder != "little":
+                values.byteswap()
+            header = {
+                "version": _LEDGER_FINGERPRINT_SIDECAR_VERSION,
+                "byteorder": "little",
+                "source_identity": self._ledger_source_identity(source_identity),
+                "source_sha256": _sha256_file_uncached(source_path),
+                "fingerprint_count": len(values),
+                "payload_sha256": hashlib.sha256(values).hexdigest(),
+            }
+            if _replay_file_identity(source_path) != source_identity:
+                return
+            # The source digest was calculated from an unchanged canonical
+            # ledger.  Preserve it for any derived cache assembled later in
+            # this manager's verified split preparation.
+            self._trained_ledger_source_sha256 = header["source_sha256"]
+            header_bytes = json.dumps(
+                header, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+            fd, temp_name = tempfile.mkstemp(
+                prefix=sidecar_path.name + ".",
+                suffix=".tmp",
+                dir=sidecar_path.parent,
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(_LEDGER_FINGERPRINT_SIDECAR_MAGIC)
+                handle.write(header_bytes)
+                handle.write(b"\n")
+                values.tofile(handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, sidecar_path)
+            temp_name = None
+        except (OSError, ValueError, TypeError, OverflowError, RuntimeError) as exc:
+            # A sidecar must never make the authoritative ledger unavailable.
+            # Leave a previous sidecar in place, where its source identity will
+            # reject it after a successful canonical-ledger rewrite.
+            print(f"[warn] Could not cache trained-ledger fingerprints: {exc}")
+        finally:
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
 
     def _seed_trained_ledger(self) -> None:
         """Recover the all-time trained set from preserved historical roots.
@@ -1203,6 +1445,9 @@ class CorpusSnapshotManager:
                 "manifest cannot be recovered"
             ),
         })
+        self._write_ledger_fingerprint_sidecar({
+            _state_key_fingerprint(key) for key in state_keys
+        })
         print(
             f"Trained-shard ledger seeded: {len(shard_records)} shard(s), "
             f"{len(state_keys)} canonical state(s) from "
@@ -1242,10 +1487,18 @@ class CorpusSnapshotManager:
                     name = record.get("name")
                     if isinstance(name, str):
                         names.add(name)
-        fingerprints: Set[int] = set()
-        if self._ledger_state_keys_path.is_file():
-            for key in _iter_state_keys(self._ledger_state_keys_path):
-                fingerprints.add(_state_key_fingerprint(key))
+        fingerprints = self._load_ledger_fingerprint_sidecar()
+        if fingerprints is None:
+            fingerprints = set()
+            if self._ledger_state_keys_path.is_file():
+                for key in _iter_state_keys(self._ledger_state_keys_path):
+                    fingerprints.add(_state_key_fingerprint(key))
+                self._write_ledger_fingerprint_sidecar(fingerprints)
+        else:
+            print(
+                "Loaded trained-ledger fingerprint sidecar "
+                f"({len(fingerprints):,} states)."
+            )
         self._trained_ledger_cache = (names, fingerprints)
         return self._trained_ledger_cache
 
@@ -1255,6 +1508,18 @@ class CorpusSnapshotManager:
     def trained_ledger_state_fingerprints(self) -> Set[int]:
         """Membership set used to reject historically trained hold-out states."""
         return set(self._load_trained_ledger()[1])
+
+    def trained_ledger_source_sha256(self) -> Optional[str]:
+        """Return the digest of the canonical ledger verified for this split.
+
+        A caller must first obtain the membership set through the ordinary
+        ledger load path.  This method deliberately triggers that same path,
+        so an unavailable or unverifiable ledger returns ``None`` instead of
+        letting a derived cache claim a source identity it did not verify.
+        """
+
+        self._load_trained_ledger()
+        return self._trained_ledger_source_sha256
 
     def trained_ledger_state_keys(self) -> Set[str]:
         """Full canonical keys, read from disk for auditing.
@@ -1315,6 +1580,8 @@ class CorpusSnapshotManager:
             self._ledger_state_keys_path, state_keys)
         known_fingerprints |= {
             _state_key_fingerprint(key) for key in state_keys}
+        if added_states:
+            self._write_ledger_fingerprint_sidecar(known_fingerprints)
         self._trained_ledger_cache = (known_names, known_fingerprints)
         if new_rows or added_states:
             print(
