@@ -73,3 +73,150 @@ def test_fast_search_binary_smoke(initial_game_state):
     assert move_dict is not None, "_fast_search returned no move on a non-terminal position"
     move = Move.from_dict(move_dict)
     assert move in legal, f"_fast_search returned an illegal move {move}"
+
+
+def test_fast_move_generation_matches_python_on_reachable_positions(
+    initial_game_state,
+):
+    """The compiled generator must preserve the Python oracle's legal moves.
+
+    Capture coordinates are compared as sets because their serialized order is
+    not part of move application, while path order is.  The deterministic walk
+    exercises both quiet and forced-capture positions without making search
+    tie-breaking part of the contract.
+    """
+    if not getattr(search_mod, "_HAS_FAST_SEARCH", False):
+        pytest.skip("Cython _fast_search not built - pure-Python fallback in use")
+
+    from dama.ai.algorithmic._fast_search import fast_generate_moves
+
+    def move_key(move):
+        return (
+            tuple(move.path),
+            frozenset(move.captures),
+            bool(move.promotion),
+        )
+
+    state = initial_game_state
+    saw_capture = False
+    saw_quiet = False
+    for step in range(96):
+        python_moves = state.legal_moves()
+        compiled_moves = [
+            Move.from_dict(move) for move in fast_generate_moves(state)
+        ]
+        assert len(compiled_moves) == len(python_moves)
+        assert {move_key(move) for move in compiled_moves} == {
+            move_key(move) for move in python_moves
+        }
+
+        saw_capture |= any(move.is_capture for move in python_moves)
+        saw_quiet |= any(not move.is_capture for move in python_moves)
+        if not python_moves:
+            state = initial_game_state
+            continue
+        state = state.apply_move(python_moves[(step * 7 + 3) % len(python_moves)])
+
+    assert saw_capture
+    assert saw_quiet
+
+
+def test_fast_capture_generation_matches_python_on_seeded_sparse_boards():
+    """Exercise multi-jump and flying captures beyond one reachable walk."""
+    if not getattr(search_mod, "_HAS_FAST_SEARCH", False):
+        pytest.skip("Cython _fast_search not built - pure-Python fallback in use")
+
+    import random
+
+    from dama.ai.algorithmic._fast_search import fast_generate_moves
+    from dama.board import Board
+    from dama.game_state import GameState
+    from dama.types import Piece, PieceType, Player
+
+    rng = random.Random(20260828)
+    playable = [
+        (row, col)
+        for row in range(8)
+        for col in range(8)
+        if Board.is_playable(row, col)
+    ]
+    saw_capture = False
+    saw_multi_capture = False
+    saw_flying_capture = False
+
+    def move_key(move):
+        return (
+            tuple(move.path),
+            frozenset(move.captures),
+            bool(move.promotion),
+        )
+
+    for case in range(256):
+        current = Player.ONE if case % 2 == 0 else Player.TWO
+        opponent = current.opponent()
+        occupied = rng.sample(playable, rng.randint(4, 10))
+        own_count = rng.randint(1, min(4, len(occupied) - 1))
+        board = Board()
+        for position in occupied[:own_count]:
+            piece_type = (
+                PieceType.KING if rng.random() < 0.45 else PieceType.MAN
+            )
+            board.set_piece(position, Piece(current, piece_type))
+        for position in occupied[own_count:]:
+            piece_type = (
+                PieceType.KING if rng.random() < 0.35 else PieceType.MAN
+            )
+            board.set_piece(position, Piece(opponent, piece_type))
+
+        state = GameState(board, current, case)
+        python_moves = state.legal_moves()
+        compiled_moves = [
+            Move.from_dict(move) for move in fast_generate_moves(state)
+        ]
+        assert len(compiled_moves) == len(python_moves), case
+        assert {move_key(move) for move in compiled_moves} == {
+            move_key(move) for move in python_moves
+        }, case
+
+        saw_capture |= any(move.is_capture for move in python_moves)
+        saw_multi_capture |= any(
+            move.num_captures > 1 for move in python_moves
+        )
+        saw_flying_capture |= any(
+            move.is_capture and board.get_piece(move.start).is_king
+            for move in python_moves
+        )
+
+    assert saw_capture
+    assert saw_multi_capture
+    assert saw_flying_capture
+
+
+def test_fast_static_evaluation_matches_python_on_reachable_positions(
+    initial_game_state,
+):
+    """The table-driven evaluator must preserve every reference score term."""
+    if not getattr(search_mod, "_HAS_FAST_SEARCH", False):
+        pytest.skip("Cython _fast_search not built - pure-Python fallback in use")
+
+    from dama.ai.algorithmic._fast_search import _fast_evaluate_static
+    from dama.ai.algorithmic.eval import _evaluate_material, _evaluate_position
+
+    state = initial_game_state
+    seen_players = set()
+    for step in range(96):
+        current = state.current_player
+        opponent = current.opponent()
+        expected = _evaluate_material(
+            state.board, current, opponent
+        ) + _evaluate_position(state.board, current, opponent)
+        assert _fast_evaluate_static(state) == expected
+        seen_players.add(current)
+
+        moves = state.legal_moves()
+        if not moves:
+            state = initial_game_state
+            continue
+        state = state.apply_move(moves[(step * 7 + 3) % len(moves)])
+
+    assert len(seen_players) == 2
