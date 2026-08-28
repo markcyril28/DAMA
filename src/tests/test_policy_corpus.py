@@ -1,6 +1,7 @@
 import json
 import gzip
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -1085,6 +1086,75 @@ def test_replay_hash_cache_reuses_and_invalidates_by_file_identity(
     changed = corpus.replay_file_sha256(path)
     assert changed != first
     assert hash_calls == 2
+
+
+def test_large_manifest_hashes_in_parallel_and_still_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent shard reads overlap without weakening digest checks."""
+    from dama.ai.ml import corpus
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    decision = manager.consider_snapshot(
+        {"difficulty": "hard"},
+        {"played_action_probability": 0.10},
+        {"algorithm_fraction": 0.70, "model_fraction": 0.30},
+    )
+    assert decision.manifest_path is not None
+    manifest = json.loads(decision.manifest_path.read_text(encoding="utf-8"))
+    expected = {
+        decision.manifest_path.parent / record["path"]: record["sha256"]
+        for record in manifest["files"]
+    }
+    assert len(expected) > 1
+
+    monkeypatch.setattr(corpus, "_PARALLEL_MANIFEST_HASH_MIN_BYTES", 0)
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    calls = 0
+    active = 0
+    peak_active = 0
+
+    def coordinated_hash(path: Path) -> str:
+        nonlocal calls, active, peak_active
+        with lock:
+            calls += 1
+            ordinal = calls
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            if ordinal <= 2:
+                barrier.wait(timeout=2.0)
+            return expected[path]
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(corpus, "replay_file_sha256", coordinated_hash)
+    verified = manager._verify_manifest_integrity(
+        decision.manifest_path, manifest, "training_snapshot")
+    assert verified
+    assert calls == len(expected)
+    assert peak_active >= 2
+
+    bad_path = next(iter(expected))
+    monkeypatch.setattr(
+        corpus,
+        "replay_file_sha256",
+        lambda path: "0" * 64 if path == bad_path else expected[path],
+    )
+    with pytest.raises(RuntimeError, match="failed integrity verification"):
+        manager._verify_manifest_integrity(
+            decision.manifest_path, manifest, "training_snapshot")
 
 
 def test_malformed_replay_json_is_never_cached(
