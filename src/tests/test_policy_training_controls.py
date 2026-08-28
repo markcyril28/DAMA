@@ -2185,6 +2185,34 @@ def test_policy_yaml_resolves_all_recovery_controls(
     assert config.enhanced_output_namespace == "policy_distillation_enhanced_p5_wd1e4"
 
 
+@pytest.mark.parametrize(
+    (
+        "profile",
+        "expected_compression",
+        "expected_validation_cache",
+        "expected_validation_compression",
+    ),
+    [
+        (None, True, "dama_policy_distillation_recovery_c174k_validation_cache.pt", False),
+        ("server", False, "policy_distillation_recovery_c174k_server_validation_cache.pt", False),
+    ],
+)
+def test_active_policy_yaml_scopes_cache_compression_to_local(
+    profile: str | None,
+    expected_compression: bool,
+    expected_validation_cache: str,
+    expected_validation_compression: bool,
+) -> None:
+    """The disk-constrained local cache must not change server warm-start I/O."""
+    root = Path(__file__).resolve().parents[2]
+    path = root / "config" / "training_config_policy_distillation_c174k.yaml"
+    config = config_from_yaml(load_config_from_yaml(str(path), profile))
+
+    assert config.ram_cache_compress is expected_compression
+    assert config.validation_tensor_cache_file.endswith(expected_validation_cache)
+    assert config.validation_tensor_cache_compress is expected_validation_compression
+
+
 def _rng_state_holder():
     """A minimal Trainer stand-in for the RNG-restore paths."""
     holder = object.__new__(Trainer)
@@ -3073,6 +3101,103 @@ def test_ram_cache_gate_falls_back_to_the_prelaunch_reading(
     assert "gate satisfied by pre-load (19.6GB)" in out
 
 
+def test_cached_tensor_dataset_save_compresses_and_preserves_prior_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failed compressed write must leave the last warm cache readable."""
+    import torch
+
+    from dama.ai.ml import dataset as dataset_module
+    from dama.ai.ml.dataset import CachedTensorDataset
+
+    dataset = CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    cache_file = tmp_path / "cache.pt"
+    dataset.save(
+        str(cache_file), metadata={"source": "test"}, compress=True)
+
+    before = cache_file.read_bytes()
+    assert before[:2] == b"\x1f\x8b"
+    restored = CachedTensorDataset.load(str(cache_file), require_complete=True)
+    assert restored.metadata["source"] == "test"
+    for field in (
+        "boards", "move_features", "move_counts", "targets",
+        "reward_weights", "value_targets",
+    ):
+        assert torch.equal(getattr(restored, field), getattr(dataset, field))
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("simulated cache write failure")
+
+    monkeypatch.setattr(dataset_module.torch, "save", fail_save)
+    with pytest.raises(OSError, match="simulated cache write failure"):
+        dataset.save(
+            str(cache_file), metadata={"source": "replacement"}, compress=True)
+
+    assert cache_file.read_bytes() == before
+    assert not list(tmp_path.glob(f".{cache_file.name}.*.tmp"))
+
+
+def test_cached_tensor_dataset_loads_legacy_raw_cache(tmp_path: Path) -> None:
+    """Compression keeps pre-existing direct torch.save cache files readable."""
+    import torch
+
+    from dama.ai.ml.dataset import CachedTensorDataset
+
+    dataset = CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    cache_file = tmp_path / "legacy-cache.pt"
+    torch.save({
+        "boards": dataset.boards,
+        "move_features": dataset.move_features,
+        "move_counts": dataset.move_counts,
+        "targets": dataset.targets,
+        "reward_weights": dataset.reward_weights,
+        "value_targets": dataset.value_targets,
+        "metadata": {"legacy": True},
+    }, cache_file)
+
+    restored = CachedTensorDataset.load(str(cache_file), require_complete=True)
+    assert restored.metadata == {"legacy": True}
+    assert torch.equal(restored.boards, dataset.boards)
+    assert torch.equal(restored.move_features, dataset.move_features)
+
+
+def test_matching_raw_tensor_cache_migrates_when_compression_is_requested(
+    tmp_path: Path,
+) -> None:
+    """A compression-enabled warm start atomically upgrades a valid raw cache."""
+    import torch
+
+    from dama.ai.ml.dataset import (
+        CachedTensorDataset,
+        load_matching_cached_tensor_dataset,
+    )
+
+    dataset = CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    cache_file = tmp_path / "legacy-cache.pt"
+    source_key = {
+        "cache_version": 3,
+        "max_moves_per_sample": 8,
+        "entry_count": len(dataset),
+    }
+    dataset.save(str(cache_file), metadata=source_key)
+    assert cache_file.read_bytes()[:2] != b"\x1f\x8b"
+
+    restored = load_matching_cached_tensor_dataset(
+        str(cache_file),
+        {"cache_version": 3, "max_moves_per_sample": 8},
+        migrate_to_compressed=True,
+    )
+
+    assert restored is not None
+    assert cache_file.read_bytes()[:2] == b"\x1f\x8b"
+    assert restored.metadata["entry_count"] == len(dataset)
+    assert torch.equal(restored.boards, dataset.boards)
+    assert torch.equal(restored.move_features, dataset.move_features)
+
+
 def test_manifest_keyed_tensor_cache_requires_the_complete_source_key(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -3116,8 +3241,10 @@ def test_manifest_keyed_tensor_cache_requires_the_complete_source_key(
         prelaunch_free_ram_gb=20.0,
         cache_metadata=source_key,
         load_existing_cache=False,
+        compress_cache=True,
     )
     assert isinstance(loader, FastBatchIterator)
+    assert cache_file.read_bytes()[:2] == b"\x1f\x8b"
 
     expected_key = dict(source_key)
     expected_key.pop("side_weight_balance")
@@ -3296,6 +3423,7 @@ def test_prepare_training_split_uses_verified_manifest_cache_before_train_parse(
         ram_cache_enabled=True,
         ram_cache_file=str(tmp_path / "cache.pt"),
         ram_cache_threshold_gb=16.0,
+        ram_cache_compress=True,
         max_moves_per_sample=8,
     )
     holder._stopped = False
@@ -3307,9 +3435,10 @@ def test_prepare_training_split_uses_verified_manifest_cache_before_train_parse(
     holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
 
     observed = {}
-    def load_cache(path, metadata):
+    def load_cache(path, metadata, *, migrate_to_compressed=False):
         observed["path"] = path
         observed["metadata"] = metadata
+        observed["migrate_to_compressed"] = migrate_to_compressed
         return cached_dataset
 
     monkeypatch.setattr(
@@ -3323,6 +3452,228 @@ def test_prepare_training_split_uses_verified_manifest_cache_before_train_parse(
     assert holder._preloaded_snapshot_dataset is cached_dataset
     assert observed["path"] == str(tmp_path / "cache.pt")
     assert observed["metadata"]["snapshot_fingerprint"] == "d" * 64
+    assert observed["migrate_to_compressed"] is True
+
+
+def test_validation_tensor_cache_key_tracks_verified_sources() -> None:
+    """A held-out cache must miss when any leakage-relevant source changes."""
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        policy_stage="policy_only",
+        validation_tensor_cache_file="validation-cache.pt",
+        max_moves_per_sample=8,
+    )
+    holder._snapshot_manager = SimpleNamespace(
+        trained_ledger_source_sha256=lambda: "a" * 64)
+    context = SimpleNamespace(
+        validation_manifest={"files": [{"sha256": "source-a"}]},
+        validation_keys={"held-out-state"},
+    )
+
+    baseline = Trainer._validation_tensor_cache_metadata(holder, context)
+    assert baseline is not None
+
+    context.validation_keys.add("frozen-suite-state")
+    changed_exclusions = Trainer._validation_tensor_cache_metadata(holder, context)
+    assert changed_exclusions is not None
+    assert (
+        changed_exclusions["validation_exclusion_keys_sha256"]
+        != baseline["validation_exclusion_keys_sha256"]
+    )
+
+    context.validation_manifest["files"][0]["sha256"] = "source-b"
+    changed_manifest = Trainer._validation_tensor_cache_metadata(holder, context)
+    assert changed_manifest is not None
+    assert (
+        changed_manifest["validation_manifest_sha256"]
+        != changed_exclusions["validation_manifest_sha256"]
+    )
+
+    holder._snapshot_manager = SimpleNamespace(
+        trained_ledger_source_sha256=lambda: "b" * 64)
+    changed_ledger = Trainer._validation_tensor_cache_metadata(holder, context)
+    assert changed_ledger is not None
+    assert (
+        changed_ledger["trained_ledger_source_sha256"]
+        != changed_manifest["trained_ledger_source_sha256"]
+    )
+
+
+def test_verified_validation_tensor_cache_bypasses_replay_materialization(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A matching cache may skip only the already-verified held-out parse."""
+    cached_dataset = trainer_module.CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    manifest_path = tmp_path / "snapshot_v000001" / "manifest.json"
+    context = SimpleNamespace(
+        manifest={"fingerprint": "d" * 64},
+        validation_manifest={"files": [{"sha256": "validation-source"}]},
+        validation_keys={"held-out-state"},
+    )
+
+    class FakeSnapshotManager:
+        external_validation_state_keys = set()
+
+        def consider_snapshot(self, **_kwargs):
+            return SnapshotDecision(True, "admitted", manifest_path, {})
+
+        def snapshot_matches_settings(self, *_args, **_kwargs):
+            return True
+
+        def prepare_split(self, path, max_train_entries=0):
+            assert path == manifest_path
+            assert max_train_entries == 100
+            return context
+
+        def trained_ledger_source_sha256(self):
+            return "e" * 64
+
+        def load_validation_entries(self, _received):
+            raise AssertionError("matching cache must skip validation replay parsing")
+
+        def load_train_entries(self, _received):
+            return ["train"]
+
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = FakeSnapshotManager()
+    holder.config = SimpleNamespace(
+        selfplay_games=72,
+        replay_max_entries=100,
+        policy_stage="policy_only",
+        ram_cache_enabled=False,
+        ram_cache_file=None,
+        ram_cache_threshold_gb=16.0,
+        ram_cache_compress=True,
+        validation_tensor_cache_file=str(tmp_path / "validation-cache.pt"),
+        max_moves_per_sample=8,
+    )
+    holder._stopped = False
+    holder.step = 7
+    holder._corpus_settings = lambda *_, **__: ({}, {}, {})
+    holder._activate_dataset_manifest = lambda _manifest: None
+    holder._service_control_queue = lambda: None
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+
+    expected = Trainer._validation_tensor_cache_metadata(holder, context)
+    assert expected is not None
+    cached_dataset.metadata = {
+        **expected,
+        "entry_count": len(cached_dataset),
+        "validation_leakage": {
+            "ledger_enabled": True,
+            "all_time_trained_state_count": 9,
+            "removed_validation_entry_count": 2,
+            "removed_validation_state_count": 1,
+            "retained_validation_entry_count": len(cached_dataset),
+        },
+    }
+    observed = {}
+
+    def load_cache(path, metadata, *, migrate_to_compressed=False):
+        observed["path"] = path
+        observed["metadata"] = metadata
+        observed["migrate_to_compressed"] = migrate_to_compressed
+        return cached_dataset
+
+    monkeypatch.setattr(
+        trainer_module, "load_matching_cached_tensor_dataset", load_cache)
+
+    train, validation = Trainer._prepare_training_split(holder)
+
+    assert train == ["train"]
+    assert validation == []
+    assert holder._preloaded_validation_dataset is cached_dataset
+    assert holder._preloaded_validation_cache_metadata is None
+    assert context.manifest["validation_leakage"]["retained_validation_entry_count"] == len(cached_dataset)
+    assert observed["path"] == str(tmp_path / "validation-cache.pt")
+    assert observed["metadata"] == expected
+    assert observed["migrate_to_compressed"] is False
+
+
+def test_validation_tensor_cache_rejects_malformed_leakage_accounting(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A cache cannot publish invented held-out leakage statistics."""
+    cached_dataset = trainer_module.CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        validation_tensor_cache_file=str(tmp_path / "validation-cache.pt"),
+        validation_tensor_cache_compress=False,
+    )
+    expected = {
+        "cache_version": 3,
+        "validation_tensor_cache_version": 1,
+        "validation_manifest_sha256": "a" * 64,
+        "validation_exclusion_keys_sha256": "b" * 64,
+        "trained_ledger_source_sha256": "c" * 64,
+        "max_moves_per_sample": 8,
+        "encoding_version": trainer_module.ENCODING_VERSION,
+        "policy_stage": "policy_only",
+    }
+    cached_dataset.metadata = {
+        **expected,
+        "entry_count": len(cached_dataset),
+        "validation_leakage": {
+            "ledger_enabled": True,
+            "all_time_trained_state_count": 9,
+            "removed_validation_entry_count": 1,
+            "removed_validation_state_count": 2,
+            "retained_validation_entry_count": len(cached_dataset),
+        },
+    }
+    monkeypatch.setattr(
+        trainer_module,
+        "load_matching_cached_tensor_dataset",
+        lambda *_args, **_kwargs: cached_dataset,
+    )
+
+    assert Trainer._load_matching_validation_tensor_cache(holder, expected) is None
+
+
+def test_validation_tensor_cache_persists_verified_leakage_metadata(
+    tmp_path: Path,
+) -> None:
+    """The saved held-out cache carries its source key and leakage accounting."""
+    from dama.ai.ml.dataset import load_matching_cached_tensor_dataset
+
+    holder = object.__new__(Trainer)
+    cache_path = tmp_path / "validation-cache.pt"
+    expected = {
+        "cache_version": 3,
+        "validation_tensor_cache_version": 1,
+        "validation_manifest_sha256": "a" * 64,
+        "validation_exclusion_keys_sha256": "b" * 64,
+        "trained_ledger_source_sha256": "c" * 64,
+        "max_moves_per_sample": 8,
+        "encoding_version": trainer_module.ENCODING_VERSION,
+        "policy_stage": "policy_only",
+    }
+    holder.config = SimpleNamespace(
+        policy_stage="policy_only",
+        max_moves_per_sample=8,
+        validation_tensor_cache_file=str(cache_path),
+        ram_cache_compress=True,
+    )
+    holder._active_snapshot_manifest = {
+        "validation_leakage": {
+            "ledger_enabled": True,
+            "all_time_trained_state_count": 9,
+            "removed_validation_entry_count": 2,
+            "removed_validation_state_count": 1,
+            "retained_validation_entry_count": len(_tiny_replay_entries()),
+        }
+    }
+
+    Trainer._set_validation_entries(
+        holder, _tiny_replay_entries(), cache_metadata=expected)
+
+    cached = load_matching_cached_tensor_dataset(
+        str(cache_path), expected, migrate_to_compressed=False)
+    assert cached is not None
+    assert cached.metadata["validation_leakage"] == holder._active_snapshot_manifest[
+        "validation_leakage"]
 
 
 def test_snapshot_tensor_cache_requires_a_prelaunch_ram_measurement() -> None:
