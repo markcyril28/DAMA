@@ -14,6 +14,7 @@ from unittest import mock
 
 import pytest
 
+import dama.ai.ml.corpus as corpus
 from dama.ai.ml.corpus import _read_state_keys, _write_state_keys
 
 
@@ -26,6 +27,42 @@ def test_write_state_keys_is_round_trip_stable(tmp_path: Path) -> None:
     # Sorted on disk so lineage diffs are deterministic.
     raw = gzip.decompress(path.read_bytes()).decode("ascii")
     assert raw == "k1\nk2\nk3\n"
+
+
+def test_read_state_keys_uses_bulk_gzip_for_bounded_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "canonical_state_keys.txt.gz"
+    _write_state_keys(path, ["k3", "k1", "k2"])
+    real_decompress = corpus.gzip.decompress
+    calls = []
+
+    def recording_decompress(value: bytes) -> bytes:
+        calls.append(value)
+        return real_decompress(value)
+
+    monkeypatch.setattr(corpus.gzip, "decompress", recording_decompress)
+
+    assert _read_state_keys(path) == {"k1", "k2", "k3"}
+    assert len(calls) == 1
+    assert calls[0] == path.read_bytes()
+
+
+def test_read_state_keys_streams_above_bulk_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "canonical_state_keys.txt.gz"
+    _write_state_keys(path, ["k3", "k1", "k2"])
+    monkeypatch.setattr(corpus, "_STATE_KEYS_BULK_READ_MAX_BYTES", 0)
+
+    def unexpected_decompress(_value: bytes) -> bytes:
+        raise AssertionError("large canonical-key files must stream")
+
+    monkeypatch.setattr(corpus.gzip, "decompress", unexpected_decompress)
+
+    assert _read_state_keys(path) == {"k1", "k2", "k3"}
 
 
 def test_write_state_keys_leaves_no_truncated_target_on_failure(
