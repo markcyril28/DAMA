@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import dama.ai.ml.corpus as corpus
 from dama.ai.ml.corpus import CorpusSnapshotManager
 
 
@@ -538,6 +539,136 @@ def test_ledger_records_each_admission_and_survives_snapshot_pruning(
     # are still known to have been trained on.
     reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
     assert first_names <= reopened.trained_ledger_shard_names()
+
+
+def test_ledger_fingerprint_sidecar_skips_text_parse_only_after_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching binary index is an accelerator, never a second ledger."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert manager.consider_snapshot(TEACHER, NOISE, GENERATION).admitted
+    expected = manager.trained_ledger_state_fingerprints()
+    assert manager._ledger_fingerprints_path.is_file()
+
+    # A fresh manager must hash both artifacts but must not inflate the gzip
+    # ledger into Python strings when the source-verified sidecar still matches.
+    def unexpected_text_parse(_path: Path):
+        raise AssertionError("matching ledger sidecar should bypass gzip parsing")
+        yield ""  # pragma: no cover, keeps this a generator for the type checker
+
+    monkeypatch.setattr(corpus, "_iter_state_keys", unexpected_text_parse)
+    reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert reopened.trained_ledger_state_fingerprints() == expected
+
+
+def test_trained_ledger_source_digest_tracks_the_verified_canonical_gzip(
+    tmp_path: Path,
+) -> None:
+    """Derived caches can key on a ledger only after its source is verified."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert manager.consider_snapshot(TEACHER, NOISE, GENERATION).admitted
+
+    expected = corpus._sha256_file_uncached(manager._ledger_state_keys_path)
+    assert manager.trained_ledger_source_sha256() == expected
+
+    # A fresh manager receives the same digest through the source-verified
+    # sidecar hit, not by trusting a persisted sidecar header alone.
+    reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert reopened.trained_ledger_source_sha256() == expected
+
+
+def test_ledger_fingerprint_sidecar_rebuilds_after_canonical_source_update(
+    tmp_path: Path,
+) -> None:
+    """An atomic ledger rewrite invalidates its previous binary sidecar."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert manager.consider_snapshot(TEACHER, NOISE, GENERATION).admitted
+    manager.trained_ledger_state_fingerprints()
+    sidecar = manager._ledger_fingerprints_path
+    before = sidecar.read_bytes()
+
+    added_key = f"{(1 << 63) + 12345:064x}"
+    assert corpus._merge_state_keys_file(
+        manager._ledger_state_keys_path, {added_key}
+    ) == 1
+    reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert corpus._state_key_fingerprint(added_key) in (
+        reopened.trained_ledger_state_fingerprints()
+    )
+    assert sidecar.read_bytes() != before
+
+
+def test_ledger_fingerprint_sidecar_corruption_rebuilds_from_source(
+    tmp_path: Path,
+) -> None:
+    """A malformed derived index cannot suppress the canonical gzip ledger."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert manager.consider_snapshot(TEACHER, NOISE, GENERATION).admitted
+    expected = manager.trained_ledger_state_fingerprints()
+    sidecar = manager._ledger_fingerprints_path
+    sidecar.write_bytes(b"not-a-valid-ledger-sidecar")
+
+    reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert reopened.trained_ledger_state_fingerprints() == expected
+    assert sidecar.read_bytes().startswith(corpus._LEDGER_FINGERPRINT_SIDECAR_MAGIC)
+
+
+def test_ledger_fingerprint_sidecar_rejects_source_digest_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source-digest mismatch must fall back to the canonical gzip parser."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert manager.consider_snapshot(TEACHER, NOISE, GENERATION).admitted
+    expected = manager.trained_ledger_state_fingerprints()
+    source_path = manager._ledger_state_keys_path
+    real_sha256 = corpus._sha256_file_uncached
+    real_iter = corpus._iter_state_keys
+    hash_calls = 0
+    parse_calls = 0
+
+    def stale_once(path: Path) -> str:
+        nonlocal hash_calls
+        if Path(path) == source_path and hash_calls == 0:
+            hash_calls += 1
+            return "0" * 64
+        return real_sha256(path)
+
+    def track_text_parse(path: Path):
+        nonlocal parse_calls
+        parse_calls += 1
+        yield from real_iter(path)
+
+    monkeypatch.setattr(corpus, "_sha256_file_uncached", stale_once)
+    monkeypatch.setattr(corpus, "_iter_state_keys", track_text_parse)
+    reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert reopened.trained_ledger_state_fingerprints() == expected
+    assert hash_calls == 1
+    assert parse_calls == 1
 
 
 def test_load_split_removes_hold_out_states_the_ledger_says_were_trained(
