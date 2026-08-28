@@ -1167,7 +1167,7 @@ static int __Pyx_init_co_variables(void) {
         return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     }
     #endif
-
+    
 #include <stdlib.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -1582,7 +1582,7 @@ struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_SearchState;
 
 /* "dama/ai/algorithmic/_fast_search.pyx":69
  * DEF NUM_KILLERS = 2
- *
+ * 
  * cdef struct CMove:             # <<<<<<<<<<<<<<
  *     int path_r[MAX_PATH]
  *     int path_c[MAX_PATH]
@@ -1601,7 +1601,7 @@ struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMove {
 
 /* "dama/ai/algorithmic/_fast_search.pyx":80
  *     int to_sq                 # path_r[path_len-1]*8 + path_c[path_len-1]
- *
+ * 
  * cdef struct CMoveList:             # <<<<<<<<<<<<<<
  *     CMove moves[MAX_MOVES]
  *     int count
@@ -1612,7 +1612,7 @@ struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList {
 };
 
 /* "dama/ai/algorithmic/_fast_search.pyx":99
- *
+ * 
  * #  Rule flags (packed into a single struct for efficient passing)
  * cdef struct Rules:             # <<<<<<<<<<<<<<
  *     bint forced_capture
@@ -1626,7 +1626,7 @@ struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules {
 
 /* "dama/ai/algorithmic/_fast_search.pyx":259
  * DEF TT_FLAG_MASK = 3            # 0x03  2 bits for flag
- *
+ * 
  * cdef struct TTEntry:             # <<<<<<<<<<<<<<
  *     unsigned long long hash_key  # 8 bytes: full hash for collision verification
  *     float score                  # 4 bytes
@@ -1640,9 +1640,9 @@ struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_TTEntry {
   unsigned char best_to;
 };
 
-/* "dama/ai/algorithmic/_fast_search.pyx":918
+/* "dama/ai/algorithmic/_fast_search.pyx":916
  * #
- *
+ * 
  * cdef struct SearchState:             # <<<<<<<<<<<<<<
  *     double deadline
  *     int nodes
@@ -2532,9 +2532,9 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_move_dirs(int, i
 static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_capture_dirs(int, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, int **, int **, int *); /*proto*/
 static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves(signed char *, int, int, int, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
 static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__add_simple_move(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *, int, int, int, int, int); /*proto*/
-static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(signed char *, int, int, int, int, int, int *, int *, int, int *, int *, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
-static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(signed char *, int, int, int, int, int, int, int, int *, int *, int, int *, int *, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
-static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *, int *, int *, int, int *, int *, int, int, int); /*proto*/
+static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(signed char *, int, int, int, int, int, int *, int, int *, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
+static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(signed char *, int, int, int, int, int, int, int, int *, int, int *, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
+static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *, int *, int, int *, int, int, int); /*proto*/
 static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures(signed char *, int, int, int, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
 static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(signed char *, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
 static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only_c(signed char *, int, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *); /*proto*/
@@ -2874,32 +2874,32 @@ return 0;
 /* #### Code section: module_code ### */
 
 /* "dama/ai/algorithmic/_fast_search.pyx":85
- *
- *
+ * 
+ * 
  * cdef inline bint _move_promotes(CMove *move) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return (move.metadata & 1) != 0
- *
+ * 
 */
 
 static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_promotes(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMove *__pyx_v_move) {
   int __pyx_r;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":86
- *
+ * 
  * cdef inline bint _move_promotes(CMove *move) noexcept nogil:
  *     return (move.metadata & 1) != 0             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = ((__pyx_v_move->metadata & 1) != 0);
   goto __pyx_L0;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":85
- *
- *
+ * 
+ * 
  * cdef inline bint _move_promotes(CMove *move) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return (move.metadata & 1) != 0
- *
+ * 
 */
 
   /* function exit code */
@@ -2908,32 +2908,32 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_pr
 }
 
 /* "dama/ai/algorithmic/_fast_search.pyx":89
- *
- *
+ * 
+ * 
  * cdef inline int _move_capture_value(CMove *move) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return move.metadata >> 1
- *
+ * 
 */
 
 static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_capture_value(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMove *__pyx_v_move) {
   int __pyx_r;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":90
- *
+ * 
  * cdef inline int _move_capture_value(CMove *move) noexcept nogil:
  *     return move.metadata >> 1             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = (__pyx_v_move->metadata >> 1);
   goto __pyx_L0;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":89
- *
- *
+ * 
+ * 
  * cdef inline int _move_capture_value(CMove *move) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return move.metadata >> 1
- *
+ * 
 */
 
   /* function exit code */
@@ -2942,8 +2942,8 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_ca
 }
 
 /* "dama/ai/algorithmic/_fast_search.pyx":93
- *
- *
+ * 
+ * 
  * cdef inline void _set_move_metadata(             # <<<<<<<<<<<<<<
  *     CMove *move, bint promotion, int capture_value
  * ) noexcept nogil:
@@ -2956,7 +2956,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__set_mo
  *     CMove *move, bint promotion, int capture_value
  * ) noexcept nogil:
  *     move.metadata = (capture_value << 1) | (1 if promotion else 0)             # <<<<<<<<<<<<<<
- *
+ * 
  * #  Rule flags (packed into a single struct for efficient passing)
 */
   if (__pyx_v_promotion) {
@@ -2967,8 +2967,8 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__set_mo
   __pyx_v_move->metadata = ((__pyx_v_capture_value << 1) | __pyx_t_1);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":93
- *
- *
+ * 
+ * 
  * cdef inline void _set_move_metadata(             # <<<<<<<<<<<<<<
  *     CMove *move, bint promotion, int capture_value
  * ) noexcept nogil:
@@ -2979,7 +2979,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__set_mo
 
 /* "dama/ai/algorithmic/_fast_search.pyx":137
  * cdef int CENTER_DIST[64]
- *
+ * 
  * cdef void _init_center():             # <<<<<<<<<<<<<<
  *     cdef int i, r, c
  *     for i in range(64):
@@ -3067,7 +3067,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_center(void) {
  *     for r in range(8):
  *         for c in range(8):             # <<<<<<<<<<<<<<
  *             CENTER_DIST[r * 8 + c] = 7 - <int>(fabs(3.5 - r) + fabs(3.5 - c))
- *
+ * 
 */
     for (__pyx_t_2 = 0; __pyx_t_2 < 8; __pyx_t_2+=1) {
       __pyx_v_c = __pyx_t_2;
@@ -3076,7 +3076,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_center(void) {
  *     for r in range(8):
  *         for c in range(8):
  *             CENTER_DIST[r * 8 + c] = 7 - <int>(fabs(3.5 - r) + fabs(3.5 - c))             # <<<<<<<<<<<<<<
- *
+ * 
  * _init_center()
 */
       (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_CENTER_DIST[((__pyx_v_r * 8) + __pyx_v_c)]) = (7 - ((int)(fabs((3.5 - __pyx_v_r)) + fabs((3.5 - __pyx_v_c)))));
@@ -3085,7 +3085,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_center(void) {
 
   /* "dama/ai/algorithmic/_fast_search.pyx":137
  * cdef int CENTER_DIST[64]
- *
+ * 
  * cdef void _init_center():             # <<<<<<<<<<<<<<
  *     cdef int i, r, c
  *     for i in range(64):
@@ -3096,7 +3096,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_center(void) {
 
 /* "dama/ai/algorithmic/_fast_search.pyx":164
  * cdef int DARK_SQ_C[32]     # col
- *
+ * 
  * cdef void _init_dark_sq():             # <<<<<<<<<<<<<<
  *     cdef int i = 0, r, c
  *     for r in range(8):
@@ -3111,7 +3111,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_dark_sq(void) {
   int __pyx_t_3;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":165
- *
+ * 
  * cdef void _init_dark_sq():
  *     cdef int i = 0, r, c             # <<<<<<<<<<<<<<
  *     for r in range(8):
@@ -3172,7 +3172,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_dark_sq(void) {
  *                 DARK_SQ_R[i] = r
  *                 DARK_SQ_C[i] = c             # <<<<<<<<<<<<<<
  *                 i += 1
- *
+ * 
 */
         (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_C[__pyx_v_i]) = __pyx_v_c;
 
@@ -3180,7 +3180,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_dark_sq(void) {
  *                 DARK_SQ_R[i] = r
  *                 DARK_SQ_C[i] = c
  *                 i += 1             # <<<<<<<<<<<<<<
- *
+ * 
  * _init_dark_sq()
 */
         __pyx_v_i = (__pyx_v_i + 1);
@@ -3198,7 +3198,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_dark_sq(void) {
 
   /* "dama/ai/algorithmic/_fast_search.pyx":164
  * cdef int DARK_SQ_C[32]     # col
- *
+ * 
  * cdef void _init_dark_sq():             # <<<<<<<<<<<<<<
  *     cdef int i = 0, r, c
  *     for r in range(8):
@@ -3209,7 +3209,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_dark_sq(void) {
 
 /* "dama/ai/algorithmic/_fast_search.pyx":183
  * cdef int EVAL_P1[5][64]
- *
+ * 
  * cdef void _init_eval_table() noexcept nogil:             # <<<<<<<<<<<<<<
  *     cdef int sq, r, center
  *     for sq in range(64):
@@ -3295,7 +3295,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_eval_table(void
  *         EVAL_P1[P1_KING][sq] = W_KING + center + (W_BACK_RANK if r == 0 else 0)
  *         EVAL_P1[P2_MAN][sq] = -W_MAN - (7 - r) * W_ADVANCEMENT - center             # <<<<<<<<<<<<<<
  *         EVAL_P1[P2_KING][sq] = -W_KING - center - (W_BACK_RANK if r == 7 else 0)
- *
+ * 
 */
     ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search_EVAL_P1[3])[__pyx_v_sq]) = ((-100L - ((7 - __pyx_v_r) * 2)) - __pyx_v_center);
 
@@ -3303,7 +3303,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_eval_table(void
  *         EVAL_P1[P1_KING][sq] = W_KING + center + (W_BACK_RANK if r == 0 else 0)
  *         EVAL_P1[P2_MAN][sq] = -W_MAN - (7 - r) * W_ADVANCEMENT - center
  *         EVAL_P1[P2_KING][sq] = -W_KING - center - (W_BACK_RANK if r == 7 else 0)             # <<<<<<<<<<<<<<
- *
+ * 
  * _init_eval_table()
 */
     __pyx_t_4 = (__pyx_v_r == 7);
@@ -3317,7 +3317,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_eval_table(void
 
   /* "dama/ai/algorithmic/_fast_search.pyx":183
  * cdef int EVAL_P1[5][64]
- *
+ * 
  * cdef void _init_eval_table() noexcept nogil:             # <<<<<<<<<<<<<<
  *     cdef int sq, r, center
  *     for sq in range(64):
@@ -3328,7 +3328,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_eval_table(void
 
 /* "dama/ai/algorithmic/_fast_search.pyx":208
  * cdef int LMR_TABLE[33][65]
- *
+ * 
  * cdef void _init_lmr_table() noexcept nogil:             # <<<<<<<<<<<<<<
  *     cdef int d, m, r
  *     for d in range(LMR_MAX_D):
@@ -3453,7 +3453,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_lmr_table(void)
  *                 if r > d - 2:
  *                     r = d - 2             # <<<<<<<<<<<<<<
  *                 LMR_TABLE[d][m] = r
- *
+ * 
 */
           __pyx_v_r = (__pyx_v_d - 2);
 
@@ -3470,7 +3470,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_lmr_table(void)
  *                 if r > d - 2:
  *                     r = d - 2
  *                 LMR_TABLE[d][m] = r             # <<<<<<<<<<<<<<
- *
+ * 
  * _init_lmr_table()
 */
         ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search_LMR_TABLE[__pyx_v_d])[__pyx_v_m]) = __pyx_v_r;
@@ -3481,7 +3481,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_lmr_table(void)
 
   /* "dama/ai/algorithmic/_fast_search.pyx":208
  * cdef int LMR_TABLE[33][65]
- *
+ * 
  * cdef void _init_lmr_table() noexcept nogil:             # <<<<<<<<<<<<<<
  *     cdef int d, m, r
  *     for d in range(LMR_MAX_D):
@@ -3492,7 +3492,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_lmr_table(void)
 
 /* "dama/ai/algorithmic/_fast_search.pyx":282
  * cdef unsigned char _tt_generation = 0
- *
+ * 
  * cdef void _init_zobrist():             # <<<<<<<<<<<<<<
  *     """Initialize Zobrist hash keys with a deterministic PRNG."""
  *     # LCG with constants from Knuth's MMIX
@@ -3560,7 +3560,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_zobrist(void) {
  *             ZOBRIST_PIECES[piece][sq] = state
  *     state = state * 6364136223846793005ULL + 1442695040888963407ULL             # <<<<<<<<<<<<<<
  *     ZOBRIST_SIDE = state
- *
+ * 
 */
   __pyx_v_state = ((__pyx_v_state * 6364136223846793005ULL) + 1442695040888963407ULL);
 
@@ -3568,14 +3568,14 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_zobrist(void) {
  *             ZOBRIST_PIECES[piece][sq] = state
  *     state = state * 6364136223846793005ULL + 1442695040888963407ULL
  *     ZOBRIST_SIDE = state             # <<<<<<<<<<<<<<
- *
+ * 
  * _init_zobrist()
 */
   __pyx_v_ZOBRIST_SIDE = __pyx_v_state;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":282
  * cdef unsigned char _tt_generation = 0
- *
+ * 
  * cdef void _init_zobrist():             # <<<<<<<<<<<<<<
  *     """Initialize Zobrist hash keys with a deterministic PRNG."""
  *     # LCG with constants from Knuth's MMIX
@@ -3586,7 +3586,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_zobrist(void) {
 
 /* "dama/ai/algorithmic/_fast_search.pyx":296
  * _init_zobrist()
- *
+ * 
  * cdef void _ensure_tt():             # <<<<<<<<<<<<<<
  *     """Allocate TT on first use (zero-initialized = all entries empty)."""
  *     global _tt_table
@@ -3600,7 +3600,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(void) {
  *     global _tt_table
  *     if _tt_table == NULL:             # <<<<<<<<<<<<<<
  *         _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table == NULL);
   if (__pyx_t_1) {
@@ -3609,7 +3609,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(void) {
  *     global _tt_table
  *     if _tt_table == NULL:
  *         _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline unsigned long long compute_hash(
 */
     __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table = ((struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_TTEntry *)calloc(0x800000, (sizeof(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_TTEntry))));
@@ -3619,13 +3619,13 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(void) {
  *     global _tt_table
  *     if _tt_table == NULL:             # <<<<<<<<<<<<<<
  *         _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))
- *
+ * 
 */
   }
 
   /* "dama/ai/algorithmic/_fast_search.pyx":296
  * _init_zobrist()
- *
+ * 
  * cdef void _ensure_tt():             # <<<<<<<<<<<<<<
  *     """Allocate TT on first use (zero-initialized = all entries empty)."""
  *     global _tt_table
@@ -3636,7 +3636,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(void) {
 
 /* "dama/ai/algorithmic/_fast_search.pyx":302
  *         _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))
- *
+ * 
  * cdef inline unsigned long long compute_hash(             # <<<<<<<<<<<<<<
  *     signed char *board, int player
  * ) noexcept nogil:
@@ -3732,7 +3732,7 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
  *     if player == PLAYER_TWO:
  *         h = h ^ ZOBRIST_SIDE             # <<<<<<<<<<<<<<
  *     return h
- *
+ * 
 */
     __pyx_v_h = (__pyx_v_h ^ __pyx_v_4dama_2ai_11algorithmic_12_fast_search_ZOBRIST_SIDE);
 
@@ -3749,7 +3749,7 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
  *     if player == PLAYER_TWO:
  *         h = h ^ ZOBRIST_SIDE
  *     return h             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline void tt_store(
 */
   __pyx_r = __pyx_v_h;
@@ -3757,7 +3757,7 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
 
   /* "dama/ai/algorithmic/_fast_search.pyx":302
  *         _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))
- *
+ * 
  * cdef inline unsigned long long compute_hash(             # <<<<<<<<<<<<<<
  *     signed char *board, int player
  * ) noexcept nogil:
@@ -3770,7 +3770,7 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
 
 /* "dama/ai/algorithmic/_fast_search.pyx":317
  *     return h
- *
+ * 
  * cdef inline void tt_store(             # <<<<<<<<<<<<<<
  *     unsigned long long hash_key, float score, int depth, int flag,
  *     int best_from, int best_to
@@ -3839,7 +3839,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_stor
  *     entry.gen_flag = (_tt_generation << TT_GEN_SHIFT) | (<unsigned char>flag & TT_FLAG_MASK)
  *     entry.best_from = <unsigned char>best_from             # <<<<<<<<<<<<<<
  *     entry.best_to = <unsigned char>best_to
- *
+ * 
 */
   __pyx_v_entry->best_from = ((unsigned char)__pyx_v_best_from);
 
@@ -3847,14 +3847,14 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_stor
  *     entry.gen_flag = (_tt_generation << TT_GEN_SHIFT) | (<unsigned char>flag & TT_FLAG_MASK)
  *     entry.best_from = <unsigned char>best_from
  *     entry.best_to = <unsigned char>best_to             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline bint tt_probe(
 */
   __pyx_v_entry->best_to = ((unsigned char)__pyx_v_best_to);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":317
  *     return h
- *
+ * 
  * cdef inline void tt_store(             # <<<<<<<<<<<<<<
  *     unsigned long long hash_key, float score, int depth, int flag,
  *     int best_from, int best_to
@@ -3865,7 +3865,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_stor
 
 /* "dama/ai/algorithmic/_fast_search.pyx":333
  *     entry.best_to = <unsigned char>best_to
- *
+ * 
  * cdef inline bint tt_probe(             # <<<<<<<<<<<<<<
  *     unsigned long long hash_key, int depth,
  *     float *score, float *alpha, float *beta,
@@ -3894,31 +3894,31 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *     cdef unsigned long long idx = hash_key & TT_MASK
  *     cdef TTEntry *entry = &_tt_table[idx]             # <<<<<<<<<<<<<<
  *     cdef unsigned char gen, flag
- *
+ * 
 */
   __pyx_v_entry = (&(__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table[__pyx_v_idx]));
 
   /* "dama/ai/algorithmic/_fast_search.pyx":348
  *     cdef unsigned char gen, flag
- *
+ * 
  *     tt_from[0] = -1             # <<<<<<<<<<<<<<
  *     tt_to[0] = -1
- *
+ * 
 */
   (__pyx_v_tt_from[0]) = -1;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":349
- *
+ * 
  *     tt_from[0] = -1
  *     tt_to[0] = -1             # <<<<<<<<<<<<<<
- *
+ * 
  *     gen = (entry.gen_flag >> TT_GEN_SHIFT) & TT_GEN_MASK
 */
   (__pyx_v_tt_to[0]) = -1;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":351
  *     tt_to[0] = -1
- *
+ * 
  *     gen = (entry.gen_flag >> TT_GEN_SHIFT) & TT_GEN_MASK             # <<<<<<<<<<<<<<
  *     if gen != _tt_generation:
  *         return False
@@ -3926,7 +3926,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
   __pyx_v_gen = ((__pyx_v_entry->gen_flag >> 2) & 63);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":352
- *
+ * 
  *     gen = (entry.gen_flag >> TT_GEN_SHIFT) & TT_GEN_MASK
  *     if gen != _tt_generation:             # <<<<<<<<<<<<<<
  *         return False
@@ -3946,7 +3946,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
     goto __pyx_L0;
 
     /* "dama/ai/algorithmic/_fast_search.pyx":352
- *
+ * 
  *     gen = (entry.gen_flag >> TT_GEN_SHIFT) & TT_GEN_MASK
  *     if gen != _tt_generation:             # <<<<<<<<<<<<<<
  *         return False
@@ -3959,7 +3959,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *         return False
  *     if entry.hash_key != hash_key:             # <<<<<<<<<<<<<<
  *         return False
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_entry->hash_key != __pyx_v_hash_key);
   if (__pyx_t_1) {
@@ -3968,7 +3968,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *         return False
  *     if entry.hash_key != hash_key:
  *         return False             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Hash match  extract best move for ordering (even if depth insufficient)
 */
     __pyx_r = 0;
@@ -3979,12 +3979,12 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *         return False
  *     if entry.hash_key != hash_key:             # <<<<<<<<<<<<<<
  *         return False
- *
+ * 
 */
   }
 
   /* "dama/ai/algorithmic/_fast_search.pyx":358
- *
+ * 
  *     # Hash match  extract best move for ordering (even if depth insufficient)
  *     if entry.best_from != 0xFF:             # <<<<<<<<<<<<<<
  *         tt_from[0] = <int>entry.best_from
@@ -3998,7 +3998,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *     if entry.best_from != 0xFF:
  *         tt_from[0] = <int>entry.best_from             # <<<<<<<<<<<<<<
  *         tt_to[0] = <int>entry.best_to
- *
+ * 
 */
     (__pyx_v_tt_from[0]) = ((int)__pyx_v_entry->best_from);
 
@@ -4006,13 +4006,13 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *     if entry.best_from != 0xFF:
  *         tt_from[0] = <int>entry.best_from
  *         tt_to[0] = <int>entry.best_to             # <<<<<<<<<<<<<<
- *
+ * 
  *     if entry.depth < depth:
 */
     (__pyx_v_tt_to[0]) = ((int)__pyx_v_entry->best_to);
 
     /* "dama/ai/algorithmic/_fast_search.pyx":358
- *
+ * 
  *     # Hash match  extract best move for ordering (even if depth insufficient)
  *     if entry.best_from != 0xFF:             # <<<<<<<<<<<<<<
  *         tt_from[0] = <int>entry.best_from
@@ -4022,19 +4022,19 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
 
   /* "dama/ai/algorithmic/_fast_search.pyx":362
  *         tt_to[0] = <int>entry.best_to
- *
+ * 
  *     if entry.depth < depth:             # <<<<<<<<<<<<<<
  *         return False
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_entry->depth < __pyx_v_depth);
   if (__pyx_t_1) {
 
     /* "dama/ai/algorithmic/_fast_search.pyx":363
- *
+ * 
  *     if entry.depth < depth:
  *         return False             # <<<<<<<<<<<<<<
- *
+ * 
  *     flag = entry.gen_flag & TT_FLAG_MASK
 */
     __pyx_r = 0;
@@ -4042,16 +4042,16 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
 
     /* "dama/ai/algorithmic/_fast_search.pyx":362
  *         tt_to[0] = <int>entry.best_to
- *
+ * 
  *     if entry.depth < depth:             # <<<<<<<<<<<<<<
  *         return False
- *
+ * 
 */
   }
 
   /* "dama/ai/algorithmic/_fast_search.pyx":365
  *         return False
- *
+ * 
  *     flag = entry.gen_flag & TT_FLAG_MASK             # <<<<<<<<<<<<<<
  *     if flag == TT_EXACT:
  *         score[0] = entry.score
@@ -4059,7 +4059,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
   __pyx_v_flag = (__pyx_v_entry->gen_flag & 3);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":366
- *
+ * 
  *     flag = entry.gen_flag & TT_FLAG_MASK
  *     if flag == TT_EXACT:             # <<<<<<<<<<<<<<
  *         score[0] = entry.score
@@ -4089,7 +4089,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
     goto __pyx_L0;
 
     /* "dama/ai/algorithmic/_fast_search.pyx":366
- *
+ * 
  *     flag = entry.gen_flag & TT_FLAG_MASK
  *     if flag == TT_EXACT:             # <<<<<<<<<<<<<<
  *         score[0] = entry.score
@@ -4202,7 +4202,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *         score[0] = entry.score
  *         return True             # <<<<<<<<<<<<<<
  *     return False
- *
+ * 
 */
     __pyx_r = 1;
     goto __pyx_L0;
@@ -4220,15 +4220,15 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
  *         score[0] = entry.score
  *         return True
  *     return False             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = 0;
   goto __pyx_L0;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":333
  *     entry.best_to = <unsigned char>best_to
- *
+ * 
  * cdef inline bint tt_probe(             # <<<<<<<<<<<<<<
  *     unsigned long long hash_key, int depth,
  *     float *score, float *alpha, float *beta,
@@ -4241,10 +4241,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe
 
 /* "dama/ai/algorithmic/_fast_search.pyx":385
  * #
- *
+ * 
  * cdef inline bint in_bounds(int r, int c) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return 0 <= r < 8 and 0 <= c < 8
- *
+ * 
 */
 
 static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_in_bounds(int __pyx_v_r, int __pyx_v_c) {
@@ -4253,10 +4253,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_in_bound
   int __pyx_t_2;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":386
- *
+ * 
  * cdef inline bint in_bounds(int r, int c) noexcept nogil:
  *     return 0 <= r < 8 and 0 <= c < 8             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline int cell(signed char *board, int r, int c) noexcept nogil:
 */
   __pyx_t_2 = (0 <= __pyx_v_r);
@@ -4279,10 +4279,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_in_bound
 
   /* "dama/ai/algorithmic/_fast_search.pyx":385
  * #
- *
+ * 
  * cdef inline bint in_bounds(int r, int c) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return 0 <= r < 8 and 0 <= c < 8
- *
+ * 
 */
 
   /* function exit code */
@@ -4292,20 +4292,20 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_in_bound
 
 /* "dama/ai/algorithmic/_fast_search.pyx":388
  *     return 0 <= r < 8 and 0 <= c < 8
- *
+ * 
  * cdef inline int cell(signed char *board, int r, int c) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return board[r * 8 + c]
- *
+ * 
 */
 
 static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(signed char *__pyx_v_board, int __pyx_v_r, int __pyx_v_c) {
   int __pyx_r;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":389
- *
+ * 
  * cdef inline int cell(signed char *board, int r, int c) noexcept nogil:
  *     return board[r * 8 + c]             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline void set_cell(signed char *board, int r, int c, int val) noexcept nogil:
 */
   __pyx_r = (__pyx_v_board[((__pyx_v_r * 8) + __pyx_v_c)]);
@@ -4313,10 +4313,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(sig
 
   /* "dama/ai/algorithmic/_fast_search.pyx":388
  *     return 0 <= r < 8 and 0 <= c < 8
- *
+ * 
  * cdef inline int cell(signed char *board, int r, int c) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return board[r * 8 + c]
- *
+ * 
 */
 
   /* function exit code */
@@ -4326,29 +4326,29 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(sig
 
 /* "dama/ai/algorithmic/_fast_search.pyx":391
  *     return board[r * 8 + c]
- *
+ * 
  * cdef inline void set_cell(signed char *board, int r, int c, int val) noexcept nogil:             # <<<<<<<<<<<<<<
  *     board[r * 8 + c] = val
- *
+ * 
 */
 
 static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(signed char *__pyx_v_board, int __pyx_v_r, int __pyx_v_c, int __pyx_v_val) {
 
   /* "dama/ai/algorithmic/_fast_search.pyx":392
- *
+ * 
  * cdef inline void set_cell(signed char *board, int r, int c, int val) noexcept nogil:
  *     board[r * 8 + c] = val             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline bint is_player(int cell_val, int player) noexcept nogil:
 */
   (__pyx_v_board[((__pyx_v_r * 8) + __pyx_v_c)]) = __pyx_v_val;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":391
  *     return board[r * 8 + c]
- *
+ * 
  * cdef inline void set_cell(signed char *board, int r, int c, int val) noexcept nogil:             # <<<<<<<<<<<<<<
  *     board[r * 8 + c] = val
- *
+ * 
 */
 
   /* function exit code */
@@ -4356,7 +4356,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cel
 
 /* "dama/ai/algorithmic/_fast_search.pyx":394
  *     board[r * 8 + c] = val
- *
+ * 
  * cdef inline bint is_player(int cell_val, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if player == PLAYER_ONE:
  *         return cell_val == P1_MAN or cell_val == P1_KING
@@ -4367,7 +4367,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_playe
   int __pyx_t_1;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":395
- *
+ * 
  * cdef inline bint is_player(int cell_val, int player) noexcept nogil:
  *     if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
  *         return cell_val == P1_MAN or cell_val == P1_KING
@@ -4396,7 +4396,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_playe
     goto __pyx_L0;
 
     /* "dama/ai/algorithmic/_fast_search.pyx":395
- *
+ * 
  * cdef inline bint is_player(int cell_val, int player) noexcept nogil:
  *     if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
  *         return cell_val == P1_MAN or cell_val == P1_KING
@@ -4408,7 +4408,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_playe
  *         return cell_val == P1_MAN or cell_val == P1_KING
  *     else:
  *         return cell_val == P2_MAN or cell_val == P2_KING             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline bint is_opponent(int cell_val, int player) noexcept nogil:
 */
   /*else*/ {
@@ -4427,7 +4427,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_playe
 
   /* "dama/ai/algorithmic/_fast_search.pyx":394
  *     board[r * 8 + c] = val
- *
+ * 
  * cdef inline bint is_player(int cell_val, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if player == PLAYER_ONE:
  *         return cell_val == P1_MAN or cell_val == P1_KING
@@ -4440,7 +4440,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_playe
 
 /* "dama/ai/algorithmic/_fast_search.pyx":400
  *         return cell_val == P2_MAN or cell_val == P2_KING
- *
+ * 
  * cdef inline bint is_opponent(int cell_val, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if player == PLAYER_ONE:
  *         return cell_val == P2_MAN or cell_val == P2_KING
@@ -4451,7 +4451,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_oppon
   int __pyx_t_1;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":401
- *
+ * 
  * cdef inline bint is_opponent(int cell_val, int player) noexcept nogil:
  *     if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
  *         return cell_val == P2_MAN or cell_val == P2_KING
@@ -4480,7 +4480,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_oppon
     goto __pyx_L0;
 
     /* "dama/ai/algorithmic/_fast_search.pyx":401
- *
+ * 
  * cdef inline bint is_opponent(int cell_val, int player) noexcept nogil:
  *     if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
  *         return cell_val == P2_MAN or cell_val == P2_KING
@@ -4492,7 +4492,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_oppon
  *         return cell_val == P2_MAN or cell_val == P2_KING
  *     else:
  *         return cell_val == P1_MAN or cell_val == P1_KING             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline bint is_king(int cell_val) noexcept nogil:
 */
   /*else*/ {
@@ -4511,7 +4511,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_oppon
 
   /* "dama/ai/algorithmic/_fast_search.pyx":400
  *         return cell_val == P2_MAN or cell_val == P2_KING
- *
+ * 
  * cdef inline bint is_opponent(int cell_val, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if player == PLAYER_ONE:
  *         return cell_val == P2_MAN or cell_val == P2_KING
@@ -4524,10 +4524,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_oppon
 
 /* "dama/ai/algorithmic/_fast_search.pyx":406
  *         return cell_val == P1_MAN or cell_val == P1_KING
- *
+ * 
  * cdef inline bint is_king(int cell_val) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return cell_val == P1_KING or cell_val == P2_KING
- *
+ * 
 */
 
 static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(int __pyx_v_cell_val) {
@@ -4535,10 +4535,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(
   int __pyx_t_1;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":407
- *
+ * 
  * cdef inline bint is_king(int cell_val) noexcept nogil:
  *     return cell_val == P1_KING or cell_val == P2_KING             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline int promotion_row(int player) noexcept nogil:
 */
   switch (__pyx_v_cell_val) {
@@ -4555,10 +4555,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(
 
   /* "dama/ai/algorithmic/_fast_search.pyx":406
  *         return cell_val == P1_MAN or cell_val == P1_KING
- *
+ * 
  * cdef inline bint is_king(int cell_val) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return cell_val == P1_KING or cell_val == P2_KING
- *
+ * 
 */
 
   /* function exit code */
@@ -4568,10 +4568,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(
 
 /* "dama/ai/algorithmic/_fast_search.pyx":409
  *     return cell_val == P1_KING or cell_val == P2_KING
- *
+ * 
  * cdef inline int promotion_row(int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return 7 if player == PLAYER_ONE else 0
- *
+ * 
 */
 
 static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promotion_row(int __pyx_v_player) {
@@ -4580,10 +4580,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promotio
   int __pyx_t_2;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":410
- *
+ * 
  * cdef inline int promotion_row(int player) noexcept nogil:
  *     return 7 if player == PLAYER_ONE else 0             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline int promote_piece(int cell_val) noexcept nogil:
 */
   __pyx_t_2 = (__pyx_v_player == 1);
@@ -4597,10 +4597,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promotio
 
   /* "dama/ai/algorithmic/_fast_search.pyx":409
  *     return cell_val == P1_KING or cell_val == P2_KING
- *
+ * 
  * cdef inline int promotion_row(int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return 7 if player == PLAYER_ONE else 0
- *
+ * 
 */
 
   /* function exit code */
@@ -4610,7 +4610,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promotio
 
 /* "dama/ai/algorithmic/_fast_search.pyx":412
  *     return 7 if player == PLAYER_ONE else 0
- *
+ * 
  * cdef inline int promote_piece(int cell_val) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if cell_val == P1_MAN:
  *         return P1_KING
@@ -4620,7 +4620,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promote_
   int __pyx_r;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":413
- *
+ * 
  * cdef inline int promote_piece(int cell_val) noexcept nogil:
  *     if cell_val == P1_MAN:             # <<<<<<<<<<<<<<
  *         return P1_KING
@@ -4640,7 +4640,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promote_
     goto __pyx_L0;
 
     /* "dama/ai/algorithmic/_fast_search.pyx":413
- *
+ * 
  * cdef inline int promote_piece(int cell_val) noexcept nogil:
  *     if cell_val == P1_MAN:             # <<<<<<<<<<<<<<
  *         return P1_KING
@@ -4654,7 +4654,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promote_
  *     elif cell_val == P2_MAN:
  *         return P2_KING             # <<<<<<<<<<<<<<
  *     return cell_val
- *
+ * 
 */
     __pyx_r = 4;
     goto __pyx_L0;
@@ -4674,7 +4674,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promote_
  *     elif cell_val == P2_MAN:
  *         return P2_KING
  *     return cell_val             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef inline int opponent(int player) noexcept nogil:
 */
   __pyx_r = __pyx_v_cell_val;
@@ -4682,7 +4682,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promote_
 
   /* "dama/ai/algorithmic/_fast_search.pyx":412
  *     return 7 if player == PLAYER_ONE else 0
- *
+ * 
  * cdef inline int promote_piece(int cell_val) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if cell_val == P1_MAN:
  *         return P1_KING
@@ -4695,10 +4695,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promote_
 
 /* "dama/ai/algorithmic/_fast_search.pyx":419
  *     return cell_val
- *
+ * 
  * cdef inline int opponent(int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return PLAYER_TWO if player == PLAYER_ONE else PLAYER_ONE
- *
+ * 
 */
 
 static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(int __pyx_v_player) {
@@ -4707,11 +4707,11 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent
   int __pyx_t_2;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":420
- *
+ * 
  * cdef inline int opponent(int player) noexcept nogil:
  *     return PLAYER_TWO if player == PLAYER_ONE else PLAYER_ONE             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_t_2 = (__pyx_v_player == 1);
   if (__pyx_t_2) {
@@ -4724,10 +4724,10 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent
 
   /* "dama/ai/algorithmic/_fast_search.pyx":419
  *     return cell_val
- *
+ * 
  * cdef inline int opponent(int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     return PLAYER_TWO if player == PLAYER_ONE else PLAYER_ONE
- *
+ * 
 */
 
   /* function exit code */
@@ -4737,7 +4737,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent
 
 /* "dama/ai/algorithmic/_fast_search.pyx":427
  * #
- *
+ * 
  * cdef void _get_move_dirs(int piece, int player, Rules *rules,             # <<<<<<<<<<<<<<
  *                          int **out_dr, int **out_dc, int *out_n) noexcept nogil:
  *     """Get movement directions for simple (non-capture) moves."""
@@ -4812,8 +4812,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_move_dirs(int __
  *         out_dr[0] = FWD_P1_DR; out_dc[0] = FWD_P1_DC; out_n[0] = 2
  *     else:
  *         out_dr[0] = FWD_P2_DR; out_dc[0] = FWD_P2_DC; out_n[0] = 2             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   /*else*/ {
     (__pyx_v_out_dr[0]) = __pyx_v_4dama_2ai_11algorithmic_12_fast_search_FWD_P2_DR;
@@ -4824,7 +4824,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_move_dirs(int __
 
   /* "dama/ai/algorithmic/_fast_search.pyx":427
  * #
- *
+ * 
  * cdef void _get_move_dirs(int piece, int player, Rules *rules,             # <<<<<<<<<<<<<<
  *                          int **out_dr, int **out_dc, int *out_n) noexcept nogil:
  *     """Get movement directions for simple (non-capture) moves."""
@@ -4834,8 +4834,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_move_dirs(int __
 }
 
 /* "dama/ai/algorithmic/_fast_search.pyx":438
- *
- *
+ * 
+ * 
  * cdef void _get_capture_dirs(int piece, int player, Rules *rules,             # <<<<<<<<<<<<<<
  *                             int **out_dr, int **out_dc, int *out_n) noexcept nogil:
  *     """Get capture directions  all 4 for kings, or forward+backward if enabled."""
@@ -4918,8 +4918,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_capture_dirs(int
  *         out_dr[0] = FWD_P1_DR; out_dc[0] = FWD_P1_DC; out_n[0] = 2
  *     else:
  *         out_dr[0] = FWD_P2_DR; out_dc[0] = FWD_P2_DC; out_n[0] = 2             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   /*else*/ {
     (__pyx_v_out_dr[0]) = __pyx_v_4dama_2ai_11algorithmic_12_fast_search_FWD_P2_DR;
@@ -4929,8 +4929,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_capture_dirs(int
   __pyx_L3:;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":438
- *
- *
+ * 
+ * 
  * cdef void _get_capture_dirs(int piece, int player, Rules *rules,             # <<<<<<<<<<<<<<
  *                             int **out_dr, int **out_dc, int *out_n) noexcept nogil:
  *     """Get capture directions  all 4 for kings, or forward+backward if enabled."""
@@ -4940,8 +4940,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_capture_dirs(int
 }
 
 /* "dama/ai/algorithmic/_fast_search.pyx":449
- *
- *
+ * 
+ * 
  * cdef void generate_simple_moves(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     Rules *rules, CMoveList *out
@@ -4966,23 +4966,23 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves
  *     cdef int *dirs_c
  *     cdef int ndirs
  *     cdef bint is_k = is_king(piece)             # <<<<<<<<<<<<<<
- *
+ * 
  *     _get_move_dirs(piece, player, rules, &dirs_r, &dirs_c, &ndirs)
 */
   __pyx_v_is_k = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(__pyx_v_piece);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":460
  *     cdef bint is_k = is_king(piece)
- *
+ * 
  *     _get_move_dirs(piece, player, rules, &dirs_r, &dirs_c, &ndirs)             # <<<<<<<<<<<<<<
- *
+ * 
  *     for d in range(ndirs):
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_move_dirs(__pyx_v_piece, __pyx_v_player, __pyx_v_rules, (&__pyx_v_dirs_r), (&__pyx_v_dirs_c), (&__pyx_v_ndirs));
 
   /* "dama/ai/algorithmic/_fast_search.pyx":462
  *     _get_move_dirs(piece, player, rules, &dirs_r, &dirs_c, &ndirs)
- *
+ * 
  *     for d in range(ndirs):             # <<<<<<<<<<<<<<
  *         if is_k and rules.king_flying_capture:
  *             # Flying king: slide along diagonal
@@ -4993,7 +4993,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves
     __pyx_v_d = __pyx_t_3;
 
     /* "dama/ai/algorithmic/_fast_search.pyx":463
- *
+ * 
  *     for d in range(ndirs):
  *         if is_k and rules.king_flying_capture:             # <<<<<<<<<<<<<<
  *             # Flying king: slide along diagonal
@@ -5140,7 +5140,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves
       __pyx_L9_break:;
 
       /* "dama/ai/algorithmic/_fast_search.pyx":463
- *
+ * 
  *     for d in range(ndirs):
  *         if is_k and rules.king_flying_capture:             # <<<<<<<<<<<<<<
  *             # Flying king: slide along diagonal
@@ -5200,8 +5200,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves
  *                 if out.count < MAX_MOVES:
  *                     _add_simple_move(out, r, c, nr, nc,
  *                                      nr == promotion_row(player) and not is_k)             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
           __pyx_t_5 = (__pyx_v_nr == __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promotion_row(__pyx_v_player));
           if (__pyx_t_5) {
@@ -5218,7 +5218,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves
  *                 if out.count < MAX_MOVES:
  *                     _add_simple_move(out, r, c, nr, nc,             # <<<<<<<<<<<<<<
  *                                      nr == promotion_row(player) and not is_k)
- *
+ * 
 */
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search__add_simple_move(__pyx_v_out, __pyx_v_r, __pyx_v_c, __pyx_v_nr, __pyx_v_nc, __pyx_t_4);
 
@@ -5244,8 +5244,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves
   }
 
   /* "dama/ai/algorithmic/_fast_search.pyx":449
- *
- *
+ * 
+ * 
  * cdef void generate_simple_moves(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     Rules *rules, CMoveList *out
@@ -5255,8 +5255,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves
 }
 
 /* "dama/ai/algorithmic/_fast_search.pyx":485
- *
- *
+ * 
+ * 
  * cdef inline void _add_simple_move(             # <<<<<<<<<<<<<<
  *     CMoveList *out, int sr, int sc, int er, int ec, bint promo
  * ) noexcept nogil:
@@ -5335,7 +5335,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__add_si
  *     m.to_sq = er * 8 + ec
  *     _set_move_metadata(m, promo, 0)             # <<<<<<<<<<<<<<
  *     out.count += 1
- *
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__set_move_metadata(__pyx_v_m, __pyx_v_promo, 0);
 
@@ -5343,14 +5343,14 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__add_si
  *     m.to_sq = er * 8 + ec
  *     _set_move_metadata(m, promo, 0)
  *     out.count += 1             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_v_out->count = (__pyx_v_out->count + 1);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":485
- *
- *
+ * 
+ * 
  * cdef inline void _add_simple_move(             # <<<<<<<<<<<<<<
  *     CMoveList *out, int sr, int sc, int er, int ec, bint promo
  * ) noexcept nogil:
@@ -5359,20 +5359,21 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__add_si
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":505
- * # this hot recursive call frame.
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":507
+ * # and columns; final CMove emission expands them back to the public layout.
+ * 
  * cdef int _generate_captures_recursive(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     int capture_value,
 */
 
-static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(signed char *__pyx_v_board, int __pyx_v_r, int __pyx_v_c, int __pyx_v_piece, int __pyx_v_player, int __pyx_v_capture_value, int *__pyx_v_path_r, int *__pyx_v_path_c, int __pyx_v_path_len, int *__pyx_v_cap_r, int *__pyx_v_cap_c, int __pyx_v_num_caps, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *__pyx_v_rules, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *__pyx_v_out) {
+static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(signed char *__pyx_v_board, int __pyx_v_r, int __pyx_v_c, int __pyx_v_piece, int __pyx_v_player, int __pyx_v_capture_value, int *__pyx_v_path_sq, int __pyx_v_path_len, int *__pyx_v_cap_sq, int __pyx_v_num_caps, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *__pyx_v_rules, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *__pyx_v_out) {
   int __pyx_v_d;
   int __pyx_v_cr;
   int __pyx_v_cc;
   int __pyx_v_lr;
   int __pyx_v_lc;
+  int __pyx_v_landing_sq;
   int __pyx_v_found;
   int __pyx_v_captured_piece;
   int __pyx_v_further;
@@ -5388,27 +5389,27 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
   int __pyx_t_5;
   long __pyx_t_6;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":514
+  /* "dama/ai/algorithmic/_fast_search.pyx":516
  *     """Recursively generate capture sequences. Returns count found."""
- *     cdef int d, cr, cc, lr, lc
+ *     cdef int d, cr, cc, lr, lc, landing_sq
  *     cdef int found = 0             # <<<<<<<<<<<<<<
  *     cdef int captured_piece, further, next_capture_value
  *     cdef int *dirs_r
 */
   __pyx_v_found = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":520
+  /* "dama/ai/algorithmic/_fast_search.pyx":522
  *     cdef int ndirs
- *
+ * 
  *     _get_capture_dirs(piece, player, rules, &dirs_r, &dirs_c, &ndirs)             # <<<<<<<<<<<<<<
- *
+ * 
  *     for d in range(ndirs):
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__get_capture_dirs(__pyx_v_piece, __pyx_v_player, __pyx_v_rules, (&__pyx_v_dirs_r), (&__pyx_v_dirs_c), (&__pyx_v_ndirs));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":522
+  /* "dama/ai/algorithmic/_fast_search.pyx":524
  *     _get_capture_dirs(piece, player, rules, &dirs_r, &dirs_c, &ndirs)
- *
+ * 
  *     for d in range(ndirs):             # <<<<<<<<<<<<<<
  *         if is_king(piece) and rules.king_flying_capture:
  *             found += _flying_king_capture(
@@ -5418,8 +5419,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
   for (__pyx_t_3 = 0; __pyx_t_3 < __pyx_t_2; __pyx_t_3+=1) {
     __pyx_v_d = __pyx_t_3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":523
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":525
+ * 
  *     for d in range(ndirs):
  *         if is_king(piece) and rules.king_flying_capture:             # <<<<<<<<<<<<<<
  *             found += _flying_king_capture(
@@ -5435,17 +5436,17 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
     __pyx_L6_bool_binop_done:;
     if (__pyx_t_4) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":524
+      /* "dama/ai/algorithmic/_fast_search.pyx":526
  *     for d in range(ndirs):
  *         if is_king(piece) and rules.king_flying_capture:
  *             found += _flying_king_capture(             # <<<<<<<<<<<<<<
  *                 board, r, c, piece, player,
  *                 dirs_r[d], dirs_c[d],
 */
-      __pyx_v_found = (__pyx_v_found + __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(__pyx_v_board, __pyx_v_r, __pyx_v_c, __pyx_v_piece, __pyx_v_player, (__pyx_v_dirs_r[__pyx_v_d]), (__pyx_v_dirs_c[__pyx_v_d]), __pyx_v_capture_value, __pyx_v_path_r, __pyx_v_path_c, __pyx_v_path_len, __pyx_v_cap_r, __pyx_v_cap_c, __pyx_v_num_caps, __pyx_v_rules, __pyx_v_out));
+      __pyx_v_found = (__pyx_v_found + __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(__pyx_v_board, __pyx_v_r, __pyx_v_c, __pyx_v_piece, __pyx_v_player, (__pyx_v_dirs_r[__pyx_v_d]), (__pyx_v_dirs_c[__pyx_v_d]), __pyx_v_capture_value, __pyx_v_path_sq, __pyx_v_path_len, __pyx_v_cap_sq, __pyx_v_num_caps, __pyx_v_rules, __pyx_v_out));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":523
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":525
+ * 
  *     for d in range(ndirs):
  *         if is_king(piece) and rules.king_flying_capture:             # <<<<<<<<<<<<<<
  *             found += _flying_king_capture(
@@ -5454,7 +5455,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
       goto __pyx_L5;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":531
+    /* "dama/ai/algorithmic/_fast_search.pyx":533
  *             )
  *         else:
  *             cr = r + dirs_r[d]             # <<<<<<<<<<<<<<
@@ -5464,7 +5465,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
     /*else*/ {
       __pyx_v_cr = (__pyx_v_r + (__pyx_v_dirs_r[__pyx_v_d]));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":532
+      /* "dama/ai/algorithmic/_fast_search.pyx":534
  *         else:
  *             cr = r + dirs_r[d]
  *             cc = c + dirs_c[d]             # <<<<<<<<<<<<<<
@@ -5473,27 +5474,27 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
 */
       __pyx_v_cc = (__pyx_v_c + (__pyx_v_dirs_c[__pyx_v_d]));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":533
+      /* "dama/ai/algorithmic/_fast_search.pyx":535
  *             cr = r + dirs_r[d]
  *             cc = c + dirs_c[d]
  *             lr = r + 2 * dirs_r[d]             # <<<<<<<<<<<<<<
  *             lc = c + 2 * dirs_c[d]
- *
+ * 
 */
       __pyx_v_lr = (__pyx_v_r + (2 * (__pyx_v_dirs_r[__pyx_v_d])));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":534
+      /* "dama/ai/algorithmic/_fast_search.pyx":536
  *             cc = c + dirs_c[d]
  *             lr = r + 2 * dirs_r[d]
  *             lc = c + 2 * dirs_c[d]             # <<<<<<<<<<<<<<
- *
+ * 
  *             if not in_bounds(lr, lc):
 */
       __pyx_v_lc = (__pyx_v_c + (2 * (__pyx_v_dirs_c[__pyx_v_d])));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":536
+      /* "dama/ai/algorithmic/_fast_search.pyx":538
  *             lc = c + 2 * dirs_c[d]
- *
+ * 
  *             if not in_bounds(lr, lc):             # <<<<<<<<<<<<<<
  *                 continue
  *             captured_piece = cell(board, cr, cc)
@@ -5501,8 +5502,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
       __pyx_t_4 = (!__pyx_f_4dama_2ai_11algorithmic_12_fast_search_in_bounds(__pyx_v_lr, __pyx_v_lc));
       if (__pyx_t_4) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":537
- *
+        /* "dama/ai/algorithmic/_fast_search.pyx":539
+ * 
  *             if not in_bounds(lr, lc):
  *                 continue             # <<<<<<<<<<<<<<
  *             captured_piece = cell(board, cr, cc)
@@ -5510,16 +5511,16 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
 */
         goto __pyx_L3_continue;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":536
+        /* "dama/ai/algorithmic/_fast_search.pyx":538
  *             lc = c + 2 * dirs_c[d]
- *
+ * 
  *             if not in_bounds(lr, lc):             # <<<<<<<<<<<<<<
  *                 continue
  *             captured_piece = cell(board, cr, cc)
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":538
+      /* "dama/ai/algorithmic/_fast_search.pyx":540
  *             if not in_bounds(lr, lc):
  *                 continue
  *             captured_piece = cell(board, cr, cc)             # <<<<<<<<<<<<<<
@@ -5528,216 +5529,198 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
 */
       __pyx_v_captured_piece = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(__pyx_v_board, __pyx_v_cr, __pyx_v_cc);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":539
+      /* "dama/ai/algorithmic/_fast_search.pyx":541
  *                 continue
  *             captured_piece = cell(board, cr, cc)
  *             if not is_opponent(captured_piece, player):             # <<<<<<<<<<<<<<
  *                 continue
- *             if cell(board, lr, lc) != EMPTY:
+ *             landing_sq = lr * 8 + lc
 */
       __pyx_t_4 = (!__pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_opponent(__pyx_v_captured_piece, __pyx_v_player));
       if (__pyx_t_4) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":540
+        /* "dama/ai/algorithmic/_fast_search.pyx":542
  *             captured_piece = cell(board, cr, cc)
  *             if not is_opponent(captured_piece, player):
  *                 continue             # <<<<<<<<<<<<<<
+ *             landing_sq = lr * 8 + lc
  *             if cell(board, lr, lc) != EMPTY:
- *                 if not (lr == path_r[0] and lc == path_c[0]):
 */
         goto __pyx_L3_continue;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":539
+        /* "dama/ai/algorithmic/_fast_search.pyx":541
  *                 continue
  *             captured_piece = cell(board, cr, cc)
  *             if not is_opponent(captured_piece, player):             # <<<<<<<<<<<<<<
  *                 continue
- *             if cell(board, lr, lc) != EMPTY:
+ *             landing_sq = lr * 8 + lc
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":541
+      /* "dama/ai/algorithmic/_fast_search.pyx":543
  *             if not is_opponent(captured_piece, player):
  *                 continue
+ *             landing_sq = lr * 8 + lc             # <<<<<<<<<<<<<<
+ *             if cell(board, lr, lc) != EMPTY:
+ *                 if landing_sq != path_sq[0]:
+*/
+      __pyx_v_landing_sq = ((__pyx_v_lr * 8) + __pyx_v_lc);
+
+      /* "dama/ai/algorithmic/_fast_search.pyx":544
+ *                 continue
+ *             landing_sq = lr * 8 + lc
  *             if cell(board, lr, lc) != EMPTY:             # <<<<<<<<<<<<<<
- *                 if not (lr == path_r[0] and lc == path_c[0]):
+ *                 if landing_sq != path_sq[0]:
  *                     continue
 */
       __pyx_t_4 = (__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(__pyx_v_board, __pyx_v_lr, __pyx_v_lc) != 0);
       if (__pyx_t_4) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":542
- *                 continue
+        /* "dama/ai/algorithmic/_fast_search.pyx":545
+ *             landing_sq = lr * 8 + lc
  *             if cell(board, lr, lc) != EMPTY:
- *                 if not (lr == path_r[0] and lc == path_c[0]):             # <<<<<<<<<<<<<<
+ *                 if landing_sq != path_sq[0]:             # <<<<<<<<<<<<<<
  *                     continue
- *
+ * 
 */
-        __pyx_t_5 = (__pyx_v_lr == (__pyx_v_path_r[0]));
-        if (__pyx_t_5) {
-        } else {
-          __pyx_t_4 = __pyx_t_5;
-          goto __pyx_L12_bool_binop_done;
-        }
-        __pyx_t_5 = (__pyx_v_lc == (__pyx_v_path_c[0]));
-        __pyx_t_4 = __pyx_t_5;
-        __pyx_L12_bool_binop_done:;
-        __pyx_t_5 = (!__pyx_t_4);
-        if (__pyx_t_5) {
+        __pyx_t_4 = (__pyx_v_landing_sq != (__pyx_v_path_sq[0]));
+        if (__pyx_t_4) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":543
+          /* "dama/ai/algorithmic/_fast_search.pyx":546
  *             if cell(board, lr, lc) != EMPTY:
- *                 if not (lr == path_r[0] and lc == path_c[0]):
+ *                 if landing_sq != path_sq[0]:
  *                     continue             # <<<<<<<<<<<<<<
- *
- *             path_r[path_len] = lr
+ * 
+ *             path_sq[path_len] = landing_sq
 */
           goto __pyx_L3_continue;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":542
- *                 continue
+          /* "dama/ai/algorithmic/_fast_search.pyx":545
+ *             landing_sq = lr * 8 + lc
  *             if cell(board, lr, lc) != EMPTY:
- *                 if not (lr == path_r[0] and lc == path_c[0]):             # <<<<<<<<<<<<<<
+ *                 if landing_sq != path_sq[0]:             # <<<<<<<<<<<<<<
  *                     continue
- *
+ * 
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":541
- *             if not is_opponent(captured_piece, player):
+        /* "dama/ai/algorithmic/_fast_search.pyx":544
  *                 continue
+ *             landing_sq = lr * 8 + lc
  *             if cell(board, lr, lc) != EMPTY:             # <<<<<<<<<<<<<<
- *                 if not (lr == path_r[0] and lc == path_c[0]):
+ *                 if landing_sq != path_sq[0]:
  *                     continue
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":545
+      /* "dama/ai/algorithmic/_fast_search.pyx":548
  *                     continue
- *
- *             path_r[path_len] = lr             # <<<<<<<<<<<<<<
- *             path_c[path_len] = lc
- *             cap_r[num_caps] = cr
-*/
-      (__pyx_v_path_r[__pyx_v_path_len]) = __pyx_v_lr;
-
-      /* "dama/ai/algorithmic/_fast_search.pyx":546
- *
- *             path_r[path_len] = lr
- *             path_c[path_len] = lc             # <<<<<<<<<<<<<<
- *             cap_r[num_caps] = cr
- *             cap_c[num_caps] = cc
-*/
-      (__pyx_v_path_c[__pyx_v_path_len]) = __pyx_v_lc;
-
-      /* "dama/ai/algorithmic/_fast_search.pyx":547
- *             path_r[path_len] = lr
- *             path_c[path_len] = lc
- *             cap_r[num_caps] = cr             # <<<<<<<<<<<<<<
- *             cap_c[num_caps] = cc
+ * 
+ *             path_sq[path_len] = landing_sq             # <<<<<<<<<<<<<<
+ *             cap_sq[num_caps] = cr * 8 + cc
  *             next_capture_value = (
 */
-      (__pyx_v_cap_r[__pyx_v_num_caps]) = __pyx_v_cr;
+      (__pyx_v_path_sq[__pyx_v_path_len]) = __pyx_v_landing_sq;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":548
- *             path_c[path_len] = lc
- *             cap_r[num_caps] = cr
- *             cap_c[num_caps] = cc             # <<<<<<<<<<<<<<
+      /* "dama/ai/algorithmic/_fast_search.pyx":549
+ * 
+ *             path_sq[path_len] = landing_sq
+ *             cap_sq[num_caps] = cr * 8 + cc             # <<<<<<<<<<<<<<
  *             next_capture_value = (
  *                 capture_value + (W_KING if is_king(captured_piece) else W_MAN)
 */
-      (__pyx_v_cap_c[__pyx_v_num_caps]) = __pyx_v_cc;
+      (__pyx_v_cap_sq[__pyx_v_num_caps]) = ((__pyx_v_cr * 8) + __pyx_v_cc);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":550
- *             cap_c[num_caps] = cc
+      /* "dama/ai/algorithmic/_fast_search.pyx":551
+ *             cap_sq[num_caps] = cr * 8 + cc
  *             next_capture_value = (
  *                 capture_value + (W_KING if is_king(captured_piece) else W_MAN)             # <<<<<<<<<<<<<<
  *             )
- *
+ * 
 */
-      __pyx_t_5 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(__pyx_v_captured_piece);
-      if (__pyx_t_5) {
+      __pyx_t_4 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(__pyx_v_captured_piece);
+      if (__pyx_t_4) {
         __pyx_t_6 = 0xC8;
       } else {
         __pyx_t_6 = 0x64;
       }
       __pyx_v_next_capture_value = (__pyx_v_capture_value + __pyx_t_6);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":553
+      /* "dama/ai/algorithmic/_fast_search.pyx":554
  *             )
- *
+ * 
  *             set_cell(board, r, c, EMPTY)             # <<<<<<<<<<<<<<
  *             set_cell(board, cr, cc, EMPTY)
  *             set_cell(board, lr, lc, piece)
 */
       __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_r, __pyx_v_c, 0);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":554
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":555
+ * 
  *             set_cell(board, r, c, EMPTY)
  *             set_cell(board, cr, cc, EMPTY)             # <<<<<<<<<<<<<<
  *             set_cell(board, lr, lc, piece)
- *
+ * 
 */
       __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_cr, __pyx_v_cc, 0);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":555
+      /* "dama/ai/algorithmic/_fast_search.pyx":556
  *             set_cell(board, r, c, EMPTY)
  *             set_cell(board, cr, cc, EMPTY)
  *             set_cell(board, lr, lc, piece)             # <<<<<<<<<<<<<<
- *
+ * 
  *             further = _generate_captures_recursive(
 */
       __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, __pyx_v_piece);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":557
+      /* "dama/ai/algorithmic/_fast_search.pyx":558
  *             set_cell(board, lr, lc, piece)
- *
+ * 
  *             further = _generate_captures_recursive(             # <<<<<<<<<<<<<<
  *                 board, lr, lc, piece, player,
  *                 next_capture_value,
 */
-      __pyx_v_further = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, __pyx_v_piece, __pyx_v_player, __pyx_v_next_capture_value, __pyx_v_path_r, __pyx_v_path_c, (__pyx_v_path_len + 1), __pyx_v_cap_r, __pyx_v_cap_c, (__pyx_v_num_caps + 1), __pyx_v_rules, __pyx_v_out);
+      __pyx_v_further = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, __pyx_v_piece, __pyx_v_player, __pyx_v_next_capture_value, __pyx_v_path_sq, (__pyx_v_path_len + 1), __pyx_v_cap_sq, (__pyx_v_num_caps + 1), __pyx_v_rules, __pyx_v_out);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":565
+      /* "dama/ai/algorithmic/_fast_search.pyx":566
  *             )
- *
+ * 
  *             set_cell(board, lr, lc, EMPTY)             # <<<<<<<<<<<<<<
  *             set_cell(board, r, c, piece)
  *             set_cell(board, cr, cc, captured_piece)
 */
       __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, 0);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":566
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":567
+ * 
  *             set_cell(board, lr, lc, EMPTY)
  *             set_cell(board, r, c, piece)             # <<<<<<<<<<<<<<
  *             set_cell(board, cr, cc, captured_piece)
- *
+ * 
 */
       __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_r, __pyx_v_c, __pyx_v_piece);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":567
+      /* "dama/ai/algorithmic/_fast_search.pyx":568
  *             set_cell(board, lr, lc, EMPTY)
  *             set_cell(board, r, c, piece)
  *             set_cell(board, cr, cc, captured_piece)             # <<<<<<<<<<<<<<
- *
+ * 
  *             if further > 0:
 */
       __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_cr, __pyx_v_cc, __pyx_v_captured_piece);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":569
+      /* "dama/ai/algorithmic/_fast_search.pyx":570
  *             set_cell(board, cr, cc, captured_piece)
- *
+ * 
  *             if further > 0:             # <<<<<<<<<<<<<<
  *                 found += further
  *             else:
 */
-      __pyx_t_5 = (__pyx_v_further > 0);
-      if (__pyx_t_5) {
+      __pyx_t_4 = (__pyx_v_further > 0);
+      if (__pyx_t_4) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":570
- *
+        /* "dama/ai/algorithmic/_fast_search.pyx":571
+ * 
  *             if further > 0:
  *                 found += further             # <<<<<<<<<<<<<<
  *             else:
@@ -5745,90 +5728,90 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
 */
         __pyx_v_found = (__pyx_v_found + __pyx_v_further);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":569
+        /* "dama/ai/algorithmic/_fast_search.pyx":570
  *             set_cell(board, cr, cc, captured_piece)
- *
+ * 
  *             if further > 0:             # <<<<<<<<<<<<<<
  *                 found += further
  *             else:
 */
-        goto __pyx_L14;
+        goto __pyx_L12;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":572
+      /* "dama/ai/algorithmic/_fast_search.pyx":573
  *                 found += further
  *             else:
  *                 if out.count < MAX_MOVES:             # <<<<<<<<<<<<<<
  *                     _copy_capture_move(
- *                         out, path_r, path_c, path_len + 1,
+ *                         out, path_sq, path_len + 1,
 */
       /*else*/ {
-        __pyx_t_5 = (__pyx_v_out->count < 0x80);
-        if (__pyx_t_5) {
+        __pyx_t_4 = (__pyx_v_out->count < 0x80);
+        if (__pyx_t_4) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":576
- *                         out, path_r, path_c, path_len + 1,
- *                         cap_r, cap_c, num_caps + 1,
+          /* "dama/ai/algorithmic/_fast_search.pyx":577
+ *                         out, path_sq, path_len + 1,
+ *                         cap_sq, num_caps + 1,
  *                         not is_king(piece) and lr == promotion_row(player),             # <<<<<<<<<<<<<<
  *                         next_capture_value,
  *                     )
 */
-          __pyx_t_4 = (!__pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(__pyx_v_piece));
-          if (__pyx_t_4) {
+          __pyx_t_5 = (!__pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(__pyx_v_piece));
+          if (__pyx_t_5) {
           } else {
-            __pyx_t_5 = __pyx_t_4;
-            goto __pyx_L16_bool_binop_done;
+            __pyx_t_4 = __pyx_t_5;
+            goto __pyx_L14_bool_binop_done;
           }
-          __pyx_t_4 = (__pyx_v_lr == __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promotion_row(__pyx_v_player));
-          __pyx_t_5 = __pyx_t_4;
-          __pyx_L16_bool_binop_done:;
+          __pyx_t_5 = (__pyx_v_lr == __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promotion_row(__pyx_v_player));
+          __pyx_t_4 = __pyx_t_5;
+          __pyx_L14_bool_binop_done:;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":573
+          /* "dama/ai/algorithmic/_fast_search.pyx":574
  *             else:
  *                 if out.count < MAX_MOVES:
  *                     _copy_capture_move(             # <<<<<<<<<<<<<<
- *                         out, path_r, path_c, path_len + 1,
- *                         cap_r, cap_c, num_caps + 1,
+ *                         out, path_sq, path_len + 1,
+ *                         cap_sq, num_caps + 1,
 */
-          __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(__pyx_v_out, __pyx_v_path_r, __pyx_v_path_c, (__pyx_v_path_len + 1), __pyx_v_cap_r, __pyx_v_cap_c, (__pyx_v_num_caps + 1), __pyx_t_5, __pyx_v_next_capture_value);
+          __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(__pyx_v_out, __pyx_v_path_sq, (__pyx_v_path_len + 1), __pyx_v_cap_sq, (__pyx_v_num_caps + 1), __pyx_t_4, __pyx_v_next_capture_value);
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":579
+          /* "dama/ai/algorithmic/_fast_search.pyx":580
  *                         next_capture_value,
  *                     )
  *                     found += 1             # <<<<<<<<<<<<<<
- *
+ * 
  *     return found
 */
           __pyx_v_found = (__pyx_v_found + 1);
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":572
+          /* "dama/ai/algorithmic/_fast_search.pyx":573
  *                 found += further
  *             else:
  *                 if out.count < MAX_MOVES:             # <<<<<<<<<<<<<<
  *                     _copy_capture_move(
- *                         out, path_r, path_c, path_len + 1,
+ *                         out, path_sq, path_len + 1,
 */
         }
       }
-      __pyx_L14:;
+      __pyx_L12:;
     }
     __pyx_L5:;
     __pyx_L3_continue:;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":581
+  /* "dama/ai/algorithmic/_fast_search.pyx":582
  *                     found += 1
- *
+ * 
  *     return found             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_found;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":505
- * # this hot recursive call frame.
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":507
+ * # and columns; final CMove emission expands them back to the public layout.
+ * 
  * cdef int _generate_captures_recursive(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     int capture_value,
@@ -5839,15 +5822,15 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_rec
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":584
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":585
+ * 
+ * 
  * cdef int _flying_king_capture(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     int dr, int dc,
 */
 
-static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(signed char *__pyx_v_board, int __pyx_v_r, int __pyx_v_c, int __pyx_v_piece, int __pyx_v_player, int __pyx_v_dr, int __pyx_v_dc, int __pyx_v_capture_value, int *__pyx_v_path_r, int *__pyx_v_path_c, int __pyx_v_path_len, int *__pyx_v_cap_r, int *__pyx_v_cap_c, int __pyx_v_num_caps, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *__pyx_v_rules, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *__pyx_v_out) {
+static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(signed char *__pyx_v_board, int __pyx_v_r, int __pyx_v_c, int __pyx_v_piece, int __pyx_v_player, int __pyx_v_dr, int __pyx_v_dc, int __pyx_v_capture_value, int *__pyx_v_path_sq, int __pyx_v_path_len, int *__pyx_v_cap_sq, int __pyx_v_num_caps, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *__pyx_v_rules, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *__pyx_v_out) {
   int __pyx_v_sr;
   int __pyx_v_sc;
   int __pyx_v_dist;
@@ -5857,6 +5840,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
   int __pyx_v_lc;
   int __pyx_v_land_dist;
   int __pyx_v_further;
+  int __pyx_v_landing_sq;
   int __pyx_v_captured_piece;
   int __pyx_v_next_capture_value;
   int __pyx_r;
@@ -5864,26 +5848,26 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
   int __pyx_t_2;
   long __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":593
+  /* "dama/ai/algorithmic/_fast_search.pyx":594
  * ) noexcept nogil:
  *     """Generate captures for a flying king along one diagonal."""
  *     cdef int sr, sc, dist, found = 0             # <<<<<<<<<<<<<<
  *     cdef int scan_piece
- *     cdef int lr, lc, land_dist, further
+ *     cdef int lr, lc, land_dist, further, landing_sq
 */
   __pyx_v_found = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":598
+  /* "dama/ai/algorithmic/_fast_search.pyx":599
  *     cdef int captured_piece, next_capture_value
- *
+ * 
  *     dist = 1             # <<<<<<<<<<<<<<
  *     while True:
  *         sr = r + dist * dr
 */
   __pyx_v_dist = 1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":599
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":600
+ * 
  *     dist = 1
  *     while True:             # <<<<<<<<<<<<<<
  *         sr = r + dist * dr
@@ -5891,7 +5875,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
   while (1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":600
+    /* "dama/ai/algorithmic/_fast_search.pyx":601
  *     dist = 1
  *     while True:
  *         sr = r + dist * dr             # <<<<<<<<<<<<<<
@@ -5900,7 +5884,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
     __pyx_v_sr = (__pyx_v_r + (__pyx_v_dist * __pyx_v_dr));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":601
+    /* "dama/ai/algorithmic/_fast_search.pyx":602
  *     while True:
  *         sr = r + dist * dr
  *         sc = c + dist * dc             # <<<<<<<<<<<<<<
@@ -5909,7 +5893,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
     __pyx_v_sc = (__pyx_v_c + (__pyx_v_dist * __pyx_v_dc));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":602
+    /* "dama/ai/algorithmic/_fast_search.pyx":603
  *         sr = r + dist * dr
  *         sc = c + dist * dc
  *         if not in_bounds(sr, sc):             # <<<<<<<<<<<<<<
@@ -5919,7 +5903,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
     __pyx_t_1 = (!__pyx_f_4dama_2ai_11algorithmic_12_fast_search_in_bounds(__pyx_v_sr, __pyx_v_sc));
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":603
+      /* "dama/ai/algorithmic/_fast_search.pyx":604
  *         sc = c + dist * dc
  *         if not in_bounds(sr, sc):
  *             break             # <<<<<<<<<<<<<<
@@ -5928,7 +5912,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
       goto __pyx_L4_break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":602
+      /* "dama/ai/algorithmic/_fast_search.pyx":603
  *         sr = r + dist * dr
  *         sc = c + dist * dc
  *         if not in_bounds(sr, sc):             # <<<<<<<<<<<<<<
@@ -5937,7 +5921,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":604
+    /* "dama/ai/algorithmic/_fast_search.pyx":605
  *         if not in_bounds(sr, sc):
  *             break
  *         scan_piece = cell(board, sr, sc)             # <<<<<<<<<<<<<<
@@ -5946,7 +5930,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
     __pyx_v_scan_piece = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(__pyx_v_board, __pyx_v_sr, __pyx_v_sc);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":605
+    /* "dama/ai/algorithmic/_fast_search.pyx":606
  *             break
  *         scan_piece = cell(board, sr, sc)
  *         if scan_piece != EMPTY:             # <<<<<<<<<<<<<<
@@ -5956,7 +5940,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
     __pyx_t_1 = (__pyx_v_scan_piece != 0);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":606
+      /* "dama/ai/algorithmic/_fast_search.pyx":607
  *         scan_piece = cell(board, sr, sc)
  *         if scan_piece != EMPTY:
  *             if is_player(scan_piece, player):             # <<<<<<<<<<<<<<
@@ -5966,7 +5950,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
       __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_player(__pyx_v_scan_piece, __pyx_v_player);
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":607
+        /* "dama/ai/algorithmic/_fast_search.pyx":608
  *         if scan_piece != EMPTY:
  *             if is_player(scan_piece, player):
  *                 break             # <<<<<<<<<<<<<<
@@ -5975,7 +5959,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
         goto __pyx_L4_break;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":606
+        /* "dama/ai/algorithmic/_fast_search.pyx":607
  *         scan_piece = cell(board, sr, sc)
  *         if scan_piece != EMPTY:
  *             if is_player(scan_piece, player):             # <<<<<<<<<<<<<<
@@ -5984,7 +5968,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":608
+      /* "dama/ai/algorithmic/_fast_search.pyx":609
  *             if is_player(scan_piece, player):
  *                 break
  *             captured_piece = scan_piece             # <<<<<<<<<<<<<<
@@ -5993,7 +5977,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
       __pyx_v_captured_piece = __pyx_v_scan_piece;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":609
+      /* "dama/ai/algorithmic/_fast_search.pyx":610
  *                 break
  *             captured_piece = scan_piece
  *             land_dist = 1             # <<<<<<<<<<<<<<
@@ -6002,7 +5986,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
       __pyx_v_land_dist = 1;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":610
+      /* "dama/ai/algorithmic/_fast_search.pyx":611
  *             captured_piece = scan_piece
  *             land_dist = 1
  *             while True:             # <<<<<<<<<<<<<<
@@ -6011,7 +5995,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
       while (1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":611
+        /* "dama/ai/algorithmic/_fast_search.pyx":612
  *             land_dist = 1
  *             while True:
  *                 lr = sr + land_dist * dr             # <<<<<<<<<<<<<<
@@ -6020,7 +6004,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
         __pyx_v_lr = (__pyx_v_sr + (__pyx_v_land_dist * __pyx_v_dr));
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":612
+        /* "dama/ai/algorithmic/_fast_search.pyx":613
  *             while True:
  *                 lr = sr + land_dist * dr
  *                 lc = sc + land_dist * dc             # <<<<<<<<<<<<<<
@@ -6029,69 +6013,70 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 */
         __pyx_v_lc = (__pyx_v_sc + (__pyx_v_land_dist * __pyx_v_dc));
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":613
+        /* "dama/ai/algorithmic/_fast_search.pyx":614
  *                 lr = sr + land_dist * dr
  *                 lc = sc + land_dist * dc
  *                 if not in_bounds(lr, lc):             # <<<<<<<<<<<<<<
  *                     break
- *                 if cell(board, lr, lc) != EMPTY:
+ *                 landing_sq = lr * 8 + lc
 */
         __pyx_t_1 = (!__pyx_f_4dama_2ai_11algorithmic_12_fast_search_in_bounds(__pyx_v_lr, __pyx_v_lc));
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":614
+          /* "dama/ai/algorithmic/_fast_search.pyx":615
  *                 lc = sc + land_dist * dc
  *                 if not in_bounds(lr, lc):
  *                     break             # <<<<<<<<<<<<<<
+ *                 landing_sq = lr * 8 + lc
  *                 if cell(board, lr, lc) != EMPTY:
- *                     if lr == path_r[0] and lc == path_c[0]:
 */
           goto __pyx_L9_break;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":613
+          /* "dama/ai/algorithmic/_fast_search.pyx":614
  *                 lr = sr + land_dist * dr
  *                 lc = sc + land_dist * dc
  *                 if not in_bounds(lr, lc):             # <<<<<<<<<<<<<<
  *                     break
- *                 if cell(board, lr, lc) != EMPTY:
+ *                 landing_sq = lr * 8 + lc
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":615
+        /* "dama/ai/algorithmic/_fast_search.pyx":616
  *                 if not in_bounds(lr, lc):
  *                     break
+ *                 landing_sq = lr * 8 + lc             # <<<<<<<<<<<<<<
+ *                 if cell(board, lr, lc) != EMPTY:
+ *                     if landing_sq == path_sq[0]:
+*/
+        __pyx_v_landing_sq = ((__pyx_v_lr * 8) + __pyx_v_lc);
+
+        /* "dama/ai/algorithmic/_fast_search.pyx":617
+ *                     break
+ *                 landing_sq = lr * 8 + lc
  *                 if cell(board, lr, lc) != EMPTY:             # <<<<<<<<<<<<<<
- *                     if lr == path_r[0] and lc == path_c[0]:
+ *                     if landing_sq == path_sq[0]:
  *                         pass
 */
         __pyx_t_1 = (__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(__pyx_v_board, __pyx_v_lr, __pyx_v_lc) != 0);
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":616
- *                     break
+          /* "dama/ai/algorithmic/_fast_search.pyx":618
+ *                 landing_sq = lr * 8 + lc
  *                 if cell(board, lr, lc) != EMPTY:
- *                     if lr == path_r[0] and lc == path_c[0]:             # <<<<<<<<<<<<<<
+ *                     if landing_sq == path_sq[0]:             # <<<<<<<<<<<<<<
  *                         pass
  *                     else:
 */
-          __pyx_t_2 = (__pyx_v_lr == (__pyx_v_path_r[0]));
-          if (__pyx_t_2) {
-          } else {
-            __pyx_t_1 = __pyx_t_2;
-            goto __pyx_L13_bool_binop_done;
-          }
-          __pyx_t_2 = (__pyx_v_lc == (__pyx_v_path_c[0]));
-          __pyx_t_1 = __pyx_t_2;
-          __pyx_L13_bool_binop_done:;
+          __pyx_t_1 = (__pyx_v_landing_sq == (__pyx_v_path_sq[0]));
           if (__pyx_t_1) {
             goto __pyx_L12;
           }
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":619
+          /* "dama/ai/algorithmic/_fast_search.pyx":621
  *                         pass
  *                     else:
  *                         break             # <<<<<<<<<<<<<<
- *
+ * 
  *                 if (cell(board, lr, lc) == EMPTY
 */
           /*else*/ {
@@ -6099,97 +6084,73 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
           }
           __pyx_L12:;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":615
- *                 if not in_bounds(lr, lc):
+          /* "dama/ai/algorithmic/_fast_search.pyx":617
  *                     break
+ *                 landing_sq = lr * 8 + lc
  *                 if cell(board, lr, lc) != EMPTY:             # <<<<<<<<<<<<<<
- *                     if lr == path_r[0] and lc == path_c[0]:
+ *                     if landing_sq == path_sq[0]:
  *                         pass
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":621
+        /* "dama/ai/algorithmic/_fast_search.pyx":623
  *                         break
- *
+ * 
  *                 if (cell(board, lr, lc) == EMPTY             # <<<<<<<<<<<<<<
- *                         or (lr == path_r[0] and lc == path_c[0])):
- *                     path_r[path_len] = lr
+ *                         or landing_sq == path_sq[0]):
+ *                     path_sq[path_len] = landing_sq
 */
         __pyx_t_2 = (__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cell(__pyx_v_board, __pyx_v_lr, __pyx_v_lc) == 0);
         if (!__pyx_t_2) {
         } else {
           __pyx_t_1 = __pyx_t_2;
-          goto __pyx_L16_bool_binop_done;
+          goto __pyx_L14_bool_binop_done;
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":622
- *
+        /* "dama/ai/algorithmic/_fast_search.pyx":624
+ * 
  *                 if (cell(board, lr, lc) == EMPTY
- *                         or (lr == path_r[0] and lc == path_c[0])):             # <<<<<<<<<<<<<<
- *                     path_r[path_len] = lr
- *                     path_c[path_len] = lc
+ *                         or landing_sq == path_sq[0]):             # <<<<<<<<<<<<<<
+ *                     path_sq[path_len] = landing_sq
+ *                     cap_sq[num_caps] = sr * 8 + sc
 */
-        __pyx_t_2 = (__pyx_v_lr == (__pyx_v_path_r[0]));
-        if (__pyx_t_2) {
-        } else {
-          __pyx_t_1 = __pyx_t_2;
-          goto __pyx_L16_bool_binop_done;
-        }
-        __pyx_t_2 = (__pyx_v_lc == (__pyx_v_path_c[0]));
+        __pyx_t_2 = (__pyx_v_landing_sq == (__pyx_v_path_sq[0]));
         __pyx_t_1 = __pyx_t_2;
-        __pyx_L16_bool_binop_done:;
+        __pyx_L14_bool_binop_done:;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":621
+        /* "dama/ai/algorithmic/_fast_search.pyx":623
  *                         break
- *
+ * 
  *                 if (cell(board, lr, lc) == EMPTY             # <<<<<<<<<<<<<<
- *                         or (lr == path_r[0] and lc == path_c[0])):
- *                     path_r[path_len] = lr
+ *                         or landing_sq == path_sq[0]):
+ *                     path_sq[path_len] = landing_sq
 */
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":623
- *                 if (cell(board, lr, lc) == EMPTY
- *                         or (lr == path_r[0] and lc == path_c[0])):
- *                     path_r[path_len] = lr             # <<<<<<<<<<<<<<
- *                     path_c[path_len] = lc
- *                     cap_r[num_caps] = sr
-*/
-          (__pyx_v_path_r[__pyx_v_path_len]) = __pyx_v_lr;
-
-          /* "dama/ai/algorithmic/_fast_search.pyx":624
- *                         or (lr == path_r[0] and lc == path_c[0])):
- *                     path_r[path_len] = lr
- *                     path_c[path_len] = lc             # <<<<<<<<<<<<<<
- *                     cap_r[num_caps] = sr
- *                     cap_c[num_caps] = sc
-*/
-          (__pyx_v_path_c[__pyx_v_path_len]) = __pyx_v_lc;
-
           /* "dama/ai/algorithmic/_fast_search.pyx":625
- *                     path_r[path_len] = lr
- *                     path_c[path_len] = lc
- *                     cap_r[num_caps] = sr             # <<<<<<<<<<<<<<
- *                     cap_c[num_caps] = sc
+ *                 if (cell(board, lr, lc) == EMPTY
+ *                         or landing_sq == path_sq[0]):
+ *                     path_sq[path_len] = landing_sq             # <<<<<<<<<<<<<<
+ *                     cap_sq[num_caps] = sr * 8 + sc
  *                     next_capture_value = (
 */
-          (__pyx_v_cap_r[__pyx_v_num_caps]) = __pyx_v_sr;
+          (__pyx_v_path_sq[__pyx_v_path_len]) = __pyx_v_landing_sq;
 
           /* "dama/ai/algorithmic/_fast_search.pyx":626
- *                     path_c[path_len] = lc
- *                     cap_r[num_caps] = sr
- *                     cap_c[num_caps] = sc             # <<<<<<<<<<<<<<
+ *                         or landing_sq == path_sq[0]):
+ *                     path_sq[path_len] = landing_sq
+ *                     cap_sq[num_caps] = sr * 8 + sc             # <<<<<<<<<<<<<<
  *                     next_capture_value = (
  *                         capture_value
 */
-          (__pyx_v_cap_c[__pyx_v_num_caps]) = __pyx_v_sc;
+          (__pyx_v_cap_sq[__pyx_v_num_caps]) = ((__pyx_v_sr * 8) + __pyx_v_sc);
 
           /* "dama/ai/algorithmic/_fast_search.pyx":629
  *                     next_capture_value = (
  *                         capture_value
  *                         + (W_KING if is_king(captured_piece) else W_MAN)             # <<<<<<<<<<<<<<
  *                     )
- *
+ * 
 */
           __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king(__pyx_v_captured_piece);
           if (__pyx_t_1) {
@@ -6201,7 +6162,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 
           /* "dama/ai/algorithmic/_fast_search.pyx":632
  *                     )
- *
+ * 
  *                     set_cell(board, r, c, EMPTY)             # <<<<<<<<<<<<<<
  *                     set_cell(board, sr, sc, EMPTY)
  *                     set_cell(board, lr, lc, piece)
@@ -6209,11 +6170,11 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_r, __pyx_v_c, 0);
 
           /* "dama/ai/algorithmic/_fast_search.pyx":633
- *
+ * 
  *                     set_cell(board, r, c, EMPTY)
  *                     set_cell(board, sr, sc, EMPTY)             # <<<<<<<<<<<<<<
  *                     set_cell(board, lr, lc, piece)
- *
+ * 
 */
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_sr, __pyx_v_sc, 0);
 
@@ -6221,23 +6182,23 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
  *                     set_cell(board, r, c, EMPTY)
  *                     set_cell(board, sr, sc, EMPTY)
  *                     set_cell(board, lr, lc, piece)             # <<<<<<<<<<<<<<
- *
+ * 
  *                     further = _generate_captures_recursive(
 */
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, __pyx_v_piece);
 
           /* "dama/ai/algorithmic/_fast_search.pyx":636
  *                     set_cell(board, lr, lc, piece)
- *
+ * 
  *                     further = _generate_captures_recursive(             # <<<<<<<<<<<<<<
  *                         board, lr, lc, piece, player,
  *                         next_capture_value,
 */
-          __pyx_v_further = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, __pyx_v_piece, __pyx_v_player, __pyx_v_next_capture_value, __pyx_v_path_r, __pyx_v_path_c, (__pyx_v_path_len + 1), __pyx_v_cap_r, __pyx_v_cap_c, (__pyx_v_num_caps + 1), __pyx_v_rules, __pyx_v_out);
+          __pyx_v_further = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, __pyx_v_piece, __pyx_v_player, __pyx_v_next_capture_value, __pyx_v_path_sq, (__pyx_v_path_len + 1), __pyx_v_cap_sq, (__pyx_v_num_caps + 1), __pyx_v_rules, __pyx_v_out);
 
           /* "dama/ai/algorithmic/_fast_search.pyx":644
  *                     )
- *
+ * 
  *                     set_cell(board, lr, lc, EMPTY)             # <<<<<<<<<<<<<<
  *                     set_cell(board, r, c, piece)
  *                     set_cell(board, sr, sc, captured_piece)
@@ -6245,11 +6206,11 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_lr, __pyx_v_lc, 0);
 
           /* "dama/ai/algorithmic/_fast_search.pyx":645
- *
+ * 
  *                     set_cell(board, lr, lc, EMPTY)
  *                     set_cell(board, r, c, piece)             # <<<<<<<<<<<<<<
  *                     set_cell(board, sr, sc, captured_piece)
- *
+ * 
 */
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_r, __pyx_v_c, __pyx_v_piece);
 
@@ -6257,14 +6218,14 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
  *                     set_cell(board, lr, lc, EMPTY)
  *                     set_cell(board, r, c, piece)
  *                     set_cell(board, sr, sc, captured_piece)             # <<<<<<<<<<<<<<
- *
+ * 
  *                     if further > 0:
 */
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search_set_cell(__pyx_v_board, __pyx_v_sr, __pyx_v_sc, __pyx_v_captured_piece);
 
           /* "dama/ai/algorithmic/_fast_search.pyx":648
  *                     set_cell(board, sr, sc, captured_piece)
- *
+ * 
  *                     if further > 0:             # <<<<<<<<<<<<<<
  *                         found += further
  *                     else:
@@ -6273,7 +6234,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
           if (__pyx_t_1) {
 
             /* "dama/ai/algorithmic/_fast_search.pyx":649
- *
+ * 
  *                     if further > 0:
  *                         found += further             # <<<<<<<<<<<<<<
  *                     else:
@@ -6283,12 +6244,12 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 
             /* "dama/ai/algorithmic/_fast_search.pyx":648
  *                     set_cell(board, sr, sc, captured_piece)
- *
+ * 
  *                     if further > 0:             # <<<<<<<<<<<<<<
  *                         found += further
  *                     else:
 */
-            goto __pyx_L19;
+            goto __pyx_L16;
           }
 
           /* "dama/ai/algorithmic/_fast_search.pyx":651
@@ -6296,7 +6257,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
  *                     else:
  *                         if out.count < MAX_MOVES:             # <<<<<<<<<<<<<<
  *                             _copy_capture_move(
- *                                 out, path_r, path_c, path_len + 1,
+ *                                 out, path_sq, path_len + 1,
 */
           /*else*/ {
             __pyx_t_1 = (__pyx_v_out->count < 0x80);
@@ -6306,16 +6267,16 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
  *                     else:
  *                         if out.count < MAX_MOVES:
  *                             _copy_capture_move(             # <<<<<<<<<<<<<<
- *                                 out, path_r, path_c, path_len + 1,
- *                                 cap_r, cap_c, num_caps + 1, 0,
+ *                                 out, path_sq, path_len + 1,
+ *                                 cap_sq, num_caps + 1, 0,
 */
-              __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(__pyx_v_out, __pyx_v_path_r, __pyx_v_path_c, (__pyx_v_path_len + 1), __pyx_v_cap_r, __pyx_v_cap_c, (__pyx_v_num_caps + 1), 0, __pyx_v_next_capture_value);
+              __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(__pyx_v_out, __pyx_v_path_sq, (__pyx_v_path_len + 1), __pyx_v_cap_sq, (__pyx_v_num_caps + 1), 0, __pyx_v_next_capture_value);
 
               /* "dama/ai/algorithmic/_fast_search.pyx":656
- *                                 cap_r, cap_c, num_caps + 1, 0,
+ *                                 cap_sq, num_caps + 1, 0,
  *                                 next_capture_value)
  *                             found += 1             # <<<<<<<<<<<<<<
- *
+ * 
  *                 land_dist += 1
 */
               __pyx_v_found = (__pyx_v_found + 1);
@@ -6325,24 +6286,24 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
  *                     else:
  *                         if out.count < MAX_MOVES:             # <<<<<<<<<<<<<<
  *                             _copy_capture_move(
- *                                 out, path_r, path_c, path_len + 1,
+ *                                 out, path_sq, path_len + 1,
 */
             }
           }
-          __pyx_L19:;
+          __pyx_L16:;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":621
+          /* "dama/ai/algorithmic/_fast_search.pyx":623
  *                         break
- *
+ * 
  *                 if (cell(board, lr, lc) == EMPTY             # <<<<<<<<<<<<<<
- *                         or (lr == path_r[0] and lc == path_c[0])):
- *                     path_r[path_len] = lr
+ *                         or landing_sq == path_sq[0]):
+ *                     path_sq[path_len] = landing_sq
 */
         }
 
         /* "dama/ai/algorithmic/_fast_search.pyx":658
  *                             found += 1
- *
+ * 
  *                 land_dist += 1             # <<<<<<<<<<<<<<
  *             break
  *         dist += 1
@@ -6352,15 +6313,15 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
       __pyx_L9_break:;
 
       /* "dama/ai/algorithmic/_fast_search.pyx":659
- *
+ * 
  *                 land_dist += 1
  *             break             # <<<<<<<<<<<<<<
  *         dist += 1
- *
+ * 
 */
       goto __pyx_L4_break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":605
+      /* "dama/ai/algorithmic/_fast_search.pyx":606
  *             break
  *         scan_piece = cell(board, sr, sc)
  *         if scan_piece != EMPTY:             # <<<<<<<<<<<<<<
@@ -6373,7 +6334,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
  *                 land_dist += 1
  *             break
  *         dist += 1             # <<<<<<<<<<<<<<
- *
+ * 
  *     return found
 */
     __pyx_v_dist = (__pyx_v_dist + 1);
@@ -6382,17 +6343,17 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 
   /* "dama/ai/algorithmic/_fast_search.pyx":662
  *         dist += 1
- *
+ * 
  *     return found             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_found;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":584
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":585
+ * 
+ * 
  * cdef int _flying_king_capture(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     int dr, int dc,
@@ -6404,14 +6365,14 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__flying_king_capture(s
 }
 
 /* "dama/ai/algorithmic/_fast_search.pyx":665
- *
- *
+ * 
+ * 
  * cdef inline void _copy_capture_move(             # <<<<<<<<<<<<<<
  *     CMoveList *out,
- *     int *path_r, int *path_c, int path_len,
+ *     int *path_sq, int path_len,
 */
 
-static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *__pyx_v_out, int *__pyx_v_path_r, int *__pyx_v_path_c, int __pyx_v_path_len, int *__pyx_v_cap_r, int *__pyx_v_cap_c, int __pyx_v_num_caps, int __pyx_v_promo, int __pyx_v_capture_value) {
+static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_capture_move(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *__pyx_v_out, int *__pyx_v_path_sq, int __pyx_v_path_len, int *__pyx_v_cap_sq, int __pyx_v_num_caps, int __pyx_v_promo, int __pyx_v_capture_value) {
   struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMove *__pyx_v_m;
   int __pyx_v_i;
   int __pyx_t_1;
@@ -6432,7 +6393,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_c
  *     cdef int i
  *     m.path_len = path_len             # <<<<<<<<<<<<<<
  *     for i in range(path_len):
- *         m.path_r[i] = path_r[i]
+ *         m.path_r[i] = path_sq[i] >> 3
 */
   __pyx_v_m->path_len = __pyx_v_path_len;
 
@@ -6440,8 +6401,8 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_c
  *     cdef int i
  *     m.path_len = path_len
  *     for i in range(path_len):             # <<<<<<<<<<<<<<
- *         m.path_r[i] = path_r[i]
- *         m.path_c[i] = path_c[i]
+ *         m.path_r[i] = path_sq[i] >> 3
+ *         m.path_c[i] = path_sq[i] & 7
 */
   __pyx_t_1 = __pyx_v_path_len;
   __pyx_t_2 = __pyx_t_1;
@@ -6451,37 +6412,37 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_c
     /* "dama/ai/algorithmic/_fast_search.pyx":675
  *     m.path_len = path_len
  *     for i in range(path_len):
- *         m.path_r[i] = path_r[i]             # <<<<<<<<<<<<<<
- *         m.path_c[i] = path_c[i]
+ *         m.path_r[i] = path_sq[i] >> 3             # <<<<<<<<<<<<<<
+ *         m.path_c[i] = path_sq[i] & 7
  *     m.num_captures = num_caps
 */
-    (__pyx_v_m->path_r[__pyx_v_i]) = (__pyx_v_path_r[__pyx_v_i]);
+    (__pyx_v_m->path_r[__pyx_v_i]) = ((__pyx_v_path_sq[__pyx_v_i]) >> 3);
 
     /* "dama/ai/algorithmic/_fast_search.pyx":676
  *     for i in range(path_len):
- *         m.path_r[i] = path_r[i]
- *         m.path_c[i] = path_c[i]             # <<<<<<<<<<<<<<
+ *         m.path_r[i] = path_sq[i] >> 3
+ *         m.path_c[i] = path_sq[i] & 7             # <<<<<<<<<<<<<<
  *     m.num_captures = num_caps
  *     for i in range(num_caps):
 */
-    (__pyx_v_m->path_c[__pyx_v_i]) = (__pyx_v_path_c[__pyx_v_i]);
+    (__pyx_v_m->path_c[__pyx_v_i]) = ((__pyx_v_path_sq[__pyx_v_i]) & 7);
   }
 
   /* "dama/ai/algorithmic/_fast_search.pyx":677
- *         m.path_r[i] = path_r[i]
- *         m.path_c[i] = path_c[i]
+ *         m.path_r[i] = path_sq[i] >> 3
+ *         m.path_c[i] = path_sq[i] & 7
  *     m.num_captures = num_caps             # <<<<<<<<<<<<<<
  *     for i in range(num_caps):
- *         m.cap_r[i] = cap_r[i]
+ *         m.cap_r[i] = cap_sq[i] >> 3
 */
   __pyx_v_m->num_captures = __pyx_v_num_caps;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":678
- *         m.path_c[i] = path_c[i]
+ *         m.path_c[i] = path_sq[i] & 7
  *     m.num_captures = num_caps
  *     for i in range(num_caps):             # <<<<<<<<<<<<<<
- *         m.cap_r[i] = cap_r[i]
- *         m.cap_c[i] = cap_c[i]
+ *         m.cap_r[i] = cap_sq[i] >> 3
+ *         m.cap_c[i] = cap_sq[i] & 7
 */
   __pyx_t_1 = __pyx_v_num_caps;
   __pyx_t_2 = __pyx_t_1;
@@ -6491,105 +6452,102 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_c
     /* "dama/ai/algorithmic/_fast_search.pyx":679
  *     m.num_captures = num_caps
  *     for i in range(num_caps):
- *         m.cap_r[i] = cap_r[i]             # <<<<<<<<<<<<<<
- *         m.cap_c[i] = cap_c[i]
- *     m.from_sq = path_r[0] * 8 + path_c[0]
+ *         m.cap_r[i] = cap_sq[i] >> 3             # <<<<<<<<<<<<<<
+ *         m.cap_c[i] = cap_sq[i] & 7
+ *     m.from_sq = path_sq[0]
 */
-    (__pyx_v_m->cap_r[__pyx_v_i]) = (__pyx_v_cap_r[__pyx_v_i]);
+    (__pyx_v_m->cap_r[__pyx_v_i]) = ((__pyx_v_cap_sq[__pyx_v_i]) >> 3);
 
     /* "dama/ai/algorithmic/_fast_search.pyx":680
  *     for i in range(num_caps):
- *         m.cap_r[i] = cap_r[i]
- *         m.cap_c[i] = cap_c[i]             # <<<<<<<<<<<<<<
- *     m.from_sq = path_r[0] * 8 + path_c[0]
- *     m.to_sq = path_r[path_len - 1] * 8 + path_c[path_len - 1]
+ *         m.cap_r[i] = cap_sq[i] >> 3
+ *         m.cap_c[i] = cap_sq[i] & 7             # <<<<<<<<<<<<<<
+ *     m.from_sq = path_sq[0]
+ *     m.to_sq = path_sq[path_len - 1]
 */
-    (__pyx_v_m->cap_c[__pyx_v_i]) = (__pyx_v_cap_c[__pyx_v_i]);
+    (__pyx_v_m->cap_c[__pyx_v_i]) = ((__pyx_v_cap_sq[__pyx_v_i]) & 7);
   }
 
   /* "dama/ai/algorithmic/_fast_search.pyx":681
- *         m.cap_r[i] = cap_r[i]
- *         m.cap_c[i] = cap_c[i]
- *     m.from_sq = path_r[0] * 8 + path_c[0]             # <<<<<<<<<<<<<<
- *     m.to_sq = path_r[path_len - 1] * 8 + path_c[path_len - 1]
+ *         m.cap_r[i] = cap_sq[i] >> 3
+ *         m.cap_c[i] = cap_sq[i] & 7
+ *     m.from_sq = path_sq[0]             # <<<<<<<<<<<<<<
+ *     m.to_sq = path_sq[path_len - 1]
  *     _set_move_metadata(m, promo, capture_value)
 */
-  __pyx_v_m->from_sq = (((__pyx_v_path_r[0]) * 8) + (__pyx_v_path_c[0]));
+  __pyx_v_m->from_sq = (__pyx_v_path_sq[0]);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":682
- *         m.cap_c[i] = cap_c[i]
- *     m.from_sq = path_r[0] * 8 + path_c[0]
- *     m.to_sq = path_r[path_len - 1] * 8 + path_c[path_len - 1]             # <<<<<<<<<<<<<<
+ *         m.cap_c[i] = cap_sq[i] & 7
+ *     m.from_sq = path_sq[0]
+ *     m.to_sq = path_sq[path_len - 1]             # <<<<<<<<<<<<<<
  *     _set_move_metadata(m, promo, capture_value)
  *     out.count += 1
 */
-  __pyx_v_m->to_sq = (((__pyx_v_path_r[(__pyx_v_path_len - 1)]) * 8) + (__pyx_v_path_c[(__pyx_v_path_len - 1)]));
+  __pyx_v_m->to_sq = (__pyx_v_path_sq[(__pyx_v_path_len - 1)]);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":683
- *     m.from_sq = path_r[0] * 8 + path_c[0]
- *     m.to_sq = path_r[path_len - 1] * 8 + path_c[path_len - 1]
+ *     m.from_sq = path_sq[0]
+ *     m.to_sq = path_sq[path_len - 1]
  *     _set_move_metadata(m, promo, capture_value)             # <<<<<<<<<<<<<<
  *     out.count += 1
- *
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__set_move_metadata(__pyx_v_m, __pyx_v_promo, __pyx_v_capture_value);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":684
- *     m.to_sq = path_r[path_len - 1] * 8 + path_c[path_len - 1]
+ *     m.to_sq = path_sq[path_len - 1]
  *     _set_move_metadata(m, promo, capture_value)
  *     out.count += 1             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_v_out->count = (__pyx_v_out->count + 1);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":665
- *
- *
+ * 
+ * 
  * cdef inline void _copy_capture_move(             # <<<<<<<<<<<<<<
  *     CMoveList *out,
- *     int *path_r, int *path_c, int path_len,
+ *     int *path_sq, int path_len,
 */
 
   /* function exit code */
 }
 
 /* "dama/ai/algorithmic/_fast_search.pyx":687
- *
- *
+ * 
+ * 
  * cdef void generate_captures(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     Rules *rules, CMoveList *out
 */
 
 static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures(signed char *__pyx_v_board, int __pyx_v_r, int __pyx_v_c, int __pyx_v_piece, int __pyx_v_player, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules *__pyx_v_rules, struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMoveList *__pyx_v_out) {
-  int __pyx_v_path_r[8];
-  int __pyx_v_path_c[8];
-  int __pyx_v_cap_r[7];
-  int __pyx_v_cap_c[7];
+  int __pyx_v_path_sq[8];
+  int __pyx_v_cap_sq[7];
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":696
- *     cdef int cap_c[MAX_CAPTURES]
- *
- *     path_r[0] = r; path_c[0] = c             # <<<<<<<<<<<<<<
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":694
+ *     cdef int cap_sq[MAX_CAPTURES]
+ * 
+ *     path_sq[0] = r * 8 + c             # <<<<<<<<<<<<<<
+ * 
  *     _generate_captures_recursive(
 */
-  (__pyx_v_path_r[0]) = __pyx_v_r;
-  (__pyx_v_path_c[0]) = __pyx_v_c;
+  (__pyx_v_path_sq[0]) = ((__pyx_v_r * 8) + __pyx_v_c);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":698
- *     path_r[0] = r; path_c[0] = c
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":696
+ *     path_sq[0] = r * 8 + c
+ * 
  *     _generate_captures_recursive(             # <<<<<<<<<<<<<<
  *         board, r, c, piece, player,
- *         0, path_r, path_c, 1, cap_r, cap_c, 0,
+ *         0, path_sq, 1, cap_sq, 0,
 */
-  (void)(__pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(__pyx_v_board, __pyx_v_r, __pyx_v_c, __pyx_v_piece, __pyx_v_player, 0, __pyx_v_path_r, __pyx_v_path_c, 1, __pyx_v_cap_r, __pyx_v_cap_c, 0, __pyx_v_rules, __pyx_v_out));
+  (void)(__pyx_f_4dama_2ai_11algorithmic_12_fast_search__generate_captures_recursive(__pyx_v_board, __pyx_v_r, __pyx_v_c, __pyx_v_piece, __pyx_v_player, 0, __pyx_v_path_sq, 1, __pyx_v_cap_sq, 0, __pyx_v_rules, __pyx_v_out));
 
   /* "dama/ai/algorithmic/_fast_search.pyx":687
- *
- *
+ * 
+ * 
  * cdef void generate_captures(             # <<<<<<<<<<<<<<
  *     signed char *board, int r, int c, int piece, int player,
  *     Rules *rules, CMoveList *out
@@ -6598,9 +6556,9 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures(sig
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":705
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":703
+ * 
+ * 
  * cdef void generate_all_moves_c(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, Rules *rules, CMoveList *out
  * ) noexcept nogil:
@@ -6614,17 +6572,17 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":727
+  /* "dama/ai/algorithmic/_fast_search.pyx":725
  *     # generated first and every append is bounded by MAX_MOVES, so those
  *     # staging buffers and copies cannot affect ordering or truncation.
  *     out.count = 0             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Pass 1: generate captures for all pieces
 */
   __pyx_v_out->count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":730
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":728
+ * 
  *     # Pass 1: generate captures for all pieces
  *     for i in range(NUM_DARK_SQ):             # <<<<<<<<<<<<<<
  *         sq = DARK_SQ[i]
@@ -6633,7 +6591,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
   for (__pyx_t_1 = 0; __pyx_t_1 < 32; __pyx_t_1+=1) {
     __pyx_v_i = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":731
+    /* "dama/ai/algorithmic/_fast_search.pyx":729
  *     # Pass 1: generate captures for all pieces
  *     for i in range(NUM_DARK_SQ):
  *         sq = DARK_SQ[i]             # <<<<<<<<<<<<<<
@@ -6642,7 +6600,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
 */
     __pyx_v_sq = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":732
+    /* "dama/ai/algorithmic/_fast_search.pyx":730
  *     for i in range(NUM_DARK_SQ):
  *         sq = DARK_SQ[i]
  *         piece = board[sq]             # <<<<<<<<<<<<<<
@@ -6651,7 +6609,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
 */
     __pyx_v_piece = (__pyx_v_board[__pyx_v_sq]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":733
+    /* "dama/ai/algorithmic/_fast_search.pyx":731
  *         sq = DARK_SQ[i]
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -6669,16 +6627,16 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
     __pyx_L6_bool_binop_done:;
     if (__pyx_t_2) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":734
+      /* "dama/ai/algorithmic/_fast_search.pyx":732
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):
  *             continue             # <<<<<<<<<<<<<<
  *         generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
- *
+ * 
 */
       goto __pyx_L3_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":733
+      /* "dama/ai/algorithmic/_fast_search.pyx":731
  *         sq = DARK_SQ[i]
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -6687,23 +6645,23 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":735
+    /* "dama/ai/algorithmic/_fast_search.pyx":733
  *         if piece == EMPTY or not is_player(piece, player):
  *             continue
  *         generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Early exit: forced capture with captures found  skip simple moves entirely
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures(__pyx_v_board, (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_R[__pyx_v_i]), (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_C[__pyx_v_i]), __pyx_v_piece, __pyx_v_player, __pyx_v_rules, __pyx_v_out);
     __pyx_L3_continue:;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":738
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":736
+ * 
  *     # Early exit: forced capture with captures found  skip simple moves entirely
  *     if rules.forced_capture and out.count > 0:             # <<<<<<<<<<<<<<
  *         return
- *
+ * 
 */
   if (__pyx_v_rules->forced_capture) {
   } else {
@@ -6715,25 +6673,25 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
   __pyx_L9_bool_binop_done:;
   if (__pyx_t_2) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":739
+    /* "dama/ai/algorithmic/_fast_search.pyx":737
  *     # Early exit: forced capture with captures found  skip simple moves entirely
  *     if rules.forced_capture and out.count > 0:
  *         return             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Pass 2: append simple moves after captures.  With forced capture enabled,
 */
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":738
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":736
+ * 
  *     # Early exit: forced capture with captures found  skip simple moves entirely
  *     if rules.forced_capture and out.count > 0:             # <<<<<<<<<<<<<<
  *         return
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":744
+  /* "dama/ai/algorithmic/_fast_search.pyx":742
  *     # reaching this point means out.count is zero.  With it disabled, the
  *     # capture-first ordering is identical to the former merge step.
  *     for i in range(NUM_DARK_SQ):             # <<<<<<<<<<<<<<
@@ -6743,7 +6701,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
   for (__pyx_t_1 = 0; __pyx_t_1 < 32; __pyx_t_1+=1) {
     __pyx_v_i = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":745
+    /* "dama/ai/algorithmic/_fast_search.pyx":743
  *     # capture-first ordering is identical to the former merge step.
  *     for i in range(NUM_DARK_SQ):
  *         sq = DARK_SQ[i]             # <<<<<<<<<<<<<<
@@ -6752,7 +6710,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
 */
     __pyx_v_sq = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":746
+    /* "dama/ai/algorithmic/_fast_search.pyx":744
  *     for i in range(NUM_DARK_SQ):
  *         sq = DARK_SQ[i]
  *         piece = board[sq]             # <<<<<<<<<<<<<<
@@ -6761,7 +6719,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
 */
     __pyx_v_piece = (__pyx_v_board[__pyx_v_sq]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":747
+    /* "dama/ai/algorithmic/_fast_search.pyx":745
  *         sq = DARK_SQ[i]
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -6779,16 +6737,16 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
     __pyx_L14_bool_binop_done:;
     if (__pyx_t_2) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":748
+      /* "dama/ai/algorithmic/_fast_search.pyx":746
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):
  *             continue             # <<<<<<<<<<<<<<
  *         generate_simple_moves(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
- *
+ * 
 */
       goto __pyx_L11_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":747
+      /* "dama/ai/algorithmic/_fast_search.pyx":745
  *         sq = DARK_SQ[i]
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -6797,20 +6755,20 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":749
+    /* "dama/ai/algorithmic/_fast_search.pyx":747
  *         if piece == EMPTY or not is_player(piece, player):
  *             continue
  *         generate_simple_moves(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_simple_moves(__pyx_v_board, (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_R[__pyx_v_i]), (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_C[__pyx_v_i]), __pyx_v_piece, __pyx_v_player, __pyx_v_rules, __pyx_v_out);
     __pyx_L11_continue:;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":705
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":703
+ * 
+ * 
  * cdef void generate_all_moves_c(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, Rules *rules, CMoveList *out
  * ) noexcept nogil:
@@ -6820,9 +6778,9 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(
   __pyx_L0:;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":752
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":750
+ * 
+ * 
  * cdef int generate_captures_only_c(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, Rules *rules, CMoveList *out
  * ) noexcept nogil:
@@ -6837,7 +6795,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":757
+  /* "dama/ai/algorithmic/_fast_search.pyx":755
  *     """Generate only capture moves (no simple moves). For quiescence search."""
  *     cdef int i, sq, piece
  *     out.count = 0             # <<<<<<<<<<<<<<
@@ -6846,7 +6804,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
 */
   __pyx_v_out->count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":758
+  /* "dama/ai/algorithmic/_fast_search.pyx":756
  *     cdef int i, sq, piece
  *     out.count = 0
  *     for i in range(NUM_DARK_SQ):             # <<<<<<<<<<<<<<
@@ -6856,7 +6814,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
   for (__pyx_t_1 = 0; __pyx_t_1 < 32; __pyx_t_1+=1) {
     __pyx_v_i = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":759
+    /* "dama/ai/algorithmic/_fast_search.pyx":757
  *     out.count = 0
  *     for i in range(NUM_DARK_SQ):
  *         sq = DARK_SQ[i]             # <<<<<<<<<<<<<<
@@ -6865,7 +6823,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
 */
     __pyx_v_sq = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":760
+    /* "dama/ai/algorithmic/_fast_search.pyx":758
  *     for i in range(NUM_DARK_SQ):
  *         sq = DARK_SQ[i]
  *         piece = board[sq]             # <<<<<<<<<<<<<<
@@ -6874,7 +6832,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
 */
     __pyx_v_piece = (__pyx_v_board[__pyx_v_sq]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":761
+    /* "dama/ai/algorithmic/_fast_search.pyx":759
  *         sq = DARK_SQ[i]
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -6892,7 +6850,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
     __pyx_L6_bool_binop_done:;
     if (__pyx_t_2) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":762
+      /* "dama/ai/algorithmic/_fast_search.pyx":760
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):
  *             continue             # <<<<<<<<<<<<<<
@@ -6901,7 +6859,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
 */
       goto __pyx_L3_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":761
+      /* "dama/ai/algorithmic/_fast_search.pyx":759
  *         sq = DARK_SQ[i]
  *         piece = board[sq]
  *         if piece == EMPTY or not is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -6910,30 +6868,30 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":763
+    /* "dama/ai/algorithmic/_fast_search.pyx":761
  *         if piece == EMPTY or not is_player(piece, player):
  *             continue
  *         generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)             # <<<<<<<<<<<<<<
  *     return out.count
- *
+ * 
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures(__pyx_v_board, (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_R[__pyx_v_i]), (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_C[__pyx_v_i]), __pyx_v_piece, __pyx_v_player, __pyx_v_rules, __pyx_v_out);
     __pyx_L3_continue:;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":764
+  /* "dama/ai/algorithmic/_fast_search.pyx":762
  *             continue
  *         generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
  *     return out.count             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_out->count;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":752
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":750
+ * 
+ * 
  * cdef int generate_captures_only_c(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, Rules *rules, CMoveList *out
  * ) noexcept nogil:
@@ -6944,9 +6902,9 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":767
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":765
+ * 
+ * 
  * cdef inline bint _has_pieces(signed char *board, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Fast check if player has any pieces. O(32) worst, early-exit on first find."""
  *     cdef int i, piece
@@ -6960,7 +6918,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__has_pie
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":770
+  /* "dama/ai/algorithmic/_fast_search.pyx":768
  *     """Fast check if player has any pieces. O(32) worst, early-exit on first find."""
  *     cdef int i, piece
  *     for i in range(NUM_DARK_SQ):             # <<<<<<<<<<<<<<
@@ -6970,7 +6928,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__has_pie
   for (__pyx_t_1 = 0; __pyx_t_1 < 32; __pyx_t_1+=1) {
     __pyx_v_i = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":771
+    /* "dama/ai/algorithmic/_fast_search.pyx":769
  *     cdef int i, piece
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]             # <<<<<<<<<<<<<<
@@ -6979,7 +6937,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__has_pie
 */
     __pyx_v_piece = (__pyx_v_board[(__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ[__pyx_v_i])]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":772
+    /* "dama/ai/algorithmic/_fast_search.pyx":770
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]
  *         if piece != EMPTY and is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -6997,17 +6955,17 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__has_pie
     __pyx_L6_bool_binop_done:;
     if (__pyx_t_2) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":773
+      /* "dama/ai/algorithmic/_fast_search.pyx":771
  *         piece = board[DARK_SQ[i]]
  *         if piece != EMPTY and is_player(piece, player):
  *             return True             # <<<<<<<<<<<<<<
  *     return False
- *
+ * 
 */
       __pyx_r = 1;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":772
+      /* "dama/ai/algorithmic/_fast_search.pyx":770
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]
  *         if piece != EMPTY and is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -7017,19 +6975,19 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__has_pie
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":774
+  /* "dama/ai/algorithmic/_fast_search.pyx":772
  *         if piece != EMPTY and is_player(piece, player):
  *             return True
  *     return False             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":767
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":765
+ * 
+ * 
  * cdef inline bint _has_pieces(signed char *board, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Fast check if player has any pieces. O(32) worst, early-exit on first find."""
  *     cdef int i, piece
@@ -7040,9 +6998,9 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__has_pie
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":781
+/* "dama/ai/algorithmic/_fast_search.pyx":779
  * #
- *
+ * 
  * cdef void apply_move_c(             # <<<<<<<<<<<<<<
  *     signed char *board, signed char *new_board, CMove *move, int player
  * ) noexcept nogil:
@@ -7060,17 +7018,17 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
   int __pyx_t_3;
   int __pyx_t_4;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":786
+  /* "dama/ai/algorithmic/_fast_search.pyx":784
  *     cdef int sr, sc, er, ec, i, piece
- *
+ * 
  *     memcpy(new_board, board, 64)             # <<<<<<<<<<<<<<
  *     sr = move.path_r[0]; sc = move.path_c[0]
  *     er = move.path_r[move.path_len - 1]; ec = move.path_c[move.path_len - 1]
 */
   (void)(memcpy(__pyx_v_new_board, __pyx_v_board, 64));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":787
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":785
+ * 
  *     memcpy(new_board, board, 64)
  *     sr = move.path_r[0]; sc = move.path_c[0]             # <<<<<<<<<<<<<<
  *     er = move.path_r[move.path_len - 1]; ec = move.path_c[move.path_len - 1]
@@ -7079,7 +7037,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
   __pyx_v_sr = (__pyx_v_move->path_r[0]);
   __pyx_v_sc = (__pyx_v_move->path_c[0]);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":788
+  /* "dama/ai/algorithmic/_fast_search.pyx":786
  *     memcpy(new_board, board, 64)
  *     sr = move.path_r[0]; sc = move.path_c[0]
  *     er = move.path_r[move.path_len - 1]; ec = move.path_c[move.path_len - 1]             # <<<<<<<<<<<<<<
@@ -7089,7 +7047,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
   __pyx_v_er = (__pyx_v_move->path_r[(__pyx_v_move->path_len - 1)]);
   __pyx_v_ec = (__pyx_v_move->path_c[(__pyx_v_move->path_len - 1)]);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":789
+  /* "dama/ai/algorithmic/_fast_search.pyx":787
  *     sr = move.path_r[0]; sc = move.path_c[0]
  *     er = move.path_r[move.path_len - 1]; ec = move.path_c[move.path_len - 1]
  *     piece = new_board[sr * 8 + sc]             # <<<<<<<<<<<<<<
@@ -7098,7 +7056,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
 */
   __pyx_v_piece = (__pyx_v_new_board[((__pyx_v_sr * 8) + __pyx_v_sc)]);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":790
+  /* "dama/ai/algorithmic/_fast_search.pyx":788
  *     er = move.path_r[move.path_len - 1]; ec = move.path_c[move.path_len - 1]
  *     piece = new_board[sr * 8 + sc]
  *     for i in range(move.num_captures):             # <<<<<<<<<<<<<<
@@ -7110,7 +7068,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
   for (__pyx_t_3 = 0; __pyx_t_3 < __pyx_t_2; __pyx_t_3+=1) {
     __pyx_v_i = __pyx_t_3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":791
+    /* "dama/ai/algorithmic/_fast_search.pyx":789
  *     piece = new_board[sr * 8 + sc]
  *     for i in range(move.num_captures):
  *         new_board[move.cap_r[i] * 8 + move.cap_c[i]] = EMPTY             # <<<<<<<<<<<<<<
@@ -7120,7 +7078,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
     (__pyx_v_new_board[(((__pyx_v_move->cap_r[__pyx_v_i]) * 8) + (__pyx_v_move->cap_c[__pyx_v_i]))]) = 0;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":792
+  /* "dama/ai/algorithmic/_fast_search.pyx":790
  *     for i in range(move.num_captures):
  *         new_board[move.cap_r[i] * 8 + move.cap_c[i]] = EMPTY
  *     new_board[sr * 8 + sc] = EMPTY             # <<<<<<<<<<<<<<
@@ -7129,7 +7087,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
 */
   (__pyx_v_new_board[((__pyx_v_sr * 8) + __pyx_v_sc)]) = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":793
+  /* "dama/ai/algorithmic/_fast_search.pyx":791
  *         new_board[move.cap_r[i] * 8 + move.cap_c[i]] = EMPTY
  *     new_board[sr * 8 + sc] = EMPTY
  *     if _move_promotes(move):             # <<<<<<<<<<<<<<
@@ -7139,16 +7097,16 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
   __pyx_t_4 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_promotes(__pyx_v_move);
   if (__pyx_t_4) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":794
+    /* "dama/ai/algorithmic/_fast_search.pyx":792
  *     new_board[sr * 8 + sc] = EMPTY
  *     if _move_promotes(move):
  *         piece = promote_piece(piece)             # <<<<<<<<<<<<<<
  *     new_board[er * 8 + ec] = piece
- *
+ * 
 */
     __pyx_v_piece = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_promote_piece(__pyx_v_piece);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":793
+    /* "dama/ai/algorithmic/_fast_search.pyx":791
  *         new_board[move.cap_r[i] * 8 + move.cap_c[i]] = EMPTY
  *     new_board[sr * 8 + sc] = EMPTY
  *     if _move_promotes(move):             # <<<<<<<<<<<<<<
@@ -7157,18 +7115,18 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":795
+  /* "dama/ai/algorithmic/_fast_search.pyx":793
  *     if _move_promotes(move):
  *         piece = promote_piece(piece)
  *     new_board[er * 8 + ec] = piece             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   (__pyx_v_new_board[((__pyx_v_er * 8) + __pyx_v_ec)]) = __pyx_v_piece;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":781
+  /* "dama/ai/algorithmic/_fast_search.pyx":779
  * #
- *
+ * 
  * cdef void apply_move_c(             # <<<<<<<<<<<<<<
  *     signed char *board, signed char *new_board, CMove *move, int player
  * ) noexcept nogil:
@@ -7177,9 +7135,9 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(signed c
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":802
+/* "dama/ai/algorithmic/_fast_search.pyx":800
  * #
- *
+ * 
  * cdef float evaluate_c(signed char *board, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Evaluate board from perspective of `player` (material + position, no mobility)."""
  *     cdef int i, piece, idx
@@ -7194,18 +7152,18 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(signed ch
   int __pyx_t_1;
   int __pyx_t_2;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":805
+  /* "dama/ai/algorithmic/_fast_search.pyx":803
  *     """Evaluate board from perspective of `player` (material + position, no mobility)."""
  *     cdef int i, piece, idx
  *     cdef int score = 0             # <<<<<<<<<<<<<<
- *
+ * 
  *     for i in range(NUM_DARK_SQ):
 */
   __pyx_v_score = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":807
+  /* "dama/ai/algorithmic/_fast_search.pyx":805
  *     cdef int score = 0
- *
+ * 
  *     for i in range(NUM_DARK_SQ):             # <<<<<<<<<<<<<<
  *         idx = DARK_SQ[i]
  *         piece = board[idx]
@@ -7213,8 +7171,8 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(signed ch
   for (__pyx_t_1 = 0; __pyx_t_1 < 32; __pyx_t_1+=1) {
     __pyx_v_i = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":808
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":806
+ * 
  *     for i in range(NUM_DARK_SQ):
  *         idx = DARK_SQ[i]             # <<<<<<<<<<<<<<
  *         piece = board[idx]
@@ -7222,31 +7180,31 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(signed ch
 */
     __pyx_v_idx = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":809
+    /* "dama/ai/algorithmic/_fast_search.pyx":807
  *     for i in range(NUM_DARK_SQ):
  *         idx = DARK_SQ[i]
  *         piece = board[idx]             # <<<<<<<<<<<<<<
  *         score += EVAL_P1[piece][idx]
- *
+ * 
 */
     __pyx_v_piece = (__pyx_v_board[__pyx_v_idx]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":810
+    /* "dama/ai/algorithmic/_fast_search.pyx":808
  *         idx = DARK_SQ[i]
  *         piece = board[idx]
  *         score += EVAL_P1[piece][idx]             # <<<<<<<<<<<<<<
- *
+ * 
  *     return <float>(score if player == PLAYER_ONE else -score)
 */
     __pyx_v_score = (__pyx_v_score + ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search_EVAL_P1[__pyx_v_piece])[__pyx_v_idx]));
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":812
+  /* "dama/ai/algorithmic/_fast_search.pyx":810
  *         score += EVAL_P1[piece][idx]
- *
+ * 
  *     return <float>(score if player == PLAYER_ONE else -score)             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_t_2 = (__pyx_v_player == 1);
   if (__pyx_t_2) {
@@ -7257,9 +7215,9 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(signed ch
   __pyx_r = ((float)__pyx_t_1);
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":802
+  /* "dama/ai/algorithmic/_fast_search.pyx":800
  * #
- *
+ * 
  * cdef float evaluate_c(signed char *board, int player) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Evaluate board from perspective of `player` (material + position, no mobility)."""
  *     cdef int i, piece, idx
@@ -7270,9 +7228,9 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(signed ch
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":818
+/* "dama/ai/algorithmic/_fast_search.pyx":816
  * DEF MAX_QS_DEPTH = 6
- *
+ * 
  * cdef float quiescence(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, float alpha, float beta,
  *     Rules *rules, SearchState *ss, unsigned long long h, int qs_depth
@@ -7299,17 +7257,17 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
   int __pyx_t_6;
   int __pyx_t_7;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":841
+  /* "dama/ai/algorithmic/_fast_search.pyx":839
  *     cdef int i, j, opp
- *
+ * 
  *     ss.nodes += 1             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Deadline check (shared counter with main search)
 */
   __pyx_v_ss->nodes = (__pyx_v_ss->nodes + 1);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":844
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":842
+ * 
  *     # Deadline check (shared counter with main search)
  *     if (ss.nodes & 4095) == 0:             # <<<<<<<<<<<<<<
  *         if _check_deadline(ss):
@@ -7318,37 +7276,37 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
   __pyx_t_1 = ((__pyx_v_ss->nodes & 0xFFF) == 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":845
+    /* "dama/ai/algorithmic/_fast_search.pyx":843
  *     # Deadline check (shared counter with main search)
  *     if (ss.nodes & 4095) == 0:
  *         if _check_deadline(ss):             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__check_deadline(__pyx_v_ss);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":846
+      /* "dama/ai/algorithmic/_fast_search.pyx":844
  *     if (ss.nodes & 4095) == 0:
  *         if _check_deadline(ss):
  *             return 0.0             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Terminal detection: if current player has no pieces, they lost
 */
       __pyx_r = 0.0;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":845
+      /* "dama/ai/algorithmic/_fast_search.pyx":843
  *     # Deadline check (shared counter with main search)
  *     if (ss.nodes & 4095) == 0:
  *         if _check_deadline(ss):             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":844
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":842
+ * 
  *     # Deadline check (shared counter with main search)
  *     if (ss.nodes & 4095) == 0:             # <<<<<<<<<<<<<<
  *         if _check_deadline(ss):
@@ -7356,46 +7314,46 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":849
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":847
+ * 
  *     # Terminal detection: if current player has no pieces, they lost
  *     if not _has_pieces(board, player):             # <<<<<<<<<<<<<<
  *         return -10000.0
- *
+ * 
 */
   __pyx_t_1 = (!__pyx_f_4dama_2ai_11algorithmic_12_fast_search__has_pieces(__pyx_v_board, __pyx_v_player));
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":850
+    /* "dama/ai/algorithmic/_fast_search.pyx":848
  *     # Terminal detection: if current player has no pieces, they lost
  *     if not _has_pieces(board, player):
  *         return -10000.0             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Stand-pat: use material+positional eval (no mobility  too expensive)
 */
     __pyx_r = -10000.0;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":849
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":847
+ * 
  *     # Terminal detection: if current player has no pieces, they lost
  *     if not _has_pieces(board, player):             # <<<<<<<<<<<<<<
  *         return -10000.0
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":853
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":851
+ * 
  *     # Stand-pat: use material+positional eval (no mobility  too expensive)
  *     stand_pat = evaluate_c(board, player)             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Beta cutoff: standing pat is already good enough
 */
   __pyx_v_stand_pat = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(__pyx_v_board, __pyx_v_player);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":856
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":854
+ * 
  *     # Beta cutoff: standing pat is already good enough
  *     if stand_pat >= beta:             # <<<<<<<<<<<<<<
  *         return beta
@@ -7404,7 +7362,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
   __pyx_t_1 = (__pyx_v_stand_pat >= __pyx_v_beta);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":857
+    /* "dama/ai/algorithmic/_fast_search.pyx":855
  *     # Beta cutoff: standing pat is already good enough
  *     if stand_pat >= beta:
  *         return beta             # <<<<<<<<<<<<<<
@@ -7414,8 +7372,8 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
     __pyx_r = __pyx_v_beta;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":856
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":854
+ * 
  *     # Beta cutoff: standing pat is already good enough
  *     if stand_pat >= beta:             # <<<<<<<<<<<<<<
  *         return beta
@@ -7423,84 +7381,84 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":858
+  /* "dama/ai/algorithmic/_fast_search.pyx":856
  *     if stand_pat >= beta:
  *         return beta
  *     if stand_pat > alpha:             # <<<<<<<<<<<<<<
  *         alpha = stand_pat
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_stand_pat > __pyx_v_alpha);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":859
+    /* "dama/ai/algorithmic/_fast_search.pyx":857
  *         return beta
  *     if stand_pat > alpha:
  *         alpha = stand_pat             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Depth limit: stop extending captures at MAX_QS_DEPTH
 */
     __pyx_v_alpha = __pyx_v_stand_pat;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":858
+    /* "dama/ai/algorithmic/_fast_search.pyx":856
  *     if stand_pat >= beta:
  *         return beta
  *     if stand_pat > alpha:             # <<<<<<<<<<<<<<
  *         alpha = stand_pat
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":862
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":860
+ * 
  *     # Depth limit: stop extending captures at MAX_QS_DEPTH
  *     if qs_depth <= 0:             # <<<<<<<<<<<<<<
  *         return alpha
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_qs_depth <= 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":863
+    /* "dama/ai/algorithmic/_fast_search.pyx":861
  *     # Depth limit: stop extending captures at MAX_QS_DEPTH
  *     if qs_depth <= 0:
  *         return alpha             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Generate captures only (skip simple moves entirely)
 */
     __pyx_r = __pyx_v_alpha;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":862
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":860
+ * 
  *     # Depth limit: stop extending captures at MAX_QS_DEPTH
  *     if qs_depth <= 0:             # <<<<<<<<<<<<<<
  *         return alpha
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":866
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":864
+ * 
  *     # Generate captures only (skip simple moves entirely)
  *     captures.count = 0             # <<<<<<<<<<<<<<
  *     generate_captures_only_c(board, player, rules, &captures)
- *
+ * 
 */
   __pyx_v_captures.count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":867
+  /* "dama/ai/algorithmic/_fast_search.pyx":865
  *     # Generate captures only (skip simple moves entirely)
  *     captures.count = 0
  *     generate_captures_only_c(board, player, rules, &captures)             # <<<<<<<<<<<<<<
- *
+ * 
  *     if captures.count == 0:
 */
   (void)(__pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_captures_only_c(__pyx_v_board, __pyx_v_player, __pyx_v_rules, (&__pyx_v_captures)));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":869
+  /* "dama/ai/algorithmic/_fast_search.pyx":867
  *     generate_captures_only_c(board, player, rules, &captures)
- *
+ * 
  *     if captures.count == 0:             # <<<<<<<<<<<<<<
  *         # No captures  position is quiet
  *         return alpha
@@ -7508,46 +7466,46 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
   __pyx_t_1 = (__pyx_v_captures.count == 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":871
+    /* "dama/ai/algorithmic/_fast_search.pyx":869
  *     if captures.count == 0:
  *         # No captures  position is quiet
  *         return alpha             # <<<<<<<<<<<<<<
- *
+ * 
  *     opp = opponent(player)
 */
     __pyx_r = __pyx_v_alpha;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":869
+    /* "dama/ai/algorithmic/_fast_search.pyx":867
  *     generate_captures_only_c(board, player, rules, &captures)
- *
+ * 
  *     if captures.count == 0:             # <<<<<<<<<<<<<<
  *         # No captures  position is quiet
  *         return alpha
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":873
+  /* "dama/ai/algorithmic/_fast_search.pyx":871
  *         return alpha
- *
+ * 
  *     opp = opponent(player)             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Search each capture with delta pruning.
 */
   __pyx_v_opp = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(__pyx_v_player);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":880
+  /* "dama/ai/algorithmic/_fast_search.pyx":878
  *     # still below alpha, skip the capture  it can't improve our position.
  *     cdef int cap_sq_dp, cap_gain
  *     cdef int DELTA_MARGIN = 50  # Small safety margin for positional gains             # <<<<<<<<<<<<<<
- *
+ * 
  *     for i in range(captures.count):
 */
   __pyx_v_DELTA_MARGIN = 50;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":882
+  /* "dama/ai/algorithmic/_fast_search.pyx":880
  *     cdef int DELTA_MARGIN = 50  # Small safety margin for positional gains
- *
+ * 
  *     for i in range(captures.count):             # <<<<<<<<<<<<<<
  *         # Delta prune: estimate maximum material gain from this capture
  *         cap_gain = 0
@@ -7557,7 +7515,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
   for (__pyx_t_4 = 0; __pyx_t_4 < __pyx_t_3; __pyx_t_4+=1) {
     __pyx_v_i = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":884
+    /* "dama/ai/algorithmic/_fast_search.pyx":882
  *     for i in range(captures.count):
  *         # Delta prune: estimate maximum material gain from this capture
  *         cap_gain = 0             # <<<<<<<<<<<<<<
@@ -7566,7 +7524,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 */
     __pyx_v_cap_gain = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":885
+    /* "dama/ai/algorithmic/_fast_search.pyx":883
  *         # Delta prune: estimate maximum material gain from this capture
  *         cap_gain = 0
  *         for j in range(captures.moves[i].num_captures):             # <<<<<<<<<<<<<<
@@ -7578,7 +7536,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
     for (__pyx_t_7 = 0; __pyx_t_7 < __pyx_t_6; __pyx_t_7+=1) {
       __pyx_v_j = __pyx_t_7;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":886
+      /* "dama/ai/algorithmic/_fast_search.pyx":884
  *         cap_gain = 0
  *         for j in range(captures.moves[i].num_captures):
  *             cap_sq_dp = captures.moves[i].cap_r[j] * 8 + captures.moves[i].cap_c[j]             # <<<<<<<<<<<<<<
@@ -7587,7 +7545,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 */
       __pyx_v_cap_sq_dp = ((((__pyx_v_captures.moves[__pyx_v_i]).cap_r[__pyx_v_j]) * 8) + ((__pyx_v_captures.moves[__pyx_v_i]).cap_c[__pyx_v_j]));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":887
+      /* "dama/ai/algorithmic/_fast_search.pyx":885
  *         for j in range(captures.moves[i].num_captures):
  *             cap_sq_dp = captures.moves[i].cap_r[j] * 8 + captures.moves[i].cap_c[j]
  *             if is_king(board[cap_sq_dp]):             # <<<<<<<<<<<<<<
@@ -7597,7 +7555,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
       __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_is_king((__pyx_v_board[__pyx_v_cap_sq_dp]));
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":888
+        /* "dama/ai/algorithmic/_fast_search.pyx":886
  *             cap_sq_dp = captures.moves[i].cap_r[j] * 8 + captures.moves[i].cap_c[j]
  *             if is_king(board[cap_sq_dp]):
  *                 cap_gain += W_KING             # <<<<<<<<<<<<<<
@@ -7606,7 +7564,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 */
         __pyx_v_cap_gain = (__pyx_v_cap_gain + 0xC8);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":887
+        /* "dama/ai/algorithmic/_fast_search.pyx":885
  *         for j in range(captures.moves[i].num_captures):
  *             cap_sq_dp = captures.moves[i].cap_r[j] * 8 + captures.moves[i].cap_c[j]
  *             if is_king(board[cap_sq_dp]):             # <<<<<<<<<<<<<<
@@ -7616,7 +7574,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
         goto __pyx_L14;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":890
+      /* "dama/ai/algorithmic/_fast_search.pyx":888
  *                 cap_gain += W_KING
  *             else:
  *                 cap_gain += W_MAN             # <<<<<<<<<<<<<<
@@ -7629,7 +7587,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
       __pyx_L14:;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":892
+    /* "dama/ai/algorithmic/_fast_search.pyx":890
  *                 cap_gain += W_MAN
  *         # Add promotion bonus if applicable
  *         if _move_promotes(&captures.moves[i]):             # <<<<<<<<<<<<<<
@@ -7639,7 +7597,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
     __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_promotes((&(__pyx_v_captures.moves[__pyx_v_i])));
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":893
+      /* "dama/ai/algorithmic/_fast_search.pyx":891
  *         # Add promotion bonus if applicable
  *         if _move_promotes(&captures.moves[i]):
  *             cap_gain += W_KING - W_MAN  # Gaining king value from promotion             # <<<<<<<<<<<<<<
@@ -7648,7 +7606,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 */
       __pyx_v_cap_gain = (__pyx_v_cap_gain + 0x64);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":892
+      /* "dama/ai/algorithmic/_fast_search.pyx":890
  *                 cap_gain += W_MAN
  *         # Add promotion bonus if applicable
  *         if _move_promotes(&captures.moves[i]):             # <<<<<<<<<<<<<<
@@ -7657,92 +7615,92 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":894
+    /* "dama/ai/algorithmic/_fast_search.pyx":892
  *         if _move_promotes(&captures.moves[i]):
  *             cap_gain += W_KING - W_MAN  # Gaining king value from promotion
  *         if stand_pat + cap_gain + DELTA_MARGIN <= alpha:             # <<<<<<<<<<<<<<
  *             continue  # This capture can't raise alpha  prune it
- *
+ * 
 */
     __pyx_t_1 = (((__pyx_v_stand_pat + __pyx_v_cap_gain) + __pyx_v_DELTA_MARGIN) <= __pyx_v_alpha);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":895
+      /* "dama/ai/algorithmic/_fast_search.pyx":893
  *             cap_gain += W_KING - W_MAN  # Gaining king value from promotion
  *         if stand_pat + cap_gain + DELTA_MARGIN <= alpha:
  *             continue  # This capture can't raise alpha  prune it             # <<<<<<<<<<<<<<
- *
+ * 
  *         apply_move_c(board, new_board, &captures.moves[i], player)
 */
       goto __pyx_L10_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":894
+      /* "dama/ai/algorithmic/_fast_search.pyx":892
  *         if _move_promotes(&captures.moves[i]):
  *             cap_gain += W_KING - W_MAN  # Gaining king value from promotion
  *         if stand_pat + cap_gain + DELTA_MARGIN <= alpha:             # <<<<<<<<<<<<<<
  *             continue  # This capture can't raise alpha  prune it
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":897
+    /* "dama/ai/algorithmic/_fast_search.pyx":895
  *             continue  # This capture can't raise alpha  prune it
- *
+ * 
  *         apply_move_c(board, new_board, &captures.moves[i], player)             # <<<<<<<<<<<<<<
  *         child_h = _hash_after_move(h, board, &captures.moves[i], player)
- *
+ * 
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(__pyx_v_board, __pyx_v_new_board, (&(__pyx_v_captures.moves[__pyx_v_i])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":898
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":896
+ * 
  *         apply_move_c(board, new_board, &captures.moves[i], player)
  *         child_h = _hash_after_move(h, board, &captures.moves[i], player)             # <<<<<<<<<<<<<<
- *
+ * 
  *         score = -quiescence(new_board, opp, -beta, -alpha,
 */
     __pyx_v_child_h = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__hash_after_move(__pyx_v_h, __pyx_v_board, (&(__pyx_v_captures.moves[__pyx_v_i])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":900
+    /* "dama/ai/algorithmic/_fast_search.pyx":898
  *         child_h = _hash_after_move(h, board, &captures.moves[i], player)
- *
+ * 
  *         score = -quiescence(new_board, opp, -beta, -alpha,             # <<<<<<<<<<<<<<
  *                             rules, ss, child_h, qs_depth - 1)
- *
+ * 
 */
     __pyx_v_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(__pyx_v_new_board, __pyx_v_opp, (-__pyx_v_beta), (-__pyx_v_alpha), __pyx_v_rules, __pyx_v_ss, __pyx_v_child_h, (__pyx_v_qs_depth - 1)));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":903
+    /* "dama/ai/algorithmic/_fast_search.pyx":901
  *                             rules, ss, child_h, qs_depth - 1)
- *
+ * 
  *         if ss.timeout:             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     if (__pyx_v_ss->timeout) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":904
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":902
+ * 
  *         if ss.timeout:
  *             return 0.0             # <<<<<<<<<<<<<<
- *
+ * 
  *         if score >= beta:
 */
       __pyx_r = 0.0;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":903
+      /* "dama/ai/algorithmic/_fast_search.pyx":901
  *                             rules, ss, child_h, qs_depth - 1)
- *
+ * 
  *         if ss.timeout:             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":906
+    /* "dama/ai/algorithmic/_fast_search.pyx":904
  *             return 0.0
- *
+ * 
  *         if score >= beta:             # <<<<<<<<<<<<<<
  *             return beta  # Beta cutoff
  *         if score > alpha:
@@ -7750,8 +7708,8 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
     __pyx_t_1 = (__pyx_v_score >= __pyx_v_beta);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":907
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":905
+ * 
  *         if score >= beta:
  *             return beta  # Beta cutoff             # <<<<<<<<<<<<<<
  *         if score > alpha:
@@ -7760,58 +7718,58 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
       __pyx_r = __pyx_v_beta;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":906
+      /* "dama/ai/algorithmic/_fast_search.pyx":904
  *             return 0.0
- *
+ * 
  *         if score >= beta:             # <<<<<<<<<<<<<<
  *             return beta  # Beta cutoff
  *         if score > alpha:
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":908
+    /* "dama/ai/algorithmic/_fast_search.pyx":906
  *         if score >= beta:
  *             return beta  # Beta cutoff
  *         if score > alpha:             # <<<<<<<<<<<<<<
  *             alpha = score
- *
+ * 
 */
     __pyx_t_1 = (__pyx_v_score > __pyx_v_alpha);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":909
+      /* "dama/ai/algorithmic/_fast_search.pyx":907
  *             return beta  # Beta cutoff
  *         if score > alpha:
  *             alpha = score             # <<<<<<<<<<<<<<
- *
+ * 
  *     return alpha
 */
       __pyx_v_alpha = __pyx_v_score;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":908
+      /* "dama/ai/algorithmic/_fast_search.pyx":906
  *         if score >= beta:
  *             return beta  # Beta cutoff
  *         if score > alpha:             # <<<<<<<<<<<<<<
  *             alpha = score
- *
+ * 
 */
     }
     __pyx_L10_continue:;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":911
+  /* "dama/ai/algorithmic/_fast_search.pyx":909
  *             alpha = score
- *
+ * 
  *     return alpha             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_alpha;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":818
+  /* "dama/ai/algorithmic/_fast_search.pyx":816
  * DEF MAX_QS_DEPTH = 6
- *
+ * 
  * cdef float quiescence(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, float alpha, float beta,
  *     Rules *rules, SearchState *ss, unsigned long long h, int qs_depth
@@ -7822,9 +7780,9 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":933
+/* "dama/ai/algorithmic/_fast_search.pyx":931
  *     int countermove_to[64][64]
- *
+ * 
  * cdef inline void _init_search_tables(SearchState *ss) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Zero killer, history, and countermove tables for a new search."""
  *     memset(ss.killers_from, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))  # -1
@@ -7832,7 +7790,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(signed ch
 
 static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_search_tables(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_SearchState *__pyx_v_ss) {
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":935
+  /* "dama/ai/algorithmic/_fast_search.pyx":933
  * cdef inline void _init_search_tables(SearchState *ss) noexcept nogil:
  *     """Zero killer, history, and countermove tables for a new search."""
  *     memset(ss.killers_from, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))  # -1             # <<<<<<<<<<<<<<
@@ -7841,7 +7799,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_s
 */
   (void)(memset(__pyx_v_ss->killers_from, 0xFF, (0x40 * (sizeof(int)))));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":936
+  /* "dama/ai/algorithmic/_fast_search.pyx":934
  *     """Zero killer, history, and countermove tables for a new search."""
  *     memset(ss.killers_from, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))  # -1
  *     memset(ss.killers_to, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))             # <<<<<<<<<<<<<<
@@ -7850,7 +7808,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_s
 */
   (void)(memset(__pyx_v_ss->killers_to, 0xFF, (0x40 * (sizeof(int)))));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":937
+  /* "dama/ai/algorithmic/_fast_search.pyx":935
  *     memset(ss.killers_from, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))  # -1
  *     memset(ss.killers_to, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))
  *     memset(ss.history, 0, 64 * 64 * sizeof(int))             # <<<<<<<<<<<<<<
@@ -7859,27 +7817,27 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_s
 */
   (void)(memset(__pyx_v_ss->history, 0, (0x1000 * (sizeof(int)))));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":938
+  /* "dama/ai/algorithmic/_fast_search.pyx":936
  *     memset(ss.killers_to, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))
  *     memset(ss.history, 0, 64 * 64 * sizeof(int))
  *     memset(ss.countermove_from, 0xFF, 64 * 64 * sizeof(int))  # -1             # <<<<<<<<<<<<<<
  *     memset(ss.countermove_to, 0xFF, 64 * 64 * sizeof(int))
- *
+ * 
 */
   (void)(memset(__pyx_v_ss->countermove_from, 0xFF, (0x1000 * (sizeof(int)))));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":939
+  /* "dama/ai/algorithmic/_fast_search.pyx":937
  *     memset(ss.history, 0, 64 * 64 * sizeof(int))
  *     memset(ss.countermove_from, 0xFF, 64 * 64 * sizeof(int))  # -1
  *     memset(ss.countermove_to, 0xFF, 64 * 64 * sizeof(int))             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   (void)(memset(__pyx_v_ss->countermove_to, 0xFF, (0x1000 * (sizeof(int)))));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":933
+  /* "dama/ai/algorithmic/_fast_search.pyx":931
  *     int countermove_to[64][64]
- *
+ * 
  * cdef inline void _init_search_tables(SearchState *ss) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Zero killer, history, and countermove tables for a new search."""
  *     memset(ss.killers_from, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))  # -1
@@ -7888,9 +7846,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_s
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":942
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":940
+ * 
+ * 
  * cdef inline void _store_killer(SearchState *ss, int ply, CMove *m) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Store a quiet move that caused beta cutoff as a killer."""
  *     if ply >= MAX_PLY:
@@ -7903,7 +7861,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":944
+  /* "dama/ai/algorithmic/_fast_search.pyx":942
  * cdef inline void _store_killer(SearchState *ss, int ply, CMove *m) noexcept nogil:
  *     """Store a quiet move that caused beta cutoff as a killer."""
  *     if ply >= MAX_PLY:             # <<<<<<<<<<<<<<
@@ -7913,7 +7871,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   __pyx_t_1 = (__pyx_v_ply >= 32);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":945
+    /* "dama/ai/algorithmic/_fast_search.pyx":943
  *     """Store a quiet move that caused beta cutoff as a killer."""
  *     if ply >= MAX_PLY:
  *         return             # <<<<<<<<<<<<<<
@@ -7922,7 +7880,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
 */
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":944
+    /* "dama/ai/algorithmic/_fast_search.pyx":942
  * cdef inline void _store_killer(SearchState *ss, int ply, CMove *m) noexcept nogil:
  *     """Store a quiet move that caused beta cutoff as a killer."""
  *     if ply >= MAX_PLY:             # <<<<<<<<<<<<<<
@@ -7931,7 +7889,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":946
+  /* "dama/ai/algorithmic/_fast_search.pyx":944
  *     if ply >= MAX_PLY:
  *         return
  *     cdef int from_sq = m.from_sq             # <<<<<<<<<<<<<<
@@ -7941,7 +7899,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   __pyx_t_2 = __pyx_v_m->from_sq;
   __pyx_v_from_sq = __pyx_t_2;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":947
+  /* "dama/ai/algorithmic/_fast_search.pyx":945
  *         return
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq             # <<<<<<<<<<<<<<
@@ -7951,7 +7909,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   __pyx_t_2 = __pyx_v_m->to_sq;
   __pyx_v_to_sq = __pyx_t_2;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":949
+  /* "dama/ai/algorithmic/_fast_search.pyx":947
  *     cdef int to_sq = m.to_sq
  *     # Don't store duplicate
  *     if ss.killers_from[ply][0] == from_sq and ss.killers_to[ply][0] == to_sq:             # <<<<<<<<<<<<<<
@@ -7969,7 +7927,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   __pyx_L5_bool_binop_done:;
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":950
+    /* "dama/ai/algorithmic/_fast_search.pyx":948
  *     # Don't store duplicate
  *     if ss.killers_from[ply][0] == from_sq and ss.killers_to[ply][0] == to_sq:
  *         return             # <<<<<<<<<<<<<<
@@ -7978,7 +7936,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
 */
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":949
+    /* "dama/ai/algorithmic/_fast_search.pyx":947
  *     cdef int to_sq = m.to_sq
  *     # Don't store duplicate
  *     if ss.killers_from[ply][0] == from_sq and ss.killers_to[ply][0] == to_sq:             # <<<<<<<<<<<<<<
@@ -7987,7 +7945,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":952
+  /* "dama/ai/algorithmic/_fast_search.pyx":950
  *         return
  *     # Shift slot 0 to slot 1, insert new at slot 0
  *     ss.killers_from[ply][1] = ss.killers_from[ply][0]             # <<<<<<<<<<<<<<
@@ -7996,7 +7954,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
 */
   ((__pyx_v_ss->killers_from[__pyx_v_ply])[1]) = ((__pyx_v_ss->killers_from[__pyx_v_ply])[0]);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":953
+  /* "dama/ai/algorithmic/_fast_search.pyx":951
  *     # Shift slot 0 to slot 1, insert new at slot 0
  *     ss.killers_from[ply][1] = ss.killers_from[ply][0]
  *     ss.killers_to[ply][1] = ss.killers_to[ply][0]             # <<<<<<<<<<<<<<
@@ -8005,27 +7963,27 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
 */
   ((__pyx_v_ss->killers_to[__pyx_v_ply])[1]) = ((__pyx_v_ss->killers_to[__pyx_v_ply])[0]);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":954
+  /* "dama/ai/algorithmic/_fast_search.pyx":952
  *     ss.killers_from[ply][1] = ss.killers_from[ply][0]
  *     ss.killers_to[ply][1] = ss.killers_to[ply][0]
  *     ss.killers_from[ply][0] = from_sq             # <<<<<<<<<<<<<<
  *     ss.killers_to[ply][0] = to_sq
- *
+ * 
 */
   ((__pyx_v_ss->killers_from[__pyx_v_ply])[0]) = __pyx_v_from_sq;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":955
+  /* "dama/ai/algorithmic/_fast_search.pyx":953
  *     ss.killers_to[ply][1] = ss.killers_to[ply][0]
  *     ss.killers_from[ply][0] = from_sq
  *     ss.killers_to[ply][0] = to_sq             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   ((__pyx_v_ss->killers_to[__pyx_v_ply])[0]) = __pyx_v_to_sq;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":942
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":940
+ * 
+ * 
  * cdef inline void _store_killer(SearchState *ss, int ply, CMove *m) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Store a quiet move that caused beta cutoff as a killer."""
  *     if ply >= MAX_PLY:
@@ -8035,9 +7993,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   __pyx_L0:;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":958
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":956
+ * 
+ * 
  * cdef inline void _update_history(SearchState *ss, CMove *m, int depth) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Increment history table on cutoff (depth^2 weighting)."""
  *     cdef int from_sq = m.from_sq
@@ -8051,7 +8009,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":960
+  /* "dama/ai/algorithmic/_fast_search.pyx":958
  * cdef inline void _update_history(SearchState *ss, CMove *m, int depth) noexcept nogil:
  *     """Increment history table on cutoff (depth^2 weighting)."""
  *     cdef int from_sq = m.from_sq             # <<<<<<<<<<<<<<
@@ -8061,7 +8019,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   __pyx_t_1 = __pyx_v_m->from_sq;
   __pyx_v_from_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":961
+  /* "dama/ai/algorithmic/_fast_search.pyx":959
  *     """Increment history table on cutoff (depth^2 weighting)."""
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq             # <<<<<<<<<<<<<<
@@ -8071,7 +8029,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   __pyx_t_1 = __pyx_v_m->to_sq;
   __pyx_v_to_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":962
+  /* "dama/ai/algorithmic/_fast_search.pyx":960
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq
  *     cdef int bonus = depth * depth             # <<<<<<<<<<<<<<
@@ -8080,7 +8038,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
 */
   __pyx_v_bonus = (__pyx_v_depth * __pyx_v_depth);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":963
+  /* "dama/ai/algorithmic/_fast_search.pyx":961
  *     cdef int to_sq = m.to_sq
  *     cdef int bonus = depth * depth
  *     ss.history[from_sq][to_sq] += bonus             # <<<<<<<<<<<<<<
@@ -8091,37 +8049,37 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   __pyx_t_2 = __pyx_v_to_sq;
   ((__pyx_v_ss->history[__pyx_t_1])[__pyx_t_2]) = (((__pyx_v_ss->history[__pyx_t_1])[__pyx_t_2]) + __pyx_v_bonus);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":964
+  /* "dama/ai/algorithmic/_fast_search.pyx":962
  *     cdef int bonus = depth * depth
  *     ss.history[from_sq][to_sq] += bonus
  *     if ss.history[from_sq][to_sq] > 10000:             # <<<<<<<<<<<<<<
  *         ss.history[from_sq][to_sq] = 10000
- *
+ * 
 */
   __pyx_t_3 = (((__pyx_v_ss->history[__pyx_v_from_sq])[__pyx_v_to_sq]) > 0x2710);
   if (__pyx_t_3) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":965
+    /* "dama/ai/algorithmic/_fast_search.pyx":963
  *     ss.history[from_sq][to_sq] += bonus
  *     if ss.history[from_sq][to_sq] > 10000:
  *         ss.history[from_sq][to_sq] = 10000             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
     ((__pyx_v_ss->history[__pyx_v_from_sq])[__pyx_v_to_sq]) = 0x2710;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":964
+    /* "dama/ai/algorithmic/_fast_search.pyx":962
  *     cdef int bonus = depth * depth
  *     ss.history[from_sq][to_sq] += bonus
  *     if ss.history[from_sq][to_sq] > 10000:             # <<<<<<<<<<<<<<
  *         ss.history[from_sq][to_sq] = 10000
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":958
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":956
+ * 
+ * 
  * cdef inline void _update_history(SearchState *ss, CMove *m, int depth) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Increment history table on cutoff (depth^2 weighting)."""
  *     cdef int from_sq = m.from_sq
@@ -8130,9 +8088,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":968
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":966
+ * 
+ * 
  * cdef inline void _update_history_malus(SearchState *ss, CMove *m, int depth) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Decrease history score for a quiet move that failed to cause cutoff.
  *     Standard complement to _update_history: moves that were searched but didn't
@@ -8146,7 +8104,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":972
+  /* "dama/ai/algorithmic/_fast_search.pyx":970
  *     Standard complement to _update_history: moves that were searched but didn't
  *     cut should be ordered lower in future searches."""
  *     cdef int from_sq = m.from_sq             # <<<<<<<<<<<<<<
@@ -8156,7 +8114,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   __pyx_t_1 = __pyx_v_m->from_sq;
   __pyx_v_from_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":973
+  /* "dama/ai/algorithmic/_fast_search.pyx":971
  *     cut should be ordered lower in future searches."""
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq             # <<<<<<<<<<<<<<
@@ -8166,7 +8124,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   __pyx_t_1 = __pyx_v_m->to_sq;
   __pyx_v_to_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":974
+  /* "dama/ai/algorithmic/_fast_search.pyx":972
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq
  *     cdef int malus = depth * depth             # <<<<<<<<<<<<<<
@@ -8175,7 +8133,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
 */
   __pyx_v_malus = (__pyx_v_depth * __pyx_v_depth);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":975
+  /* "dama/ai/algorithmic/_fast_search.pyx":973
  *     cdef int to_sq = m.to_sq
  *     cdef int malus = depth * depth
  *     ss.history[from_sq][to_sq] -= malus             # <<<<<<<<<<<<<<
@@ -8186,37 +8144,37 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   __pyx_t_2 = __pyx_v_to_sq;
   ((__pyx_v_ss->history[__pyx_t_1])[__pyx_t_2]) = (((__pyx_v_ss->history[__pyx_t_1])[__pyx_t_2]) - __pyx_v_malus);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":976
+  /* "dama/ai/algorithmic/_fast_search.pyx":974
  *     cdef int malus = depth * depth
  *     ss.history[from_sq][to_sq] -= malus
  *     if ss.history[from_sq][to_sq] < -10000:             # <<<<<<<<<<<<<<
  *         ss.history[from_sq][to_sq] = -10000
- *
+ * 
 */
   __pyx_t_3 = (((__pyx_v_ss->history[__pyx_v_from_sq])[__pyx_v_to_sq]) < -10000L);
   if (__pyx_t_3) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":977
+    /* "dama/ai/algorithmic/_fast_search.pyx":975
  *     ss.history[from_sq][to_sq] -= malus
  *     if ss.history[from_sq][to_sq] < -10000:
  *         ss.history[from_sq][to_sq] = -10000             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
     ((__pyx_v_ss->history[__pyx_v_from_sq])[__pyx_v_to_sq]) = -10000;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":976
+    /* "dama/ai/algorithmic/_fast_search.pyx":974
  *     cdef int malus = depth * depth
  *     ss.history[from_sq][to_sq] -= malus
  *     if ss.history[from_sq][to_sq] < -10000:             # <<<<<<<<<<<<<<
  *         ss.history[from_sq][to_sq] = -10000
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":968
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":966
+ * 
+ * 
  * cdef inline void _update_history_malus(SearchState *ss, CMove *m, int depth) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Decrease history score for a quiet move that failed to cause cutoff.
  *     Standard complement to _update_history: moves that were searched but didn't
@@ -8225,9 +8183,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":980
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":978
+ * 
+ * 
  * cdef inline void _store_countermove(             # <<<<<<<<<<<<<<
  *     SearchState *ss, int prev_from, int prev_to, CMove *m
  * ) noexcept nogil:
@@ -8238,7 +8196,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   int __pyx_v_to_sq;
   int __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":985
+  /* "dama/ai/algorithmic/_fast_search.pyx":983
  *     """Store a response move as countermove for the opponent's previous move.
  *     On beta cutoff, the current move is a good response to prev_fromprev_to."""
  *     cdef int from_sq = m.from_sq             # <<<<<<<<<<<<<<
@@ -8248,7 +8206,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   __pyx_t_1 = __pyx_v_m->from_sq;
   __pyx_v_from_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":986
+  /* "dama/ai/algorithmic/_fast_search.pyx":984
  *     On beta cutoff, the current move is a good response to prev_fromprev_to."""
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq             # <<<<<<<<<<<<<<
@@ -8258,27 +8216,27 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   __pyx_t_1 = __pyx_v_m->to_sq;
   __pyx_v_to_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":987
+  /* "dama/ai/algorithmic/_fast_search.pyx":985
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq
  *     ss.countermove_from[prev_from][prev_to] = from_sq             # <<<<<<<<<<<<<<
  *     ss.countermove_to[prev_from][prev_to] = to_sq
- *
+ * 
 */
   ((__pyx_v_ss->countermove_from[__pyx_v_prev_from])[__pyx_v_prev_to]) = __pyx_v_from_sq;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":988
+  /* "dama/ai/algorithmic/_fast_search.pyx":986
  *     cdef int to_sq = m.to_sq
  *     ss.countermove_from[prev_from][prev_to] = from_sq
  *     ss.countermove_to[prev_from][prev_to] = to_sq             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   ((__pyx_v_ss->countermove_to[__pyx_v_prev_from])[__pyx_v_prev_to]) = __pyx_v_to_sq;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":980
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":978
+ * 
+ * 
  * cdef inline void _store_countermove(             # <<<<<<<<<<<<<<
  *     SearchState *ss, int prev_from, int prev_to, CMove *m
  * ) noexcept nogil:
@@ -8287,9 +8245,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":991
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":989
+ * 
+ * 
  * cdef inline void _age_history(SearchState *ss) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Halve all history table entries to prevent saturation over long games.
  *     Called once per move. Without aging, all entries eventually reach the cap
@@ -8303,7 +8261,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__age_hi
   int __pyx_t_3;
   int __pyx_t_4;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":996
+  /* "dama/ai/algorithmic/_fast_search.pyx":994
  *     (10000) and the history heuristic loses its discriminative power."""
  *     cdef int i, j
  *     for i in range(64):             # <<<<<<<<<<<<<<
@@ -8313,22 +8271,22 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__age_hi
   for (__pyx_t_1 = 0; __pyx_t_1 < 64; __pyx_t_1+=1) {
     __pyx_v_i = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":997
+    /* "dama/ai/algorithmic/_fast_search.pyx":995
  *     cdef int i, j
  *     for i in range(64):
  *         for j in range(64):             # <<<<<<<<<<<<<<
  *             ss.history[i][j] >>= 1  # Right-shift by 1 = halve
- *
+ * 
 */
     for (__pyx_t_2 = 0; __pyx_t_2 < 64; __pyx_t_2+=1) {
       __pyx_v_j = __pyx_t_2;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":998
+      /* "dama/ai/algorithmic/_fast_search.pyx":996
  *     for i in range(64):
  *         for j in range(64):
  *             ss.history[i][j] >>= 1  # Right-shift by 1 = halve             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
       __pyx_t_3 = __pyx_v_i;
       __pyx_t_4 = __pyx_v_j;
@@ -8336,9 +8294,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__age_hi
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":991
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":989
+ * 
+ * 
  * cdef inline void _age_history(SearchState *ss) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Halve all history table entries to prevent saturation over long games.
  *     Called once per move. Without aging, all entries eventually reach the cap
@@ -8347,9 +8305,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__age_hi
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1001
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":999
+ * 
+ * 
  * cdef inline unsigned long long _hash_after_move(             # <<<<<<<<<<<<<<
  *     unsigned long long h, signed char *board, CMove *m, int player
  * ) noexcept nogil:
@@ -8369,7 +8327,7 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
   int __pyx_t_3;
   int __pyx_t_4;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1005
+  /* "dama/ai/algorithmic/_fast_search.pyx":1003
  * ) noexcept nogil:
  *     """Compute Zobrist hash after move, incrementally (O(captures) not O(64))."""
  *     cdef int from_sq = m.from_sq             # <<<<<<<<<<<<<<
@@ -8379,7 +8337,7 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
   __pyx_t_1 = __pyx_v_m->from_sq;
   __pyx_v_from_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1006
+  /* "dama/ai/algorithmic/_fast_search.pyx":1004
  *     """Compute Zobrist hash after move, incrementally (O(captures) not O(64))."""
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq             # <<<<<<<<<<<<<<
@@ -8389,26 +8347,26 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
   __pyx_t_1 = __pyx_v_m->to_sq;
   __pyx_v_to_sq = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1007
+  /* "dama/ai/algorithmic/_fast_search.pyx":1005
  *     cdef int from_sq = m.from_sq
  *     cdef int to_sq = m.to_sq
  *     cdef int piece = board[from_sq]             # <<<<<<<<<<<<<<
  *     cdef int i, cap_sq, cap_piece, end_piece
- *
+ * 
 */
   __pyx_v_piece = (__pyx_v_board[__pyx_v_from_sq]);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1011
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1009
+ * 
  *     # Remove piece from start square
  *     h = h ^ ZOBRIST_PIECES[piece][from_sq]             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Remove captured pieces
 */
   __pyx_v_h = (__pyx_v_h ^ ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search_ZOBRIST_PIECES[__pyx_v_piece])[__pyx_v_from_sq]));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1014
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1012
+ * 
  *     # Remove captured pieces
  *     for i in range(m.num_captures):             # <<<<<<<<<<<<<<
  *         cap_sq = m.cap_r[i] * 8 + m.cap_c[i]
@@ -8419,7 +8377,7 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
   for (__pyx_t_3 = 0; __pyx_t_3 < __pyx_t_2; __pyx_t_3+=1) {
     __pyx_v_i = __pyx_t_3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1015
+    /* "dama/ai/algorithmic/_fast_search.pyx":1013
  *     # Remove captured pieces
  *     for i in range(m.num_captures):
  *         cap_sq = m.cap_r[i] * 8 + m.cap_c[i]             # <<<<<<<<<<<<<<
@@ -8428,31 +8386,31 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
 */
     __pyx_v_cap_sq = (((__pyx_v_m->cap_r[__pyx_v_i]) * 8) + (__pyx_v_m->cap_c[__pyx_v_i]));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1016
+    /* "dama/ai/algorithmic/_fast_search.pyx":1014
  *     for i in range(m.num_captures):
  *         cap_sq = m.cap_r[i] * 8 + m.cap_c[i]
  *         cap_piece = board[cap_sq]             # <<<<<<<<<<<<<<
  *         h = h ^ ZOBRIST_PIECES[cap_piece][cap_sq]
- *
+ * 
 */
     __pyx_v_cap_piece = (__pyx_v_board[__pyx_v_cap_sq]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1017
+    /* "dama/ai/algorithmic/_fast_search.pyx":1015
  *         cap_sq = m.cap_r[i] * 8 + m.cap_c[i]
  *         cap_piece = board[cap_sq]
  *         h = h ^ ZOBRIST_PIECES[cap_piece][cap_sq]             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Add piece to end square (with possible promotion)
 */
     __pyx_v_h = (__pyx_v_h ^ ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search_ZOBRIST_PIECES[__pyx_v_cap_piece])[__pyx_v_cap_sq]));
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1020
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1018
+ * 
  *     # Add piece to end square (with possible promotion)
  *     end_piece = promote_piece(piece) if _move_promotes(m) else piece             # <<<<<<<<<<<<<<
  *     h = h ^ ZOBRIST_PIECES[end_piece][to_sq]
- *
+ * 
 */
   __pyx_t_4 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_promotes(__pyx_v_m);
   if (__pyx_t_4) {
@@ -8462,37 +8420,37 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
   }
   __pyx_v_end_piece = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1021
+  /* "dama/ai/algorithmic/_fast_search.pyx":1019
  *     # Add piece to end square (with possible promotion)
  *     end_piece = promote_piece(piece) if _move_promotes(m) else piece
  *     h = h ^ ZOBRIST_PIECES[end_piece][to_sq]             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Toggle side to move
 */
   __pyx_v_h = (__pyx_v_h ^ ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search_ZOBRIST_PIECES[__pyx_v_end_piece])[__pyx_v_to_sq]));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1024
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1022
+ * 
  *     # Toggle side to move
  *     h = h ^ ZOBRIST_SIDE             # <<<<<<<<<<<<<<
- *
+ * 
  *     return h
 */
   __pyx_v_h = (__pyx_v_h ^ __pyx_v_4dama_2ai_11algorithmic_12_fast_search_ZOBRIST_SIDE);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1026
+  /* "dama/ai/algorithmic/_fast_search.pyx":1024
  *     h = h ^ ZOBRIST_SIDE
- *
+ * 
  *     return h             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_h;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1001
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":999
+ * 
+ * 
  * cdef inline unsigned long long _hash_after_move(             # <<<<<<<<<<<<<<
  *     unsigned long long h, signed char *board, CMove *m, int player
  * ) noexcept nogil:
@@ -8503,9 +8461,9 @@ static CYTHON_INLINE unsigned PY_LONG_LONG __pyx_f_4dama_2ai_11algorithmic_12_fa
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1029
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1027
+ * 
+ * 
  * cdef inline int _count_player_pieces(             # <<<<<<<<<<<<<<
  *     signed char *board, int player
  * ) noexcept nogil:
@@ -8520,7 +8478,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1034
+  /* "dama/ai/algorithmic/_fast_search.pyx":1032
  *     """Count pieces for the given player (for NMP zugzwang guard).
  *     Early-exits once threshold (4) is met  avoids scanning remaining squares."""
  *     cdef int count = 0, i, piece             # <<<<<<<<<<<<<<
@@ -8529,7 +8487,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
 */
   __pyx_v_count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1035
+  /* "dama/ai/algorithmic/_fast_search.pyx":1033
  *     Early-exits once threshold (4) is met  avoids scanning remaining squares."""
  *     cdef int count = 0, i, piece
  *     for i in range(NUM_DARK_SQ):             # <<<<<<<<<<<<<<
@@ -8539,7 +8497,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
   for (__pyx_t_1 = 0; __pyx_t_1 < 32; __pyx_t_1+=1) {
     __pyx_v_i = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1036
+    /* "dama/ai/algorithmic/_fast_search.pyx":1034
  *     cdef int count = 0, i, piece
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]             # <<<<<<<<<<<<<<
@@ -8548,7 +8506,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
 */
     __pyx_v_piece = (__pyx_v_board[(__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ[__pyx_v_i])]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1037
+    /* "dama/ai/algorithmic/_fast_search.pyx":1035
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]
  *         if piece != EMPTY and is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -8566,7 +8524,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
     __pyx_L6_bool_binop_done:;
     if (__pyx_t_2) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1038
+      /* "dama/ai/algorithmic/_fast_search.pyx":1036
  *         piece = board[DARK_SQ[i]]
  *         if piece != EMPTY and is_player(piece, player):
  *             count += 1             # <<<<<<<<<<<<<<
@@ -8575,7 +8533,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
 */
       __pyx_v_count = (__pyx_v_count + 1);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1039
+      /* "dama/ai/algorithmic/_fast_search.pyx":1037
  *         if piece != EMPTY and is_player(piece, player):
  *             count += 1
  *             if count >= 4:             # <<<<<<<<<<<<<<
@@ -8585,17 +8543,17 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
       __pyx_t_2 = (__pyx_v_count >= 4);
       if (__pyx_t_2) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1040
+        /* "dama/ai/algorithmic/_fast_search.pyx":1038
  *             count += 1
  *             if count >= 4:
  *                 return count             # <<<<<<<<<<<<<<
  *     return count
- *
+ * 
 */
         __pyx_r = __pyx_v_count;
         goto __pyx_L0;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1039
+        /* "dama/ai/algorithmic/_fast_search.pyx":1037
  *         if piece != EMPTY and is_player(piece, player):
  *             count += 1
  *             if count >= 4:             # <<<<<<<<<<<<<<
@@ -8604,7 +8562,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1037
+      /* "dama/ai/algorithmic/_fast_search.pyx":1035
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]
  *         if piece != EMPTY and is_player(piece, player):             # <<<<<<<<<<<<<<
@@ -8614,19 +8572,19 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1041
+  /* "dama/ai/algorithmic/_fast_search.pyx":1039
  *             if count >= 4:
  *                 return count
  *     return count             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_count;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1029
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1027
+ * 
+ * 
  * cdef inline int _count_player_pieces(             # <<<<<<<<<<<<<<
  *     signed char *board, int player
  * ) noexcept nogil:
@@ -8637,9 +8595,9 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__count_p
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1044
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1042
+ * 
+ * 
  * cdef void _order_moves_full(             # <<<<<<<<<<<<<<
  *     CMoveList *moves, int ply, SearchState *ss, int tt_from, int tt_to,
  *     signed char *board, int prev_from, int prev_to
@@ -8661,37 +8619,37 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
   int __pyx_t_5;
   int __pyx_t_6;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1056
+  /* "dama/ai/algorithmic/_fast_search.pyx":1054
  *     # Defensive clamp: scores[] holds MAX_MOVES entries, so a corrupt or
  *     # oversized count would read/write out of bounds (boundscheck off).
  *     if moves.count > MAX_MOVES:             # <<<<<<<<<<<<<<
  *         moves.count = MAX_MOVES
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_moves->count > 0x80);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1057
+    /* "dama/ai/algorithmic/_fast_search.pyx":1055
  *     # oversized count would read/write out of bounds (boundscheck off).
  *     if moves.count > MAX_MOVES:
  *         moves.count = MAX_MOVES             # <<<<<<<<<<<<<<
- *
+ * 
  *     for i in range(moves.count):
 */
     __pyx_v_moves->count = 0x80;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1056
+    /* "dama/ai/algorithmic/_fast_search.pyx":1054
  *     # Defensive clamp: scores[] holds MAX_MOVES entries, so a corrupt or
  *     # oversized count would read/write out of bounds (boundscheck off).
  *     if moves.count > MAX_MOVES:             # <<<<<<<<<<<<<<
  *         moves.count = MAX_MOVES
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1059
+  /* "dama/ai/algorithmic/_fast_search.pyx":1057
  *         moves.count = MAX_MOVES
- *
+ * 
  *     for i in range(moves.count):             # <<<<<<<<<<<<<<
  *         from_sq = moves.moves[i].from_sq
  *         to_sq = moves.moves[i].to_sq
@@ -8701,28 +8659,28 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
   for (__pyx_t_4 = 0; __pyx_t_4 < __pyx_t_3; __pyx_t_4+=1) {
     __pyx_v_i = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1060
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1058
+ * 
  *     for i in range(moves.count):
  *         from_sq = moves.moves[i].from_sq             # <<<<<<<<<<<<<<
  *         to_sq = moves.moves[i].to_sq
- *
+ * 
 */
     __pyx_t_5 = (__pyx_v_moves->moves[__pyx_v_i]).from_sq;
     __pyx_v_from_sq = __pyx_t_5;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1061
+    /* "dama/ai/algorithmic/_fast_search.pyx":1059
  *     for i in range(moves.count):
  *         from_sq = moves.moves[i].from_sq
  *         to_sq = moves.moves[i].to_sq             # <<<<<<<<<<<<<<
- *
+ * 
  *         # TT move: absolute highest priority  search this first
 */
     __pyx_t_5 = (__pyx_v_moves->moves[__pyx_v_i]).to_sq;
     __pyx_v_to_sq = __pyx_t_5;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1064
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1062
+ * 
  *         # TT move: absolute highest priority  search this first
  *         if tt_from >= 0 and from_sq == tt_from and to_sq == tt_to:             # <<<<<<<<<<<<<<
  *             scores[i] = 50000
@@ -8745,26 +8703,26 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
     __pyx_L7_bool_binop_done:;
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1065
+      /* "dama/ai/algorithmic/_fast_search.pyx":1063
  *         # TT move: absolute highest priority  search this first
  *         if tt_from >= 0 and from_sq == tt_from and to_sq == tt_to:
  *             scores[i] = 50000             # <<<<<<<<<<<<<<
  *             continue
- *
+ * 
 */
       (__pyx_v_scores[__pyx_v_i]) = 0xC350;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1066
+      /* "dama/ai/algorithmic/_fast_search.pyx":1064
  *         if tt_from >= 0 and from_sq == tt_from and to_sq == tt_to:
  *             scores[i] = 50000
  *             continue             # <<<<<<<<<<<<<<
- *
+ * 
  *         s = 0
 */
       goto __pyx_L4_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1064
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1062
+ * 
  *         # TT move: absolute highest priority  search this first
  *         if tt_from >= 0 and from_sq == tt_from and to_sq == tt_to:             # <<<<<<<<<<<<<<
  *             scores[i] = 50000
@@ -8772,17 +8730,17 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1068
+    /* "dama/ai/algorithmic/_fast_search.pyx":1066
  *             continue
- *
+ * 
  *         s = 0             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Captures: highest priority, scored by material value of captured pieces.
 */
     __pyx_v_s = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1071
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1069
+ * 
  *         # Captures: highest priority, scored by material value of captured pieces.
  *         if moves.moves[i].num_captures > 0:             # <<<<<<<<<<<<<<
  *             s = 20000 + _move_capture_value(&moves.moves[i])
@@ -8791,7 +8749,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
     __pyx_t_1 = ((__pyx_v_moves->moves[__pyx_v_i]).num_captures > 0);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1072
+      /* "dama/ai/algorithmic/_fast_search.pyx":1070
  *         # Captures: highest priority, scored by material value of captured pieces.
  *         if moves.moves[i].num_captures > 0:
  *             s = 20000 + _move_capture_value(&moves.moves[i])             # <<<<<<<<<<<<<<
@@ -8800,8 +8758,8 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
       __pyx_v_s = (0x4E20 + __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_capture_value((&(__pyx_v_moves->moves[__pyx_v_i]))));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1071
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1069
+ * 
  *         # Captures: highest priority, scored by material value of captured pieces.
  *         if moves.moves[i].num_captures > 0:             # <<<<<<<<<<<<<<
  *             s = 20000 + _move_capture_value(&moves.moves[i])
@@ -8810,7 +8768,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
       goto __pyx_L10;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1075
+    /* "dama/ai/algorithmic/_fast_search.pyx":1073
  *         else:
  *             # Killer move bonus
  *             if ply < MAX_PLY:             # <<<<<<<<<<<<<<
@@ -8821,7 +8779,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
       __pyx_t_1 = (__pyx_v_ply < 32);
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1076
+        /* "dama/ai/algorithmic/_fast_search.pyx":1074
  *             # Killer move bonus
  *             if ply < MAX_PLY:
  *                 for k in range(NUM_KILLERS):             # <<<<<<<<<<<<<<
@@ -8831,7 +8789,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
         for (__pyx_t_5 = 0; __pyx_t_5 < 2; __pyx_t_5+=1) {
           __pyx_v_k = __pyx_t_5;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1077
+          /* "dama/ai/algorithmic/_fast_search.pyx":1075
  *             if ply < MAX_PLY:
  *                 for k in range(NUM_KILLERS):
  *                     if (ss.killers_from[ply][k] == from_sq and             # <<<<<<<<<<<<<<
@@ -8845,7 +8803,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
             goto __pyx_L15_bool_binop_done;
           }
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1078
+          /* "dama/ai/algorithmic/_fast_search.pyx":1076
  *                 for k in range(NUM_KILLERS):
  *                     if (ss.killers_from[ply][k] == from_sq and
  *                             ss.killers_to[ply][k] == to_sq):             # <<<<<<<<<<<<<<
@@ -8856,7 +8814,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
           __pyx_t_1 = __pyx_t_6;
           __pyx_L15_bool_binop_done:;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1077
+          /* "dama/ai/algorithmic/_fast_search.pyx":1075
  *             if ply < MAX_PLY:
  *                 for k in range(NUM_KILLERS):
  *                     if (ss.killers_from[ply][k] == from_sq and             # <<<<<<<<<<<<<<
@@ -8865,7 +8823,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
           if (__pyx_t_1) {
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1079
+            /* "dama/ai/algorithmic/_fast_search.pyx":1077
  *                     if (ss.killers_from[ply][k] == from_sq and
  *                             ss.killers_to[ply][k] == to_sq):
  *                         s = 15000             # <<<<<<<<<<<<<<
@@ -8874,7 +8832,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
             __pyx_v_s = 0x3A98;
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1080
+            /* "dama/ai/algorithmic/_fast_search.pyx":1078
  *                             ss.killers_to[ply][k] == to_sq):
  *                         s = 15000
  *                         break             # <<<<<<<<<<<<<<
@@ -8883,7 +8841,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
             goto __pyx_L13_break;
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1077
+            /* "dama/ai/algorithmic/_fast_search.pyx":1075
  *             if ply < MAX_PLY:
  *                 for k in range(NUM_KILLERS):
  *                     if (ss.killers_from[ply][k] == from_sq and             # <<<<<<<<<<<<<<
@@ -8894,7 +8852,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
         }
         __pyx_L13_break:;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1075
+        /* "dama/ai/algorithmic/_fast_search.pyx":1073
  *         else:
  *             # Killer move bonus
  *             if ply < MAX_PLY:             # <<<<<<<<<<<<<<
@@ -8903,7 +8861,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1083
+      /* "dama/ai/algorithmic/_fast_search.pyx":1081
  *             # Countermove bonus: if opponent just played prev_fromprev_to,
  *             # the stored response that previously caused a cutoff gets priority.
  *             if s == 0 and prev_from >= 0:             # <<<<<<<<<<<<<<
@@ -8921,7 +8879,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
       __pyx_L18_bool_binop_done:;
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1084
+        /* "dama/ai/algorithmic/_fast_search.pyx":1082
  *             # the stored response that previously caused a cutoff gets priority.
  *             if s == 0 and prev_from >= 0:
  *                 if (ss.countermove_from[prev_from][prev_to] == from_sq and             # <<<<<<<<<<<<<<
@@ -8935,7 +8893,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
           goto __pyx_L21_bool_binop_done;
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1085
+        /* "dama/ai/algorithmic/_fast_search.pyx":1083
  *             if s == 0 and prev_from >= 0:
  *                 if (ss.countermove_from[prev_from][prev_to] == from_sq and
  *                         ss.countermove_to[prev_from][prev_to] == to_sq):             # <<<<<<<<<<<<<<
@@ -8946,7 +8904,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
         __pyx_t_1 = __pyx_t_6;
         __pyx_L21_bool_binop_done:;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1084
+        /* "dama/ai/algorithmic/_fast_search.pyx":1082
  *             # the stored response that previously caused a cutoff gets priority.
  *             if s == 0 and prev_from >= 0:
  *                 if (ss.countermove_from[prev_from][prev_to] == from_sq and             # <<<<<<<<<<<<<<
@@ -8955,7 +8913,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1086
+          /* "dama/ai/algorithmic/_fast_search.pyx":1084
  *                 if (ss.countermove_from[prev_from][prev_to] == from_sq and
  *                         ss.countermove_to[prev_from][prev_to] == to_sq):
  *                     s = 12000             # <<<<<<<<<<<<<<
@@ -8964,7 +8922,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
           __pyx_v_s = 0x2EE0;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1084
+          /* "dama/ai/algorithmic/_fast_search.pyx":1082
  *             # the stored response that previously caused a cutoff gets priority.
  *             if s == 0 and prev_from >= 0:
  *                 if (ss.countermove_from[prev_from][prev_to] == from_sq and             # <<<<<<<<<<<<<<
@@ -8973,7 +8931,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1083
+        /* "dama/ai/algorithmic/_fast_search.pyx":1081
  *             # Countermove bonus: if opponent just played prev_fromprev_to,
  *             # the stored response that previously caused a cutoff gets priority.
  *             if s == 0 and prev_from >= 0:             # <<<<<<<<<<<<<<
@@ -8982,85 +8940,85 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1088
+      /* "dama/ai/algorithmic/_fast_search.pyx":1086
  *                     s = 12000
  *             # History heuristic for quiet moves
  *             if s == 0:             # <<<<<<<<<<<<<<
  *                 s = ss.history[from_sq][to_sq]
- *
+ * 
 */
       __pyx_t_1 = (__pyx_v_s == 0);
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1089
+        /* "dama/ai/algorithmic/_fast_search.pyx":1087
  *             # History heuristic for quiet moves
  *             if s == 0:
  *                 s = ss.history[from_sq][to_sq]             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Promotion bonus
 */
         __pyx_v_s = ((__pyx_v_ss->history[__pyx_v_from_sq])[__pyx_v_to_sq]);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1088
+        /* "dama/ai/algorithmic/_fast_search.pyx":1086
  *                     s = 12000
  *             # History heuristic for quiet moves
  *             if s == 0:             # <<<<<<<<<<<<<<
  *                 s = ss.history[from_sq][to_sq]
- *
+ * 
 */
       }
     }
     __pyx_L10:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1092
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1090
+ * 
  *         # Promotion bonus
  *         if _move_promotes(&moves.moves[i]):             # <<<<<<<<<<<<<<
  *             s += 10000
- *
+ * 
 */
     __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_promotes((&(__pyx_v_moves->moves[__pyx_v_i])));
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1093
+      /* "dama/ai/algorithmic/_fast_search.pyx":1091
  *         # Promotion bonus
  *         if _move_promotes(&moves.moves[i]):
  *             s += 10000             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Center bias (precomputed lookup  no FP math)
 */
       __pyx_v_s = (__pyx_v_s + 0x2710);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1092
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1090
+ * 
  *         # Promotion bonus
  *         if _move_promotes(&moves.moves[i]):             # <<<<<<<<<<<<<<
  *             s += 10000
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1096
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1094
+ * 
  *         # Center bias (precomputed lookup  no FP math)
  *         s += CENTER_DIST[to_sq]             # <<<<<<<<<<<<<<
  *         scores[i] = s
- *
+ * 
 */
     __pyx_v_s = (__pyx_v_s + (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_CENTER_DIST[__pyx_v_to_sq]));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1097
+    /* "dama/ai/algorithmic/_fast_search.pyx":1095
  *         # Center bias (precomputed lookup  no FP math)
  *         s += CENTER_DIST[to_sq]
  *         scores[i] = s             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Insertion sort  O(n) best case on nearly-ordered input (common with
 */
     (__pyx_v_scores[__pyx_v_i]) = __pyx_v_s;
     __pyx_L4_continue:;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1102
+  /* "dama/ai/algorithmic/_fast_search.pyx":1100
  *     # TT/killer pre-ordering), O(n) worst case. Better than selection sort
  *     # for the typical 10-20 move lists in Dama.
  *     for i in range(1, moves.count):             # <<<<<<<<<<<<<<
@@ -9072,7 +9030,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
   for (__pyx_t_4 = 1; __pyx_t_4 < __pyx_t_3; __pyx_t_4+=1) {
     __pyx_v_i = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1103
+    /* "dama/ai/algorithmic/_fast_search.pyx":1101
  *     # for the typical 10-20 move lists in Dama.
  *     for i in range(1, moves.count):
  *         s = scores[i]             # <<<<<<<<<<<<<<
@@ -9081,7 +9039,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
     __pyx_v_s = (__pyx_v_scores[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1104
+    /* "dama/ai/algorithmic/_fast_search.pyx":1102
  *     for i in range(1, moves.count):
  *         s = scores[i]
  *         temp = moves.moves[i]             # <<<<<<<<<<<<<<
@@ -9090,7 +9048,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
     __pyx_v_temp = (__pyx_v_moves->moves[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1105
+    /* "dama/ai/algorithmic/_fast_search.pyx":1103
  *         s = scores[i]
  *         temp = moves.moves[i]
  *         j = i - 1             # <<<<<<<<<<<<<<
@@ -9099,7 +9057,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
     __pyx_v_j = (__pyx_v_i - 1);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1106
+    /* "dama/ai/algorithmic/_fast_search.pyx":1104
  *         temp = moves.moves[i]
  *         j = i - 1
  *         while j >= 0 and scores[j] < s:             # <<<<<<<<<<<<<<
@@ -9118,7 +9076,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
       __pyx_L29_bool_binop_done:;
       if (!__pyx_t_1) break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1107
+      /* "dama/ai/algorithmic/_fast_search.pyx":1105
  *         j = i - 1
  *         while j >= 0 and scores[j] < s:
  *             scores[j + 1] = scores[j]             # <<<<<<<<<<<<<<
@@ -9127,7 +9085,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
       (__pyx_v_scores[(__pyx_v_j + 1)]) = (__pyx_v_scores[__pyx_v_j]);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1108
+      /* "dama/ai/algorithmic/_fast_search.pyx":1106
  *         while j >= 0 and scores[j] < s:
  *             scores[j + 1] = scores[j]
  *             moves.moves[j + 1] = moves.moves[j]             # <<<<<<<<<<<<<<
@@ -9136,7 +9094,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
 */
       (__pyx_v_moves->moves[(__pyx_v_j + 1)]) = (__pyx_v_moves->moves[__pyx_v_j]);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1109
+      /* "dama/ai/algorithmic/_fast_search.pyx":1107
  *             scores[j + 1] = scores[j]
  *             moves.moves[j + 1] = moves.moves[j]
  *             j -= 1             # <<<<<<<<<<<<<<
@@ -9146,28 +9104,28 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
       __pyx_v_j = (__pyx_v_j - 1);
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1110
+    /* "dama/ai/algorithmic/_fast_search.pyx":1108
  *             moves.moves[j + 1] = moves.moves[j]
  *             j -= 1
  *         scores[j + 1] = s             # <<<<<<<<<<<<<<
  *         moves.moves[j + 1] = temp
- *
+ * 
 */
     (__pyx_v_scores[(__pyx_v_j + 1)]) = __pyx_v_s;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1111
+    /* "dama/ai/algorithmic/_fast_search.pyx":1109
  *             j -= 1
  *         scores[j + 1] = s
  *         moves.moves[j + 1] = temp             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
     (__pyx_v_moves->moves[(__pyx_v_j + 1)]) = __pyx_v_temp;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1044
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1042
+ * 
+ * 
  * cdef void _order_moves_full(             # <<<<<<<<<<<<<<
  *     CMoveList *moves, int ply, SearchState *ss, int tt_from, int tt_to,
  *     signed char *board, int prev_from, int prev_to
@@ -9176,9 +9134,9 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(str
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1114
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1112
+ * 
+ * 
  * cdef float alphabeta(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, int depth, float alpha, float beta,
  *     Rules *rules, SearchState *ss, unsigned long long h, int ply,
@@ -9223,18 +9181,18 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   int __pyx_t_8;
   int __pyx_t_9;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1132
+  /* "dama/ai/algorithmic/_fast_search.pyx":1130
  *     cdef float _iid_score, _iid_alpha, _iid_beta
- *
+ * 
  *     ss.nodes += 1             # <<<<<<<<<<<<<<
- *
+ * 
  *     if (ss.nodes & 4095) == 0:
 */
   __pyx_v_ss->nodes = (__pyx_v_ss->nodes + 1);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1134
+  /* "dama/ai/algorithmic/_fast_search.pyx":1132
  *     ss.nodes += 1
- *
+ * 
  *     if (ss.nodes & 4095) == 0:             # <<<<<<<<<<<<<<
  *         if _check_deadline(ss):
  *             return 0.0
@@ -9242,75 +9200,75 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   __pyx_t_1 = ((__pyx_v_ss->nodes & 0xFFF) == 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1135
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1133
+ * 
  *     if (ss.nodes & 4095) == 0:
  *         if _check_deadline(ss):             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__check_deadline(__pyx_v_ss);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1136
+      /* "dama/ai/algorithmic/_fast_search.pyx":1134
  *     if (ss.nodes & 4095) == 0:
  *         if _check_deadline(ss):
  *             return 0.0             # <<<<<<<<<<<<<<
- *
+ * 
  *     if depth == 0:
 */
       __pyx_r = 0.0;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1135
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1133
+ * 
  *     if (ss.nodes & 4095) == 0:
  *         if _check_deadline(ss):             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1134
+    /* "dama/ai/algorithmic/_fast_search.pyx":1132
  *     ss.nodes += 1
- *
+ * 
  *     if (ss.nodes & 4095) == 0:             # <<<<<<<<<<<<<<
  *         if _check_deadline(ss):
  *             return 0.0
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1138
+  /* "dama/ai/algorithmic/_fast_search.pyx":1136
  *             return 0.0
- *
+ * 
  *     if depth == 0:             # <<<<<<<<<<<<<<
  *         return quiescence(board, player, alpha, beta, rules, ss, h, MAX_QS_DEPTH)
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_depth == 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1139
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1137
+ * 
  *     if depth == 0:
  *         return quiescence(board, player, alpha, beta, rules, ss, h, MAX_QS_DEPTH)             # <<<<<<<<<<<<<<
- *
+ * 
  *     #  TT probe
 */
     __pyx_r = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_quiescence(__pyx_v_board, __pyx_v_player, __pyx_v_alpha, __pyx_v_beta, __pyx_v_rules, __pyx_v_ss, __pyx_v_h, 6);
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1138
+    /* "dama/ai/algorithmic/_fast_search.pyx":1136
  *             return 0.0
- *
+ * 
  *     if depth == 0:             # <<<<<<<<<<<<<<
  *         return quiescence(board, player, alpha, beta, rules, ss, h, MAX_QS_DEPTH)
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1142
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1140
+ * 
  *     #  TT probe
  *     orig_alpha = alpha             # <<<<<<<<<<<<<<
  *     tt_from_sq = -1
@@ -9318,7 +9276,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   __pyx_v_orig_alpha = __pyx_v_alpha;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1143
+  /* "dama/ai/algorithmic/_fast_search.pyx":1141
  *     #  TT probe
  *     orig_alpha = alpha
  *     tt_from_sq = -1             # <<<<<<<<<<<<<<
@@ -9327,7 +9285,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   __pyx_v_tt_from_sq = -1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1144
+  /* "dama/ai/algorithmic/_fast_search.pyx":1142
  *     orig_alpha = alpha
  *     tt_from_sq = -1
  *     tt_to_sq = -1             # <<<<<<<<<<<<<<
@@ -9336,7 +9294,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   __pyx_v_tt_to_sq = -1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1145
+  /* "dama/ai/algorithmic/_fast_search.pyx":1143
  *     tt_from_sq = -1
  *     tt_to_sq = -1
  *     if _tt_table != NULL:             # <<<<<<<<<<<<<<
@@ -9346,36 +9304,36 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   __pyx_t_1 = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table != NULL);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1146
+    /* "dama/ai/algorithmic/_fast_search.pyx":1144
  *     tt_to_sq = -1
  *     if _tt_table != NULL:
  *         if tt_probe(h, depth, &score, &alpha, &beta, &tt_from_sq, &tt_to_sq):             # <<<<<<<<<<<<<<
  *             return score
- *
+ * 
 */
     __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe(__pyx_v_h, __pyx_v_depth, (&__pyx_v_score), (&__pyx_v_alpha), (&__pyx_v_beta), (&__pyx_v_tt_from_sq), (&__pyx_v_tt_to_sq));
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1147
+      /* "dama/ai/algorithmic/_fast_search.pyx":1145
  *     if _tt_table != NULL:
  *         if tt_probe(h, depth, &score, &alpha, &beta, &tt_from_sq, &tt_to_sq):
  *             return score             # <<<<<<<<<<<<<<
- *
+ * 
  *     #  Internal Iterative Deepening (IID)
 */
       __pyx_r = __pyx_v_score;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1146
+      /* "dama/ai/algorithmic/_fast_search.pyx":1144
  *     tt_to_sq = -1
  *     if _tt_table != NULL:
  *         if tt_probe(h, depth, &score, &alpha, &beta, &tt_from_sq, &tt_to_sq):             # <<<<<<<<<<<<<<
  *             return score
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1145
+    /* "dama/ai/algorithmic/_fast_search.pyx":1143
  *     tt_from_sq = -1
  *     tt_to_sq = -1
  *     if _tt_table != NULL:             # <<<<<<<<<<<<<<
@@ -9384,7 +9342,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1155
+  /* "dama/ai/algorithmic/_fast_search.pyx":1153
  *     # effective. Cost: one depth-(depth-3) search. Payoff: better move
  *     # ordering reduces the full-depth tree by 20-40% at these depths.
  *     if tt_from_sq < 0 and depth >= 6 and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -9408,7 +9366,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   __pyx_L9_bool_binop_done:;
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1156
+    /* "dama/ai/algorithmic/_fast_search.pyx":1154
  *     # ordering reduces the full-depth tree by 20-40% at these depths.
  *     if tt_from_sq < 0 and depth >= 6 and not ss.timeout:
  *         alphabeta(board, player, depth - 3, alpha, beta, rules, ss, h, ply, True, prev_from, prev_to)             # <<<<<<<<<<<<<<
@@ -9417,7 +9375,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     (void)(__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_board, __pyx_v_player, (__pyx_v_depth - 3), __pyx_v_alpha, __pyx_v_beta, __pyx_v_rules, __pyx_v_ss, __pyx_v_h, __pyx_v_ply, 1, __pyx_v_prev_from, __pyx_v_prev_to));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1157
+    /* "dama/ai/algorithmic/_fast_search.pyx":1155
  *     if tt_from_sq < 0 and depth >= 6 and not ss.timeout:
  *         alphabeta(board, player, depth - 3, alpha, beta, rules, ss, h, ply, True, prev_from, prev_to)
  *         if _tt_table != NULL and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -9435,7 +9393,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_L13_bool_binop_done:;
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1158
+      /* "dama/ai/algorithmic/_fast_search.pyx":1156
  *         alphabeta(board, player, depth - 3, alpha, beta, rules, ss, h, ply, True, prev_from, prev_to)
  *         if _tt_table != NULL and not ss.timeout:
  *             _iid_alpha = -100000.0; _iid_beta = 100000.0             # <<<<<<<<<<<<<<
@@ -9445,16 +9403,16 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       __pyx_v__iid_alpha = -100000.0;
       __pyx_v__iid_beta = 100000.0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1159
+      /* "dama/ai/algorithmic/_fast_search.pyx":1157
  *         if _tt_table != NULL and not ss.timeout:
  *             _iid_alpha = -100000.0; _iid_beta = 100000.0
  *             tt_probe(h, 0, &_iid_score, &_iid_alpha, &_iid_beta,             # <<<<<<<<<<<<<<
  *                      &tt_from_sq, &tt_to_sq)
- *
+ * 
 */
       (void)(__pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe(__pyx_v_h, 0, (&__pyx_v__iid_score), (&__pyx_v__iid_alpha), (&__pyx_v__iid_beta), (&__pyx_v_tt_from_sq), (&__pyx_v_tt_to_sq)));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1157
+      /* "dama/ai/algorithmic/_fast_search.pyx":1155
  *     if tt_from_sq < 0 and depth >= 6 and not ss.timeout:
  *         alphabeta(board, player, depth - 3, alpha, beta, rules, ss, h, ply, True, prev_from, prev_to)
  *         if _tt_table != NULL and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -9463,7 +9421,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1155
+    /* "dama/ai/algorithmic/_fast_search.pyx":1153
  *     # effective. Cost: one depth-(depth-3) search. Payoff: better move
  *     # ordering reduces the full-depth tree by 20-40% at these depths.
  *     if tt_from_sq < 0 and depth >= 6 and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -9472,63 +9430,63 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1162
+  /* "dama/ai/algorithmic/_fast_search.pyx":1160
  *                      &tt_from_sq, &tt_to_sq)
- *
+ * 
  *     moves.count = 0             # <<<<<<<<<<<<<<
  *     generate_all_moves_c(board, player, rules, &moves)
- *
+ * 
 */
   __pyx_v_moves.count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1163
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1161
+ * 
  *     moves.count = 0
  *     generate_all_moves_c(board, player, rules, &moves)             # <<<<<<<<<<<<<<
- *
+ * 
  *     if moves.count == 0:
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(__pyx_v_board, __pyx_v_player, __pyx_v_rules, (&__pyx_v_moves));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1165
+  /* "dama/ai/algorithmic/_fast_search.pyx":1163
  *     generate_all_moves_c(board, player, rules, &moves)
- *
+ * 
  *     if moves.count == 0:             # <<<<<<<<<<<<<<
  *         return -10000.0
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_moves.count == 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1166
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1164
+ * 
  *     if moves.count == 0:
  *         return -10000.0             # <<<<<<<<<<<<<<
- *
+ * 
  *     opp = opponent(player)
 */
     __pyx_r = -10000.0;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1165
+    /* "dama/ai/algorithmic/_fast_search.pyx":1163
  *     generate_all_moves_c(board, player, rules, &moves)
- *
+ * 
  *     if moves.count == 0:             # <<<<<<<<<<<<<<
  *         return -10000.0
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1168
+  /* "dama/ai/algorithmic/_fast_search.pyx":1166
  *         return -10000.0
- *
+ * 
  *     opp = opponent(player)             # <<<<<<<<<<<<<<
- *
+ * 
  *     #  Null Move Pruning
 */
   __pyx_v_opp = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(__pyx_v_player);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1179
+  /* "dama/ai/algorithmic/_fast_search.pyx":1177
  *     # No eval guard: in balanced positions NMP still cuts effectively at depth 4+
  *     # and the straggler reduction on hard games outweighs the rare wasted search.
  *     if (allow_null and depth >= 4             # <<<<<<<<<<<<<<
@@ -9541,7 +9499,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     goto __pyx_L17_bool_binop_done;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1180
+  /* "dama/ai/algorithmic/_fast_search.pyx":1178
  *     # and the straggler reduction on hard games outweighs the rare wasted search.
  *     if (allow_null and depth >= 4
  *             and not (alpha > 9000 or alpha < -9000)             # <<<<<<<<<<<<<<
@@ -9555,7 +9513,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     goto __pyx_L17_bool_binop_done;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1181
+  /* "dama/ai/algorithmic/_fast_search.pyx":1179
  *     if (allow_null and depth >= 4
  *             and not (alpha > 9000 or alpha < -9000)
  *             and moves.moves[0].num_captures == 0             # <<<<<<<<<<<<<<
@@ -9569,7 +9527,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     goto __pyx_L21_bool_binop_done;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1180
+  /* "dama/ai/algorithmic/_fast_search.pyx":1178
  *     # and the straggler reduction on hard games outweighs the rare wasted search.
  *     if (allow_null and depth >= 4
  *             and not (alpha > 9000 or alpha < -9000)             # <<<<<<<<<<<<<<
@@ -9586,7 +9544,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     goto __pyx_L17_bool_binop_done;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1181
+  /* "dama/ai/algorithmic/_fast_search.pyx":1179
  *     if (allow_null and depth >= 4
  *             and not (alpha > 9000 or alpha < -9000)
  *             and moves.moves[0].num_captures == 0             # <<<<<<<<<<<<<<
@@ -9600,7 +9558,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     goto __pyx_L17_bool_binop_done;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1182
+  /* "dama/ai/algorithmic/_fast_search.pyx":1180
  *             and not (alpha > 9000 or alpha < -9000)
  *             and moves.moves[0].num_captures == 0
  *             and _count_player_pieces(board, player) >= 4):             # <<<<<<<<<<<<<<
@@ -9611,7 +9569,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   __pyx_t_1 = __pyx_t_3;
   __pyx_L17_bool_binop_done:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1179
+  /* "dama/ai/algorithmic/_fast_search.pyx":1177
  *     # No eval guard: in balanced positions NMP still cuts effectively at depth 4+
  *     # and the straggler reduction on hard games outweighs the rare wasted search.
  *     if (allow_null and depth >= 4             # <<<<<<<<<<<<<<
@@ -9620,7 +9578,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1183
+    /* "dama/ai/algorithmic/_fast_search.pyx":1181
  *             and moves.moves[0].num_captures == 0
  *             and _count_player_pieces(board, player) >= 4):
  *         nmp_R = 2 + depth // 6  # Adaptive reduction: deeper  more aggressive             # <<<<<<<<<<<<<<
@@ -9629,7 +9587,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     __pyx_v_nmp_R = (2 + (__pyx_v_depth / 6));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1184
+    /* "dama/ai/algorithmic/_fast_search.pyx":1182
  *             and _count_player_pieces(board, player) >= 4):
  *         nmp_R = 2 + depth // 6  # Adaptive reduction: deeper  more aggressive
  *         null_h = h ^ ZOBRIST_SIDE             # <<<<<<<<<<<<<<
@@ -9638,7 +9596,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     __pyx_v_null_h = (__pyx_v_h ^ __pyx_v_4dama_2ai_11algorithmic_12_fast_search_ZOBRIST_SIDE);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1185
+    /* "dama/ai/algorithmic/_fast_search.pyx":1183
  *         nmp_R = 2 + depth // 6  # Adaptive reduction: deeper  more aggressive
  *         null_h = h ^ ZOBRIST_SIDE
  *         null_score = -alphabeta(board, opp, depth - 1 - nmp_R, -beta, -beta + 1,             # <<<<<<<<<<<<<<
@@ -9647,7 +9605,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     __pyx_v_null_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_board, __pyx_v_opp, ((__pyx_v_depth - 1) - __pyx_v_nmp_R), (-__pyx_v_beta), ((-__pyx_v_beta) + 1.0), __pyx_v_rules, __pyx_v_ss, __pyx_v_null_h, (__pyx_v_ply + 1), 0, -1, -1));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1187
+    /* "dama/ai/algorithmic/_fast_search.pyx":1185
  *         null_score = -alphabeta(board, opp, depth - 1 - nmp_R, -beta, -beta + 1,
  *                                 rules, ss, null_h, ply + 1, False, -1, -1)
  *         if not ss.timeout and null_score >= beta:             # <<<<<<<<<<<<<<
@@ -9665,7 +9623,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_L25_bool_binop_done:;
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1189
+      /* "dama/ai/algorithmic/_fast_search.pyx":1187
  *         if not ss.timeout and null_score >= beta:
  *             # Don't trust mate scores from null move
  *             if null_score >= 9000:             # <<<<<<<<<<<<<<
@@ -9675,17 +9633,17 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       __pyx_t_1 = (__pyx_v_null_score >= 9000.0);
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1190
+        /* "dama/ai/algorithmic/_fast_search.pyx":1188
  *             # Don't trust mate scores from null move
  *             if null_score >= 9000:
  *                 return beta             # <<<<<<<<<<<<<<
  *             return null_score
- *
+ * 
 */
         __pyx_r = __pyx_v_beta;
         goto __pyx_L0;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1189
+        /* "dama/ai/algorithmic/_fast_search.pyx":1187
  *         if not ss.timeout and null_score >= beta:
  *             # Don't trust mate scores from null move
  *             if null_score >= 9000:             # <<<<<<<<<<<<<<
@@ -9694,17 +9652,17 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1191
+      /* "dama/ai/algorithmic/_fast_search.pyx":1189
  *             if null_score >= 9000:
  *                 return beta
  *             return null_score             # <<<<<<<<<<<<<<
- *
+ * 
  *     #  Futility pruning
 */
       __pyx_r = __pyx_v_null_score;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1187
+      /* "dama/ai/algorithmic/_fast_search.pyx":1185
  *         null_score = -alphabeta(board, opp, depth - 1 - nmp_R, -beta, -beta + 1,
  *                                 rules, ss, null_h, ply + 1, False, -1, -1)
  *         if not ss.timeout and null_score >= beta:             # <<<<<<<<<<<<<<
@@ -9713,7 +9671,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1179
+    /* "dama/ai/algorithmic/_fast_search.pyx":1177
  *     # No eval guard: in balanced positions NMP still cuts effectively at depth 4+
  *     # and the straggler reduction on hard games outweighs the rare wasted search.
  *     if (allow_null and depth >= 4             # <<<<<<<<<<<<<<
@@ -9722,7 +9680,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1197
+  /* "dama/ai/algorithmic/_fast_search.pyx":1195
  *     # an optimistic margin, quiet moves (non-captures, non-promotions) are
  *     # unlikely to raise the score above alpha. Skip them.
  *     futility_ok = False             # <<<<<<<<<<<<<<
@@ -9731,7 +9689,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   __pyx_v_futility_ok = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1198
+  /* "dama/ai/algorithmic/_fast_search.pyx":1196
  *     # unlikely to raise the score above alpha. Skip them.
  *     futility_ok = False
  *     if depth <= 2 and not (alpha > 9000 or alpha < -9000):             # <<<<<<<<<<<<<<
@@ -9758,7 +9716,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   __pyx_L29_bool_binop_done:;
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1199
+    /* "dama/ai/algorithmic/_fast_search.pyx":1197
  *     futility_ok = False
  *     if depth <= 2 and not (alpha > 9000 or alpha < -9000):
  *         static_eval = evaluate_c(board, player)             # <<<<<<<<<<<<<<
@@ -9767,35 +9725,35 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     __pyx_v_static_eval = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(__pyx_v_board, __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1200
+    /* "dama/ai/algorithmic/_fast_search.pyx":1198
  *     if depth <= 2 and not (alpha > 9000 or alpha < -9000):
  *         static_eval = evaluate_c(board, player)
  *         if static_eval + depth * 100 <= alpha:             # <<<<<<<<<<<<<<
  *             futility_ok = True
- *
+ * 
 */
     __pyx_t_1 = ((__pyx_v_static_eval + (__pyx_v_depth * 0x64)) <= __pyx_v_alpha);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1201
+      /* "dama/ai/algorithmic/_fast_search.pyx":1199
  *         static_eval = evaluate_c(board, player)
  *         if static_eval + depth * 100 <= alpha:
  *             futility_ok = True             # <<<<<<<<<<<<<<
- *
+ * 
  *     #  Late Move Pruning (LMP) limit
 */
       __pyx_v_futility_ok = 1;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1200
+      /* "dama/ai/algorithmic/_fast_search.pyx":1198
  *     if depth <= 2 and not (alpha > 9000 or alpha < -9000):
  *         static_eval = evaluate_c(board, player)
  *         if static_eval + depth * 100 <= alpha:             # <<<<<<<<<<<<<<
  *             futility_ok = True
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1198
+    /* "dama/ai/algorithmic/_fast_search.pyx":1196
  *     # unlikely to raise the score above alpha. Skip them.
  *     futility_ok = False
  *     if depth <= 2 and not (alpha > 9000 or alpha < -9000):             # <<<<<<<<<<<<<<
@@ -9804,7 +9762,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1210
+  /* "dama/ai/algorithmic/_fast_search.pyx":1208
  *     # promotions always searched regardless.
  *     # depth 1: 6, depth 2: 8, depth 3: 12, depth 4: 16
  *     if depth <= 4 and not (alpha > 9000 or alpha < -9000):             # <<<<<<<<<<<<<<
@@ -9831,7 +9789,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   __pyx_L35_bool_binop_done:;
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1211
+    /* "dama/ai/algorithmic/_fast_search.pyx":1209
  *     # depth 1: 6, depth 2: 8, depth 3: 12, depth 4: 16
  *     if depth <= 4 and not (alpha > 9000 or alpha < -9000):
  *         lmp_limit = LMP_TABLE[depth]             # <<<<<<<<<<<<<<
@@ -9840,7 +9798,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     __pyx_v_lmp_limit = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_LMP_TABLE[__pyx_v_depth]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1210
+    /* "dama/ai/algorithmic/_fast_search.pyx":1208
  *     # promotions always searched regardless.
  *     # depth 1: 6, depth 2: 8, depth 3: 12, depth 4: 16
  *     if depth <= 4 and not (alpha > 9000 or alpha < -9000):             # <<<<<<<<<<<<<<
@@ -9850,11 +9808,11 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     goto __pyx_L34;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1213
+  /* "dama/ai/algorithmic/_fast_search.pyx":1211
  *         lmp_limit = LMP_TABLE[depth]
  *     else:
  *         lmp_limit = 999  # No LMP at deeper depths             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Enhanced move ordering with killers, countermove, history, and TT best move
 */
   /*else*/ {
@@ -9862,36 +9820,36 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   }
   __pyx_L34:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1216
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1214
+ * 
  *     # Enhanced move ordering with killers, countermove, history, and TT best move
  *     _order_moves_full(&moves, ply, ss, tt_from_sq, tt_to_sq, board, prev_from, prev_to)             # <<<<<<<<<<<<<<
- *
+ * 
  *     best = -100000.0
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full((&__pyx_v_moves), __pyx_v_ply, __pyx_v_ss, __pyx_v_tt_from_sq, __pyx_v_tt_to_sq, __pyx_v_board, __pyx_v_prev_from, __pyx_v_prev_to);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1218
+  /* "dama/ai/algorithmic/_fast_search.pyx":1216
  *     _order_moves_full(&moves, ply, ss, tt_from_sq, tt_to_sq, board, prev_from, prev_to)
- *
+ * 
  *     best = -100000.0             # <<<<<<<<<<<<<<
  *     best_move_idx = 0
- *
+ * 
 */
   __pyx_v_best = -100000.0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1219
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1217
+ * 
  *     best = -100000.0
  *     best_move_idx = 0             # <<<<<<<<<<<<<<
- *
+ * 
  *     for i in range(moves.count):
 */
   __pyx_v_best_move_idx = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1221
+  /* "dama/ai/algorithmic/_fast_search.pyx":1219
  *     best_move_idx = 0
- *
+ * 
  *     for i in range(moves.count):             # <<<<<<<<<<<<<<
  *         # Futility prune: skip quiet moves when static eval + margin <= alpha.
  *         # Always search the first move (we need at least one legal move result)
@@ -9901,7 +9859,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   for (__pyx_t_6 = 0; __pyx_t_6 < __pyx_t_5; __pyx_t_6+=1) {
     __pyx_v_i = __pyx_t_6;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1225
+    /* "dama/ai/algorithmic/_fast_search.pyx":1223
  *         # Always search the first move (we need at least one legal move result)
  *         # and always search captures and promotions.
  *         if (futility_ok and i > 0             # <<<<<<<<<<<<<<
@@ -9914,7 +9872,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L42_bool_binop_done;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1226
+    /* "dama/ai/algorithmic/_fast_search.pyx":1224
  *         # and always search captures and promotions.
  *         if (futility_ok and i > 0
  *                 and moves.moves[i].num_captures == 0             # <<<<<<<<<<<<<<
@@ -9928,12 +9886,12 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L42_bool_binop_done;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1227
+    /* "dama/ai/algorithmic/_fast_search.pyx":1225
  *         if (futility_ok and i > 0
  *                 and moves.moves[i].num_captures == 0
  *                 and not _move_promotes(&moves.moves[i])):             # <<<<<<<<<<<<<<
  *             continue
- *
+ * 
 */
     __pyx_t_3 = ((__pyx_v_moves.moves[__pyx_v_i]).num_captures == 0);
     if (__pyx_t_3) {
@@ -9945,7 +9903,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_1 = __pyx_t_3;
     __pyx_L42_bool_binop_done:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1225
+    /* "dama/ai/algorithmic/_fast_search.pyx":1223
  *         # Always search the first move (we need at least one legal move result)
  *         # and always search captures and promotions.
  *         if (futility_ok and i > 0             # <<<<<<<<<<<<<<
@@ -9954,16 +9912,16 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1228
+      /* "dama/ai/algorithmic/_fast_search.pyx":1226
  *                 and moves.moves[i].num_captures == 0
  *                 and not _move_promotes(&moves.moves[i])):
  *             continue             # <<<<<<<<<<<<<<
- *
+ * 
  *         # LMP: skip late quiet moves at shallow depths
 */
       goto __pyx_L39_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1225
+      /* "dama/ai/algorithmic/_fast_search.pyx":1223
  *         # Always search the first move (we need at least one legal move result)
  *         # and always search captures and promotions.
  *         if (futility_ok and i > 0             # <<<<<<<<<<<<<<
@@ -9972,8 +9930,8 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1231
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1229
+ * 
  *         # LMP: skip late quiet moves at shallow depths
  *         if (i >= lmp_limit             # <<<<<<<<<<<<<<
  *                 and moves.moves[i].num_captures == 0
@@ -9986,7 +9944,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L47_bool_binop_done;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1232
+    /* "dama/ai/algorithmic/_fast_search.pyx":1230
  *         # LMP: skip late quiet moves at shallow depths
  *         if (i >= lmp_limit
  *                 and moves.moves[i].num_captures == 0             # <<<<<<<<<<<<<<
@@ -10000,7 +9958,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L47_bool_binop_done;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1233
+    /* "dama/ai/algorithmic/_fast_search.pyx":1231
  *         if (i >= lmp_limit
  *                 and moves.moves[i].num_captures == 0
  *                 and not _move_promotes(&moves.moves[i])             # <<<<<<<<<<<<<<
@@ -10014,19 +9972,19 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L47_bool_binop_done;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1234
+    /* "dama/ai/algorithmic/_fast_search.pyx":1232
  *                 and moves.moves[i].num_captures == 0
  *                 and not _move_promotes(&moves.moves[i])
  *                 and best > -9000):  # Don't prune if we haven't found any good move yet             # <<<<<<<<<<<<<<
  *             continue
- *
+ * 
 */
     __pyx_t_3 = (__pyx_v_best > -9000.0);
     __pyx_t_1 = __pyx_t_3;
     __pyx_L47_bool_binop_done:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1231
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1229
+ * 
  *         # LMP: skip late quiet moves at shallow depths
  *         if (i >= lmp_limit             # <<<<<<<<<<<<<<
  *                 and moves.moves[i].num_captures == 0
@@ -10034,17 +9992,17 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1235
+      /* "dama/ai/algorithmic/_fast_search.pyx":1233
  *                 and not _move_promotes(&moves.moves[i])
  *                 and best > -9000):  # Don't prune if we haven't found any good move yet
  *             continue             # <<<<<<<<<<<<<<
- *
+ * 
  *         apply_move_c(board, new_board, &moves.moves[i], player)
 */
       goto __pyx_L39_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1231
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1229
+ * 
  *         # LMP: skip late quiet moves at shallow depths
  *         if (i >= lmp_limit             # <<<<<<<<<<<<<<
  *                 and moves.moves[i].num_captures == 0
@@ -10052,47 +10010,47 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1237
+    /* "dama/ai/algorithmic/_fast_search.pyx":1235
  *             continue
- *
+ * 
  *         apply_move_c(board, new_board, &moves.moves[i], player)             # <<<<<<<<<<<<<<
  *         # Incremental hash update (O(captures) not O(64))
  *         child_h = _hash_after_move(h, board, &moves.moves[i], player)
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(__pyx_v_board, __pyx_v_new_board, (&(__pyx_v_moves.moves[__pyx_v_i])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1239
+    /* "dama/ai/algorithmic/_fast_search.pyx":1237
  *         apply_move_c(board, new_board, &moves.moves[i], player)
  *         # Incremental hash update (O(captures) not O(64))
  *         child_h = _hash_after_move(h, board, &moves.moves[i], player)             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Precomputed from/to for countermove passing to child
 */
     __pyx_v_child_h = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__hash_after_move(__pyx_v_h, __pyx_v_board, (&(__pyx_v_moves.moves[__pyx_v_i])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1242
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1240
+ * 
  *         # Precomputed from/to for countermove passing to child
  *         mv_from = moves.moves[i].from_sq             # <<<<<<<<<<<<<<
  *         mv_to = moves.moves[i].to_sq
- *
+ * 
 */
     __pyx_t_7 = (__pyx_v_moves.moves[__pyx_v_i]).from_sq;
     __pyx_v_mv_from = __pyx_t_7;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1243
+    /* "dama/ai/algorithmic/_fast_search.pyx":1241
  *         # Precomputed from/to for countermove passing to child
  *         mv_from = moves.moves[i].from_sq
  *         mv_to = moves.moves[i].to_sq             # <<<<<<<<<<<<<<
- *
+ * 
  *         if i == 0:
 */
     __pyx_t_7 = (__pyx_v_moves.moves[__pyx_v_i]).to_sq;
     __pyx_v_mv_to = __pyx_t_7;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1245
+    /* "dama/ai/algorithmic/_fast_search.pyx":1243
  *         mv_to = moves.moves[i].to_sq
- *
+ * 
  *         if i == 0:             # <<<<<<<<<<<<<<
  *             # First move (expected best): full window, full depth
  *             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
@@ -10100,7 +10058,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_1 = (__pyx_v_i == 0);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1247
+      /* "dama/ai/algorithmic/_fast_search.pyx":1245
  *         if i == 0:
  *             # First move (expected best): full window, full depth
  *             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,             # <<<<<<<<<<<<<<
@@ -10109,9 +10067,9 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       __pyx_v_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_new_board, __pyx_v_opp, (__pyx_v_depth - 1), (-__pyx_v_beta), (-__pyx_v_alpha), __pyx_v_rules, __pyx_v_ss, __pyx_v_child_h, (__pyx_v_ply + 1), 1, __pyx_v_mv_from, __pyx_v_mv_to));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1245
+      /* "dama/ai/algorithmic/_fast_search.pyx":1243
  *         mv_to = moves.moves[i].to_sq
- *
+ * 
  *         if i == 0:             # <<<<<<<<<<<<<<
  *             # First move (expected best): full window, full depth
  *             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
@@ -10119,7 +10077,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L51;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1252
+    /* "dama/ai/algorithmic/_fast_search.pyx":1250
  *             # Graduated LMR: reduce depth for late quiet moves using precomputed
  *             # table. Later moves at deeper depths get stronger reductions.
  *             reduced = 0             # <<<<<<<<<<<<<<
@@ -10129,7 +10087,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     /*else*/ {
       __pyx_v_reduced = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1253
+      /* "dama/ai/algorithmic/_fast_search.pyx":1251
  *             # table. Later moves at deeper depths get stronger reductions.
  *             reduced = 0
  *             if (i >= 3 and depth >= 3             # <<<<<<<<<<<<<<
@@ -10143,7 +10101,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
         goto __pyx_L53_bool_binop_done;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1254
+      /* "dama/ai/algorithmic/_fast_search.pyx":1252
  *             reduced = 0
  *             if (i >= 3 and depth >= 3
  *                     and moves.moves[i].num_captures == 0             # <<<<<<<<<<<<<<
@@ -10157,12 +10115,12 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
         goto __pyx_L53_bool_binop_done;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1255
+      /* "dama/ai/algorithmic/_fast_search.pyx":1253
  *             if (i >= 3 and depth >= 3
  *                     and moves.moves[i].num_captures == 0
  *                     and not _move_promotes(&moves.moves[i])):             # <<<<<<<<<<<<<<
  *                 reduced = LMR_TABLE[depth][i] if depth < LMR_MAX_D and i < LMR_MAX_M else 1
- *
+ * 
 */
       __pyx_t_3 = ((__pyx_v_moves.moves[__pyx_v_i]).num_captures == 0);
       if (__pyx_t_3) {
@@ -10174,7 +10132,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       __pyx_t_1 = __pyx_t_3;
       __pyx_L53_bool_binop_done:;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1253
+      /* "dama/ai/algorithmic/_fast_search.pyx":1251
  *             # table. Later moves at deeper depths get stronger reductions.
  *             reduced = 0
  *             if (i >= 3 and depth >= 3             # <<<<<<<<<<<<<<
@@ -10183,11 +10141,11 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1256
+        /* "dama/ai/algorithmic/_fast_search.pyx":1254
  *                     and moves.moves[i].num_captures == 0
  *                     and not _move_promotes(&moves.moves[i])):
  *                 reduced = LMR_TABLE[depth][i] if depth < LMR_MAX_D and i < LMR_MAX_M else 1             # <<<<<<<<<<<<<<
- *
+ * 
  *             # PVS + LMR: scout with null window at (potentially reduced) depth
 */
         __pyx_t_3 = (__pyx_v_depth < 33);
@@ -10206,7 +10164,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
         }
         __pyx_v_reduced = __pyx_t_7;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1253
+        /* "dama/ai/algorithmic/_fast_search.pyx":1251
  *             # table. Later moves at deeper depths get stronger reductions.
  *             reduced = 0
  *             if (i >= 3 and depth >= 3             # <<<<<<<<<<<<<<
@@ -10215,8 +10173,8 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1259
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1257
+ * 
  *             # PVS + LMR: scout with null window at (potentially reduced) depth
  *             score = -alphabeta(new_board, opp, depth - 1 - reduced,             # <<<<<<<<<<<<<<
  *                                -alpha - 1, -alpha,
@@ -10224,7 +10182,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       __pyx_v_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_new_board, __pyx_v_opp, ((__pyx_v_depth - 1) - __pyx_v_reduced), ((-__pyx_v_alpha) - 1.0), (-__pyx_v_alpha), __pyx_v_rules, __pyx_v_ss, __pyx_v_child_h, (__pyx_v_ply + 1), 1, __pyx_v_mv_from, __pyx_v_mv_to));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1262
+      /* "dama/ai/algorithmic/_fast_search.pyx":1260
  *                                -alpha - 1, -alpha,
  *                                rules, ss, child_h, ply + 1, True, mv_from, mv_to)
  *             if score > alpha and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -10242,16 +10200,16 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       __pyx_L60_bool_binop_done:;
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1264
+        /* "dama/ai/algorithmic/_fast_search.pyx":1262
  *             if score > alpha and not ss.timeout:
  *                 # Promising  re-search at full depth, full window
  *                 score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,             # <<<<<<<<<<<<<<
  *                                    rules, ss, child_h, ply + 1, True, mv_from, mv_to)
- *
+ * 
 */
         __pyx_v_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_new_board, __pyx_v_opp, (__pyx_v_depth - 1), (-__pyx_v_beta), (-__pyx_v_alpha), __pyx_v_rules, __pyx_v_ss, __pyx_v_child_h, (__pyx_v_ply + 1), 1, __pyx_v_mv_from, __pyx_v_mv_to));
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1262
+        /* "dama/ai/algorithmic/_fast_search.pyx":1260
  *                                -alpha - 1, -alpha,
  *                                rules, ss, child_h, ply + 1, True, mv_from, mv_to)
  *             if score > alpha and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -10262,37 +10220,37 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     }
     __pyx_L51:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1267
+    /* "dama/ai/algorithmic/_fast_search.pyx":1265
  *                                    rules, ss, child_h, ply + 1, True, mv_from, mv_to)
- *
+ * 
  *         if ss.timeout:             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     if (__pyx_v_ss->timeout) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1268
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1266
+ * 
  *         if ss.timeout:
  *             return 0.0             # <<<<<<<<<<<<<<
- *
+ * 
  *         if score > best:
 */
       __pyx_r = 0.0;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1267
+      /* "dama/ai/algorithmic/_fast_search.pyx":1265
  *                                    rules, ss, child_h, ply + 1, True, mv_from, mv_to)
- *
+ * 
  *         if ss.timeout:             # <<<<<<<<<<<<<<
  *             return 0.0
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1270
+    /* "dama/ai/algorithmic/_fast_search.pyx":1268
  *             return 0.0
- *
+ * 
  *         if score > best:             # <<<<<<<<<<<<<<
  *             best = score
  *             best_move_idx = i
@@ -10300,8 +10258,8 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_1 = (__pyx_v_score > __pyx_v_best);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1271
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1269
+ * 
  *         if score > best:
  *             best = score             # <<<<<<<<<<<<<<
  *             best_move_idx = i
@@ -10309,7 +10267,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       __pyx_v_best = __pyx_v_score;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1272
+      /* "dama/ai/algorithmic/_fast_search.pyx":1270
  *         if score > best:
  *             best = score
  *             best_move_idx = i             # <<<<<<<<<<<<<<
@@ -10318,16 +10276,16 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       __pyx_v_best_move_idx = __pyx_v_i;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1270
+      /* "dama/ai/algorithmic/_fast_search.pyx":1268
  *             return 0.0
- *
+ * 
  *         if score > best:             # <<<<<<<<<<<<<<
  *             best = score
  *             best_move_idx = i
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1273
+    /* "dama/ai/algorithmic/_fast_search.pyx":1271
  *             best = score
  *             best_move_idx = i
  *         if score > alpha:             # <<<<<<<<<<<<<<
@@ -10337,7 +10295,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_1 = (__pyx_v_score > __pyx_v_alpha);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1274
+      /* "dama/ai/algorithmic/_fast_search.pyx":1272
  *             best_move_idx = i
  *         if score > alpha:
  *             alpha = score             # <<<<<<<<<<<<<<
@@ -10346,7 +10304,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       __pyx_v_alpha = __pyx_v_score;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1273
+      /* "dama/ai/algorithmic/_fast_search.pyx":1271
  *             best = score
  *             best_move_idx = i
  *         if score > alpha:             # <<<<<<<<<<<<<<
@@ -10355,7 +10313,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1275
+    /* "dama/ai/algorithmic/_fast_search.pyx":1273
  *         if score > alpha:
  *             alpha = score
  *         if alpha >= beta:             # <<<<<<<<<<<<<<
@@ -10365,7 +10323,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_1 = (__pyx_v_alpha >= __pyx_v_beta);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1277
+      /* "dama/ai/algorithmic/_fast_search.pyx":1275
  *         if alpha >= beta:
  *             # Beta cutoff  update killer, history, and countermove for quiet moves
  *             if moves.moves[i].num_captures == 0:             # <<<<<<<<<<<<<<
@@ -10375,7 +10333,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       __pyx_t_1 = ((__pyx_v_moves.moves[__pyx_v_i]).num_captures == 0);
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1278
+        /* "dama/ai/algorithmic/_fast_search.pyx":1276
  *             # Beta cutoff  update killer, history, and countermove for quiet moves
  *             if moves.moves[i].num_captures == 0:
  *                 _store_killer(ss, ply, &moves.moves[i])             # <<<<<<<<<<<<<<
@@ -10384,7 +10342,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
         __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_killer(__pyx_v_ss, __pyx_v_ply, (&(__pyx_v_moves.moves[__pyx_v_i])));
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1279
+        /* "dama/ai/algorithmic/_fast_search.pyx":1277
  *             if moves.moves[i].num_captures == 0:
  *                 _store_killer(ss, ply, &moves.moves[i])
  *                 _update_history(ss, &moves.moves[i], depth)             # <<<<<<<<<<<<<<
@@ -10393,7 +10351,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
         __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update_history(__pyx_v_ss, (&(__pyx_v_moves.moves[__pyx_v_i])), __pyx_v_depth);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1280
+        /* "dama/ai/algorithmic/_fast_search.pyx":1278
  *                 _store_killer(ss, ply, &moves.moves[i])
  *                 _update_history(ss, &moves.moves[i], depth)
  *                 if prev_from >= 0:             # <<<<<<<<<<<<<<
@@ -10403,7 +10361,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
         __pyx_t_1 = (__pyx_v_prev_from >= 0);
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1281
+          /* "dama/ai/algorithmic/_fast_search.pyx":1279
  *                 _update_history(ss, &moves.moves[i], depth)
  *                 if prev_from >= 0:
  *                     _store_countermove(ss, prev_from, prev_to, &moves.moves[i])             # <<<<<<<<<<<<<<
@@ -10412,7 +10370,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
           __pyx_f_4dama_2ai_11algorithmic_12_fast_search__store_countermove(__pyx_v_ss, __pyx_v_prev_from, __pyx_v_prev_to, (&(__pyx_v_moves.moves[__pyx_v_i])));
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1280
+          /* "dama/ai/algorithmic/_fast_search.pyx":1278
  *                 _store_killer(ss, ply, &moves.moves[i])
  *                 _update_history(ss, &moves.moves[i], depth)
  *                 if prev_from >= 0:             # <<<<<<<<<<<<<<
@@ -10421,7 +10379,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1277
+        /* "dama/ai/algorithmic/_fast_search.pyx":1275
  *         if alpha >= beta:
  *             # Beta cutoff  update killer, history, and countermove for quiet moves
  *             if moves.moves[i].num_captures == 0:             # <<<<<<<<<<<<<<
@@ -10430,7 +10388,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1285
+      /* "dama/ai/algorithmic/_fast_search.pyx":1283
  *             # didn't cause a cutoff. Only at depth >= 3 where history ordering
  *             # matters and the penalty is meaningful.
  *             if depth >= 3:             # <<<<<<<<<<<<<<
@@ -10440,7 +10398,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       __pyx_t_1 = (__pyx_v_depth >= 3);
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1286
+        /* "dama/ai/algorithmic/_fast_search.pyx":1284
  *             # matters and the penalty is meaningful.
  *             if depth >= 3:
  *                 for j in range(i):             # <<<<<<<<<<<<<<
@@ -10452,7 +10410,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
         for (__pyx_t_9 = 0; __pyx_t_9 < __pyx_t_8; __pyx_t_9+=1) {
           __pyx_v_j = __pyx_t_9;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1287
+          /* "dama/ai/algorithmic/_fast_search.pyx":1285
  *             if depth >= 3:
  *                 for j in range(i):
  *                     if (moves.moves[j].num_captures == 0             # <<<<<<<<<<<<<<
@@ -10466,7 +10424,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
             goto __pyx_L72_bool_binop_done;
           }
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1288
+          /* "dama/ai/algorithmic/_fast_search.pyx":1286
  *                 for j in range(i):
  *                     if (moves.moves[j].num_captures == 0
  *                             and not _move_promotes(&moves.moves[j])):             # <<<<<<<<<<<<<<
@@ -10477,7 +10435,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
           __pyx_t_1 = __pyx_t_3;
           __pyx_L72_bool_binop_done:;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1287
+          /* "dama/ai/algorithmic/_fast_search.pyx":1285
  *             if depth >= 3:
  *                 for j in range(i):
  *                     if (moves.moves[j].num_captures == 0             # <<<<<<<<<<<<<<
@@ -10486,16 +10444,16 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
           if (__pyx_t_1) {
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1289
+            /* "dama/ai/algorithmic/_fast_search.pyx":1287
  *                     if (moves.moves[j].num_captures == 0
  *                             and not _move_promotes(&moves.moves[j])):
  *                         _update_history_malus(ss, &moves.moves[j], depth)             # <<<<<<<<<<<<<<
  *             break
- *
+ * 
 */
             __pyx_f_4dama_2ai_11algorithmic_12_fast_search__update_history_malus(__pyx_v_ss, (&(__pyx_v_moves.moves[__pyx_v_j])), __pyx_v_depth);
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1287
+            /* "dama/ai/algorithmic/_fast_search.pyx":1285
  *             if depth >= 3:
  *                 for j in range(i):
  *                     if (moves.moves[j].num_captures == 0             # <<<<<<<<<<<<<<
@@ -10505,7 +10463,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
           }
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1285
+        /* "dama/ai/algorithmic/_fast_search.pyx":1283
  *             # didn't cause a cutoff. Only at depth >= 3 where history ordering
  *             # matters and the penalty is meaningful.
  *             if depth >= 3:             # <<<<<<<<<<<<<<
@@ -10514,16 +10472,16 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1290
+      /* "dama/ai/algorithmic/_fast_search.pyx":1288
  *                             and not _move_promotes(&moves.moves[j])):
  *                         _update_history_malus(ss, &moves.moves[j], depth)
  *             break             # <<<<<<<<<<<<<<
- *
+ * 
  *     #  TT store (with best move from/to for future ordering)
 */
       goto __pyx_L40_break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1275
+      /* "dama/ai/algorithmic/_fast_search.pyx":1273
  *         if score > alpha:
  *             alpha = score
  *         if alpha >= beta:             # <<<<<<<<<<<<<<
@@ -10535,8 +10493,8 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   }
   __pyx_L40_break:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1293
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1291
+ * 
  *     #  TT store (with best move from/to for future ordering)
  *     if _tt_table != NULL and not ss.timeout:             # <<<<<<<<<<<<<<
  *         if best <= orig_alpha:
@@ -10553,7 +10511,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   __pyx_L75_bool_binop_done:;
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1294
+    /* "dama/ai/algorithmic/_fast_search.pyx":1292
  *     #  TT store (with best move from/to for future ordering)
  *     if _tt_table != NULL and not ss.timeout:
  *         if best <= orig_alpha:             # <<<<<<<<<<<<<<
@@ -10563,7 +10521,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_1 = (__pyx_v_best <= __pyx_v_orig_alpha);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1295
+      /* "dama/ai/algorithmic/_fast_search.pyx":1293
  *     if _tt_table != NULL and not ss.timeout:
  *         if best <= orig_alpha:
  *             tt_flag = TT_UPPERBOUND             # <<<<<<<<<<<<<<
@@ -10572,7 +10530,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       __pyx_v_tt_flag = 2;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1294
+      /* "dama/ai/algorithmic/_fast_search.pyx":1292
  *     #  TT store (with best move from/to for future ordering)
  *     if _tt_table != NULL and not ss.timeout:
  *         if best <= orig_alpha:             # <<<<<<<<<<<<<<
@@ -10582,7 +10540,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L77;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1296
+    /* "dama/ai/algorithmic/_fast_search.pyx":1294
  *         if best <= orig_alpha:
  *             tt_flag = TT_UPPERBOUND
  *         elif best >= beta:             # <<<<<<<<<<<<<<
@@ -10592,7 +10550,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_1 = (__pyx_v_best >= __pyx_v_beta);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1297
+      /* "dama/ai/algorithmic/_fast_search.pyx":1295
  *             tt_flag = TT_UPPERBOUND
  *         elif best >= beta:
  *             tt_flag = TT_LOWERBOUND             # <<<<<<<<<<<<<<
@@ -10601,7 +10559,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
       __pyx_v_tt_flag = 1;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1296
+      /* "dama/ai/algorithmic/_fast_search.pyx":1294
  *         if best <= orig_alpha:
  *             tt_flag = TT_UPPERBOUND
  *         elif best >= beta:             # <<<<<<<<<<<<<<
@@ -10611,7 +10569,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
       goto __pyx_L77;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1299
+    /* "dama/ai/algorithmic/_fast_search.pyx":1297
  *             tt_flag = TT_LOWERBOUND
  *         else:
  *             tt_flag = TT_EXACT             # <<<<<<<<<<<<<<
@@ -10623,7 +10581,7 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     }
     __pyx_L77:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1300
+    /* "dama/ai/algorithmic/_fast_search.pyx":1298
  *         else:
  *             tt_flag = TT_EXACT
  *         best_from_sq = moves.moves[best_move_idx].from_sq             # <<<<<<<<<<<<<<
@@ -10633,27 +10591,27 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
     __pyx_t_4 = (__pyx_v_moves.moves[__pyx_v_best_move_idx]).from_sq;
     __pyx_v_best_from_sq = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1301
+    /* "dama/ai/algorithmic/_fast_search.pyx":1299
  *             tt_flag = TT_EXACT
  *         best_from_sq = moves.moves[best_move_idx].from_sq
  *         best_to_sq = moves.moves[best_move_idx].to_sq             # <<<<<<<<<<<<<<
  *         tt_store(h, best, depth, tt_flag, best_from_sq, best_to_sq)
- *
+ * 
 */
     __pyx_t_4 = (__pyx_v_moves.moves[__pyx_v_best_move_idx]).to_sq;
     __pyx_v_best_to_sq = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1302
+    /* "dama/ai/algorithmic/_fast_search.pyx":1300
  *         best_from_sq = moves.moves[best_move_idx].from_sq
  *         best_to_sq = moves.moves[best_move_idx].to_sq
  *         tt_store(h, best, depth, tt_flag, best_from_sq, best_to_sq)             # <<<<<<<<<<<<<<
- *
+ * 
  *     return best
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_store(__pyx_v_h, __pyx_v_best, __pyx_v_depth, __pyx_v_tt_flag, __pyx_v_best_from_sq, __pyx_v_best_to_sq);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1293
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1291
+ * 
  *     #  TT store (with best move from/to for future ordering)
  *     if _tt_table != NULL and not ss.timeout:             # <<<<<<<<<<<<<<
  *         if best <= orig_alpha:
@@ -10661,19 +10619,19 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1304
+  /* "dama/ai/algorithmic/_fast_search.pyx":1302
  *         tt_store(h, best, depth, tt_flag, best_from_sq, best_to_sq)
- *
+ * 
  *     return best             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_best;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1114
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1112
+ * 
+ * 
  * cdef float alphabeta(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, int depth, float alpha, float beta,
  *     Rules *rules, SearchState *ss, unsigned long long h, int ply,
@@ -10684,33 +10642,33 @@ static float __pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(signed cha
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1307
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1305
+ * 
+ * 
  * cdef inline double _wall_now() noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Monotonic wall-clock seconds, callable inside nogil sections.
- *
+ * 
 */
 
 static CYTHON_INLINE double __pyx_f_4dama_2ai_11algorithmic_12_fast_search__wall_now(void) {
   double __pyx_r;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1317
+  /* "dama/ai/algorithmic/_fast_search.pyx":1315
  *     QueryPerformanceCounter on Windows.
  *     """
  *     return dama_wall_now()             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = dama_wall_now();
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1307
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1305
+ * 
+ * 
  * cdef inline double _wall_now() noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Monotonic wall-clock seconds, callable inside nogil sections.
- *
+ * 
 */
 
   /* function exit code */
@@ -10718,9 +10676,9 @@ static CYTHON_INLINE double __pyx_f_4dama_2ai_11algorithmic_12_fast_search__wall
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1320
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1318
+ * 
+ * 
  * cdef bint _check_deadline(SearchState *ss) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if _wall_now() >= ss.deadline:
  *         ss.timeout = True
@@ -10730,8 +10688,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__check_deadline(struct
   int __pyx_r;
   int __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1321
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1319
+ * 
  * cdef bint _check_deadline(SearchState *ss) noexcept nogil:
  *     if _wall_now() >= ss.deadline:             # <<<<<<<<<<<<<<
  *         ss.timeout = True
@@ -10740,7 +10698,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__check_deadline(struct
   __pyx_t_1 = (__pyx_f_4dama_2ai_11algorithmic_12_fast_search__wall_now() >= __pyx_v_ss->deadline);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1322
+    /* "dama/ai/algorithmic/_fast_search.pyx":1320
  * cdef bint _check_deadline(SearchState *ss) noexcept nogil:
  *     if _wall_now() >= ss.deadline:
  *         ss.timeout = True             # <<<<<<<<<<<<<<
@@ -10749,18 +10707,18 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__check_deadline(struct
 */
     __pyx_v_ss->timeout = 1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1323
+    /* "dama/ai/algorithmic/_fast_search.pyx":1321
  *     if _wall_now() >= ss.deadline:
  *         ss.timeout = True
  *         return True             # <<<<<<<<<<<<<<
  *     return False
- *
+ * 
 */
     __pyx_r = 1;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1321
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1319
+ * 
  * cdef bint _check_deadline(SearchState *ss) noexcept nogil:
  *     if _wall_now() >= ss.deadline:             # <<<<<<<<<<<<<<
  *         ss.timeout = True
@@ -10768,19 +10726,19 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__check_deadline(struct
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1324
+  /* "dama/ai/algorithmic/_fast_search.pyx":1322
  *         ss.timeout = True
  *         return True
  *     return False             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1320
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1318
+ * 
+ * 
  * cdef bint _check_deadline(SearchState *ss) noexcept nogil:             # <<<<<<<<<<<<<<
  *     if _wall_now() >= ss.deadline:
  *         ss.timeout = True
@@ -10791,9 +10749,9 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__check_deadline(struct
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1327
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1325
+ * 
+ * 
  * cdef int search_root(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, CMoveList *moves, int depth,
  *     float alpha, float beta,
@@ -10817,7 +10775,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
   int __pyx_t_5;
   int __pyx_t_6;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1336
+  /* "dama/ai/algorithmic/_fast_search.pyx":1334
  *     Stores the best score in ss.root_score for aspiration window logic.
  *     """
  *     cdef float best_score = -100000.0             # <<<<<<<<<<<<<<
@@ -10826,7 +10784,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
   __pyx_v_best_score = -100000.0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1338
+  /* "dama/ai/algorithmic/_fast_search.pyx":1336
  *     cdef float best_score = -100000.0
  *     cdef float score
  *     cdef int best_idx = 0             # <<<<<<<<<<<<<<
@@ -10835,18 +10793,18 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
   __pyx_v_best_idx = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1344
+  /* "dama/ai/algorithmic/_fast_search.pyx":1342
  *     cdef int mv_from, mv_to
- *
+ * 
  *     opp = opponent(player)             # <<<<<<<<<<<<<<
- *
+ * 
  *     for i in range(moves.count):
 */
   __pyx_v_opp = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(__pyx_v_player);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1346
+  /* "dama/ai/algorithmic/_fast_search.pyx":1344
  *     opp = opponent(player)
- *
+ * 
  *     for i in range(moves.count):             # <<<<<<<<<<<<<<
  *         apply_move_c(board, new_board, &moves.moves[i], player)
  *         child_h = _hash_after_move(h, board, &moves.moves[i], player)
@@ -10856,8 +10814,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
   for (__pyx_t_3 = 0; __pyx_t_3 < __pyx_t_2; __pyx_t_3+=1) {
     __pyx_v_i = __pyx_t_3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1347
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1345
+ * 
  *     for i in range(moves.count):
  *         apply_move_c(board, new_board, &moves.moves[i], player)             # <<<<<<<<<<<<<<
  *         child_h = _hash_after_move(h, board, &moves.moves[i], player)
@@ -10865,7 +10823,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(__pyx_v_board, __pyx_v_new_board, (&(__pyx_v_moves->moves[__pyx_v_i])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1348
+    /* "dama/ai/algorithmic/_fast_search.pyx":1346
  *     for i in range(moves.count):
  *         apply_move_c(board, new_board, &moves.moves[i], player)
  *         child_h = _hash_after_move(h, board, &moves.moves[i], player)             # <<<<<<<<<<<<<<
@@ -10874,29 +10832,29 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
     __pyx_v_child_h = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__hash_after_move(__pyx_v_h, __pyx_v_board, (&(__pyx_v_moves->moves[__pyx_v_i])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1349
+    /* "dama/ai/algorithmic/_fast_search.pyx":1347
  *         apply_move_c(board, new_board, &moves.moves[i], player)
  *         child_h = _hash_after_move(h, board, &moves.moves[i], player)
  *         mv_from = moves.moves[i].from_sq             # <<<<<<<<<<<<<<
  *         mv_to = moves.moves[i].to_sq
- *
+ * 
 */
     __pyx_t_4 = (__pyx_v_moves->moves[__pyx_v_i]).from_sq;
     __pyx_v_mv_from = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1350
+    /* "dama/ai/algorithmic/_fast_search.pyx":1348
  *         child_h = _hash_after_move(h, board, &moves.moves[i], player)
  *         mv_from = moves.moves[i].from_sq
  *         mv_to = moves.moves[i].to_sq             # <<<<<<<<<<<<<<
- *
+ * 
  *         if i == 0:
 */
     __pyx_t_4 = (__pyx_v_moves->moves[__pyx_v_i]).to_sq;
     __pyx_v_mv_to = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1352
+    /* "dama/ai/algorithmic/_fast_search.pyx":1350
  *         mv_to = moves.moves[i].to_sq
- *
+ * 
  *         if i == 0:             # <<<<<<<<<<<<<<
  *             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
  *                                rules, ss, child_h, 1, True, mv_from, mv_to)
@@ -10904,8 +10862,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
     __pyx_t_5 = (__pyx_v_i == 0);
     if (__pyx_t_5) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1353
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1351
+ * 
  *         if i == 0:
  *             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,             # <<<<<<<<<<<<<<
  *                                rules, ss, child_h, 1, True, mv_from, mv_to)
@@ -10913,9 +10871,9 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
       __pyx_v_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_new_board, __pyx_v_opp, (__pyx_v_depth - 1), (-__pyx_v_beta), (-__pyx_v_alpha), __pyx_v_rules, __pyx_v_ss, __pyx_v_child_h, 1, 1, __pyx_v_mv_from, __pyx_v_mv_to));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1352
+      /* "dama/ai/algorithmic/_fast_search.pyx":1350
  *         mv_to = moves.moves[i].to_sq
- *
+ * 
  *         if i == 0:             # <<<<<<<<<<<<<<
  *             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
  *                                rules, ss, child_h, 1, True, mv_from, mv_to)
@@ -10923,7 +10881,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
       goto __pyx_L5;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1357
+    /* "dama/ai/algorithmic/_fast_search.pyx":1355
  *         else:
  *             # PVS: null window scout
  *             score = -alphabeta(new_board, opp, depth - 1, -alpha - 1, -alpha,             # <<<<<<<<<<<<<<
@@ -10932,7 +10890,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
     /*else*/ {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1358
+      /* "dama/ai/algorithmic/_fast_search.pyx":1356
  *             # PVS: null window scout
  *             score = -alphabeta(new_board, opp, depth - 1, -alpha - 1, -alpha,
  *                                rules, ss, child_h, 1, True, mv_from, mv_to)             # <<<<<<<<<<<<<<
@@ -10941,7 +10899,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
       __pyx_v_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_new_board, __pyx_v_opp, (__pyx_v_depth - 1), ((-__pyx_v_alpha) - 1.0), (-__pyx_v_alpha), __pyx_v_rules, __pyx_v_ss, __pyx_v_child_h, 1, 1, __pyx_v_mv_from, __pyx_v_mv_to));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1359
+      /* "dama/ai/algorithmic/_fast_search.pyx":1357
  *             score = -alphabeta(new_board, opp, depth - 1, -alpha - 1, -alpha,
  *                                rules, ss, child_h, 1, True, mv_from, mv_to)
  *             if score > alpha and score < beta and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -10965,16 +10923,16 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
       __pyx_L7_bool_binop_done:;
       if (__pyx_t_5) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1360
+        /* "dama/ai/algorithmic/_fast_search.pyx":1358
  *                                rules, ss, child_h, 1, True, mv_from, mv_to)
  *             if score > alpha and score < beta and not ss.timeout:
  *                 score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,             # <<<<<<<<<<<<<<
  *                                    rules, ss, child_h, 1, True, mv_from, mv_to)
- *
+ * 
 */
         __pyx_v_score = (-__pyx_f_4dama_2ai_11algorithmic_12_fast_search_alphabeta(__pyx_v_new_board, __pyx_v_opp, (__pyx_v_depth - 1), (-__pyx_v_beta), (-__pyx_v_alpha), __pyx_v_rules, __pyx_v_ss, __pyx_v_child_h, 1, 1, __pyx_v_mv_from, __pyx_v_mv_to));
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1359
+        /* "dama/ai/algorithmic/_fast_search.pyx":1357
  *             score = -alphabeta(new_board, opp, depth - 1, -alpha - 1, -alpha,
  *                                rules, ss, child_h, 1, True, mv_from, mv_to)
  *             if score > alpha and score < beta and not ss.timeout:             # <<<<<<<<<<<<<<
@@ -10985,46 +10943,46 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
     }
     __pyx_L5:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1363
+    /* "dama/ai/algorithmic/_fast_search.pyx":1361
  *                                    rules, ss, child_h, 1, True, mv_from, mv_to)
- *
+ * 
  *         if ss.timeout:             # <<<<<<<<<<<<<<
  *             ss.root_score = best_score
  *             return best_idx
 */
     if (__pyx_v_ss->timeout) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1364
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1362
+ * 
  *         if ss.timeout:
  *             ss.root_score = best_score             # <<<<<<<<<<<<<<
  *             return best_idx
- *
+ * 
 */
       __pyx_v_ss->root_score = __pyx_v_best_score;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1365
+      /* "dama/ai/algorithmic/_fast_search.pyx":1363
  *         if ss.timeout:
  *             ss.root_score = best_score
  *             return best_idx             # <<<<<<<<<<<<<<
- *
+ * 
  *         if score > best_score:
 */
       __pyx_r = __pyx_v_best_idx;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1363
+      /* "dama/ai/algorithmic/_fast_search.pyx":1361
  *                                    rules, ss, child_h, 1, True, mv_from, mv_to)
- *
+ * 
  *         if ss.timeout:             # <<<<<<<<<<<<<<
  *             ss.root_score = best_score
  *             return best_idx
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1367
+    /* "dama/ai/algorithmic/_fast_search.pyx":1365
  *             return best_idx
- *
+ * 
  *         if score > best_score:             # <<<<<<<<<<<<<<
  *             best_score = score
  *             best_idx = i
@@ -11032,8 +10990,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
     __pyx_t_5 = (__pyx_v_score > __pyx_v_best_score);
     if (__pyx_t_5) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1368
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1366
+ * 
  *         if score > best_score:
  *             best_score = score             # <<<<<<<<<<<<<<
  *             best_idx = i
@@ -11041,7 +10999,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
       __pyx_v_best_score = __pyx_v_score;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1369
+      /* "dama/ai/algorithmic/_fast_search.pyx":1367
  *         if score > best_score:
  *             best_score = score
  *             best_idx = i             # <<<<<<<<<<<<<<
@@ -11050,16 +11008,16 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
       __pyx_v_best_idx = __pyx_v_i;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1367
+      /* "dama/ai/algorithmic/_fast_search.pyx":1365
  *             return best_idx
- *
+ * 
  *         if score > best_score:             # <<<<<<<<<<<<<<
  *             best_score = score
  *             best_idx = i
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1370
+    /* "dama/ai/algorithmic/_fast_search.pyx":1368
  *             best_score = score
  *             best_idx = i
  *         if score > alpha:             # <<<<<<<<<<<<<<
@@ -11069,7 +11027,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
     __pyx_t_5 = (__pyx_v_score > __pyx_v_alpha);
     if (__pyx_t_5) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1371
+      /* "dama/ai/algorithmic/_fast_search.pyx":1369
  *             best_idx = i
  *         if score > alpha:
  *             alpha = score             # <<<<<<<<<<<<<<
@@ -11078,7 +11036,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
       __pyx_v_alpha = __pyx_v_score;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1370
+      /* "dama/ai/algorithmic/_fast_search.pyx":1368
  *             best_score = score
  *             best_idx = i
  *         if score > alpha:             # <<<<<<<<<<<<<<
@@ -11087,12 +11045,12 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1372
+    /* "dama/ai/algorithmic/_fast_search.pyx":1370
  *         if score > alpha:
  *             alpha = score
  *         if alpha >= beta or best_score >= 9000:             # <<<<<<<<<<<<<<
  *             break
- *
+ * 
 */
     __pyx_t_6 = (__pyx_v_alpha >= __pyx_v_beta);
     if (!__pyx_t_6) {
@@ -11105,48 +11063,48 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
     __pyx_L14_bool_binop_done:;
     if (__pyx_t_5) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1373
+      /* "dama/ai/algorithmic/_fast_search.pyx":1371
  *             alpha = score
  *         if alpha >= beta or best_score >= 9000:
  *             break             # <<<<<<<<<<<<<<
- *
+ * 
  *     ss.root_score = best_score
 */
       goto __pyx_L4_break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1372
+      /* "dama/ai/algorithmic/_fast_search.pyx":1370
  *         if score > alpha:
  *             alpha = score
  *         if alpha >= beta or best_score >= 9000:             # <<<<<<<<<<<<<<
  *             break
- *
+ * 
 */
     }
   }
   __pyx_L4_break:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1375
+  /* "dama/ai/algorithmic/_fast_search.pyx":1373
  *             break
- *
+ * 
  *     ss.root_score = best_score             # <<<<<<<<<<<<<<
  *     return best_idx
- *
+ * 
 */
   __pyx_v_ss->root_score = __pyx_v_best_score;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1376
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1374
+ * 
  *     ss.root_score = best_score
  *     return best_idx             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_best_idx;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1327
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1325
+ * 
+ * 
  * cdef int search_root(             # <<<<<<<<<<<<<<
  *     signed char *board, int player, CMoveList *moves, int depth,
  *     float alpha, float beta,
@@ -11157,12 +11115,12 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(signed cha
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1379
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1377
+ * 
+ * 
  * cdef dict cmove_to_dict(CMove *m):             # <<<<<<<<<<<<<<
  *     """Convert CMove to Python dict matching Move.to_dict() format.
- *
+ * 
 */
 
 static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict(struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_CMove *__pyx_v_m) {
@@ -11184,31 +11142,31 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict(st
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("cmove_to_dict", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1387
+  /* "dama/ai/algorithmic/_fast_search.pyx":1385
  *     Tuples are also ~40% smaller and faster to create.
  *     """
  *     cdef list path = []             # <<<<<<<<<<<<<<
  *     cdef list captures = []
  *     cdef int i
 */
-  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1387, __pyx_L1_error)
+  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1385, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_path = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1388
+  /* "dama/ai/algorithmic/_fast_search.pyx":1386
  *     """
  *     cdef list path = []
  *     cdef list captures = []             # <<<<<<<<<<<<<<
  *     cdef int i
  *     for i in range(m.path_len):
 */
-  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1388, __pyx_L1_error)
+  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1386, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_captures = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1390
+  /* "dama/ai/algorithmic/_fast_search.pyx":1388
  *     cdef list captures = []
  *     cdef int i
  *     for i in range(m.path_len):             # <<<<<<<<<<<<<<
@@ -11220,30 +11178,30 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict(st
   for (__pyx_t_4 = 0; __pyx_t_4 < __pyx_t_3; __pyx_t_4+=1) {
     __pyx_v_i = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1391
+    /* "dama/ai/algorithmic/_fast_search.pyx":1389
  *     cdef int i
  *     for i in range(m.path_len):
  *         path.append((m.path_r[i], m.path_c[i]))             # <<<<<<<<<<<<<<
  *     for i in range(m.num_captures):
  *         captures.append((m.cap_r[i], m.cap_c[i]))
 */
-    __pyx_t_1 = __Pyx_PyLong_From_int((__pyx_v_m->path_r[__pyx_v_i])); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1391, __pyx_L1_error)
+    __pyx_t_1 = __Pyx_PyLong_From_int((__pyx_v_m->path_r[__pyx_v_i])); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1389, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
-    __pyx_t_5 = __Pyx_PyLong_From_int((__pyx_v_m->path_c[__pyx_v_i])); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1391, __pyx_L1_error)
+    __pyx_t_5 = __Pyx_PyLong_From_int((__pyx_v_m->path_c[__pyx_v_i])); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1389, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_5);
-    __pyx_t_6 = PyTuple_New(2); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1391, __pyx_L1_error)
+    __pyx_t_6 = PyTuple_New(2); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1389, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_6);
     __Pyx_GIVEREF(__pyx_t_1);
-    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_6, 0, __pyx_t_1) != (0)) __PYX_ERR(0, 1391, __pyx_L1_error);
+    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_6, 0, __pyx_t_1) != (0)) __PYX_ERR(0, 1389, __pyx_L1_error);
     __Pyx_GIVEREF(__pyx_t_5);
-    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_6, 1, __pyx_t_5) != (0)) __PYX_ERR(0, 1391, __pyx_L1_error);
+    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_6, 1, __pyx_t_5) != (0)) __PYX_ERR(0, 1389, __pyx_L1_error);
     __pyx_t_1 = 0;
     __pyx_t_5 = 0;
-    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_path, __pyx_t_6); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1391, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_path, __pyx_t_6); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1389, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1392
+  /* "dama/ai/algorithmic/_fast_search.pyx":1390
  *     for i in range(m.path_len):
  *         path.append((m.path_r[i], m.path_c[i]))
  *     for i in range(m.num_captures):             # <<<<<<<<<<<<<<
@@ -11255,30 +11213,30 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict(st
   for (__pyx_t_4 = 0; __pyx_t_4 < __pyx_t_3; __pyx_t_4+=1) {
     __pyx_v_i = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1393
+    /* "dama/ai/algorithmic/_fast_search.pyx":1391
  *         path.append((m.path_r[i], m.path_c[i]))
  *     for i in range(m.num_captures):
  *         captures.append((m.cap_r[i], m.cap_c[i]))             # <<<<<<<<<<<<<<
  *     return {
  *         "path": path,
 */
-    __pyx_t_6 = __Pyx_PyLong_From_int((__pyx_v_m->cap_r[__pyx_v_i])); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1393, __pyx_L1_error)
+    __pyx_t_6 = __Pyx_PyLong_From_int((__pyx_v_m->cap_r[__pyx_v_i])); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1391, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_6);
-    __pyx_t_5 = __Pyx_PyLong_From_int((__pyx_v_m->cap_c[__pyx_v_i])); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1393, __pyx_L1_error)
+    __pyx_t_5 = __Pyx_PyLong_From_int((__pyx_v_m->cap_c[__pyx_v_i])); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1391, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_5);
-    __pyx_t_1 = PyTuple_New(2); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1393, __pyx_L1_error)
+    __pyx_t_1 = PyTuple_New(2); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1391, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
     __Pyx_GIVEREF(__pyx_t_6);
-    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 0, __pyx_t_6) != (0)) __PYX_ERR(0, 1393, __pyx_L1_error);
+    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 0, __pyx_t_6) != (0)) __PYX_ERR(0, 1391, __pyx_L1_error);
     __Pyx_GIVEREF(__pyx_t_5);
-    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 1, __pyx_t_5) != (0)) __PYX_ERR(0, 1393, __pyx_L1_error);
+    if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 1, __pyx_t_5) != (0)) __PYX_ERR(0, 1391, __pyx_L1_error);
     __pyx_t_6 = 0;
     __pyx_t_5 = 0;
-    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_captures, __pyx_t_1); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1393, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_captures, __pyx_t_1); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1391, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1394
+  /* "dama/ai/algorithmic/_fast_search.pyx":1392
  *     for i in range(m.num_captures):
  *         captures.append((m.cap_r[i], m.cap_c[i]))
  *     return {             # <<<<<<<<<<<<<<
@@ -11287,48 +11245,48 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict(st
 */
   __Pyx_XDECREF(__pyx_r);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1395
+  /* "dama/ai/algorithmic/_fast_search.pyx":1393
  *         captures.append((m.cap_r[i], m.cap_c[i]))
  *     return {
  *         "path": path,             # <<<<<<<<<<<<<<
  *         "captures": captures,
  *         "promotion": bool(_move_promotes(m)),
 */
-  __pyx_t_1 = __Pyx_PyDict_NewPresized(3); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1395, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyDict_NewPresized(3); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1393, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_path, __pyx_v_path) < (0)) __PYX_ERR(0, 1395, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_path, __pyx_v_path) < (0)) __PYX_ERR(0, 1393, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1396
+  /* "dama/ai/algorithmic/_fast_search.pyx":1394
  *     return {
  *         "path": path,
  *         "captures": captures,             # <<<<<<<<<<<<<<
  *         "promotion": bool(_move_promotes(m)),
  *     }
 */
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_captures, __pyx_v_captures) < (0)) __PYX_ERR(0, 1395, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_captures, __pyx_v_captures) < (0)) __PYX_ERR(0, 1393, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1397
+  /* "dama/ai/algorithmic/_fast_search.pyx":1395
  *         "path": path,
  *         "captures": captures,
  *         "promotion": bool(_move_promotes(m)),             # <<<<<<<<<<<<<<
  *     }
- *
+ * 
 */
   __pyx_t_8 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__move_promotes(__pyx_v_m);
-  __pyx_t_5 = __Pyx_PyBool_FromLong((!(!__pyx_t_8))); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1397, __pyx_L1_error)
+  __pyx_t_5 = __Pyx_PyBool_FromLong((!(!__pyx_t_8))); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1395, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_5);
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_promotion, __pyx_t_5) < (0)) __PYX_ERR(0, 1395, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_promotion, __pyx_t_5) < (0)) __PYX_ERR(0, 1393, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
   __pyx_r = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1379
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1377
+ * 
+ * 
  * cdef dict cmove_to_dict(CMove *m):             # <<<<<<<<<<<<<<
  *     """Convert CMove to Python dict matching Move.to_dict() format.
- *
+ * 
 */
 
   /* function exit code */
@@ -11346,9 +11304,9 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict(st
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1401
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1399
+ * 
+ * 
  * cdef void _load_board(object state, signed char *board):             # <<<<<<<<<<<<<<
  *     """Load a GameState's board into a flat array."""
  *     memset(board, 0, 64)
@@ -11379,7 +11337,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("_load_board", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1403
+  /* "dama/ai/algorithmic/_fast_search.pyx":1401
  * cdef void _load_board(object state, signed char *board):
  *     """Load a GameState's board into a flat array."""
  *     memset(board, 0, 64)             # <<<<<<<<<<<<<<
@@ -11388,19 +11346,19 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
 */
   (void)(memset(__pyx_v_board, 0, 64));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1404
+  /* "dama/ai/algorithmic/_fast_search.pyx":1402
  *     """Load a GameState's board into a flat array."""
  *     memset(board, 0, 64)
  *     py_board = state.board             # <<<<<<<<<<<<<<
  *     for (r, c), piece in py_board._pieces.items():
  *         if piece.player.value == 1:
 */
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_board); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1404, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_board); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1402, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_py_board = __pyx_t_1;
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1405
+  /* "dama/ai/algorithmic/_fast_search.pyx":1403
  *     memset(board, 0, 64)
  *     py_board = state.board
  *     for (r, c), piece in py_board._pieces.items():             # <<<<<<<<<<<<<<
@@ -11408,13 +11366,13 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
  *             board[r * 8 + c] = P1_KING if piece.is_king else P1_MAN
 */
   __pyx_t_2 = 0;
-  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_v_py_board, __pyx_mstate_global->__pyx_n_u_pieces); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1405, __pyx_L1_error)
+  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_v_py_board, __pyx_mstate_global->__pyx_n_u_pieces); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1403, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_5);
   if (unlikely(__pyx_t_5 == Py_None)) {
     PyErr_Format(PyExc_AttributeError, "'NoneType' object has no attribute '%.30s'", "items");
-    __PYX_ERR(0, 1405, __pyx_L1_error)
+    __PYX_ERR(0, 1403, __pyx_L1_error)
   }
-  __pyx_t_6 = __Pyx_dict_iterator(__pyx_t_5, 0, __pyx_mstate_global->__pyx_n_u_items, (&__pyx_t_3), (&__pyx_t_4)); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1405, __pyx_L1_error)
+  __pyx_t_6 = __Pyx_dict_iterator(__pyx_t_5, 0, __pyx_mstate_global->__pyx_n_u_items, (&__pyx_t_3), (&__pyx_t_4)); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1403, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_6);
   __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
   __Pyx_XDECREF(__pyx_t_1);
@@ -11423,7 +11381,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
   while (1) {
     __pyx_t_7 = __Pyx_dict_iter_next(__pyx_t_1, __pyx_t_3, &__pyx_t_2, &__pyx_t_6, &__pyx_t_5, NULL, __pyx_t_4);
     if (unlikely(__pyx_t_7 == 0)) break;
-    if (unlikely(__pyx_t_7 == -1)) __PYX_ERR(0, 1405, __pyx_L1_error)
+    if (unlikely(__pyx_t_7 == -1)) __PYX_ERR(0, 1403, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_6);
     __Pyx_GOTREF(__pyx_t_5);
     if ((likely(PyTuple_CheckExact(__pyx_t_6))) || (PyList_CheckExact(__pyx_t_6))) {
@@ -11432,7 +11390,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
       if (unlikely(size != 2)) {
         if (size > 2) __Pyx_RaiseTooManyValuesError(2);
         else if (size >= 0) __Pyx_RaiseNeedMoreValuesError(size);
-        __PYX_ERR(0, 1405, __pyx_L1_error)
+        __PYX_ERR(0, 1403, __pyx_L1_error)
       }
       #if CYTHON_ASSUME_SAFE_MACROS && !CYTHON_AVOID_BORROWED_REFS
       if (likely(PyTuple_CheckExact(sequence))) {
@@ -11442,22 +11400,22 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
         __Pyx_INCREF(__pyx_t_9);
       } else {
         __pyx_t_8 = __Pyx_PyList_GET_ITEM_REF(sequence, 0, __Pyx_ReferenceSharing_SharedReference);
-        if (unlikely(!__pyx_t_8)) __PYX_ERR(0, 1405, __pyx_L1_error)
+        if (unlikely(!__pyx_t_8)) __PYX_ERR(0, 1403, __pyx_L1_error)
         __Pyx_XGOTREF(__pyx_t_8);
         __pyx_t_9 = __Pyx_PyList_GET_ITEM_REF(sequence, 1, __Pyx_ReferenceSharing_SharedReference);
-        if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1405, __pyx_L1_error)
+        if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1403, __pyx_L1_error)
         __Pyx_XGOTREF(__pyx_t_9);
       }
       #else
-      __pyx_t_8 = __Pyx_PySequence_ITEM(sequence, 0); if (unlikely(!__pyx_t_8)) __PYX_ERR(0, 1405, __pyx_L1_error)
+      __pyx_t_8 = __Pyx_PySequence_ITEM(sequence, 0); if (unlikely(!__pyx_t_8)) __PYX_ERR(0, 1403, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_8);
-      __pyx_t_9 = __Pyx_PySequence_ITEM(sequence, 1); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1405, __pyx_L1_error)
+      __pyx_t_9 = __Pyx_PySequence_ITEM(sequence, 1); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1403, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_9);
       #endif
       __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
     } else {
       Py_ssize_t index = -1;
-      __pyx_t_10 = PyObject_GetIter(__pyx_t_6); if (unlikely(!__pyx_t_10)) __PYX_ERR(0, 1405, __pyx_L1_error)
+      __pyx_t_10 = PyObject_GetIter(__pyx_t_6); if (unlikely(!__pyx_t_10)) __PYX_ERR(0, 1403, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_10);
       __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
       __pyx_t_11 = (CYTHON_COMPILING_IN_LIMITED_API) ? PyIter_Next : __Pyx_PyObject_GetIterNextFunc(__pyx_t_10);
@@ -11465,7 +11423,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
       __Pyx_GOTREF(__pyx_t_8);
       index = 1; __pyx_t_9 = __pyx_t_11(__pyx_t_10); if (unlikely(!__pyx_t_9)) goto __pyx_L5_unpacking_failed;
       __Pyx_GOTREF(__pyx_t_9);
-      if (__Pyx_IternextUnpackEndCheck(__pyx_t_11(__pyx_t_10), 2) < (0)) __PYX_ERR(0, 1405, __pyx_L1_error)
+      if (__Pyx_IternextUnpackEndCheck(__pyx_t_11(__pyx_t_10), 2) < (0)) __PYX_ERR(0, 1403, __pyx_L1_error)
       __pyx_t_11 = NULL;
       __Pyx_DECREF(__pyx_t_10); __pyx_t_10 = 0;
       goto __pyx_L6_unpacking_done;
@@ -11473,7 +11431,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
       __Pyx_DECREF(__pyx_t_10); __pyx_t_10 = 0;
       __pyx_t_11 = NULL;
       if (__Pyx_IterFinish() == 0) __Pyx_RaiseNeedMoreValuesError(index);
-      __PYX_ERR(0, 1405, __pyx_L1_error)
+      __PYX_ERR(0, 1403, __pyx_L1_error)
       __pyx_L6_unpacking_done:;
     }
     __Pyx_XDECREF_SET(__pyx_v_r, __pyx_t_8);
@@ -11483,48 +11441,48 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
     __Pyx_XDECREF_SET(__pyx_v_piece, __pyx_t_5);
     __pyx_t_5 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1406
+    /* "dama/ai/algorithmic/_fast_search.pyx":1404
  *     py_board = state.board
  *     for (r, c), piece in py_board._pieces.items():
  *         if piece.player.value == 1:             # <<<<<<<<<<<<<<
  *             board[r * 8 + c] = P1_KING if piece.is_king else P1_MAN
  *         else:
 */
-    __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_v_piece, __pyx_mstate_global->__pyx_n_u_player); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1406, __pyx_L1_error)
+    __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_v_piece, __pyx_mstate_global->__pyx_n_u_player); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1404, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_5);
-    __pyx_t_6 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_value); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1406, __pyx_L1_error)
+    __pyx_t_6 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_value); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1404, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_6);
     __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-    __pyx_t_12 = (__Pyx_PyLong_BoolEqObjC(__pyx_t_6, __pyx_mstate_global->__pyx_int_1, 1, 0)); if (unlikely((__pyx_t_12 < 0))) __PYX_ERR(0, 1406, __pyx_L1_error)
+    __pyx_t_12 = (__Pyx_PyLong_BoolEqObjC(__pyx_t_6, __pyx_mstate_global->__pyx_int_1, 1, 0)); if (unlikely((__pyx_t_12 < 0))) __PYX_ERR(0, 1404, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
     if (__pyx_t_12) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1407
+      /* "dama/ai/algorithmic/_fast_search.pyx":1405
  *     for (r, c), piece in py_board._pieces.items():
  *         if piece.player.value == 1:
  *             board[r * 8 + c] = P1_KING if piece.is_king else P1_MAN             # <<<<<<<<<<<<<<
  *         else:
  *             board[r * 8 + c] = P2_KING if piece.is_king else P2_MAN
 */
-      __pyx_t_6 = __Pyx_PyObject_GetAttrStr(__pyx_v_piece, __pyx_mstate_global->__pyx_n_u_is_king); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1407, __pyx_L1_error)
+      __pyx_t_6 = __Pyx_PyObject_GetAttrStr(__pyx_v_piece, __pyx_mstate_global->__pyx_n_u_is_king); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1405, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_6);
-      __pyx_t_12 = __Pyx_PyObject_IsTrue(__pyx_t_6); if (unlikely((__pyx_t_12 < 0))) __PYX_ERR(0, 1407, __pyx_L1_error)
+      __pyx_t_12 = __Pyx_PyObject_IsTrue(__pyx_t_6); if (unlikely((__pyx_t_12 < 0))) __PYX_ERR(0, 1405, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
       if (__pyx_t_12) {
         __pyx_t_13 = 2;
       } else {
         __pyx_t_13 = 1;
       }
-      __pyx_t_6 = __Pyx_PyLong_MultiplyObjC(__pyx_v_r, __pyx_mstate_global->__pyx_int_8, 8, 0, 0); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1407, __pyx_L1_error)
+      __pyx_t_6 = __Pyx_PyLong_MultiplyObjC(__pyx_v_r, __pyx_mstate_global->__pyx_int_8, 8, 0, 0); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1405, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_6);
-      __pyx_t_5 = PyNumber_Add(__pyx_t_6, __pyx_v_c); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1407, __pyx_L1_error)
+      __pyx_t_5 = PyNumber_Add(__pyx_t_6, __pyx_v_c); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1405, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_5);
       __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
-      __pyx_t_14 = __Pyx_PyIndex_AsSsize_t(__pyx_t_5); if (unlikely((__pyx_t_14 == (Py_ssize_t)-1) && PyErr_Occurred())) __PYX_ERR(0, 1407, __pyx_L1_error)
+      __pyx_t_14 = __Pyx_PyIndex_AsSsize_t(__pyx_t_5); if (unlikely((__pyx_t_14 == (Py_ssize_t)-1) && PyErr_Occurred())) __PYX_ERR(0, 1405, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
       (__pyx_v_board[__pyx_t_14]) = __pyx_t_13;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1406
+      /* "dama/ai/algorithmic/_fast_search.pyx":1404
  *     py_board = state.board
  *     for (r, c), piece in py_board._pieces.items():
  *         if piece.player.value == 1:             # <<<<<<<<<<<<<<
@@ -11534,29 +11492,29 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
       goto __pyx_L7;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1409
+    /* "dama/ai/algorithmic/_fast_search.pyx":1407
  *             board[r * 8 + c] = P1_KING if piece.is_king else P1_MAN
  *         else:
  *             board[r * 8 + c] = P2_KING if piece.is_king else P2_MAN             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
     /*else*/ {
-      __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_v_piece, __pyx_mstate_global->__pyx_n_u_is_king); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1409, __pyx_L1_error)
+      __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_v_piece, __pyx_mstate_global->__pyx_n_u_is_king); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1407, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_5);
-      __pyx_t_12 = __Pyx_PyObject_IsTrue(__pyx_t_5); if (unlikely((__pyx_t_12 < 0))) __PYX_ERR(0, 1409, __pyx_L1_error)
+      __pyx_t_12 = __Pyx_PyObject_IsTrue(__pyx_t_5); if (unlikely((__pyx_t_12 < 0))) __PYX_ERR(0, 1407, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
       if (__pyx_t_12) {
         __pyx_t_13 = 4;
       } else {
         __pyx_t_13 = 3;
       }
-      __pyx_t_5 = __Pyx_PyLong_MultiplyObjC(__pyx_v_r, __pyx_mstate_global->__pyx_int_8, 8, 0, 0); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1409, __pyx_L1_error)
+      __pyx_t_5 = __Pyx_PyLong_MultiplyObjC(__pyx_v_r, __pyx_mstate_global->__pyx_int_8, 8, 0, 0); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1407, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_5);
-      __pyx_t_6 = PyNumber_Add(__pyx_t_5, __pyx_v_c); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1409, __pyx_L1_error)
+      __pyx_t_6 = PyNumber_Add(__pyx_t_5, __pyx_v_c); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1407, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_6);
       __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-      __pyx_t_14 = __Pyx_PyIndex_AsSsize_t(__pyx_t_6); if (unlikely((__pyx_t_14 == (Py_ssize_t)-1) && PyErr_Occurred())) __PYX_ERR(0, 1409, __pyx_L1_error)
+      __pyx_t_14 = __Pyx_PyIndex_AsSsize_t(__pyx_t_6); if (unlikely((__pyx_t_14 == (Py_ssize_t)-1) && PyErr_Occurred())) __PYX_ERR(0, 1407, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
       (__pyx_v_board[__pyx_t_14]) = __pyx_t_13;
     }
@@ -11564,9 +11522,9 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
   }
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1401
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1399
+ * 
+ * 
  * cdef void _load_board(object state, signed char *board):             # <<<<<<<<<<<<<<
  *     """Load a GameState's board into a flat array."""
  *     memset(board, 0, 64)
@@ -11590,9 +11548,9 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(PyObject 
   __Pyx_RefNannyFinishContext();
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1419
+/* "dama/ai/algorithmic/_fast_search.pyx":1417
  * cdef Rules _cached_rules
- *
+ * 
  * cdef Rules _load_rules():             # <<<<<<<<<<<<<<
  *     """Load rules from the Python config singleton, caching after first call."""
  *     global _rules_cached, _cached_rules
@@ -11615,7 +11573,7 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("_load_rules", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1422
+  /* "dama/ai/algorithmic/_fast_search.pyx":1420
  *     """Load rules from the Python config singleton, caching after first call."""
  *     global _rules_cached, _cached_rules
  *     if _rules_cached:             # <<<<<<<<<<<<<<
@@ -11624,7 +11582,7 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
 */
   if (__pyx_v_4dama_2ai_11algorithmic_12_fast_search__rules_cached) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1423
+    /* "dama/ai/algorithmic/_fast_search.pyx":1421
  *     global _rules_cached, _cached_rules
  *     if _rules_cached:
  *         return _cached_rules             # <<<<<<<<<<<<<<
@@ -11634,7 +11592,7 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
     __pyx_r = __pyx_v_4dama_2ai_11algorithmic_12_fast_search__cached_rules;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1422
+    /* "dama/ai/algorithmic/_fast_search.pyx":1420
  *     """Load rules from the Python config singleton, caching after first call."""
  *     global _rules_cached, _cached_rules
  *     if _rules_cached:             # <<<<<<<<<<<<<<
@@ -11643,7 +11601,7 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1424
+  /* "dama/ai/algorithmic/_fast_search.pyx":1422
  *     if _rules_cached:
  *         return _cached_rules
  *     from dama.config import get_config             # <<<<<<<<<<<<<<
@@ -11652,14 +11610,14 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
 */
   {
     PyObject* const __pyx_imported_names[] = {__pyx_mstate_global->__pyx_n_u_get_config};
-    __pyx_t_2 = __Pyx_Import(__pyx_mstate_global->__pyx_n_u_dama_config, __pyx_imported_names, 1, NULL, 0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1424, __pyx_L1_error)
+    __pyx_t_2 = __Pyx_Import(__pyx_mstate_global->__pyx_n_u_dama_config, __pyx_imported_names, 1, NULL, 0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1422, __pyx_L1_error)
   }
   __pyx_t_1 = __pyx_t_2;
   __Pyx_GOTREF(__pyx_t_1);
   {
     PyObject* const __pyx_imported_names[] = {__pyx_mstate_global->__pyx_n_u_get_config};
     __pyx_t_3 = 0; {
-      __pyx_t_4 = __Pyx_ImportFrom(__pyx_t_1, __pyx_imported_names[__pyx_t_3]); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1424, __pyx_L1_error)
+      __pyx_t_4 = __Pyx_ImportFrom(__pyx_t_1, __pyx_imported_names[__pyx_t_3]); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1422, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_4);
       switch (__pyx_t_3) {
         case 0:
@@ -11673,7 +11631,7 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
   }
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1425
+  /* "dama/ai/algorithmic/_fast_search.pyx":1423
  *         return _cached_rules
  *     from dama.config import get_config
  *     cfg = get_config()             # <<<<<<<<<<<<<<
@@ -11682,7 +11640,7 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
 */
   __pyx_t_4 = NULL;
   __Pyx_INCREF(__pyx_v_get_config);
-  __pyx_t_5 = __pyx_v_get_config;
+  __pyx_t_5 = __pyx_v_get_config; 
   __pyx_t_6 = 1;
   #if CYTHON_UNPACK_METHODS
   if (unlikely(PyMethod_Check(__pyx_t_5))) {
@@ -11700,91 +11658,91 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
     __pyx_t_1 = __Pyx_PyObject_FastCall((PyObject*)__pyx_t_5, __pyx_callargs+__pyx_t_6, (1-__pyx_t_6) | (__pyx_t_6*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
     __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
     __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1425, __pyx_L1_error)
+    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1423, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
   }
   __pyx_v_cfg = __pyx_t_1;
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1426
+  /* "dama/ai/algorithmic/_fast_search.pyx":1424
  *     from dama.config import get_config
  *     cfg = get_config()
  *     _cached_rules.forced_capture = cfg.game.rules.forced_capture             # <<<<<<<<<<<<<<
  *     _cached_rules.backward_capture = cfg.game.rules.backward_capture
  *     _cached_rules.king_flying_capture = cfg.game.rules.king_flying_capture
 */
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_cfg, __pyx_mstate_global->__pyx_n_u_game); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1426, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_cfg, __pyx_mstate_global->__pyx_n_u_game); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1424, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_rules); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1426, __pyx_L1_error)
+  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_rules); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1424, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_5);
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_forced_capture); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1426, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_forced_capture); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1424, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-  __pyx_t_7 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_7 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1426, __pyx_L1_error)
+  __pyx_t_7 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_7 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1424, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__cached_rules.forced_capture = __pyx_t_7;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1427
+  /* "dama/ai/algorithmic/_fast_search.pyx":1425
  *     cfg = get_config()
  *     _cached_rules.forced_capture = cfg.game.rules.forced_capture
  *     _cached_rules.backward_capture = cfg.game.rules.backward_capture             # <<<<<<<<<<<<<<
  *     _cached_rules.king_flying_capture = cfg.game.rules.king_flying_capture
  *     _rules_cached = True
 */
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_cfg, __pyx_mstate_global->__pyx_n_u_game); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1427, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_cfg, __pyx_mstate_global->__pyx_n_u_game); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1425, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_rules); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1427, __pyx_L1_error)
+  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_rules); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1425, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_5);
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_backward_capture); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1427, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_backward_capture); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1425, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-  __pyx_t_7 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_7 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1427, __pyx_L1_error)
+  __pyx_t_7 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_7 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1425, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__cached_rules.backward_capture = __pyx_t_7;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1428
+  /* "dama/ai/algorithmic/_fast_search.pyx":1426
  *     _cached_rules.forced_capture = cfg.game.rules.forced_capture
  *     _cached_rules.backward_capture = cfg.game.rules.backward_capture
  *     _cached_rules.king_flying_capture = cfg.game.rules.king_flying_capture             # <<<<<<<<<<<<<<
  *     _rules_cached = True
  *     return _cached_rules
 */
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_cfg, __pyx_mstate_global->__pyx_n_u_game); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1428, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_cfg, __pyx_mstate_global->__pyx_n_u_game); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1426, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_rules); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1428, __pyx_L1_error)
+  __pyx_t_5 = __Pyx_PyObject_GetAttrStr(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_rules); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1426, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_5);
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_king_flying_capture); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1428, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_king_flying_capture); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1426, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-  __pyx_t_7 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_7 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1428, __pyx_L1_error)
+  __pyx_t_7 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_7 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1426, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__cached_rules.king_flying_capture = __pyx_t_7;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1429
+  /* "dama/ai/algorithmic/_fast_search.pyx":1427
  *     _cached_rules.backward_capture = cfg.game.rules.backward_capture
  *     _cached_rules.king_flying_capture = cfg.game.rules.king_flying_capture
  *     _rules_cached = True             # <<<<<<<<<<<<<<
  *     return _cached_rules
- *
+ * 
 */
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__rules_cached = 1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1430
+  /* "dama/ai/algorithmic/_fast_search.pyx":1428
  *     _cached_rules.king_flying_capture = cfg.game.rules.king_flying_capture
  *     _rules_cached = True
  *     return _cached_rules             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_4dama_2ai_11algorithmic_12_fast_search__cached_rules;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1419
+  /* "dama/ai/algorithmic/_fast_search.pyx":1417
  * cdef Rules _cached_rules
- *
+ * 
  * cdef Rules _load_rules():             # <<<<<<<<<<<<<<
  *     """Load rules from the Python config singleton, caching after first call."""
  *     global _rules_cached, _cached_rules
@@ -11804,16 +11762,16 @@ static struct __pyx_t_4dama_2ai_11algorithmic_12_fast_search_Rules __pyx_f_4dama
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1437
+/* "dama/ai/algorithmic/_fast_search.pyx":1435
  * #
- *
+ * 
  * def _fast_evaluate_static(object state) -> float:             # <<<<<<<<<<<<<<
  *     """Expose the compiled static evaluator for reference-parity tests."""
  *     cdef signed char board[64]
 */
 
 /* Python wrapper */
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -11822,7 +11780,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
 ); /*proto*/
 PyDoc_STRVAR(__pyx_doc_4dama_2ai_11algorithmic_12_fast_search__fast_evaluate_static, "Expose the compiled static evaluator for reference-parity tests.");
 static PyMethodDef __pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static = {"_fast_evaluate_static", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_11algorithmic_12_fast_search__fast_evaluate_static};
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -11852,32 +11810,32 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_state,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1437, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1435, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1437, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1435, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "_fast_evaluate_static", 0) < (0)) __PYX_ERR(0, 1437, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "_fast_evaluate_static", 0) < (0)) __PYX_ERR(0, 1435, __pyx_L3_error)
       for (Py_ssize_t i = __pyx_nargs; i < 1; i++) {
-        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("_fast_evaluate_static", 1, 1, 1, i); __PYX_ERR(0, 1437, __pyx_L3_error) }
+        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("_fast_evaluate_static", 1, 1, 1, i); __PYX_ERR(0, 1435, __pyx_L3_error) }
       }
     } else if (unlikely(__pyx_nargs != 1)) {
       goto __pyx_L5_argtuple_error;
     } else {
       values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1437, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1435, __pyx_L3_error)
     }
     __pyx_v_state = values[0];
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("_fast_evaluate_static", 1, 1, 1, __pyx_nargs); __PYX_ERR(0, 1437, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("_fast_evaluate_static", 1, 1, 1, __pyx_nargs); __PYX_ERR(0, 1435, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -11910,39 +11868,39 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search__fast_evaluate_
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("_fast_evaluate_static", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1440
+  /* "dama/ai/algorithmic/_fast_search.pyx":1438
  *     """Expose the compiled static evaluator for reference-parity tests."""
  *     cdef signed char board[64]
  *     _load_board(state, board)             # <<<<<<<<<<<<<<
  *     return evaluate_c(board, int(state.current_player))
- *
+ * 
 */
-  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(__pyx_v_state, __pyx_v_board); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1440, __pyx_L1_error)
+  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(__pyx_v_state, __pyx_v_board); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1438, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1441
+  /* "dama/ai/algorithmic/_fast_search.pyx":1439
  *     cdef signed char board[64]
  *     _load_board(state, board)
  *     return evaluate_c(board, int(state.current_player))             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __Pyx_XDECREF(__pyx_r);
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_current_player); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1441, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_current_player); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1439, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  __pyx_t_2 = __Pyx_PyNumber_Int(__pyx_t_1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1441, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyNumber_Int(__pyx_t_1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1439, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-  __pyx_t_3 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_3 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1441, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_3 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1439, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  __pyx_t_2 = PyFloat_FromDouble(__pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(__pyx_v_board, __pyx_t_3)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1441, __pyx_L1_error)
+  __pyx_t_2 = PyFloat_FromDouble(__pyx_f_4dama_2ai_11algorithmic_12_fast_search_evaluate_c(__pyx_v_board, __pyx_t_3)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1439, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   __pyx_r = __pyx_t_2;
   __pyx_t_2 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1437
+  /* "dama/ai/algorithmic/_fast_search.pyx":1435
  * #
- *
+ * 
  * def _fast_evaluate_static(object state) -> float:             # <<<<<<<<<<<<<<
  *     """Expose the compiled static evaluator for reference-parity tests."""
  *     cdef signed char board[64]
@@ -11960,16 +11918,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search__fast_evaluate_
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1444
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1442
+ * 
+ * 
  * def fast_search(             # <<<<<<<<<<<<<<
  *     object state,
  *     str difficulty = 'medium',
 */
 
 /* Python wrapper */
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_3fast_search(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_3fast_search(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -11978,7 +11936,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
 ); /*proto*/
 PyDoc_STRVAR(__pyx_doc_4dama_2ai_11algorithmic_12_fast_search_2fast_search, "Run iterative-deepening alpha-beta search entirely in C.\n\n    Args:\n        state: GameState object\n        difficulty: 'easy', 'medium', 'hard'\n        time_budget_override: Override time budget (seconds), 0 = use default\n        max_depth_override: Override max depth, 0 = use default\n\n    Returns:\n        dict with keys: 'move' (Move-compatible dict or None), 'score', 'depth', 'nodes'\n    ");
 static PyMethodDef __pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_3fast_search = {"fast_search", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_3fast_search, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_11algorithmic_12_fast_search_2fast_search};
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_3fast_search(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_3fast_search(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -12011,51 +11969,51 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_state,&__pyx_mstate_global->__pyx_n_u_difficulty,&__pyx_mstate_global->__pyx_n_u_time_budget_override,&__pyx_mstate_global->__pyx_n_u_max_depth_override,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1444, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1442, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case  4:
         values[3] = __Pyx_ArgRef_FASTCALL(__pyx_args, 3);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1442, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  3:
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1442, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1442, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1442, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "fast_search", 0) < (0)) __PYX_ERR(0, 1444, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "fast_search", 0) < (0)) __PYX_ERR(0, 1442, __pyx_L3_error)
       if (!values[1]) values[1] = __Pyx_NewRef(((PyObject*)((PyObject*)__pyx_mstate_global->__pyx_n_u_medium)));
       for (Py_ssize_t i = __pyx_nargs; i < 1; i++) {
-        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("fast_search", 0, 1, 4, i); __PYX_ERR(0, 1444, __pyx_L3_error) }
+        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("fast_search", 0, 1, 4, i); __PYX_ERR(0, 1442, __pyx_L3_error) }
       }
     } else {
       switch (__pyx_nargs) {
         case  4:
         values[3] = __Pyx_ArgRef_FASTCALL(__pyx_args, 3);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1442, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  3:
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1442, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1442, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1444, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1442, __pyx_L3_error)
         break;
         default: goto __pyx_L5_argtuple_error;
       }
@@ -12064,19 +12022,19 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
     __pyx_v_state = values[0];
     __pyx_v_difficulty = ((PyObject*)values[1]);
     if (values[2]) {
-      __pyx_v_time_budget_override = __Pyx_PyFloat_AsDouble(values[2]); if (unlikely((__pyx_v_time_budget_override == (double)-1) && PyErr_Occurred())) __PYX_ERR(0, 1447, __pyx_L3_error)
+      __pyx_v_time_budget_override = __Pyx_PyFloat_AsDouble(values[2]); if (unlikely((__pyx_v_time_budget_override == (double)-1) && PyErr_Occurred())) __PYX_ERR(0, 1445, __pyx_L3_error)
     } else {
       __pyx_v_time_budget_override = ((double)((double)0.0));
     }
     if (values[3]) {
-      __pyx_v_max_depth_override = __Pyx_PyLong_As_int(values[3]); if (unlikely((__pyx_v_max_depth_override == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1448, __pyx_L3_error)
+      __pyx_v_max_depth_override = __Pyx_PyLong_As_int(values[3]); if (unlikely((__pyx_v_max_depth_override == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1446, __pyx_L3_error)
     } else {
       __pyx_v_max_depth_override = ((int)((int)0));
     }
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("fast_search", 0, 1, 4, __pyx_nargs); __PYX_ERR(0, 1444, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("fast_search", 0, 1, 4, __pyx_nargs); __PYX_ERR(0, 1442, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -12087,7 +12045,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   __Pyx_RefNannyFinishContext();
   return NULL;
   __pyx_L4_argument_unpacking_done:;
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_difficulty), (&PyUnicode_Type), 1, "difficulty", 1))) __PYX_ERR(0, 1446, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_difficulty), (&PyUnicode_Type), 1, "difficulty", 1))) __PYX_ERR(0, 1444, __pyx_L1_error)
   __pyx_r = __pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(__pyx_self, __pyx_v_state, __pyx_v_difficulty, __pyx_v_time_budget_override, __pyx_v_max_depth_override);
 
   /* function exit code */
@@ -12147,8 +12105,8 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("fast_search", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1472
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1470
+ * 
  *     # Parse difficulty
  *     if time_budget_override > 0:             # <<<<<<<<<<<<<<
  *         time_budget = time_budget_override
@@ -12157,7 +12115,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   __pyx_t_1 = (__pyx_v_time_budget_override > 0.0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1473
+    /* "dama/ai/algorithmic/_fast_search.pyx":1471
  *     # Parse difficulty
  *     if time_budget_override > 0:
  *         time_budget = time_budget_override             # <<<<<<<<<<<<<<
@@ -12166,8 +12124,8 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_time_budget = __pyx_v_time_budget_override;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1472
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1470
+ * 
  *     # Parse difficulty
  *     if time_budget_override > 0:             # <<<<<<<<<<<<<<
  *         time_budget = time_budget_override
@@ -12176,17 +12134,17 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L3;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1474
+  /* "dama/ai/algorithmic/_fast_search.pyx":1472
  *     if time_budget_override > 0:
  *         time_budget = time_budget_override
  *     elif difficulty == 'easy':             # <<<<<<<<<<<<<<
  *         time_budget = 0.2
  *     elif difficulty == 'hard':
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_easy, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1474, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_easy, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1472, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1475
+    /* "dama/ai/algorithmic/_fast_search.pyx":1473
  *         time_budget = time_budget_override
  *     elif difficulty == 'easy':
  *         time_budget = 0.2             # <<<<<<<<<<<<<<
@@ -12195,7 +12153,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_time_budget = 0.2;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1474
+    /* "dama/ai/algorithmic/_fast_search.pyx":1472
  *     if time_budget_override > 0:
  *         time_budget = time_budget_override
  *     elif difficulty == 'easy':             # <<<<<<<<<<<<<<
@@ -12205,17 +12163,17 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L3;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1476
+  /* "dama/ai/algorithmic/_fast_search.pyx":1474
  *     elif difficulty == 'easy':
  *         time_budget = 0.2
  *     elif difficulty == 'hard':             # <<<<<<<<<<<<<<
  *         time_budget = 2.5
  *     elif difficulty == 'super_hard':
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1476, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1474, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1477
+    /* "dama/ai/algorithmic/_fast_search.pyx":1475
  *         time_budget = 0.2
  *     elif difficulty == 'hard':
  *         time_budget = 2.5             # <<<<<<<<<<<<<<
@@ -12224,7 +12182,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_time_budget = 2.5;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1476
+    /* "dama/ai/algorithmic/_fast_search.pyx":1474
  *     elif difficulty == 'easy':
  *         time_budget = 0.2
  *     elif difficulty == 'hard':             # <<<<<<<<<<<<<<
@@ -12234,17 +12192,17 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L3;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1478
+  /* "dama/ai/algorithmic/_fast_search.pyx":1476
  *     elif difficulty == 'hard':
  *         time_budget = 2.5
  *     elif difficulty == 'super_hard':             # <<<<<<<<<<<<<<
  *         time_budget = 5.0
  *     else:
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_super_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1478, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_super_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1476, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1479
+    /* "dama/ai/algorithmic/_fast_search.pyx":1477
  *         time_budget = 2.5
  *     elif difficulty == 'super_hard':
  *         time_budget = 5.0             # <<<<<<<<<<<<<<
@@ -12253,7 +12211,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_time_budget = 5.0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1478
+    /* "dama/ai/algorithmic/_fast_search.pyx":1476
  *     elif difficulty == 'hard':
  *         time_budget = 2.5
  *     elif difficulty == 'super_hard':             # <<<<<<<<<<<<<<
@@ -12263,11 +12221,11 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L3;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1481
+  /* "dama/ai/algorithmic/_fast_search.pyx":1479
  *         time_budget = 5.0
  *     else:
  *         time_budget = 0.8             # <<<<<<<<<<<<<<
- *
+ * 
  *     if max_depth_override > 0:
 */
   /*else*/ {
@@ -12275,9 +12233,9 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   }
   __pyx_L3:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1483
+  /* "dama/ai/algorithmic/_fast_search.pyx":1481
  *         time_budget = 0.8
- *
+ * 
  *     if max_depth_override > 0:             # <<<<<<<<<<<<<<
  *         max_depth = max_depth_override
  *     elif difficulty == 'easy':
@@ -12285,8 +12243,8 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   __pyx_t_1 = (__pyx_v_max_depth_override > 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1484
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1482
+ * 
  *     if max_depth_override > 0:
  *         max_depth = max_depth_override             # <<<<<<<<<<<<<<
  *     elif difficulty == 'easy':
@@ -12294,9 +12252,9 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_max_depth = __pyx_v_max_depth_override;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1483
+    /* "dama/ai/algorithmic/_fast_search.pyx":1481
  *         time_budget = 0.8
- *
+ * 
  *     if max_depth_override > 0:             # <<<<<<<<<<<<<<
  *         max_depth = max_depth_override
  *     elif difficulty == 'easy':
@@ -12304,17 +12262,17 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L4;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1485
+  /* "dama/ai/algorithmic/_fast_search.pyx":1483
  *     if max_depth_override > 0:
  *         max_depth = max_depth_override
  *     elif difficulty == 'easy':             # <<<<<<<<<<<<<<
  *         max_depth = 3
  *     elif difficulty == 'hard':
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_easy, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1485, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_easy, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1483, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1486
+    /* "dama/ai/algorithmic/_fast_search.pyx":1484
  *         max_depth = max_depth_override
  *     elif difficulty == 'easy':
  *         max_depth = 3             # <<<<<<<<<<<<<<
@@ -12323,7 +12281,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_max_depth = 3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1485
+    /* "dama/ai/algorithmic/_fast_search.pyx":1483
  *     if max_depth_override > 0:
  *         max_depth = max_depth_override
  *     elif difficulty == 'easy':             # <<<<<<<<<<<<<<
@@ -12333,17 +12291,17 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L4;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1487
+  /* "dama/ai/algorithmic/_fast_search.pyx":1485
  *     elif difficulty == 'easy':
  *         max_depth = 3
  *     elif difficulty == 'hard':             # <<<<<<<<<<<<<<
  *         max_depth = 8
  *     elif difficulty == 'super_hard':
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1487, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1485, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1488
+    /* "dama/ai/algorithmic/_fast_search.pyx":1486
  *         max_depth = 3
  *     elif difficulty == 'hard':
  *         max_depth = 8             # <<<<<<<<<<<<<<
@@ -12352,7 +12310,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_max_depth = 8;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1487
+    /* "dama/ai/algorithmic/_fast_search.pyx":1485
  *     elif difficulty == 'easy':
  *         max_depth = 3
  *     elif difficulty == 'hard':             # <<<<<<<<<<<<<<
@@ -12362,17 +12320,17 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L4;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1489
+  /* "dama/ai/algorithmic/_fast_search.pyx":1487
  *     elif difficulty == 'hard':
  *         max_depth = 8
  *     elif difficulty == 'super_hard':             # <<<<<<<<<<<<<<
  *         max_depth = 12
  *     else:
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_super_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1489, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_super_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1487, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1490
+    /* "dama/ai/algorithmic/_fast_search.pyx":1488
  *         max_depth = 8
  *     elif difficulty == 'super_hard':
  *         max_depth = 12             # <<<<<<<<<<<<<<
@@ -12381,7 +12339,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
     __pyx_v_max_depth = 12;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1489
+    /* "dama/ai/algorithmic/_fast_search.pyx":1487
  *     elif difficulty == 'hard':
  *         max_depth = 8
  *     elif difficulty == 'super_hard':             # <<<<<<<<<<<<<<
@@ -12391,11 +12349,11 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
     goto __pyx_L4;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1492
+  /* "dama/ai/algorithmic/_fast_search.pyx":1490
  *         max_depth = 12
  *     else:
  *         max_depth = 5             # <<<<<<<<<<<<<<
- *
+ * 
  *     cdef unsigned long long h
 */
   /*else*/ {
@@ -12403,62 +12361,62 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   }
   __pyx_L4:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1496
+  /* "dama/ai/algorithmic/_fast_search.pyx":1494
  *     cdef unsigned long long h
- *
+ * 
  *     _load_board(state, board)             # <<<<<<<<<<<<<<
  *     player = int(state.current_player)
  *     rules = _load_rules()
 */
-  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(__pyx_v_state, __pyx_v_board); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1496, __pyx_L1_error)
+  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(__pyx_v_state, __pyx_v_board); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1494, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1497
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1495
+ * 
  *     _load_board(state, board)
  *     player = int(state.current_player)             # <<<<<<<<<<<<<<
  *     rules = _load_rules()
- *
+ * 
 */
-  __pyx_t_2 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_current_player); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1497, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_current_player); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1495, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  __pyx_t_3 = __Pyx_PyNumber_Int(__pyx_t_2); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1497, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyNumber_Int(__pyx_t_2); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1495, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  __pyx_t_4 = __Pyx_PyLong_As_int(__pyx_t_3); if (unlikely((__pyx_t_4 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1497, __pyx_L1_error)
+  __pyx_t_4 = __Pyx_PyLong_As_int(__pyx_t_3); if (unlikely((__pyx_t_4 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1495, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
   __pyx_v_player = __pyx_t_4;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1498
+  /* "dama/ai/algorithmic/_fast_search.pyx":1496
  *     _load_board(state, board)
  *     player = int(state.current_player)
  *     rules = _load_rules()             # <<<<<<<<<<<<<<
- *
+ * 
  *     moves.count = 0
 */
-  __pyx_t_5 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1498, __pyx_L1_error)
+  __pyx_t_5 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1496, __pyx_L1_error)
   __pyx_v_rules = __pyx_t_5;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1500
+  /* "dama/ai/algorithmic/_fast_search.pyx":1498
  *     rules = _load_rules()
- *
+ * 
  *     moves.count = 0             # <<<<<<<<<<<<<<
  *     generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
 */
   __pyx_v_moves.count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1501
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1499
+ * 
  *     moves.count = 0
  *     generate_all_moves_c(board, player, &rules, &moves)             # <<<<<<<<<<<<<<
- *
+ * 
  *     if moves.count == 0:
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(__pyx_v_board, __pyx_v_player, (&__pyx_v_rules), (&__pyx_v_moves));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1503
+  /* "dama/ai/algorithmic/_fast_search.pyx":1501
  *     generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
  *     if moves.count == 0:             # <<<<<<<<<<<<<<
  *         return {'move': None, 'score': -10000, 'depth': 0, 'nodes': 0}
  *     if moves.count == 1:
@@ -12466,93 +12424,93 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   __pyx_t_1 = (__pyx_v_moves.count == 0);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1504
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1502
+ * 
  *     if moves.count == 0:
  *         return {'move': None, 'score': -10000, 'depth': 0, 'nodes': 0}             # <<<<<<<<<<<<<<
  *     if moves.count == 1:
  *         return {'move': cmove_to_dict(&moves.moves[0]), 'score': 0, 'depth': 0, 'nodes': 1}
 */
     __Pyx_XDECREF(__pyx_r);
-    __pyx_t_3 = __Pyx_PyDict_NewPresized(4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1504, __pyx_L1_error)
+    __pyx_t_3 = __Pyx_PyDict_NewPresized(4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1502, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_3);
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_move, Py_None) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_int_neg_10000) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_depth, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_nodes, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_move, Py_None) < (0)) __PYX_ERR(0, 1502, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_int_neg_10000) < (0)) __PYX_ERR(0, 1502, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_depth, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1502, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_nodes, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1502, __pyx_L1_error)
     __pyx_r = ((PyObject*)__pyx_t_3);
     __pyx_t_3 = 0;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1503
+    /* "dama/ai/algorithmic/_fast_search.pyx":1501
  *     generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
  *     if moves.count == 0:             # <<<<<<<<<<<<<<
  *         return {'move': None, 'score': -10000, 'depth': 0, 'nodes': 0}
  *     if moves.count == 1:
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1505
+  /* "dama/ai/algorithmic/_fast_search.pyx":1503
  *     if moves.count == 0:
  *         return {'move': None, 'score': -10000, 'depth': 0, 'nodes': 0}
  *     if moves.count == 1:             # <<<<<<<<<<<<<<
  *         return {'move': cmove_to_dict(&moves.moves[0]), 'score': 0, 'depth': 0, 'nodes': 1}
- *
+ * 
 */
   __pyx_t_1 = (__pyx_v_moves.count == 1);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1506
+    /* "dama/ai/algorithmic/_fast_search.pyx":1504
  *         return {'move': None, 'score': -10000, 'depth': 0, 'nodes': 0}
  *     if moves.count == 1:
  *         return {'move': cmove_to_dict(&moves.moves[0]), 'score': 0, 'depth': 0, 'nodes': 1}             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Allocate TT on first use. Bump generation counter to logically invalidate
 */
     __Pyx_XDECREF(__pyx_r);
-    __pyx_t_3 = __Pyx_PyDict_NewPresized(4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1506, __pyx_L1_error)
+    __pyx_t_3 = __Pyx_PyDict_NewPresized(4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1504, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_3);
-    __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[0]))); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1506, __pyx_L1_error)
+    __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[0]))); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1504, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_move, __pyx_t_2) < (0)) __PYX_ERR(0, 1506, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_move, __pyx_t_2) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1506, __pyx_L1_error)
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_depth, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1506, __pyx_L1_error)
-    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_nodes, __pyx_mstate_global->__pyx_int_1) < (0)) __PYX_ERR(0, 1506, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_depth, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_nodes, __pyx_mstate_global->__pyx_int_1) < (0)) __PYX_ERR(0, 1504, __pyx_L1_error)
     __pyx_r = ((PyObject*)__pyx_t_3);
     __pyx_t_3 = 0;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1505
+    /* "dama/ai/algorithmic/_fast_search.pyx":1503
  *     if moves.count == 0:
  *         return {'move': None, 'score': -10000, 'depth': 0, 'nodes': 0}
  *     if moves.count == 1:             # <<<<<<<<<<<<<<
  *         return {'move': cmove_to_dict(&moves.moves[0]), 'score': 0, 'depth': 0, 'nodes': 1}
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1510
+  /* "dama/ai/algorithmic/_fast_search.pyx":1508
  *     # Allocate TT on first use. Bump generation counter to logically invalidate
  *     # all stale entries  avoids a 16MB memset (~1ms) per search call.
  *     _ensure_tt()             # <<<<<<<<<<<<<<
  *     global _tt_generation
  *     _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
 */
-  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1510, __pyx_L1_error)
+  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1508, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1512
+  /* "dama/ai/algorithmic/_fast_search.pyx":1510
  *     _ensure_tt()
  *     global _tt_generation
  *     _tt_generation = (_tt_generation + 1) & TT_GEN_MASK             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Declare C variables before the nogil block
 */
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation = ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation + 1) & 63);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1515
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1513
+ * 
  *     # Declare C variables before the nogil block
  *     cdef int _tt_from = -1, _tt_to = -1             # <<<<<<<<<<<<<<
  *     cdef float _d_score, _d_alpha, _d_beta
@@ -12561,34 +12519,34 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   __pyx_v__tt_from = -1;
   __pyx_v__tt_to = -1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1518
+  /* "dama/ai/algorithmic/_fast_search.pyx":1516
  *     cdef float _d_score, _d_alpha, _d_beta
  *     cdef CMove _tmp_move
  *     cdef float prev_score = 0.0             # <<<<<<<<<<<<<<
  *     cdef float asp_delta, asp_alpha, asp_beta
- *
+ * 
 */
   __pyx_v_prev_score = 0.0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1521
+  /* "dama/ai/algorithmic/_fast_search.pyx":1519
  *     cdef float asp_delta, asp_alpha, asp_beta
- *
+ * 
  *     best_idx = 0             # <<<<<<<<<<<<<<
  *     best_depth = 0
- *
+ * 
 */
   __pyx_v_best_idx = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1522
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1520
+ * 
  *     best_idx = 0
  *     best_depth = 0             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Release the GIL for the entire compute-intensive section.
 */
   __pyx_v_best_depth = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1535
+  /* "dama/ai/algorithmic/_fast_search.pyx":1533
  *     # entries only reduce search efficiency, never correctness (move
  *     # generation is deterministic, TT probes have hash verification).
  *     with nogil:             # <<<<<<<<<<<<<<
@@ -12601,26 +12559,26 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
       __Pyx_FastGIL_Remember();
       /*try:*/ {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1537
+        /* "dama/ai/algorithmic/_fast_search.pyx":1535
  *     with nogil:
  *         # Compute initial Zobrist hash and initialize killer/history tables
  *         h = compute_hash(board, player)             # <<<<<<<<<<<<<<
  *         _init_search_tables(&ss)
- *
+ * 
 */
         __pyx_v_h = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_compute_hash(__pyx_v_board, __pyx_v_player);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1538
+        /* "dama/ai/algorithmic/_fast_search.pyx":1536
  *         # Compute initial Zobrist hash and initialize killer/history tables
  *         h = compute_hash(board, player)
  *         _init_search_tables(&ss)             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Order moves using full heuristic (TT move from prior searches + killers + history)
 */
         __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_search_tables((&__pyx_v_ss));
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1541
- *
+        /* "dama/ai/algorithmic/_fast_search.pyx":1539
+ * 
  *         # Order moves using full heuristic (TT move from prior searches + killers + history)
  *         if _tt_table != NULL:             # <<<<<<<<<<<<<<
  *             _d_alpha = -100000.0; _d_beta = 100000.0
@@ -12629,7 +12587,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
         __pyx_t_1 = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table != NULL);
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1542
+          /* "dama/ai/algorithmic/_fast_search.pyx":1540
  *         # Order moves using full heuristic (TT move from prior searches + killers + history)
  *         if _tt_table != NULL:
  *             _d_alpha = -100000.0; _d_beta = 100000.0             # <<<<<<<<<<<<<<
@@ -12639,17 +12597,17 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
           __pyx_v__d_alpha = -100000.0;
           __pyx_v__d_beta = 100000.0;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1543
+          /* "dama/ai/algorithmic/_fast_search.pyx":1541
  *         if _tt_table != NULL:
  *             _d_alpha = -100000.0; _d_beta = 100000.0
  *             tt_probe(h, 0, &_d_score, &_d_alpha, &_d_beta, &_tt_from, &_tt_to)             # <<<<<<<<<<<<<<
  *         _order_moves_full(&moves, 0, &ss, _tt_from, _tt_to, board, -1, -1)
- *
+ * 
 */
           (void)(__pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe(__pyx_v_h, 0, (&__pyx_v__d_score), (&__pyx_v__d_alpha), (&__pyx_v__d_beta), (&__pyx_v__tt_from), (&__pyx_v__tt_to)));
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1541
- *
+          /* "dama/ai/algorithmic/_fast_search.pyx":1539
+ * 
  *         # Order moves using full heuristic (TT move from prior searches + killers + history)
  *         if _tt_table != NULL:             # <<<<<<<<<<<<<<
  *             _d_alpha = -100000.0; _d_beta = 100000.0
@@ -12657,26 +12615,26 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1544
+        /* "dama/ai/algorithmic/_fast_search.pyx":1542
  *             _d_alpha = -100000.0; _d_beta = 100000.0
  *             tt_probe(h, 0, &_d_score, &_d_alpha, &_d_beta, &_tt_from, &_tt_to)
  *         _order_moves_full(&moves, 0, &ss, _tt_from, _tt_to, board, -1, -1)             # <<<<<<<<<<<<<<
- *
+ * 
  *         deadline = _wall_now() + time_budget
 */
         __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full((&__pyx_v_moves), 0, (&__pyx_v_ss), __pyx_v__tt_from, __pyx_v__tt_to, __pyx_v_board, -1, -1);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1546
+        /* "dama/ai/algorithmic/_fast_search.pyx":1544
  *         _order_moves_full(&moves, 0, &ss, _tt_from, _tt_to, board, -1, -1)
- *
+ * 
  *         deadline = _wall_now() + time_budget             # <<<<<<<<<<<<<<
  *         ss.deadline = deadline
  *         ss.nodes = 0
 */
         __pyx_v_deadline = (__pyx_f_4dama_2ai_11algorithmic_12_fast_search__wall_now() + __pyx_v_time_budget);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1547
- *
+        /* "dama/ai/algorithmic/_fast_search.pyx":1545
+ * 
  *         deadline = _wall_now() + time_budget
  *         ss.deadline = deadline             # <<<<<<<<<<<<<<
  *         ss.nodes = 0
@@ -12684,48 +12642,48 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
         __pyx_v_ss.deadline = __pyx_v_deadline;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1548
+        /* "dama/ai/algorithmic/_fast_search.pyx":1546
  *         deadline = _wall_now() + time_budget
  *         ss.deadline = deadline
  *         ss.nodes = 0             # <<<<<<<<<<<<<<
  *         ss.timeout = False
- *
+ * 
 */
         __pyx_v_ss.nodes = 0;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1549
+        /* "dama/ai/algorithmic/_fast_search.pyx":1547
  *         ss.deadline = deadline
  *         ss.nodes = 0
  *         ss.timeout = False             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Iterative deepening with aspiration windows.
 */
         __pyx_v_ss.timeout = 0;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1554
+        /* "dama/ai/algorithmic/_fast_search.pyx":1552
  *         # At depth < 5 (easy), the tree is small enough that full-window PVS
  *         # is faster than the overhead of fail/retry cycles.
  *         for depth in range(1, max_depth + 1):             # <<<<<<<<<<<<<<
  *             ss.timeout = False
- *
+ * 
 */
         __pyx_t_6 = (__pyx_v_max_depth + 1);
         __pyx_t_7 = __pyx_t_6;
         for (__pyx_t_4 = 1; __pyx_t_4 < __pyx_t_7; __pyx_t_4+=1) {
           __pyx_v_depth = __pyx_t_4;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1555
+          /* "dama/ai/algorithmic/_fast_search.pyx":1553
  *         # is faster than the overhead of fail/retry cycles.
  *         for depth in range(1, max_depth + 1):
  *             ss.timeout = False             # <<<<<<<<<<<<<<
- *
+ * 
  *             if depth < 5:
 */
           __pyx_v_ss.timeout = 0;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1557
+          /* "dama/ai/algorithmic/_fast_search.pyx":1555
  *             ss.timeout = False
- *
+ * 
  *             if depth < 5:             # <<<<<<<<<<<<<<
  *                 # Full window for shallow depths
  *                 idx = search_root(board, player, &moves, depth,
@@ -12733,7 +12691,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
           __pyx_t_1 = (__pyx_v_depth < 5);
           if (__pyx_t_1) {
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1559
+            /* "dama/ai/algorithmic/_fast_search.pyx":1557
  *             if depth < 5:
  *                 # Full window for shallow depths
  *                 idx = search_root(board, player, &moves, depth,             # <<<<<<<<<<<<<<
@@ -12742,9 +12700,9 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
             __pyx_v_idx = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(__pyx_v_board, __pyx_v_player, (&__pyx_v_moves), __pyx_v_depth, -100000.0, 100000.0, (&__pyx_v_rules), (&__pyx_v_ss), __pyx_v_h);
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1557
+            /* "dama/ai/algorithmic/_fast_search.pyx":1555
  *             ss.timeout = False
- *
+ * 
  *             if depth < 5:             # <<<<<<<<<<<<<<
  *                 # Full window for shallow depths
  *                 idx = search_root(board, player, &moves, depth,
@@ -12752,7 +12710,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
             goto __pyx_L13;
           }
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1563
+          /* "dama/ai/algorithmic/_fast_search.pyx":1561
  *             else:
  *                 # Aspiration window with progressive widening on fail
  *                 asp_delta = 75.0  # ~3/4 man value             # <<<<<<<<<<<<<<
@@ -12762,7 +12720,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
           /*else*/ {
             __pyx_v_asp_delta = 75.0;
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1564
+            /* "dama/ai/algorithmic/_fast_search.pyx":1562
  *                 # Aspiration window with progressive widening on fail
  *                 asp_delta = 75.0  # ~3/4 man value
  *                 while True:             # <<<<<<<<<<<<<<
@@ -12771,7 +12729,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
             while (1) {
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1565
+              /* "dama/ai/algorithmic/_fast_search.pyx":1563
  *                 asp_delta = 75.0  # ~3/4 man value
  *                 while True:
  *                     asp_alpha = prev_score - asp_delta             # <<<<<<<<<<<<<<
@@ -12780,7 +12738,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               __pyx_v_asp_alpha = (__pyx_v_prev_score - __pyx_v_asp_delta);
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1566
+              /* "dama/ai/algorithmic/_fast_search.pyx":1564
  *                 while True:
  *                     asp_alpha = prev_score - asp_delta
  *                     asp_beta = prev_score + asp_delta             # <<<<<<<<<<<<<<
@@ -12789,7 +12747,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               __pyx_v_asp_beta = (__pyx_v_prev_score + __pyx_v_asp_delta);
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1567
+              /* "dama/ai/algorithmic/_fast_search.pyx":1565
  *                     asp_alpha = prev_score - asp_delta
  *                     asp_beta = prev_score + asp_delta
  *                     idx = search_root(board, player, &moves, depth,             # <<<<<<<<<<<<<<
@@ -12798,7 +12756,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               __pyx_v_idx = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(__pyx_v_board, __pyx_v_player, (&__pyx_v_moves), __pyx_v_depth, __pyx_v_asp_alpha, __pyx_v_asp_beta, (&__pyx_v_rules), (&__pyx_v_ss), __pyx_v_h);
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1569
+              /* "dama/ai/algorithmic/_fast_search.pyx":1567
  *                     idx = search_root(board, player, &moves, depth,
  *                                       asp_alpha, asp_beta, &rules, &ss, h)
  *                     if ss.timeout:             # <<<<<<<<<<<<<<
@@ -12807,7 +12765,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               if (__pyx_v_ss.timeout) {
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1570
+                /* "dama/ai/algorithmic/_fast_search.pyx":1568
  *                                       asp_alpha, asp_beta, &rules, &ss, h)
  *                     if ss.timeout:
  *                         break             # <<<<<<<<<<<<<<
@@ -12816,7 +12774,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
                 goto __pyx_L15_break;
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1569
+                /* "dama/ai/algorithmic/_fast_search.pyx":1567
  *                     idx = search_root(board, player, &moves, depth,
  *                                       asp_alpha, asp_beta, &rules, &ss, h)
  *                     if ss.timeout:             # <<<<<<<<<<<<<<
@@ -12825,7 +12783,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               }
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1571
+              /* "dama/ai/algorithmic/_fast_search.pyx":1569
  *                     if ss.timeout:
  *                         break
  *                     if ss.root_score > asp_alpha and ss.root_score < asp_beta:             # <<<<<<<<<<<<<<
@@ -12843,7 +12801,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
               __pyx_L18_bool_binop_done:;
               if (__pyx_t_1) {
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1572
+                /* "dama/ai/algorithmic/_fast_search.pyx":1570
  *                         break
  *                     if ss.root_score > asp_alpha and ss.root_score < asp_beta:
  *                         break  # Score within window  accept result             # <<<<<<<<<<<<<<
@@ -12852,7 +12810,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
                 goto __pyx_L15_break;
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1571
+                /* "dama/ai/algorithmic/_fast_search.pyx":1569
  *                     if ss.timeout:
  *                         break
  *                     if ss.root_score > asp_alpha and ss.root_score < asp_beta:             # <<<<<<<<<<<<<<
@@ -12861,7 +12819,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               }
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1574
+              /* "dama/ai/algorithmic/_fast_search.pyx":1572
  *                         break  # Score within window  accept result
  *                     # Fail-low or fail-high: widen window
  *                     asp_delta = asp_delta * 2.0             # <<<<<<<<<<<<<<
@@ -12870,7 +12828,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               __pyx_v_asp_delta = (__pyx_v_asp_delta * 2.0);
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1575
+              /* "dama/ai/algorithmic/_fast_search.pyx":1573
  *                     # Fail-low or fail-high: widen window
  *                     asp_delta = asp_delta * 2.0
  *                     if asp_delta >= 5000.0:             # <<<<<<<<<<<<<<
@@ -12880,7 +12838,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
               __pyx_t_1 = (__pyx_v_asp_delta >= 5000.0);
               if (__pyx_t_1) {
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1577
+                /* "dama/ai/algorithmic/_fast_search.pyx":1575
  *                     if asp_delta >= 5000.0:
  *                         # Window is wide enough  fall back to full window
  *                         ss.timeout = False             # <<<<<<<<<<<<<<
@@ -12889,7 +12847,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
                 __pyx_v_ss.timeout = 0;
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1578
+                /* "dama/ai/algorithmic/_fast_search.pyx":1576
  *                         # Window is wide enough  fall back to full window
  *                         ss.timeout = False
  *                         idx = search_root(board, player, &moves, depth,             # <<<<<<<<<<<<<<
@@ -12898,16 +12856,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
                 __pyx_v_idx = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(__pyx_v_board, __pyx_v_player, (&__pyx_v_moves), __pyx_v_depth, -100000.0, 100000.0, (&__pyx_v_rules), (&__pyx_v_ss), __pyx_v_h);
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1580
+                /* "dama/ai/algorithmic/_fast_search.pyx":1578
  *                         idx = search_root(board, player, &moves, depth,
  *                                           -100000.0, 100000.0, &rules, &ss, h)
  *                         break             # <<<<<<<<<<<<<<
- *
+ * 
  *             if not ss.timeout:
 */
                 goto __pyx_L15_break;
 
-                /* "dama/ai/algorithmic/_fast_search.pyx":1575
+                /* "dama/ai/algorithmic/_fast_search.pyx":1573
  *                     # Fail-low or fail-high: widen window
  *                     asp_delta = asp_delta * 2.0
  *                     if asp_delta >= 5000.0:             # <<<<<<<<<<<<<<
@@ -12920,9 +12878,9 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
           }
           __pyx_L13:;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1582
+          /* "dama/ai/algorithmic/_fast_search.pyx":1580
  *                         break
- *
+ * 
  *             if not ss.timeout:             # <<<<<<<<<<<<<<
  *                 best_idx = idx
  *                 best_depth = depth
@@ -12930,8 +12888,8 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
           __pyx_t_1 = (!__pyx_v_ss.timeout);
           if (__pyx_t_1) {
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1583
- *
+            /* "dama/ai/algorithmic/_fast_search.pyx":1581
+ * 
  *             if not ss.timeout:
  *                 best_idx = idx             # <<<<<<<<<<<<<<
  *                 best_depth = depth
@@ -12939,7 +12897,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
             __pyx_v_best_idx = __pyx_v_idx;
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1584
+            /* "dama/ai/algorithmic/_fast_search.pyx":1582
  *             if not ss.timeout:
  *                 best_idx = idx
  *                 best_depth = depth             # <<<<<<<<<<<<<<
@@ -12948,7 +12906,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
             __pyx_v_best_depth = __pyx_v_depth;
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1585
+            /* "dama/ai/algorithmic/_fast_search.pyx":1583
  *                 best_idx = idx
  *                 best_depth = depth
  *                 prev_score = ss.root_score             # <<<<<<<<<<<<<<
@@ -12958,7 +12916,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
             __pyx_t_9 = __pyx_v_ss.root_score;
             __pyx_v_prev_score = __pyx_t_9;
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1587
+            /* "dama/ai/algorithmic/_fast_search.pyx":1585
  *                 prev_score = ss.root_score
  *                 # Swap best move to position 0 for next ID iteration
  *                 if best_idx != 0:             # <<<<<<<<<<<<<<
@@ -12968,7 +12926,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
             __pyx_t_1 = (__pyx_v_best_idx != 0);
             if (__pyx_t_1) {
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1588
+              /* "dama/ai/algorithmic/_fast_search.pyx":1586
  *                 # Swap best move to position 0 for next ID iteration
  *                 if best_idx != 0:
  *                     _tmp_move = moves.moves[0]             # <<<<<<<<<<<<<<
@@ -12977,7 +12935,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               __pyx_v__tmp_move = (__pyx_v_moves.moves[0]);
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1589
+              /* "dama/ai/algorithmic/_fast_search.pyx":1587
  *                 if best_idx != 0:
  *                     _tmp_move = moves.moves[0]
  *                     moves.moves[0] = moves.moves[best_idx]             # <<<<<<<<<<<<<<
@@ -12986,7 +12944,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               (__pyx_v_moves.moves[0]) = (__pyx_v_moves.moves[__pyx_v_best_idx]);
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1590
+              /* "dama/ai/algorithmic/_fast_search.pyx":1588
  *                     _tmp_move = moves.moves[0]
  *                     moves.moves[0] = moves.moves[best_idx]
  *                     moves.moves[best_idx] = _tmp_move             # <<<<<<<<<<<<<<
@@ -12995,7 +12953,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               (__pyx_v_moves.moves[__pyx_v_best_idx]) = __pyx_v__tmp_move;
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1591
+              /* "dama/ai/algorithmic/_fast_search.pyx":1589
  *                     moves.moves[0] = moves.moves[best_idx]
  *                     moves.moves[best_idx] = _tmp_move
  *                     best_idx = 0             # <<<<<<<<<<<<<<
@@ -13004,7 +12962,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
               __pyx_v_best_idx = 0;
 
-              /* "dama/ai/algorithmic/_fast_search.pyx":1587
+              /* "dama/ai/algorithmic/_fast_search.pyx":1585
  *                 prev_score = ss.root_score
  *                 # Swap best move to position 0 for next ID iteration
  *                 if best_idx != 0:             # <<<<<<<<<<<<<<
@@ -13013,21 +12971,21 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
 */
             }
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1582
+            /* "dama/ai/algorithmic/_fast_search.pyx":1580
  *                         break
- *
+ * 
  *             if not ss.timeout:             # <<<<<<<<<<<<<<
  *                 best_idx = idx
  *                 best_depth = depth
 */
           }
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1592
+          /* "dama/ai/algorithmic/_fast_search.pyx":1590
  *                     moves.moves[best_idx] = _tmp_move
  *                     best_idx = 0
  *             if ss.timeout or _check_deadline(&ss):             # <<<<<<<<<<<<<<
  *                 break
- *
+ * 
 */
           if (!__pyx_v_ss.timeout) {
           } else {
@@ -13039,28 +12997,28 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
           __pyx_L24_bool_binop_done:;
           if (__pyx_t_1) {
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1593
+            /* "dama/ai/algorithmic/_fast_search.pyx":1591
  *                     best_idx = 0
  *             if ss.timeout or _check_deadline(&ss):
  *                 break             # <<<<<<<<<<<<<<
- *
+ * 
  *     return {
 */
             goto __pyx_L12_break;
 
-            /* "dama/ai/algorithmic/_fast_search.pyx":1592
+            /* "dama/ai/algorithmic/_fast_search.pyx":1590
  *                     moves.moves[best_idx] = _tmp_move
  *                     best_idx = 0
  *             if ss.timeout or _check_deadline(&ss):             # <<<<<<<<<<<<<<
  *                 break
- *
+ * 
 */
           }
         }
         __pyx_L12_break:;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1535
+      /* "dama/ai/algorithmic/_fast_search.pyx":1533
  *     # entries only reduce search efficiency, never correctness (move
  *     # generation is deterministic, TT probes have hash verification).
  *     with nogil:             # <<<<<<<<<<<<<<
@@ -13077,60 +13035,60 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
       }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1595
+  /* "dama/ai/algorithmic/_fast_search.pyx":1593
  *                 break
- *
+ * 
  *     return {             # <<<<<<<<<<<<<<
  *         'move': cmove_to_dict(&moves.moves[best_idx]),
  *         'score': 0,
 */
   __Pyx_XDECREF(__pyx_r);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1596
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1594
+ * 
  *     return {
  *         'move': cmove_to_dict(&moves.moves[best_idx]),             # <<<<<<<<<<<<<<
  *         'score': 0,
  *         'depth': best_depth,
 */
-  __pyx_t_3 = __Pyx_PyDict_NewPresized(4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1596, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyDict_NewPresized(4); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1594, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
-  __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_best_idx]))); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1596, __pyx_L1_error)
+  __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_best_idx]))); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1594, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_move, __pyx_t_2) < (0)) __PYX_ERR(0, 1596, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_move, __pyx_t_2) < (0)) __PYX_ERR(0, 1594, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1596, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 1594, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1598
+  /* "dama/ai/algorithmic/_fast_search.pyx":1596
  *         'move': cmove_to_dict(&moves.moves[best_idx]),
  *         'score': 0,
  *         'depth': best_depth,             # <<<<<<<<<<<<<<
  *         'nodes': ss.nodes,
  *     }
 */
-  __pyx_t_2 = __Pyx_PyLong_From_int(__pyx_v_best_depth); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1598, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyLong_From_int(__pyx_v_best_depth); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1596, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_depth, __pyx_t_2) < (0)) __PYX_ERR(0, 1596, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_depth, __pyx_t_2) < (0)) __PYX_ERR(0, 1594, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1599
+  /* "dama/ai/algorithmic/_fast_search.pyx":1597
  *         'score': 0,
  *         'depth': best_depth,
  *         'nodes': ss.nodes,             # <<<<<<<<<<<<<<
  *     }
- *
+ * 
 */
-  __pyx_t_2 = __Pyx_PyLong_From_int(__pyx_v_ss.nodes); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1599, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyLong_From_int(__pyx_v_ss.nodes); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1597, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_nodes, __pyx_t_2) < (0)) __PYX_ERR(0, 1596, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_nodes, __pyx_t_2) < (0)) __PYX_ERR(0, 1594, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
   __pyx_r = ((PyObject*)__pyx_t_3);
   __pyx_t_3 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1444
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1442
+ * 
+ * 
  * def fast_search(             # <<<<<<<<<<<<<<
  *     object state,
  *     str difficulty = 'medium',
@@ -13148,16 +13106,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_2fast_search(CY
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1603
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1601
+ * 
+ * 
  * def fast_generate_moves(object state) -> list:             # <<<<<<<<<<<<<<
  *     """Generate all legal moves for a GameState. Returns list of move dicts."""
  *     cdef signed char board[64]
 */
 
 /* Python wrapper */
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -13166,7 +13124,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
 ); /*proto*/
 PyDoc_STRVAR(__pyx_doc_4dama_2ai_11algorithmic_12_fast_search_4fast_generate_moves, "Generate all legal moves for a GameState. Returns list of move dicts.");
 static PyMethodDef __pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves = {"fast_generate_moves", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_11algorithmic_12_fast_search_4fast_generate_moves};
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -13196,32 +13154,32 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_state,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1603, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1601, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1603, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1601, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "fast_generate_moves", 0) < (0)) __PYX_ERR(0, 1603, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "fast_generate_moves", 0) < (0)) __PYX_ERR(0, 1601, __pyx_L3_error)
       for (Py_ssize_t i = __pyx_nargs; i < 1; i++) {
-        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("fast_generate_moves", 1, 1, 1, i); __PYX_ERR(0, 1603, __pyx_L3_error) }
+        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("fast_generate_moves", 1, 1, 1, i); __PYX_ERR(0, 1601, __pyx_L3_error) }
       }
     } else if (unlikely(__pyx_nargs != 1)) {
       goto __pyx_L5_argtuple_error;
     } else {
       values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1603, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1601, __pyx_L3_error)
     }
     __pyx_v_state = values[0];
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("fast_generate_moves", 1, 1, 1, __pyx_nargs); __PYX_ERR(0, 1603, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("fast_generate_moves", 1, 1, 1, __pyx_nargs); __PYX_ERR(0, 1601, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -13263,73 +13221,73 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_4fast_generate_
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("fast_generate_moves", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1611
+  /* "dama/ai/algorithmic/_fast_search.pyx":1609
  *     cdef int i
- *
+ * 
  *     _load_board(state, board)             # <<<<<<<<<<<<<<
  *     player = int(state.current_player)
  *     rules = _load_rules()
 */
-  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(__pyx_v_state, __pyx_v_board); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1611, __pyx_L1_error)
+  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_board(__pyx_v_state, __pyx_v_board); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1609, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1612
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1610
+ * 
  *     _load_board(state, board)
  *     player = int(state.current_player)             # <<<<<<<<<<<<<<
  *     rules = _load_rules()
- *
+ * 
 */
-  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_current_player); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1612, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyObject_GetAttrStr(__pyx_v_state, __pyx_mstate_global->__pyx_n_u_current_player); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1610, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  __pyx_t_2 = __Pyx_PyNumber_Int(__pyx_t_1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1612, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyNumber_Int(__pyx_t_1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1610, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-  __pyx_t_3 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_3 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1612, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_3 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1610, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
   __pyx_v_player = __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1613
+  /* "dama/ai/algorithmic/_fast_search.pyx":1611
  *     _load_board(state, board)
  *     player = int(state.current_player)
  *     rules = _load_rules()             # <<<<<<<<<<<<<<
- *
+ * 
  *     moves.count = 0
 */
-  __pyx_t_4 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1613, __pyx_L1_error)
+  __pyx_t_4 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1611, __pyx_L1_error)
   __pyx_v_rules = __pyx_t_4;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1615
+  /* "dama/ai/algorithmic/_fast_search.pyx":1613
  *     rules = _load_rules()
- *
+ * 
  *     moves.count = 0             # <<<<<<<<<<<<<<
  *     generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
 */
   __pyx_v_moves.count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1616
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1614
+ * 
  *     moves.count = 0
  *     generate_all_moves_c(board, player, &rules, &moves)             # <<<<<<<<<<<<<<
- *
+ * 
  *     result = []
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(__pyx_v_board, __pyx_v_player, (&__pyx_v_rules), (&__pyx_v_moves));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1618
+  /* "dama/ai/algorithmic/_fast_search.pyx":1616
  *     generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
  *     result = []             # <<<<<<<<<<<<<<
  *     for i in range(moves.count):
  *         result.append(cmove_to_dict(&moves.moves[i]))
 */
-  __pyx_t_2 = PyList_New(0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1618, __pyx_L1_error)
+  __pyx_t_2 = PyList_New(0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1616, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   __pyx_v_result = ((PyObject*)__pyx_t_2);
   __pyx_t_2 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1619
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1617
+ * 
  *     result = []
  *     for i in range(moves.count):             # <<<<<<<<<<<<<<
  *         result.append(cmove_to_dict(&moves.moves[i]))
@@ -13340,34 +13298,34 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_4fast_generate_
   for (__pyx_t_6 = 0; __pyx_t_6 < __pyx_t_5; __pyx_t_6+=1) {
     __pyx_v_i = __pyx_t_6;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1620
+    /* "dama/ai/algorithmic/_fast_search.pyx":1618
  *     result = []
  *     for i in range(moves.count):
  *         result.append(cmove_to_dict(&moves.moves[i]))             # <<<<<<<<<<<<<<
  *     return result
- *
+ * 
 */
-    __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_i]))); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1620, __pyx_L1_error)
+    __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_i]))); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1618, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
-    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_result, __pyx_t_2); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1620, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_result, __pyx_t_2); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1618, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1621
+  /* "dama/ai/algorithmic/_fast_search.pyx":1619
  *     for i in range(moves.count):
  *         result.append(cmove_to_dict(&moves.moves[i]))
  *     return result             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __Pyx_XDECREF(__pyx_r);
   __Pyx_INCREF(__pyx_v_result);
   __pyx_r = __pyx_v_result;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1603
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1601
+ * 
+ * 
  * def fast_generate_moves(object state) -> list:             # <<<<<<<<<<<<<<
  *     """Generate all legal moves for a GameState. Returns list of move dicts."""
  *     cdef signed char board[64]
@@ -13386,9 +13344,9 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_4fast_generate_
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1633
+/* "dama/ai/algorithmic/_fast_search.pyx":1631
  * # Cython access via <const char*>.
- *
+ * 
  * def init_board_bytes() -> bytes:             # <<<<<<<<<<<<<<
  *     """Return the standard starting position as 64 raw bytes."""
  *     cdef signed char board[64]
@@ -13421,32 +13379,32 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_6init_board_byt
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("init_board_bytes", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1636
+  /* "dama/ai/algorithmic/_fast_search.pyx":1634
  *     """Return the standard starting position as 64 raw bytes."""
  *     cdef signed char board[64]
  *     init_standard_board(board)             # <<<<<<<<<<<<<<
  *     return (<char*>board)[:64]
- *
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(__pyx_v_board);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1637
+  /* "dama/ai/algorithmic/_fast_search.pyx":1635
  *     cdef signed char board[64]
  *     init_standard_board(board)
  *     return (<char*>board)[:64]             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __Pyx_XDECREF(__pyx_r);
-  __pyx_t_1 = __Pyx_PyBytes_FromStringAndSize(((char *)__pyx_v_board) + 0, 64 - 0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1637, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyBytes_FromStringAndSize(((char *)__pyx_v_board) + 0, 64 - 0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1635, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_r = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1633
+  /* "dama/ai/algorithmic/_fast_search.pyx":1631
  * # Cython access via <const char*>.
- *
+ * 
  * def init_board_bytes() -> bytes:             # <<<<<<<<<<<<<<
  *     """Return the standard starting position as 64 raw bytes."""
  *     cdef signed char board[64]
@@ -13463,16 +13421,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_6init_board_byt
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1640
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1638
+ * 
+ * 
  * def gen_moves_from_board(bytes board_bytes, int player) -> list:             # <<<<<<<<<<<<<<
  *     """Generate all legal moves from raw board bytes. Returns list of move dicts.
- *
+ * 
 */
 
 /* Python wrapper */
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -13481,7 +13439,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
 ); /*proto*/
 PyDoc_STRVAR(__pyx_doc_4dama_2ai_11algorithmic_12_fast_search_8gen_moves_from_board, "Generate all legal moves from raw board bytes. Returns list of move dicts.\n\n    Drop-in replacement for fast_generate_moves() that takes raw board+player\n    instead of a GameState. Avoids _load_board() overhead (Python dict iteration\n    over Board._pieces).\n    ");
 static PyMethodDef __pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board = {"gen_moves_from_board", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_11algorithmic_12_fast_search_8gen_moves_from_board};
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -13512,39 +13470,39 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_board_bytes,&__pyx_mstate_global->__pyx_n_u_player,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1640, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1638, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1640, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1638, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1640, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1638, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "gen_moves_from_board", 0) < (0)) __PYX_ERR(0, 1640, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "gen_moves_from_board", 0) < (0)) __PYX_ERR(0, 1638, __pyx_L3_error)
       for (Py_ssize_t i = __pyx_nargs; i < 2; i++) {
-        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("gen_moves_from_board", 1, 2, 2, i); __PYX_ERR(0, 1640, __pyx_L3_error) }
+        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("gen_moves_from_board", 1, 2, 2, i); __PYX_ERR(0, 1638, __pyx_L3_error) }
       }
     } else if (unlikely(__pyx_nargs != 2)) {
       goto __pyx_L5_argtuple_error;
     } else {
       values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1640, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1638, __pyx_L3_error)
       values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1640, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1638, __pyx_L3_error)
     }
     __pyx_v_board_bytes = ((PyObject*)values[0]);
-    __pyx_v_player = __Pyx_PyLong_As_int(values[1]); if (unlikely((__pyx_v_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1640, __pyx_L3_error)
+    __pyx_v_player = __Pyx_PyLong_As_int(values[1]); if (unlikely((__pyx_v_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1638, __pyx_L3_error)
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("gen_moves_from_board", 1, 2, 2, __pyx_nargs); __PYX_ERR(0, 1640, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("gen_moves_from_board", 1, 2, 2, __pyx_nargs); __PYX_ERR(0, 1638, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -13555,7 +13513,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   __Pyx_RefNannyFinishContext();
   return NULL;
   __pyx_L4_argument_unpacking_done:;
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_board_bytes), (&PyBytes_Type), 1, "board_bytes", 1))) __PYX_ERR(0, 1640, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_board_bytes), (&PyBytes_Type), 1, "board_bytes", 1))) __PYX_ERR(0, 1638, __pyx_L1_error)
   __pyx_r = __pyx_pf_4dama_2ai_11algorithmic_12_fast_search_8gen_moves_from_board(__pyx_self, __pyx_v_board_bytes, __pyx_v_player);
 
   /* function exit code */
@@ -13595,62 +13553,62 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_8gen_moves_from
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("gen_moves_from_board", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1652
+  /* "dama/ai/algorithmic/_fast_search.pyx":1650
  *     cdef int i
- *
+ * 
  *     memcpy(board, <const char*>board_bytes, 64)             # <<<<<<<<<<<<<<
  *     rules = _load_rules()
- *
+ * 
 */
   if (unlikely(__pyx_v_board_bytes == Py_None)) {
     PyErr_SetString(PyExc_TypeError, "expected bytes, NoneType found");
-    __PYX_ERR(0, 1652, __pyx_L1_error)
+    __PYX_ERR(0, 1650, __pyx_L1_error)
   }
-  __pyx_t_1 = __Pyx_PyBytes_AsString(__pyx_v_board_bytes); if (unlikely((!__pyx_t_1) && PyErr_Occurred())) __PYX_ERR(0, 1652, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyBytes_AsString(__pyx_v_board_bytes); if (unlikely((!__pyx_t_1) && PyErr_Occurred())) __PYX_ERR(0, 1650, __pyx_L1_error)
   (void)(memcpy(__pyx_v_board, ((char const *)__pyx_t_1), 64));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1653
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1651
+ * 
  *     memcpy(board, <const char*>board_bytes, 64)
  *     rules = _load_rules()             # <<<<<<<<<<<<<<
- *
+ * 
  *     moves.count = 0
 */
-  __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1653, __pyx_L1_error)
+  __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1651, __pyx_L1_error)
   __pyx_v_rules = __pyx_t_2;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1655
+  /* "dama/ai/algorithmic/_fast_search.pyx":1653
  *     rules = _load_rules()
- *
+ * 
  *     moves.count = 0             # <<<<<<<<<<<<<<
  *     generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
 */
   __pyx_v_moves.count = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1656
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1654
+ * 
  *     moves.count = 0
  *     generate_all_moves_c(board, player, &rules, &moves)             # <<<<<<<<<<<<<<
- *
+ * 
  *     result = []
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(__pyx_v_board, __pyx_v_player, (&__pyx_v_rules), (&__pyx_v_moves));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1658
+  /* "dama/ai/algorithmic/_fast_search.pyx":1656
  *     generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
  *     result = []             # <<<<<<<<<<<<<<
  *     for i in range(moves.count):
  *         result.append(cmove_to_dict(&moves.moves[i]))
 */
-  __pyx_t_3 = PyList_New(0); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1658, __pyx_L1_error)
+  __pyx_t_3 = PyList_New(0); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1656, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
   __pyx_v_result = ((PyObject*)__pyx_t_3);
   __pyx_t_3 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1659
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1657
+ * 
  *     result = []
  *     for i in range(moves.count):             # <<<<<<<<<<<<<<
  *         result.append(cmove_to_dict(&moves.moves[i]))
@@ -13661,37 +13619,37 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_8gen_moves_from
   for (__pyx_t_6 = 0; __pyx_t_6 < __pyx_t_5; __pyx_t_6+=1) {
     __pyx_v_i = __pyx_t_6;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1660
+    /* "dama/ai/algorithmic/_fast_search.pyx":1658
  *     result = []
  *     for i in range(moves.count):
  *         result.append(cmove_to_dict(&moves.moves[i]))             # <<<<<<<<<<<<<<
  *     return result
- *
+ * 
 */
-    __pyx_t_3 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_i]))); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1660, __pyx_L1_error)
+    __pyx_t_3 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_i]))); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1658, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_3);
-    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_result, __pyx_t_3); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1660, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_PyList_Append(__pyx_v_result, __pyx_t_3); if (unlikely(__pyx_t_7 == ((int)-1))) __PYX_ERR(0, 1658, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1661
+  /* "dama/ai/algorithmic/_fast_search.pyx":1659
  *     for i in range(moves.count):
  *         result.append(cmove_to_dict(&moves.moves[i]))
  *     return result             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __Pyx_XDECREF(__pyx_r);
   __Pyx_INCREF(__pyx_v_result);
   __pyx_r = __pyx_v_result;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1640
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1638
+ * 
+ * 
  * def gen_moves_from_board(bytes board_bytes, int player) -> list:             # <<<<<<<<<<<<<<
  *     """Generate all legal moves from raw board bytes. Returns list of move dicts.
- *
+ * 
 */
 
   /* function exit code */
@@ -13706,16 +13664,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_8gen_moves_from
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1664
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1662
+ * 
+ * 
  * def apply_move_board(bytes board_bytes, int player, dict move_dict) -> tuple:             # <<<<<<<<<<<<<<
  *     """Apply a move dict to raw board bytes. Returns (new_board_bytes, new_player, num_captures).
- *
+ * 
 */
 
 /* Python wrapper */
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -13724,7 +13682,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
 ); /*proto*/
 PyDoc_STRVAR(__pyx_doc_4dama_2ai_11algorithmic_12_fast_search_10apply_move_board, "Apply a move dict to raw board bytes. Returns (new_board_bytes, new_player, num_captures).\n\n    Entirely in C \342\200\224 no GameState/Move/Board Python objects created.\n    Replaces the Python-side ``state.apply_move(Move.from_dict(md))`` which\n    creates a Move object, a new Board (with _pieces dict), and a new GameState\n    per position.\n    ");
 static PyMethodDef __pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board = {"apply_move_board", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_11algorithmic_12_fast_search_10apply_move_board};
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -13756,46 +13714,46 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_board_bytes,&__pyx_mstate_global->__pyx_n_u_player,&__pyx_mstate_global->__pyx_n_u_move_dict,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1664, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1662, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case  3:
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1664, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1662, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1664, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1662, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1664, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1662, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "apply_move_board", 0) < (0)) __PYX_ERR(0, 1664, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "apply_move_board", 0) < (0)) __PYX_ERR(0, 1662, __pyx_L3_error)
       for (Py_ssize_t i = __pyx_nargs; i < 3; i++) {
-        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("apply_move_board", 1, 3, 3, i); __PYX_ERR(0, 1664, __pyx_L3_error) }
+        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("apply_move_board", 1, 3, 3, i); __PYX_ERR(0, 1662, __pyx_L3_error) }
       }
     } else if (unlikely(__pyx_nargs != 3)) {
       goto __pyx_L5_argtuple_error;
     } else {
       values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1664, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1662, __pyx_L3_error)
       values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1664, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1662, __pyx_L3_error)
       values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1664, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1662, __pyx_L3_error)
     }
     __pyx_v_board_bytes = ((PyObject*)values[0]);
-    __pyx_v_player = __Pyx_PyLong_As_int(values[1]); if (unlikely((__pyx_v_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1664, __pyx_L3_error)
+    __pyx_v_player = __Pyx_PyLong_As_int(values[1]); if (unlikely((__pyx_v_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1662, __pyx_L3_error)
     __pyx_v_move_dict = ((PyObject*)values[2]);
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("apply_move_board", 1, 3, 3, __pyx_nargs); __PYX_ERR(0, 1664, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("apply_move_board", 1, 3, 3, __pyx_nargs); __PYX_ERR(0, 1662, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -13806,8 +13764,8 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   __Pyx_RefNannyFinishContext();
   return NULL;
   __pyx_L4_argument_unpacking_done:;
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_board_bytes), (&PyBytes_Type), 1, "board_bytes", 1))) __PYX_ERR(0, 1664, __pyx_L1_error)
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_move_dict), (&PyDict_Type), 1, "move_dict", 1))) __PYX_ERR(0, 1664, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_board_bytes), (&PyBytes_Type), 1, "board_bytes", 1))) __PYX_ERR(0, 1662, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_move_dict), (&PyDict_Type), 1, "move_dict", 1))) __PYX_ERR(0, 1662, __pyx_L1_error)
   __pyx_r = __pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_board(__pyx_self, __pyx_v_board_bytes, __pyx_v_player, __pyx_v_move_dict);
 
   /* function exit code */
@@ -13854,21 +13812,21 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("apply_move_board", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1677
+  /* "dama/ai/algorithmic/_fast_search.pyx":1675
  *     cdef int i, n
- *
+ * 
  *     memcpy(board, <const char*>board_bytes, 64)             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Convert move dict  CMove
 */
   if (unlikely(__pyx_v_board_bytes == Py_None)) {
     PyErr_SetString(PyExc_TypeError, "expected bytes, NoneType found");
-    __PYX_ERR(0, 1677, __pyx_L1_error)
+    __PYX_ERR(0, 1675, __pyx_L1_error)
   }
-  __pyx_t_1 = __Pyx_PyBytes_AsString(__pyx_v_board_bytes); if (unlikely((!__pyx_t_1) && PyErr_Occurred())) __PYX_ERR(0, 1677, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyBytes_AsString(__pyx_v_board_bytes); if (unlikely((!__pyx_t_1) && PyErr_Occurred())) __PYX_ERR(0, 1675, __pyx_L1_error)
   (void)(memcpy(__pyx_v_board, ((char const *)__pyx_t_1), 64));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1681
+  /* "dama/ai/algorithmic/_fast_search.pyx":1679
  *     # Convert move dict  CMove
  *     # [Pass 83] Direct key access: cmove_to_dict always includes all three keys.
  *     path = move_dict['path']             # <<<<<<<<<<<<<<
@@ -13877,24 +13835,24 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
 */
   if (unlikely(__pyx_v_move_dict == Py_None)) {
     PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-    __PYX_ERR(0, 1681, __pyx_L1_error)
+    __PYX_ERR(0, 1679, __pyx_L1_error)
   }
-  __pyx_t_2 = __Pyx_PyDict_GetItem(__pyx_v_move_dict, __pyx_mstate_global->__pyx_n_u_path); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1681, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyDict_GetItem(__pyx_v_move_dict, __pyx_mstate_global->__pyx_n_u_path); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1679, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   __pyx_v_path = __pyx_t_2;
   __pyx_t_2 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1682
+  /* "dama/ai/algorithmic/_fast_search.pyx":1680
  *     # [Pass 83] Direct key access: cmove_to_dict always includes all three keys.
  *     path = move_dict['path']
  *     n = len(path)             # <<<<<<<<<<<<<<
  *     cmove.path_len = n
  *     for i in range(n):
 */
-  __pyx_t_3 = PyObject_Length(__pyx_v_path); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 1682, __pyx_L1_error)
+  __pyx_t_3 = PyObject_Length(__pyx_v_path); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 1680, __pyx_L1_error)
   __pyx_v_n = __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1683
+  /* "dama/ai/algorithmic/_fast_search.pyx":1681
  *     path = move_dict['path']
  *     n = len(path)
  *     cmove.path_len = n             # <<<<<<<<<<<<<<
@@ -13903,7 +13861,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
 */
   __pyx_v_cmove.path_len = __pyx_v_n;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1684
+  /* "dama/ai/algorithmic/_fast_search.pyx":1682
  *     n = len(path)
  *     cmove.path_len = n
  *     for i in range(n):             # <<<<<<<<<<<<<<
@@ -13915,66 +13873,66 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
   for (__pyx_t_6 = 0; __pyx_t_6 < __pyx_t_5; __pyx_t_6+=1) {
     __pyx_v_i = __pyx_t_6;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1685
+    /* "dama/ai/algorithmic/_fast_search.pyx":1683
  *     cmove.path_len = n
  *     for i in range(n):
  *         cmove.path_r[i] = path[i][0]             # <<<<<<<<<<<<<<
  *         cmove.path_c[i] = path[i][1]
- *
+ * 
 */
-    __pyx_t_2 = __Pyx_GetItemInt(__pyx_v_path, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1685, __pyx_L1_error)
+    __pyx_t_2 = __Pyx_GetItemInt(__pyx_v_path, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1683, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
-    __pyx_t_7 = __Pyx_GetItemInt(__pyx_t_2, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1685, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_GetItemInt(__pyx_t_2, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1683, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
     __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1685, __pyx_L1_error)
+    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1683, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
     (__pyx_v_cmove.path_r[__pyx_v_i]) = __pyx_t_8;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1686
+    /* "dama/ai/algorithmic/_fast_search.pyx":1684
  *     for i in range(n):
  *         cmove.path_r[i] = path[i][0]
  *         cmove.path_c[i] = path[i][1]             # <<<<<<<<<<<<<<
- *
+ * 
  *     captures = move_dict['captures']
 */
-    __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_path, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1686, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_path, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1684, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
-    __pyx_t_2 = __Pyx_GetItemInt(__pyx_t_7, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1686, __pyx_L1_error)
+    __pyx_t_2 = __Pyx_GetItemInt(__pyx_t_7, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1684, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
     __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1686, __pyx_L1_error)
+    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1684, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
     (__pyx_v_cmove.path_c[__pyx_v_i]) = __pyx_t_8;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1688
+  /* "dama/ai/algorithmic/_fast_search.pyx":1686
  *         cmove.path_c[i] = path[i][1]
- *
+ * 
  *     captures = move_dict['captures']             # <<<<<<<<<<<<<<
  *     cmove.num_captures = len(captures)
  *     for i in range(cmove.num_captures):
 */
   if (unlikely(__pyx_v_move_dict == Py_None)) {
     PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-    __PYX_ERR(0, 1688, __pyx_L1_error)
+    __PYX_ERR(0, 1686, __pyx_L1_error)
   }
-  __pyx_t_2 = __Pyx_PyDict_GetItem(__pyx_v_move_dict, __pyx_mstate_global->__pyx_n_u_captures); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1688, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyDict_GetItem(__pyx_v_move_dict, __pyx_mstate_global->__pyx_n_u_captures); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1686, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   __pyx_v_captures = __pyx_t_2;
   __pyx_t_2 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1689
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1687
+ * 
  *     captures = move_dict['captures']
  *     cmove.num_captures = len(captures)             # <<<<<<<<<<<<<<
  *     for i in range(cmove.num_captures):
  *         cmove.cap_r[i] = captures[i][0]
 */
-  __pyx_t_3 = PyObject_Length(__pyx_v_captures); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 1689, __pyx_L1_error)
+  __pyx_t_3 = PyObject_Length(__pyx_v_captures); if (unlikely(__pyx_t_3 == ((Py_ssize_t)-1))) __PYX_ERR(0, 1687, __pyx_L1_error)
   __pyx_v_cmove.num_captures = __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1690
+  /* "dama/ai/algorithmic/_fast_search.pyx":1688
  *     captures = move_dict['captures']
  *     cmove.num_captures = len(captures)
  *     for i in range(cmove.num_captures):             # <<<<<<<<<<<<<<
@@ -13986,71 +13944,71 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
   for (__pyx_t_6 = 0; __pyx_t_6 < __pyx_t_5; __pyx_t_6+=1) {
     __pyx_v_i = __pyx_t_6;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1691
+    /* "dama/ai/algorithmic/_fast_search.pyx":1689
  *     cmove.num_captures = len(captures)
  *     for i in range(cmove.num_captures):
  *         cmove.cap_r[i] = captures[i][0]             # <<<<<<<<<<<<<<
  *         cmove.cap_c[i] = captures[i][1]
- *
+ * 
 */
-    __pyx_t_2 = __Pyx_GetItemInt(__pyx_v_captures, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1691, __pyx_L1_error)
+    __pyx_t_2 = __Pyx_GetItemInt(__pyx_v_captures, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1689, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
-    __pyx_t_7 = __Pyx_GetItemInt(__pyx_t_2, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1691, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_GetItemInt(__pyx_t_2, 0, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1689, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
     __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1691, __pyx_L1_error)
+    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_7); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1689, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
     (__pyx_v_cmove.cap_r[__pyx_v_i]) = __pyx_t_8;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1692
+    /* "dama/ai/algorithmic/_fast_search.pyx":1690
  *     for i in range(cmove.num_captures):
  *         cmove.cap_r[i] = captures[i][0]
  *         cmove.cap_c[i] = captures[i][1]             # <<<<<<<<<<<<<<
- *
+ * 
  *     _set_move_metadata(&cmove, bool(move_dict['promotion']), 0)
 */
-    __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_captures, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1692, __pyx_L1_error)
+    __pyx_t_7 = __Pyx_GetItemInt(__pyx_v_captures, __pyx_v_i, int, 1, __Pyx_PyLong_From_int, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1690, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_7);
-    __pyx_t_2 = __Pyx_GetItemInt(__pyx_t_7, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1692, __pyx_L1_error)
+    __pyx_t_2 = __Pyx_GetItemInt(__pyx_t_7, 1, long, 1, __Pyx_PyLong_From_long, 0, 0, 0, 1, __Pyx_ReferenceSharing_OwnStrongReference); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1690, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_2);
     __Pyx_DECREF(__pyx_t_7); __pyx_t_7 = 0;
-    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1692, __pyx_L1_error)
+    __pyx_t_8 = __Pyx_PyLong_As_int(__pyx_t_2); if (unlikely((__pyx_t_8 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1690, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
     (__pyx_v_cmove.cap_c[__pyx_v_i]) = __pyx_t_8;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1694
+  /* "dama/ai/algorithmic/_fast_search.pyx":1692
  *         cmove.cap_c[i] = captures[i][1]
- *
+ * 
  *     _set_move_metadata(&cmove, bool(move_dict['promotion']), 0)             # <<<<<<<<<<<<<<
- *
+ * 
  *     apply_move_c(board, new_board, &cmove, player)
 */
   if (unlikely(__pyx_v_move_dict == Py_None)) {
     PyErr_SetString(PyExc_TypeError, "'NoneType' object is not subscriptable");
-    __PYX_ERR(0, 1694, __pyx_L1_error)
+    __PYX_ERR(0, 1692, __pyx_L1_error)
   }
-  __pyx_t_2 = __Pyx_PyDict_GetItem(__pyx_v_move_dict, __pyx_mstate_global->__pyx_n_u_promotion); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1694, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyDict_GetItem(__pyx_v_move_dict, __pyx_mstate_global->__pyx_n_u_promotion); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1692, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  __pyx_t_9 = __Pyx_PyObject_IsTrue(__pyx_t_2); if (unlikely((__pyx_t_9 < 0))) __PYX_ERR(0, 1694, __pyx_L1_error)
+  __pyx_t_9 = __Pyx_PyObject_IsTrue(__pyx_t_2); if (unlikely((__pyx_t_9 < 0))) __PYX_ERR(0, 1692, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__set_move_metadata((&__pyx_v_cmove), (!(!__pyx_t_9)), 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1696
+  /* "dama/ai/algorithmic/_fast_search.pyx":1694
  *     _set_move_metadata(&cmove, bool(move_dict['promotion']), 0)
- *
+ * 
  *     apply_move_c(board, new_board, &cmove, player)             # <<<<<<<<<<<<<<
- *
+ * 
  *     cdef int new_player = PLAYER_TWO if player == PLAYER_ONE else PLAYER_ONE
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(__pyx_v_board, __pyx_v_new_board, (&__pyx_v_cmove), __pyx_v_player);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1698
+  /* "dama/ai/algorithmic/_fast_search.pyx":1696
  *     apply_move_c(board, new_board, &cmove, player)
- *
+ * 
  *     cdef int new_player = PLAYER_TWO if player == PLAYER_ONE else PLAYER_ONE             # <<<<<<<<<<<<<<
  *     return ((<char*>new_board)[:64], new_player, cmove.num_captures)
- *
+ * 
 */
   __pyx_t_9 = (__pyx_v_player == 1);
   if (__pyx_t_9) {
@@ -14060,28 +14018,28 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
   }
   __pyx_v_new_player = __pyx_t_4;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1699
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1697
+ * 
  *     cdef int new_player = PLAYER_TWO if player == PLAYER_ONE else PLAYER_ONE
  *     return ((<char*>new_board)[:64], new_player, cmove.num_captures)             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __Pyx_XDECREF(__pyx_r);
-  __pyx_t_2 = __Pyx_PyBytes_FromStringAndSize(((char *)__pyx_v_new_board) + 0, 64 - 0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1699, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyBytes_FromStringAndSize(((char *)__pyx_v_new_board) + 0, 64 - 0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1697, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  __pyx_t_7 = __Pyx_PyLong_From_int(__pyx_v_new_player); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1699, __pyx_L1_error)
+  __pyx_t_7 = __Pyx_PyLong_From_int(__pyx_v_new_player); if (unlikely(!__pyx_t_7)) __PYX_ERR(0, 1697, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_7);
-  __pyx_t_10 = __Pyx_PyLong_From_int(__pyx_v_cmove.num_captures); if (unlikely(!__pyx_t_10)) __PYX_ERR(0, 1699, __pyx_L1_error)
+  __pyx_t_10 = __Pyx_PyLong_From_int(__pyx_v_cmove.num_captures); if (unlikely(!__pyx_t_10)) __PYX_ERR(0, 1697, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_10);
-  __pyx_t_11 = PyTuple_New(3); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 1699, __pyx_L1_error)
+  __pyx_t_11 = PyTuple_New(3); if (unlikely(!__pyx_t_11)) __PYX_ERR(0, 1697, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_11);
   __Pyx_GIVEREF(__pyx_t_2);
-  if (__Pyx_PyTuple_SET_ITEM(__pyx_t_11, 0, __pyx_t_2) != (0)) __PYX_ERR(0, 1699, __pyx_L1_error);
+  if (__Pyx_PyTuple_SET_ITEM(__pyx_t_11, 0, __pyx_t_2) != (0)) __PYX_ERR(0, 1697, __pyx_L1_error);
   __Pyx_GIVEREF(__pyx_t_7);
-  if (__Pyx_PyTuple_SET_ITEM(__pyx_t_11, 1, __pyx_t_7) != (0)) __PYX_ERR(0, 1699, __pyx_L1_error);
+  if (__Pyx_PyTuple_SET_ITEM(__pyx_t_11, 1, __pyx_t_7) != (0)) __PYX_ERR(0, 1697, __pyx_L1_error);
   __Pyx_GIVEREF(__pyx_t_10);
-  if (__Pyx_PyTuple_SET_ITEM(__pyx_t_11, 2, __pyx_t_10) != (0)) __PYX_ERR(0, 1699, __pyx_L1_error);
+  if (__Pyx_PyTuple_SET_ITEM(__pyx_t_11, 2, __pyx_t_10) != (0)) __PYX_ERR(0, 1697, __pyx_L1_error);
   __pyx_t_2 = 0;
   __pyx_t_7 = 0;
   __pyx_t_10 = 0;
@@ -14089,12 +14047,12 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
   __pyx_t_11 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1664
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1662
+ * 
+ * 
  * def apply_move_board(bytes board_bytes, int player, dict move_dict) -> tuple:             # <<<<<<<<<<<<<<
  *     """Apply a move dict to raw board bytes. Returns (new_board_bytes, new_player, num_captures).
- *
+ * 
 */
 
   /* function exit code */
@@ -14113,16 +14071,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_10apply_move_bo
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1702
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1700
+ * 
+ * 
  * def board_bytes_to_compact(bytes board_bytes, int player, int move_count) -> dict:             # <<<<<<<<<<<<<<
  *     """Convert raw board bytes to compact dict for replay recording."""
  *     cdef signed char board[64]
 */
 
 /* Python wrapper */
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -14131,7 +14089,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
 ); /*proto*/
 PyDoc_STRVAR(__pyx_doc_4dama_2ai_11algorithmic_12_fast_search_12board_bytes_to_compact, "Convert raw board bytes to compact dict for replay recording.");
 static PyMethodDef __pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact = {"board_bytes_to_compact", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_11algorithmic_12_fast_search_12board_bytes_to_compact};
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -14163,46 +14121,46 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_board_bytes,&__pyx_mstate_global->__pyx_n_u_player,&__pyx_mstate_global->__pyx_n_u_move_count,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1702, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1700, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case  3:
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1702, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1700, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1702, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1700, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1702, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1700, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "board_bytes_to_compact", 0) < (0)) __PYX_ERR(0, 1702, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "board_bytes_to_compact", 0) < (0)) __PYX_ERR(0, 1700, __pyx_L3_error)
       for (Py_ssize_t i = __pyx_nargs; i < 3; i++) {
-        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("board_bytes_to_compact", 1, 3, 3, i); __PYX_ERR(0, 1702, __pyx_L3_error) }
+        if (unlikely(!values[i])) { __Pyx_RaiseArgtupleInvalid("board_bytes_to_compact", 1, 3, 3, i); __PYX_ERR(0, 1700, __pyx_L3_error) }
       }
     } else if (unlikely(__pyx_nargs != 3)) {
       goto __pyx_L5_argtuple_error;
     } else {
       values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1702, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1700, __pyx_L3_error)
       values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1702, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1700, __pyx_L3_error)
       values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1702, __pyx_L3_error)
+      if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1700, __pyx_L3_error)
     }
     __pyx_v_board_bytes = ((PyObject*)values[0]);
-    __pyx_v_player = __Pyx_PyLong_As_int(values[1]); if (unlikely((__pyx_v_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1702, __pyx_L3_error)
-    __pyx_v_move_count = __Pyx_PyLong_As_int(values[2]); if (unlikely((__pyx_v_move_count == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1702, __pyx_L3_error)
+    __pyx_v_player = __Pyx_PyLong_As_int(values[1]); if (unlikely((__pyx_v_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1700, __pyx_L3_error)
+    __pyx_v_move_count = __Pyx_PyLong_As_int(values[2]); if (unlikely((__pyx_v_move_count == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1700, __pyx_L3_error)
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("board_bytes_to_compact", 1, 3, 3, __pyx_nargs); __PYX_ERR(0, 1702, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("board_bytes_to_compact", 1, 3, 3, __pyx_nargs); __PYX_ERR(0, 1700, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -14213,7 +14171,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   __Pyx_RefNannyFinishContext();
   return NULL;
   __pyx_L4_argument_unpacking_done:;
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_board_bytes), (&PyBytes_Type), 1, "board_bytes", 1))) __PYX_ERR(0, 1702, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_board_bytes), (&PyBytes_Type), 1, "board_bytes", 1))) __PYX_ERR(0, 1700, __pyx_L1_error)
   __pyx_r = __pyx_pf_4dama_2ai_11algorithmic_12_fast_search_12board_bytes_to_compact(__pyx_self, __pyx_v_board_bytes, __pyx_v_player, __pyx_v_move_count);
 
   /* function exit code */
@@ -14244,37 +14202,37 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_12board_bytes_t
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("board_bytes_to_compact", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1705
+  /* "dama/ai/algorithmic/_fast_search.pyx":1703
  *     """Convert raw board bytes to compact dict for replay recording."""
  *     cdef signed char board[64]
  *     memcpy(board, <const char*>board_bytes, 64)             # <<<<<<<<<<<<<<
  *     return board_to_compact_dict(board, player, move_count)
- *
+ * 
 */
   if (unlikely(__pyx_v_board_bytes == Py_None)) {
     PyErr_SetString(PyExc_TypeError, "expected bytes, NoneType found");
-    __PYX_ERR(0, 1705, __pyx_L1_error)
+    __PYX_ERR(0, 1703, __pyx_L1_error)
   }
-  __pyx_t_1 = __Pyx_PyBytes_AsString(__pyx_v_board_bytes); if (unlikely((!__pyx_t_1) && PyErr_Occurred())) __PYX_ERR(0, 1705, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyBytes_AsString(__pyx_v_board_bytes); if (unlikely((!__pyx_t_1) && PyErr_Occurred())) __PYX_ERR(0, 1703, __pyx_L1_error)
   (void)(memcpy(__pyx_v_board, ((char const *)__pyx_t_1), 64));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1706
+  /* "dama/ai/algorithmic/_fast_search.pyx":1704
  *     cdef signed char board[64]
  *     memcpy(board, <const char*>board_bytes, 64)
  *     return board_to_compact_dict(board, player, move_count)             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __Pyx_XDECREF(__pyx_r);
-  __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact_dict(__pyx_v_board, __pyx_v_player, __pyx_v_move_count); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1706, __pyx_L1_error)
+  __pyx_t_2 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact_dict(__pyx_v_board, __pyx_v_player, __pyx_v_move_count); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1704, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   __pyx_r = ((PyObject*)__pyx_t_2);
   __pyx_t_2 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1702
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1700
+ * 
+ * 
  * def board_bytes_to_compact(bytes board_bytes, int player, int move_count) -> dict:             # <<<<<<<<<<<<<<
  *     """Convert raw board bytes to compact dict for replay recording."""
  *     cdef signed char board[64]
@@ -14291,9 +14249,9 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_12board_bytes_t
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1717
+/* "dama/ai/algorithmic/_fast_search.pyx":1715
  * # after fast_search: the Python game loop overhead.
- *
+ * 
  * cdef void init_standard_board(signed char *board) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Initialize board with the standard Filipino Dama starting position."""
  *     cdef int r, c
@@ -14306,7 +14264,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1720
+  /* "dama/ai/algorithmic/_fast_search.pyx":1718
  *     """Initialize board with the standard Filipino Dama starting position."""
  *     cdef int r, c
  *     memset(board, 0, 64)             # <<<<<<<<<<<<<<
@@ -14315,7 +14273,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
 */
   (void)(memset(__pyx_v_board, 0, 64));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1722
+  /* "dama/ai/algorithmic/_fast_search.pyx":1720
  *     memset(board, 0, 64)
  *     # Player 1 on rows 0-2, dark squares
  *     for r in range(3):             # <<<<<<<<<<<<<<
@@ -14325,7 +14283,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
   for (__pyx_t_1 = 0; __pyx_t_1 < 3; __pyx_t_1+=1) {
     __pyx_v_r = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1723
+    /* "dama/ai/algorithmic/_fast_search.pyx":1721
  *     # Player 1 on rows 0-2, dark squares
  *     for r in range(3):
  *         for c in range(8):             # <<<<<<<<<<<<<<
@@ -14335,7 +14293,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
     for (__pyx_t_2 = 0; __pyx_t_2 < 8; __pyx_t_2+=1) {
       __pyx_v_c = __pyx_t_2;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1724
+      /* "dama/ai/algorithmic/_fast_search.pyx":1722
  *     for r in range(3):
  *         for c in range(8):
  *             if (r + c) % 2 == 1:             # <<<<<<<<<<<<<<
@@ -14345,7 +14303,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
       __pyx_t_3 = (((__pyx_v_r + __pyx_v_c) % 2) == 1);
       if (__pyx_t_3) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1725
+        /* "dama/ai/algorithmic/_fast_search.pyx":1723
  *         for c in range(8):
  *             if (r + c) % 2 == 1:
  *                 board[r * 8 + c] = P1_MAN             # <<<<<<<<<<<<<<
@@ -14354,7 +14312,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
 */
         (__pyx_v_board[((__pyx_v_r * 8) + __pyx_v_c)]) = 1;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1724
+        /* "dama/ai/algorithmic/_fast_search.pyx":1722
  *     for r in range(3):
  *         for c in range(8):
  *             if (r + c) % 2 == 1:             # <<<<<<<<<<<<<<
@@ -14365,7 +14323,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1727
+  /* "dama/ai/algorithmic/_fast_search.pyx":1725
  *                 board[r * 8 + c] = P1_MAN
  *     # Player 2 on rows 5-7, dark squares
  *     for r in range(5, 8):             # <<<<<<<<<<<<<<
@@ -14375,7 +14333,7 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
   for (__pyx_t_1 = 5; __pyx_t_1 < 8; __pyx_t_1+=1) {
     __pyx_v_r = __pyx_t_1;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1728
+    /* "dama/ai/algorithmic/_fast_search.pyx":1726
  *     # Player 2 on rows 5-7, dark squares
  *     for r in range(5, 8):
  *         for c in range(8):             # <<<<<<<<<<<<<<
@@ -14385,39 +14343,39 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
     for (__pyx_t_2 = 0; __pyx_t_2 < 8; __pyx_t_2+=1) {
       __pyx_v_c = __pyx_t_2;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1729
+      /* "dama/ai/algorithmic/_fast_search.pyx":1727
  *     for r in range(5, 8):
  *         for c in range(8):
  *             if (r + c) % 2 == 1:             # <<<<<<<<<<<<<<
  *                 board[r * 8 + c] = P2_MAN
- *
+ * 
 */
       __pyx_t_3 = (((__pyx_v_r + __pyx_v_c) % 2) == 1);
       if (__pyx_t_3) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1730
+        /* "dama/ai/algorithmic/_fast_search.pyx":1728
  *         for c in range(8):
  *             if (r + c) % 2 == 1:
  *                 board[r * 8 + c] = P2_MAN             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
         (__pyx_v_board[((__pyx_v_r * 8) + __pyx_v_c)]) = 3;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1729
+        /* "dama/ai/algorithmic/_fast_search.pyx":1727
  *     for r in range(5, 8):
  *         for c in range(8):
  *             if (r + c) % 2 == 1:             # <<<<<<<<<<<<<<
  *                 board[r * 8 + c] = P2_MAN
- *
+ * 
 */
       }
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1717
+  /* "dama/ai/algorithmic/_fast_search.pyx":1715
  * # after fast_search: the Python game loop overhead.
- *
+ * 
  * cdef void init_standard_board(signed char *board) noexcept nogil:             # <<<<<<<<<<<<<<
  *     """Initialize board with the standard Filipino Dama starting position."""
  *     cdef int r, c
@@ -14426,12 +14384,12 @@ static void __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(s
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1733
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1731
+ * 
+ * 
  * cdef dict board_to_compact_dict(signed char *board, int player, int move_count):             # <<<<<<<<<<<<<<
  *     """Convert flat board array to compact Python dict (same as Board.to_compact + turn).
- *
+ * 
 */
 
 static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact_dict(signed char *__pyx_v_board, int __pyx_v_player, int __pyx_v_move_count) {
@@ -14456,31 +14414,31 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("board_to_compact_dict", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1743
+  /* "dama/ai/algorithmic/_fast_search.pyx":1741
  *     Tuples are also ~40% smaller and ~20ns faster to create per position.
  *     """
  *     cdef list p1_men = [], p1_kings = [], p2_men = [], p2_kings = []             # <<<<<<<<<<<<<<
  *     cdef int i, r, c, piece
  *     for i in range(NUM_DARK_SQ):
 */
-  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1743, __pyx_L1_error)
+  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1741, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_p1_men = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
-  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1743, __pyx_L1_error)
+  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1741, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_p1_kings = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
-  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1743, __pyx_L1_error)
+  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1741, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_p2_men = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
-  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1743, __pyx_L1_error)
+  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1741, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_p2_kings = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1745
+  /* "dama/ai/algorithmic/_fast_search.pyx":1743
  *     cdef list p1_men = [], p1_kings = [], p2_men = [], p2_kings = []
  *     cdef int i, r, c, piece
  *     for i in range(NUM_DARK_SQ):             # <<<<<<<<<<<<<<
@@ -14490,7 +14448,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
   for (__pyx_t_2 = 0; __pyx_t_2 < 32; __pyx_t_2+=1) {
     __pyx_v_i = __pyx_t_2;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1746
+    /* "dama/ai/algorithmic/_fast_search.pyx":1744
  *     cdef int i, r, c, piece
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]             # <<<<<<<<<<<<<<
@@ -14499,7 +14457,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
 */
     __pyx_v_piece = (__pyx_v_board[(__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ[__pyx_v_i])]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1747
+    /* "dama/ai/algorithmic/_fast_search.pyx":1745
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]
  *         if piece == EMPTY:             # <<<<<<<<<<<<<<
@@ -14509,7 +14467,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
     __pyx_t_3 = (__pyx_v_piece == 0);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1748
+      /* "dama/ai/algorithmic/_fast_search.pyx":1746
  *         piece = board[DARK_SQ[i]]
  *         if piece == EMPTY:
  *             continue             # <<<<<<<<<<<<<<
@@ -14518,7 +14476,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
 */
       goto __pyx_L3_continue;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1747
+      /* "dama/ai/algorithmic/_fast_search.pyx":1745
  *     for i in range(NUM_DARK_SQ):
  *         piece = board[DARK_SQ[i]]
  *         if piece == EMPTY:             # <<<<<<<<<<<<<<
@@ -14527,7 +14485,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1749
+    /* "dama/ai/algorithmic/_fast_search.pyx":1747
  *         if piece == EMPTY:
  *             continue
  *         r = DARK_SQ_R[i]             # <<<<<<<<<<<<<<
@@ -14536,7 +14494,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
 */
     __pyx_v_r = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_R[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1750
+    /* "dama/ai/algorithmic/_fast_search.pyx":1748
  *             continue
  *         r = DARK_SQ_R[i]
  *         c = DARK_SQ_C[i]             # <<<<<<<<<<<<<<
@@ -14545,7 +14503,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
 */
     __pyx_v_c = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_DARK_SQ_C[__pyx_v_i]);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1751
+    /* "dama/ai/algorithmic/_fast_search.pyx":1749
  *         r = DARK_SQ_R[i]
  *         c = DARK_SQ_C[i]
  *         if piece == P1_MAN:             # <<<<<<<<<<<<<<
@@ -14555,29 +14513,29 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
     switch (__pyx_v_piece) {
       case 1:
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1752
+      /* "dama/ai/algorithmic/_fast_search.pyx":1750
  *         c = DARK_SQ_C[i]
  *         if piece == P1_MAN:
  *             p1_men.append((r, c))             # <<<<<<<<<<<<<<
  *         elif piece == P1_KING:
  *             p1_kings.append((r, c))
 */
-      __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1752, __pyx_L1_error)
+      __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1750, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
-      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1752, __pyx_L1_error)
+      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1750, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_4);
-      __pyx_t_5 = PyTuple_New(2); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1752, __pyx_L1_error)
+      __pyx_t_5 = PyTuple_New(2); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1750, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_5);
       __Pyx_GIVEREF(__pyx_t_1);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 0, __pyx_t_1) != (0)) __PYX_ERR(0, 1752, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 0, __pyx_t_1) != (0)) __PYX_ERR(0, 1750, __pyx_L1_error);
       __Pyx_GIVEREF(__pyx_t_4);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1752, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1750, __pyx_L1_error);
       __pyx_t_1 = 0;
       __pyx_t_4 = 0;
-      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p1_men, __pyx_t_5); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1752, __pyx_L1_error)
+      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p1_men, __pyx_t_5); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1750, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1751
+      /* "dama/ai/algorithmic/_fast_search.pyx":1749
  *         r = DARK_SQ_R[i]
  *         c = DARK_SQ_C[i]
  *         if piece == P1_MAN:             # <<<<<<<<<<<<<<
@@ -14587,29 +14545,29 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
       break;
       case 2:
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1754
+      /* "dama/ai/algorithmic/_fast_search.pyx":1752
  *             p1_men.append((r, c))
  *         elif piece == P1_KING:
  *             p1_kings.append((r, c))             # <<<<<<<<<<<<<<
  *         elif piece == P2_MAN:
  *             p2_men.append((r, c))
 */
-      __pyx_t_5 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1754, __pyx_L1_error)
+      __pyx_t_5 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1752, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_5);
-      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1754, __pyx_L1_error)
+      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1752, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_4);
-      __pyx_t_1 = PyTuple_New(2); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1754, __pyx_L1_error)
+      __pyx_t_1 = PyTuple_New(2); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1752, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
       __Pyx_GIVEREF(__pyx_t_5);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 0, __pyx_t_5) != (0)) __PYX_ERR(0, 1754, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 0, __pyx_t_5) != (0)) __PYX_ERR(0, 1752, __pyx_L1_error);
       __Pyx_GIVEREF(__pyx_t_4);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1754, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1752, __pyx_L1_error);
       __pyx_t_5 = 0;
       __pyx_t_4 = 0;
-      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p1_kings, __pyx_t_1); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1754, __pyx_L1_error)
+      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p1_kings, __pyx_t_1); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1752, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1753
+      /* "dama/ai/algorithmic/_fast_search.pyx":1751
  *         if piece == P1_MAN:
  *             p1_men.append((r, c))
  *         elif piece == P1_KING:             # <<<<<<<<<<<<<<
@@ -14619,29 +14577,29 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
       break;
       case 3:
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1756
+      /* "dama/ai/algorithmic/_fast_search.pyx":1754
  *             p1_kings.append((r, c))
  *         elif piece == P2_MAN:
  *             p2_men.append((r, c))             # <<<<<<<<<<<<<<
  *         elif piece == P2_KING:
  *             p2_kings.append((r, c))
 */
-      __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1756, __pyx_L1_error)
+      __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1754, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
-      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1756, __pyx_L1_error)
+      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1754, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_4);
-      __pyx_t_5 = PyTuple_New(2); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1756, __pyx_L1_error)
+      __pyx_t_5 = PyTuple_New(2); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1754, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_5);
       __Pyx_GIVEREF(__pyx_t_1);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 0, __pyx_t_1) != (0)) __PYX_ERR(0, 1756, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 0, __pyx_t_1) != (0)) __PYX_ERR(0, 1754, __pyx_L1_error);
       __Pyx_GIVEREF(__pyx_t_4);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1756, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_5, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1754, __pyx_L1_error);
       __pyx_t_1 = 0;
       __pyx_t_4 = 0;
-      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p2_men, __pyx_t_5); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1756, __pyx_L1_error)
+      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p2_men, __pyx_t_5); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1754, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1755
+      /* "dama/ai/algorithmic/_fast_search.pyx":1753
  *         elif piece == P1_KING:
  *             p1_kings.append((r, c))
  *         elif piece == P2_MAN:             # <<<<<<<<<<<<<<
@@ -14651,29 +14609,29 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
       break;
       case 4:
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1758
+      /* "dama/ai/algorithmic/_fast_search.pyx":1756
  *             p2_men.append((r, c))
  *         elif piece == P2_KING:
  *             p2_kings.append((r, c))             # <<<<<<<<<<<<<<
  *     return {
  *         'p1_men': p1_men,
 */
-      __pyx_t_5 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1758, __pyx_L1_error)
+      __pyx_t_5 = __Pyx_PyLong_From_int(__pyx_v_r); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1756, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_5);
-      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1758, __pyx_L1_error)
+      __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_c); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1756, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_4);
-      __pyx_t_1 = PyTuple_New(2); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1758, __pyx_L1_error)
+      __pyx_t_1 = PyTuple_New(2); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1756, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
       __Pyx_GIVEREF(__pyx_t_5);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 0, __pyx_t_5) != (0)) __PYX_ERR(0, 1758, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 0, __pyx_t_5) != (0)) __PYX_ERR(0, 1756, __pyx_L1_error);
       __Pyx_GIVEREF(__pyx_t_4);
-      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1758, __pyx_L1_error);
+      if (__Pyx_PyTuple_SET_ITEM(__pyx_t_1, 1, __pyx_t_4) != (0)) __PYX_ERR(0, 1756, __pyx_L1_error);
       __pyx_t_5 = 0;
       __pyx_t_4 = 0;
-      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p2_kings, __pyx_t_1); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1758, __pyx_L1_error)
+      __pyx_t_6 = __Pyx_PyList_Append(__pyx_v_p2_kings, __pyx_t_1); if (unlikely(__pyx_t_6 == ((int)-1))) __PYX_ERR(0, 1756, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1757
+      /* "dama/ai/algorithmic/_fast_search.pyx":1755
  *         elif piece == P2_MAN:
  *             p2_men.append((r, c))
  *         elif piece == P2_KING:             # <<<<<<<<<<<<<<
@@ -14686,7 +14644,7 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
     __pyx_L3_continue:;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1759
+  /* "dama/ai/algorithmic/_fast_search.pyx":1757
  *         elif piece == P2_KING:
  *             p2_kings.append((r, c))
  *     return {             # <<<<<<<<<<<<<<
@@ -14695,77 +14653,77 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
 */
   __Pyx_XDECREF(__pyx_r);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1760
+  /* "dama/ai/algorithmic/_fast_search.pyx":1758
  *             p2_kings.append((r, c))
  *     return {
  *         'p1_men': p1_men,             # <<<<<<<<<<<<<<
  *         'p1_kings': p1_kings,
  *         'p2_men': p2_men,
 */
-  __pyx_t_1 = __Pyx_PyDict_NewPresized(6); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1760, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyDict_NewPresized(6); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1758, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p1_men, __pyx_v_p1_men) < (0)) __PYX_ERR(0, 1760, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p1_men, __pyx_v_p1_men) < (0)) __PYX_ERR(0, 1758, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1761
+  /* "dama/ai/algorithmic/_fast_search.pyx":1759
  *     return {
  *         'p1_men': p1_men,
  *         'p1_kings': p1_kings,             # <<<<<<<<<<<<<<
  *         'p2_men': p2_men,
  *         'p2_kings': p2_kings,
 */
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p1_kings, __pyx_v_p1_kings) < (0)) __PYX_ERR(0, 1760, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p1_kings, __pyx_v_p1_kings) < (0)) __PYX_ERR(0, 1758, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1762
+  /* "dama/ai/algorithmic/_fast_search.pyx":1760
  *         'p1_men': p1_men,
  *         'p1_kings': p1_kings,
  *         'p2_men': p2_men,             # <<<<<<<<<<<<<<
  *         'p2_kings': p2_kings,
  *         'turn': player,
 */
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p2_men, __pyx_v_p2_men) < (0)) __PYX_ERR(0, 1760, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p2_men, __pyx_v_p2_men) < (0)) __PYX_ERR(0, 1758, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1763
+  /* "dama/ai/algorithmic/_fast_search.pyx":1761
  *         'p1_kings': p1_kings,
  *         'p2_men': p2_men,
  *         'p2_kings': p2_kings,             # <<<<<<<<<<<<<<
  *         'turn': player,
  *         'move_count': move_count,
 */
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p2_kings, __pyx_v_p2_kings) < (0)) __PYX_ERR(0, 1760, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_p2_kings, __pyx_v_p2_kings) < (0)) __PYX_ERR(0, 1758, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1764
+  /* "dama/ai/algorithmic/_fast_search.pyx":1762
  *         'p2_men': p2_men,
  *         'p2_kings': p2_kings,
  *         'turn': player,             # <<<<<<<<<<<<<<
  *         'move_count': move_count,
  *     }
 */
-  __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_player); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1764, __pyx_L1_error)
+  __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_player); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1762, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_4);
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_turn, __pyx_t_4) < (0)) __PYX_ERR(0, 1760, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_turn, __pyx_t_4) < (0)) __PYX_ERR(0, 1758, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1765
+  /* "dama/ai/algorithmic/_fast_search.pyx":1763
  *         'p2_kings': p2_kings,
  *         'turn': player,
  *         'move_count': move_count,             # <<<<<<<<<<<<<<
  *     }
- *
+ * 
 */
-  __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_move_count); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1765, __pyx_L1_error)
+  __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_move_count); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1763, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_4);
-  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_move_count, __pyx_t_4) < (0)) __PYX_ERR(0, 1760, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_move_count, __pyx_t_4) < (0)) __PYX_ERR(0, 1758, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
   __pyx_r = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1733
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1731
+ * 
+ * 
  * cdef dict board_to_compact_dict(signed char *board, int player, int move_count):             # <<<<<<<<<<<<<<
  *     """Convert flat board array to compact Python dict (same as Board.to_compact + turn).
- *
+ * 
 */
 
   /* function exit code */
@@ -14785,9 +14743,9 @@ static PyObject *__pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1769
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1767
+ * 
+ * 
  * cdef inline void _copy_move_list(CMoveList *source, CMoveList *target):             # <<<<<<<<<<<<<<
  *     cdef int i
  *     target.count = source.count
@@ -14799,7 +14757,7 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_m
   int __pyx_t_2;
   int __pyx_t_3;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1771
+  /* "dama/ai/algorithmic/_fast_search.pyx":1769
  * cdef inline void _copy_move_list(CMoveList *source, CMoveList *target):
  *     cdef int i
  *     target.count = source.count             # <<<<<<<<<<<<<<
@@ -14809,31 +14767,31 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_m
   __pyx_t_1 = __pyx_v_source->count;
   __pyx_v_target->count = __pyx_t_1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1772
+  /* "dama/ai/algorithmic/_fast_search.pyx":1770
  *     cdef int i
  *     target.count = source.count
  *     for i in range(source.count):             # <<<<<<<<<<<<<<
  *         target.moves[i] = source.moves[i]
- *
+ * 
 */
   __pyx_t_1 = __pyx_v_source->count;
   __pyx_t_2 = __pyx_t_1;
   for (__pyx_t_3 = 0; __pyx_t_3 < __pyx_t_2; __pyx_t_3+=1) {
     __pyx_v_i = __pyx_t_3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1773
+    /* "dama/ai/algorithmic/_fast_search.pyx":1771
  *     target.count = source.count
  *     for i in range(source.count):
  *         target.moves[i] = source.moves[i]             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
     (__pyx_v_target->moves[__pyx_v_i]) = (__pyx_v_source->moves[__pyx_v_i]);
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1769
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1767
+ * 
+ * 
  * cdef inline void _copy_move_list(CMoveList *source, CMoveList *target):             # <<<<<<<<<<<<<<
  *     cdef int i
  *     target.count = source.count
@@ -14842,9 +14800,9 @@ static CYTHON_INLINE void __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_m
   /* function exit code */
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1776
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1774
+ * 
+ * 
  * cdef inline bint _same_cmove(CMove *left, CMove *right):             # <<<<<<<<<<<<<<
  *     cdef int i
  *     if (left.path_len != right.path_len
@@ -14859,7 +14817,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
   int __pyx_t_4;
   int __pyx_t_5;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1778
+  /* "dama/ai/algorithmic/_fast_search.pyx":1776
  * cdef inline bint _same_cmove(CMove *left, CMove *right):
  *     cdef int i
  *     if (left.path_len != right.path_len             # <<<<<<<<<<<<<<
@@ -14873,7 +14831,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
     goto __pyx_L4_bool_binop_done;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1779
+  /* "dama/ai/algorithmic/_fast_search.pyx":1777
  *     cdef int i
  *     if (left.path_len != right.path_len
  *             or left.num_captures != right.num_captures             # <<<<<<<<<<<<<<
@@ -14887,7 +14845,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
     goto __pyx_L4_bool_binop_done;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1780
+  /* "dama/ai/algorithmic/_fast_search.pyx":1778
  *     if (left.path_len != right.path_len
  *             or left.num_captures != right.num_captures
  *             or _move_promotes(left) != _move_promotes(right)):             # <<<<<<<<<<<<<<
@@ -14898,7 +14856,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
   __pyx_t_1 = __pyx_t_2;
   __pyx_L4_bool_binop_done:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1778
+  /* "dama/ai/algorithmic/_fast_search.pyx":1776
  * cdef inline bint _same_cmove(CMove *left, CMove *right):
  *     cdef int i
  *     if (left.path_len != right.path_len             # <<<<<<<<<<<<<<
@@ -14907,7 +14865,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
 */
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1781
+    /* "dama/ai/algorithmic/_fast_search.pyx":1779
  *             or left.num_captures != right.num_captures
  *             or _move_promotes(left) != _move_promotes(right)):
  *         return False             # <<<<<<<<<<<<<<
@@ -14917,7 +14875,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
     __pyx_r = 0;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1778
+    /* "dama/ai/algorithmic/_fast_search.pyx":1776
  * cdef inline bint _same_cmove(CMove *left, CMove *right):
  *     cdef int i
  *     if (left.path_len != right.path_len             # <<<<<<<<<<<<<<
@@ -14926,7 +14884,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1782
+  /* "dama/ai/algorithmic/_fast_search.pyx":1780
  *             or _move_promotes(left) != _move_promotes(right)):
  *         return False
  *     for i in range(left.path_len):             # <<<<<<<<<<<<<<
@@ -14938,7 +14896,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
   for (__pyx_t_5 = 0; __pyx_t_5 < __pyx_t_4; __pyx_t_5+=1) {
     __pyx_v_i = __pyx_t_5;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1783
+    /* "dama/ai/algorithmic/_fast_search.pyx":1781
  *         return False
  *     for i in range(left.path_len):
  *         if (left.path_r[i] != right.path_r[i]             # <<<<<<<<<<<<<<
@@ -14952,7 +14910,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
       goto __pyx_L10_bool_binop_done;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1784
+    /* "dama/ai/algorithmic/_fast_search.pyx":1782
  *     for i in range(left.path_len):
  *         if (left.path_r[i] != right.path_r[i]
  *                 or left.path_c[i] != right.path_c[i]):             # <<<<<<<<<<<<<<
@@ -14963,7 +14921,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
     __pyx_t_1 = __pyx_t_2;
     __pyx_L10_bool_binop_done:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1783
+    /* "dama/ai/algorithmic/_fast_search.pyx":1781
  *         return False
  *     for i in range(left.path_len):
  *         if (left.path_r[i] != right.path_r[i]             # <<<<<<<<<<<<<<
@@ -14972,7 +14930,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
 */
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1785
+      /* "dama/ai/algorithmic/_fast_search.pyx":1783
  *         if (left.path_r[i] != right.path_r[i]
  *                 or left.path_c[i] != right.path_c[i]):
  *             return False             # <<<<<<<<<<<<<<
@@ -14982,7 +14940,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
       __pyx_r = 0;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1783
+      /* "dama/ai/algorithmic/_fast_search.pyx":1781
  *         return False
  *     for i in range(left.path_len):
  *         if (left.path_r[i] != right.path_r[i]             # <<<<<<<<<<<<<<
@@ -14992,7 +14950,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1786
+  /* "dama/ai/algorithmic/_fast_search.pyx":1784
  *                 or left.path_c[i] != right.path_c[i]):
  *             return False
  *     for i in range(left.num_captures):             # <<<<<<<<<<<<<<
@@ -15004,7 +14962,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
   for (__pyx_t_5 = 0; __pyx_t_5 < __pyx_t_4; __pyx_t_5+=1) {
     __pyx_v_i = __pyx_t_5;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1787
+    /* "dama/ai/algorithmic/_fast_search.pyx":1785
  *             return False
  *     for i in range(left.num_captures):
  *         if (left.cap_r[i] != right.cap_r[i]             # <<<<<<<<<<<<<<
@@ -15018,7 +14976,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
       goto __pyx_L15_bool_binop_done;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1788
+    /* "dama/ai/algorithmic/_fast_search.pyx":1786
  *     for i in range(left.num_captures):
  *         if (left.cap_r[i] != right.cap_r[i]
  *                 or left.cap_c[i] != right.cap_c[i]):             # <<<<<<<<<<<<<<
@@ -15029,7 +14987,7 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
     __pyx_t_1 = __pyx_t_2;
     __pyx_L15_bool_binop_done:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1787
+    /* "dama/ai/algorithmic/_fast_search.pyx":1785
  *             return False
  *     for i in range(left.num_captures):
  *         if (left.cap_r[i] != right.cap_r[i]             # <<<<<<<<<<<<<<
@@ -15038,17 +14996,17 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
 */
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1789
+      /* "dama/ai/algorithmic/_fast_search.pyx":1787
  *         if (left.cap_r[i] != right.cap_r[i]
  *                 or left.cap_c[i] != right.cap_c[i]):
  *             return False             # <<<<<<<<<<<<<<
  *     return True
- *
+ * 
 */
       __pyx_r = 0;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1787
+      /* "dama/ai/algorithmic/_fast_search.pyx":1785
  *             return False
  *     for i in range(left.num_captures):
  *         if (left.cap_r[i] != right.cap_r[i]             # <<<<<<<<<<<<<<
@@ -15058,19 +15016,19 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1790
+  /* "dama/ai/algorithmic/_fast_search.pyx":1788
  *                 or left.cap_c[i] != right.cap_c[i]):
  *             return False
  *     return True             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = 1;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1776
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1774
+ * 
+ * 
  * cdef inline bint _same_cmove(CMove *left, CMove *right):             # <<<<<<<<<<<<<<
  *     cdef int i
  *     if (left.path_len != right.path_len
@@ -15081,9 +15039,9 @@ static CYTHON_INLINE int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cm
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1793
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1791
+ * 
+ * 
  * cdef int _find_cmove_index(CMoveList *moves, CMove *target):             # <<<<<<<<<<<<<<
  *     cdef int i
  *     for i in range(moves.count):
@@ -15100,7 +15058,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index(stru
   const char *__pyx_filename = NULL;
   int __pyx_clineno = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1795
+  /* "dama/ai/algorithmic/_fast_search.pyx":1793
  * cdef int _find_cmove_index(CMoveList *moves, CMove *target):
  *     cdef int i
  *     for i in range(moves.count):             # <<<<<<<<<<<<<<
@@ -15112,27 +15070,27 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index(stru
   for (__pyx_t_3 = 0; __pyx_t_3 < __pyx_t_2; __pyx_t_3+=1) {
     __pyx_v_i = __pyx_t_3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1796
+    /* "dama/ai/algorithmic/_fast_search.pyx":1794
  *     cdef int i
  *     for i in range(moves.count):
  *         if _same_cmove(&moves.moves[i], target):             # <<<<<<<<<<<<<<
  *             return i
  *     return 0
 */
-    __pyx_t_4 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cmove((&(__pyx_v_moves->moves[__pyx_v_i])), __pyx_v_target); if (unlikely(__pyx_t_4 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1796, __pyx_L1_error)
+    __pyx_t_4 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__same_cmove((&(__pyx_v_moves->moves[__pyx_v_i])), __pyx_v_target); if (unlikely(__pyx_t_4 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1794, __pyx_L1_error)
     if (__pyx_t_4) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1797
+      /* "dama/ai/algorithmic/_fast_search.pyx":1795
  *     for i in range(moves.count):
  *         if _same_cmove(&moves.moves[i], target):
  *             return i             # <<<<<<<<<<<<<<
  *     return 0
- *
+ * 
 */
       __pyx_r = __pyx_v_i;
       goto __pyx_L0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1796
+      /* "dama/ai/algorithmic/_fast_search.pyx":1794
  *     cdef int i
  *     for i in range(moves.count):
  *         if _same_cmove(&moves.moves[i], target):             # <<<<<<<<<<<<<<
@@ -15142,19 +15100,19 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index(stru
     }
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1798
+  /* "dama/ai/algorithmic/_fast_search.pyx":1796
  *         if _same_cmove(&moves.moves[i], target):
  *             return i
  *     return 0             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1793
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1791
+ * 
+ * 
  * cdef int _find_cmove_index(CMoveList *moves, CMove *target):             # <<<<<<<<<<<<<<
  *     cdef int i
  *     for i in range(moves.count):
@@ -15168,9 +15126,9 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index(stru
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1801
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1799
+ * 
+ * 
  * cdef int _search_game_move(             # <<<<<<<<<<<<<<
  *     signed char *board,
  *     int player,
@@ -15203,7 +15161,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
   const char *__pyx_filename = NULL;
   int __pyx_clineno = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1813
+  /* "dama/ai/algorithmic/_fast_search.pyx":1811
  *     cdef double time_budget
  *     cdef int max_depth, best_idx, idx, depth
  *     cdef int tt_from_sq = -1, tt_to_sq = -1             # <<<<<<<<<<<<<<
@@ -15213,7 +15171,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
   __pyx_v_tt_from_sq = -1;
   __pyx_v_tt_to_sq = -1;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1815
+  /* "dama/ai/algorithmic/_fast_search.pyx":1813
  *     cdef int tt_from_sq = -1, tt_to_sq = -1
  *     cdef float dummy_score, dummy_alpha, dummy_beta
  *     cdef float previous_score = 0.0             # <<<<<<<<<<<<<<
@@ -15222,9 +15180,9 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
   __pyx_v_previous_score = 0.0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1819
+  /* "dama/ai/algorithmic/_fast_search.pyx":1817
  *     cdef CMove temp_move
- *
+ * 
  *     if moves.count <= 1:             # <<<<<<<<<<<<<<
  *         return 0
  *     if difficulty == 'easy':
@@ -15232,8 +15190,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
   __pyx_t_1 = (__pyx_v_moves->count <= 1);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1820
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1818
+ * 
  *     if moves.count <= 1:
  *         return 0             # <<<<<<<<<<<<<<
  *     if difficulty == 'easy':
@@ -15242,26 +15200,26 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     __pyx_r = 0;
     goto __pyx_L0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1819
+    /* "dama/ai/algorithmic/_fast_search.pyx":1817
  *     cdef CMove temp_move
- *
+ * 
  *     if moves.count <= 1:             # <<<<<<<<<<<<<<
  *         return 0
  *     if difficulty == 'easy':
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1821
+  /* "dama/ai/algorithmic/_fast_search.pyx":1819
  *     if moves.count <= 1:
  *         return 0
  *     if difficulty == 'easy':             # <<<<<<<<<<<<<<
  *         time_budget = 0.2
  *         max_depth = 3
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_easy, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1821, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_easy, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1819, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1822
+    /* "dama/ai/algorithmic/_fast_search.pyx":1820
  *         return 0
  *     if difficulty == 'easy':
  *         time_budget = 0.2             # <<<<<<<<<<<<<<
@@ -15270,7 +15228,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_time_budget = 0.2;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1823
+    /* "dama/ai/algorithmic/_fast_search.pyx":1821
  *     if difficulty == 'easy':
  *         time_budget = 0.2
  *         max_depth = 3             # <<<<<<<<<<<<<<
@@ -15279,7 +15237,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_max_depth = 3;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1821
+    /* "dama/ai/algorithmic/_fast_search.pyx":1819
  *     if moves.count <= 1:
  *         return 0
  *     if difficulty == 'easy':             # <<<<<<<<<<<<<<
@@ -15289,17 +15247,17 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     goto __pyx_L4;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1824
+  /* "dama/ai/algorithmic/_fast_search.pyx":1822
  *         time_budget = 0.2
  *         max_depth = 3
  *     elif difficulty == 'hard':             # <<<<<<<<<<<<<<
  *         time_budget = 2.5
  *         max_depth = 8
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1824, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1822, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1825
+    /* "dama/ai/algorithmic/_fast_search.pyx":1823
  *         max_depth = 3
  *     elif difficulty == 'hard':
  *         time_budget = 2.5             # <<<<<<<<<<<<<<
@@ -15308,7 +15266,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_time_budget = 2.5;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1826
+    /* "dama/ai/algorithmic/_fast_search.pyx":1824
  *     elif difficulty == 'hard':
  *         time_budget = 2.5
  *         max_depth = 8             # <<<<<<<<<<<<<<
@@ -15317,7 +15275,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_max_depth = 8;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1824
+    /* "dama/ai/algorithmic/_fast_search.pyx":1822
  *         time_budget = 0.2
  *         max_depth = 3
  *     elif difficulty == 'hard':             # <<<<<<<<<<<<<<
@@ -15327,17 +15285,17 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     goto __pyx_L4;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1827
+  /* "dama/ai/algorithmic/_fast_search.pyx":1825
  *         time_budget = 2.5
  *         max_depth = 8
  *     elif difficulty == 'super_hard':             # <<<<<<<<<<<<<<
  *         time_budget = 5.0
  *         max_depth = 12
 */
-  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_super_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1827, __pyx_L1_error)
+  __pyx_t_1 = (__Pyx_PyUnicode_Equals(__pyx_v_difficulty, __pyx_mstate_global->__pyx_n_u_super_hard, Py_EQ)); if (unlikely((__pyx_t_1 < 0))) __PYX_ERR(0, 1825, __pyx_L1_error)
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1828
+    /* "dama/ai/algorithmic/_fast_search.pyx":1826
  *         max_depth = 8
  *     elif difficulty == 'super_hard':
  *         time_budget = 5.0             # <<<<<<<<<<<<<<
@@ -15346,7 +15304,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_time_budget = 5.0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1829
+    /* "dama/ai/algorithmic/_fast_search.pyx":1827
  *     elif difficulty == 'super_hard':
  *         time_budget = 5.0
  *         max_depth = 12             # <<<<<<<<<<<<<<
@@ -15355,7 +15313,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_max_depth = 12;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1827
+    /* "dama/ai/algorithmic/_fast_search.pyx":1825
  *         time_budget = 2.5
  *         max_depth = 8
  *     elif difficulty == 'super_hard':             # <<<<<<<<<<<<<<
@@ -15365,30 +15323,30 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     goto __pyx_L4;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1831
+  /* "dama/ai/algorithmic/_fast_search.pyx":1829
  *         max_depth = 12
  *     else:
  *         time_budget = 0.8             # <<<<<<<<<<<<<<
  *         max_depth = 5
- *
+ * 
 */
   /*else*/ {
     __pyx_v_time_budget = 0.8;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1832
+    /* "dama/ai/algorithmic/_fast_search.pyx":1830
  *     else:
  *         time_budget = 0.8
  *         max_depth = 5             # <<<<<<<<<<<<<<
- *
+ * 
  *     if _tt_table != NULL:
 */
     __pyx_v_max_depth = 5;
   }
   __pyx_L4:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1834
+  /* "dama/ai/algorithmic/_fast_search.pyx":1832
  *         max_depth = 5
- *
+ * 
  *     if _tt_table != NULL:             # <<<<<<<<<<<<<<
  *         dummy_alpha = -100000.0
  *         dummy_beta = 100000.0
@@ -15396,8 +15354,8 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
   __pyx_t_1 = (__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_table != NULL);
   if (__pyx_t_1) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1835
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1833
+ * 
  *     if _tt_table != NULL:
  *         dummy_alpha = -100000.0             # <<<<<<<<<<<<<<
  *         dummy_beta = 100000.0
@@ -15405,7 +15363,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_dummy_alpha = -100000.0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1836
+    /* "dama/ai/algorithmic/_fast_search.pyx":1834
  *     if _tt_table != NULL:
  *         dummy_alpha = -100000.0
  *         dummy_beta = 100000.0             # <<<<<<<<<<<<<<
@@ -15414,7 +15372,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_dummy_beta = 100000.0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1837
+    /* "dama/ai/algorithmic/_fast_search.pyx":1835
  *         dummy_alpha = -100000.0
  *         dummy_beta = 100000.0
  *         tt_probe(h, 0, &dummy_score, &dummy_alpha, &dummy_beta,             # <<<<<<<<<<<<<<
@@ -15423,16 +15381,16 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     (void)(__pyx_f_4dama_2ai_11algorithmic_12_fast_search_tt_probe(__pyx_v_h, 0, (&__pyx_v_dummy_score), (&__pyx_v_dummy_alpha), (&__pyx_v_dummy_beta), (&__pyx_v_tt_from_sq), (&__pyx_v_tt_to_sq)));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1834
+    /* "dama/ai/algorithmic/_fast_search.pyx":1832
  *         max_depth = 5
- *
+ * 
  *     if _tt_table != NULL:             # <<<<<<<<<<<<<<
  *         dummy_alpha = -100000.0
  *         dummy_beta = 100000.0
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1839
+  /* "dama/ai/algorithmic/_fast_search.pyx":1837
  *         tt_probe(h, 0, &dummy_score, &dummy_alpha, &dummy_beta,
  *                  &tt_from_sq, &tt_to_sq)
  *     _order_moves_full(moves, 0, ss, tt_from_sq, tt_to_sq, board, -1, -1)             # <<<<<<<<<<<<<<
@@ -15441,7 +15399,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__order_moves_full(__pyx_v_moves, 0, __pyx_v_ss, __pyx_v_tt_from_sq, __pyx_v_tt_to_sq, __pyx_v_board, -1, -1);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1840
+  /* "dama/ai/algorithmic/_fast_search.pyx":1838
  *                  &tt_from_sq, &tt_to_sq)
  *     _order_moves_full(moves, 0, ss, tt_from_sq, tt_to_sq, board, -1, -1)
  *     _age_history(ss)             # <<<<<<<<<<<<<<
@@ -15450,7 +15408,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__age_history(__pyx_v_ss);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1841
+  /* "dama/ai/algorithmic/_fast_search.pyx":1839
  *     _order_moves_full(moves, 0, ss, tt_from_sq, tt_to_sq, board, -1, -1)
  *     _age_history(ss)
  *     ss.deadline = _wall_now() + time_budget             # <<<<<<<<<<<<<<
@@ -15459,35 +15417,35 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
   __pyx_v_ss->deadline = (__pyx_f_4dama_2ai_11algorithmic_12_fast_search__wall_now() + __pyx_v_time_budget);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1842
+  /* "dama/ai/algorithmic/_fast_search.pyx":1840
  *     _age_history(ss)
  *     ss.deadline = _wall_now() + time_budget
  *     ss.nodes = 0             # <<<<<<<<<<<<<<
  *     ss.timeout = False
- *
+ * 
 */
   __pyx_v_ss->nodes = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1843
+  /* "dama/ai/algorithmic/_fast_search.pyx":1841
  *     ss.deadline = _wall_now() + time_budget
  *     ss.nodes = 0
  *     ss.timeout = False             # <<<<<<<<<<<<<<
- *
+ * 
  *     best_idx = 0
 */
   __pyx_v_ss->timeout = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1845
+  /* "dama/ai/algorithmic/_fast_search.pyx":1843
  *     ss.timeout = False
- *
+ * 
  *     best_idx = 0             # <<<<<<<<<<<<<<
  *     for depth in range(1, max_depth + 1):
  *         ss.timeout = False
 */
   __pyx_v_best_idx = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1846
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1844
+ * 
  *     best_idx = 0
  *     for depth in range(1, max_depth + 1):             # <<<<<<<<<<<<<<
  *         ss.timeout = False
@@ -15498,7 +15456,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
   for (__pyx_t_4 = 1; __pyx_t_4 < __pyx_t_3; __pyx_t_4+=1) {
     __pyx_v_depth = __pyx_t_4;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1847
+    /* "dama/ai/algorithmic/_fast_search.pyx":1845
  *     best_idx = 0
  *     for depth in range(1, max_depth + 1):
  *         ss.timeout = False             # <<<<<<<<<<<<<<
@@ -15507,7 +15465,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     __pyx_v_ss->timeout = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1848
+    /* "dama/ai/algorithmic/_fast_search.pyx":1846
  *     for depth in range(1, max_depth + 1):
  *         ss.timeout = False
  *         if depth < 5:             # <<<<<<<<<<<<<<
@@ -15517,7 +15475,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     __pyx_t_1 = (__pyx_v_depth < 5);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1849
+      /* "dama/ai/algorithmic/_fast_search.pyx":1847
  *         ss.timeout = False
  *         if depth < 5:
  *             idx = search_root(board, player, moves, depth,             # <<<<<<<<<<<<<<
@@ -15526,7 +15484,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
       __pyx_v_idx = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(__pyx_v_board, __pyx_v_player, __pyx_v_moves, __pyx_v_depth, -100000.0, 100000.0, __pyx_v_rules, __pyx_v_ss, __pyx_v_h);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1848
+      /* "dama/ai/algorithmic/_fast_search.pyx":1846
  *     for depth in range(1, max_depth + 1):
  *         ss.timeout = False
  *         if depth < 5:             # <<<<<<<<<<<<<<
@@ -15536,7 +15494,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
       goto __pyx_L8;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1852
+    /* "dama/ai/algorithmic/_fast_search.pyx":1850
  *                               -100000.0, 100000.0, rules, ss, h)
  *         else:
  *             aspiration_delta = 50.0             # <<<<<<<<<<<<<<
@@ -15546,7 +15504,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     /*else*/ {
       __pyx_v_aspiration_delta = 50.0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1853
+      /* "dama/ai/algorithmic/_fast_search.pyx":1851
  *         else:
  *             aspiration_delta = 50.0
  *             aspiration_alpha = previous_score - aspiration_delta             # <<<<<<<<<<<<<<
@@ -15555,7 +15513,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
       __pyx_v_aspiration_alpha = (__pyx_v_previous_score - __pyx_v_aspiration_delta);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1854
+      /* "dama/ai/algorithmic/_fast_search.pyx":1852
  *             aspiration_delta = 50.0
  *             aspiration_alpha = previous_score - aspiration_delta
  *             aspiration_beta = previous_score + aspiration_delta             # <<<<<<<<<<<<<<
@@ -15564,7 +15522,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
       __pyx_v_aspiration_beta = (__pyx_v_previous_score + __pyx_v_aspiration_delta);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1855
+      /* "dama/ai/algorithmic/_fast_search.pyx":1853
  *             aspiration_alpha = previous_score - aspiration_delta
  *             aspiration_beta = previous_score + aspiration_delta
  *             while True:             # <<<<<<<<<<<<<<
@@ -15573,7 +15531,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
       while (1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1856
+        /* "dama/ai/algorithmic/_fast_search.pyx":1854
  *             aspiration_beta = previous_score + aspiration_delta
  *             while True:
  *                 idx = search_root(board, player, moves, depth,             # <<<<<<<<<<<<<<
@@ -15582,7 +15540,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         __pyx_v_idx = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(__pyx_v_board, __pyx_v_player, __pyx_v_moves, __pyx_v_depth, __pyx_v_aspiration_alpha, __pyx_v_aspiration_beta, __pyx_v_rules, __pyx_v_ss, __pyx_v_h);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1859
+        /* "dama/ai/algorithmic/_fast_search.pyx":1857
  *                                   aspiration_alpha, aspiration_beta,
  *                                   rules, ss, h)
  *                 if ss.timeout:             # <<<<<<<<<<<<<<
@@ -15591,7 +15549,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         if (__pyx_v_ss->timeout) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1860
+          /* "dama/ai/algorithmic/_fast_search.pyx":1858
  *                                   rules, ss, h)
  *                 if ss.timeout:
  *                     break             # <<<<<<<<<<<<<<
@@ -15600,7 +15558,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
           goto __pyx_L10_break;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1859
+          /* "dama/ai/algorithmic/_fast_search.pyx":1857
  *                                   aspiration_alpha, aspiration_beta,
  *                                   rules, ss, h)
  *                 if ss.timeout:             # <<<<<<<<<<<<<<
@@ -15609,7 +15567,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1861
+        /* "dama/ai/algorithmic/_fast_search.pyx":1859
  *                 if ss.timeout:
  *                     break
  *                 if (ss.root_score > aspiration_alpha             # <<<<<<<<<<<<<<
@@ -15623,7 +15581,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
           goto __pyx_L13_bool_binop_done;
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1862
+        /* "dama/ai/algorithmic/_fast_search.pyx":1860
  *                     break
  *                 if (ss.root_score > aspiration_alpha
  *                         and ss.root_score < aspiration_beta):             # <<<<<<<<<<<<<<
@@ -15634,7 +15592,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
         __pyx_t_1 = __pyx_t_5;
         __pyx_L13_bool_binop_done:;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1861
+        /* "dama/ai/algorithmic/_fast_search.pyx":1859
  *                 if ss.timeout:
  *                     break
  *                 if (ss.root_score > aspiration_alpha             # <<<<<<<<<<<<<<
@@ -15643,7 +15601,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1863
+          /* "dama/ai/algorithmic/_fast_search.pyx":1861
  *                 if (ss.root_score > aspiration_alpha
  *                         and ss.root_score < aspiration_beta):
  *                     break             # <<<<<<<<<<<<<<
@@ -15652,7 +15610,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
           goto __pyx_L10_break;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1861
+          /* "dama/ai/algorithmic/_fast_search.pyx":1859
  *                 if ss.timeout:
  *                     break
  *                 if (ss.root_score > aspiration_alpha             # <<<<<<<<<<<<<<
@@ -15661,7 +15619,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1864
+        /* "dama/ai/algorithmic/_fast_search.pyx":1862
  *                         and ss.root_score < aspiration_beta):
  *                     break
  *                 aspiration_delta = aspiration_delta * 2.0             # <<<<<<<<<<<<<<
@@ -15670,7 +15628,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         __pyx_v_aspiration_delta = (__pyx_v_aspiration_delta * 2.0);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1865
+        /* "dama/ai/algorithmic/_fast_search.pyx":1863
  *                     break
  *                 aspiration_delta = aspiration_delta * 2.0
  *                 if aspiration_delta >= 5000.0:             # <<<<<<<<<<<<<<
@@ -15680,7 +15638,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
         __pyx_t_1 = (__pyx_v_aspiration_delta >= 5000.0);
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1866
+          /* "dama/ai/algorithmic/_fast_search.pyx":1864
  *                 aspiration_delta = aspiration_delta * 2.0
  *                 if aspiration_delta >= 5000.0:
  *                     ss.timeout = False             # <<<<<<<<<<<<<<
@@ -15689,7 +15647,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
           __pyx_v_ss->timeout = 0;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1867
+          /* "dama/ai/algorithmic/_fast_search.pyx":1865
  *                 if aspiration_delta >= 5000.0:
  *                     ss.timeout = False
  *                     idx = search_root(board, player, moves, depth,             # <<<<<<<<<<<<<<
@@ -15698,7 +15656,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
           __pyx_v_idx = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_search_root(__pyx_v_board, __pyx_v_player, __pyx_v_moves, __pyx_v_depth, -100000.0, 100000.0, __pyx_v_rules, __pyx_v_ss, __pyx_v_h);
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1869
+          /* "dama/ai/algorithmic/_fast_search.pyx":1867
  *                     idx = search_root(board, player, moves, depth,
  *                                       -100000.0, 100000.0, rules, ss, h)
  *                     break             # <<<<<<<<<<<<<<
@@ -15707,7 +15665,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
           goto __pyx_L10_break;
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1865
+          /* "dama/ai/algorithmic/_fast_search.pyx":1863
  *                     break
  *                 aspiration_delta = aspiration_delta * 2.0
  *                 if aspiration_delta >= 5000.0:             # <<<<<<<<<<<<<<
@@ -15716,7 +15674,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1870
+        /* "dama/ai/algorithmic/_fast_search.pyx":1868
  *                                       -100000.0, 100000.0, rules, ss, h)
  *                     break
  *                 if ss.root_score <= aspiration_alpha:             # <<<<<<<<<<<<<<
@@ -15726,7 +15684,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
         __pyx_t_1 = (__pyx_v_ss->root_score <= __pyx_v_aspiration_alpha);
         if (__pyx_t_1) {
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1871
+          /* "dama/ai/algorithmic/_fast_search.pyx":1869
  *                     break
  *                 if ss.root_score <= aspiration_alpha:
  *                     aspiration_alpha = previous_score - aspiration_delta             # <<<<<<<<<<<<<<
@@ -15735,7 +15693,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
           __pyx_v_aspiration_alpha = (__pyx_v_previous_score - __pyx_v_aspiration_delta);
 
-          /* "dama/ai/algorithmic/_fast_search.pyx":1870
+          /* "dama/ai/algorithmic/_fast_search.pyx":1868
  *                                       -100000.0, 100000.0, rules, ss, h)
  *                     break
  *                 if ss.root_score <= aspiration_alpha:             # <<<<<<<<<<<<<<
@@ -15745,7 +15703,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
           goto __pyx_L16;
         }
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1873
+        /* "dama/ai/algorithmic/_fast_search.pyx":1871
  *                     aspiration_alpha = previous_score - aspiration_delta
  *                 else:
  *                     aspiration_beta = previous_score + aspiration_delta             # <<<<<<<<<<<<<<
@@ -15757,7 +15715,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
         }
         __pyx_L16:;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1874
+        /* "dama/ai/algorithmic/_fast_search.pyx":1872
  *                 else:
  *                     aspiration_beta = previous_score + aspiration_delta
  *                 ss.timeout = False             # <<<<<<<<<<<<<<
@@ -15770,7 +15728,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     }
     __pyx_L8:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1875
+    /* "dama/ai/algorithmic/_fast_search.pyx":1873
  *                     aspiration_beta = previous_score + aspiration_delta
  *                 ss.timeout = False
  *         if not ss.timeout:             # <<<<<<<<<<<<<<
@@ -15780,7 +15738,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     __pyx_t_1 = (!__pyx_v_ss->timeout);
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1876
+      /* "dama/ai/algorithmic/_fast_search.pyx":1874
  *                 ss.timeout = False
  *         if not ss.timeout:
  *             best_idx = idx             # <<<<<<<<<<<<<<
@@ -15789,7 +15747,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
       __pyx_v_best_idx = __pyx_v_idx;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1877
+      /* "dama/ai/algorithmic/_fast_search.pyx":1875
  *         if not ss.timeout:
  *             best_idx = idx
  *             previous_score = ss.root_score             # <<<<<<<<<<<<<<
@@ -15799,7 +15757,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
       __pyx_t_6 = __pyx_v_ss->root_score;
       __pyx_v_previous_score = __pyx_t_6;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1878
+      /* "dama/ai/algorithmic/_fast_search.pyx":1876
  *             best_idx = idx
  *             previous_score = ss.root_score
  *             if best_idx != 0:             # <<<<<<<<<<<<<<
@@ -15809,7 +15767,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
       __pyx_t_1 = (__pyx_v_best_idx != 0);
       if (__pyx_t_1) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1879
+        /* "dama/ai/algorithmic/_fast_search.pyx":1877
  *             previous_score = ss.root_score
  *             if best_idx != 0:
  *                 temp_move = moves.moves[0]             # <<<<<<<<<<<<<<
@@ -15818,7 +15776,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         __pyx_v_temp_move = (__pyx_v_moves->moves[0]);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1880
+        /* "dama/ai/algorithmic/_fast_search.pyx":1878
  *             if best_idx != 0:
  *                 temp_move = moves.moves[0]
  *                 moves.moves[0] = moves.moves[best_idx]             # <<<<<<<<<<<<<<
@@ -15827,7 +15785,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         (__pyx_v_moves->moves[0]) = (__pyx_v_moves->moves[__pyx_v_best_idx]);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1881
+        /* "dama/ai/algorithmic/_fast_search.pyx":1879
  *                 temp_move = moves.moves[0]
  *                 moves.moves[0] = moves.moves[best_idx]
  *                 moves.moves[best_idx] = temp_move             # <<<<<<<<<<<<<<
@@ -15836,7 +15794,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         (__pyx_v_moves->moves[__pyx_v_best_idx]) = __pyx_v_temp_move;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1882
+        /* "dama/ai/algorithmic/_fast_search.pyx":1880
  *                 moves.moves[0] = moves.moves[best_idx]
  *                 moves.moves[best_idx] = temp_move
  *                 best_idx = 0             # <<<<<<<<<<<<<<
@@ -15845,7 +15803,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
         __pyx_v_best_idx = 0;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1878
+        /* "dama/ai/algorithmic/_fast_search.pyx":1876
  *             best_idx = idx
  *             previous_score = ss.root_score
  *             if best_idx != 0:             # <<<<<<<<<<<<<<
@@ -15854,7 +15812,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1875
+      /* "dama/ai/algorithmic/_fast_search.pyx":1873
  *                     aspiration_beta = previous_score + aspiration_delta
  *                 ss.timeout = False
  *         if not ss.timeout:             # <<<<<<<<<<<<<<
@@ -15863,7 +15821,7 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1883
+    /* "dama/ai/algorithmic/_fast_search.pyx":1881
  *                 moves.moves[best_idx] = temp_move
  *                 best_idx = 0
  *         if ss.timeout or _check_deadline(ss):             # <<<<<<<<<<<<<<
@@ -15880,16 +15838,16 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
     __pyx_L20_bool_binop_done:;
     if (__pyx_t_1) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1884
+      /* "dama/ai/algorithmic/_fast_search.pyx":1882
  *                 best_idx = 0
  *         if ss.timeout or _check_deadline(ss):
  *             break             # <<<<<<<<<<<<<<
  *     return best_idx
- *
+ * 
 */
       goto __pyx_L7_break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1883
+      /* "dama/ai/algorithmic/_fast_search.pyx":1881
  *                 moves.moves[best_idx] = temp_move
  *                 best_idx = 0
  *         if ss.timeout or _check_deadline(ss):             # <<<<<<<<<<<<<<
@@ -15900,19 +15858,19 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
   }
   __pyx_L7_break:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1885
+  /* "dama/ai/algorithmic/_fast_search.pyx":1883
  *         if ss.timeout or _check_deadline(ss):
  *             break
  *     return best_idx             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_r = __pyx_v_best_idx;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1801
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1799
+ * 
+ * 
  * cdef int _search_game_move(             # <<<<<<<<<<<<<<
  *     signed char *board,
  *     int player,
@@ -15926,16 +15884,16 @@ static int __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(sign
   return __pyx_r;
 }
 
-/* "dama/ai/algorithmic/_fast_search.pyx":1888
- *
- *
+/* "dama/ai/algorithmic/_fast_search.pyx":1886
+ * 
+ * 
  * def play_full_game_cy(             # <<<<<<<<<<<<<<
  *     str p1_difficulty = 'medium',
  *     str p2_difficulty = 'medium',
 */
 
 /* Python wrapper */
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -15944,7 +15902,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
 ); /*proto*/
 PyDoc_STRVAR(__pyx_doc_4dama_2ai_11algorithmic_12_fast_search_14play_full_game_cy, "Play a complete algorithmic game entirely in C.\n\n    Both players use iterative-deepening alpha-beta search. The entire game\n    loop stays in C \342\200\224 no GameState, Board, Move, or Piece Python objects are\n    created during gameplay. Only the output (compact dicts) touches Python.\n\n    Returns:\n        dict with 'entries' (list of replay-entry dicts), 'winner' (1/2/None),\n        'num_moves', 'p1_captures', 'p2_captures', 'final_state' (compact dict).\n    ");
 static PyMethodDef __pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy = {"play_full_game_cy", (PyCFunction)(void(*)(void))(__Pyx_PyCFunction_FastCallWithKeywords)__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy, __Pyx_METH_FASTCALL|METH_KEYWORDS, __pyx_doc_4dama_2ai_11algorithmic_12_fast_search_14play_full_game_cy};
-static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy(PyObject *__pyx_self,
+static PyObject *__pyx_pw_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy(PyObject *__pyx_self, 
 #if CYTHON_METH_FASTCALL
 PyObject *const *__pyx_args, Py_ssize_t __pyx_nargs, PyObject *__pyx_kwds
 #else
@@ -15983,61 +15941,61 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   {
     PyObject ** const __pyx_pyargnames[] = {&__pyx_mstate_global->__pyx_n_u_p1_difficulty,&__pyx_mstate_global->__pyx_n_u_p2_difficulty,&__pyx_mstate_global->__pyx_n_u_max_moves,&__pyx_mstate_global->__pyx_n_u_noise_prob,&__pyx_mstate_global->__pyx_n_u_start_player,&__pyx_mstate_global->__pyx_n_u_teacher_difficulty,&__pyx_mstate_global->__pyx_n_u_opening_plies,&__pyx_mstate_global->__pyx_n_u_opening_seed,&__pyx_mstate_global->__pyx_n_u_trajectory_source,&__pyx_mstate_global->__pyx_n_u_game_id,0};
     const Py_ssize_t __pyx_kwds_len = (__pyx_kwds) ? __Pyx_NumKwargs_FASTCALL(__pyx_kwds) : 0;
-    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1888, __pyx_L3_error)
+    if (unlikely(__pyx_kwds_len < 0)) __PYX_ERR(0, 1886, __pyx_L3_error)
     if (__pyx_kwds_len > 0) {
       switch (__pyx_nargs) {
         case 10:
         values[9] = __Pyx_ArgRef_FASTCALL(__pyx_args, 9);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[9])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[9])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  9:
         values[8] = __Pyx_ArgRef_FASTCALL(__pyx_args, 8);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[8])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[8])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  8:
         values[7] = __Pyx_ArgRef_FASTCALL(__pyx_args, 7);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[7])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[7])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  7:
         values[6] = __Pyx_ArgRef_FASTCALL(__pyx_args, 6);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  6:
         values[5] = __Pyx_ArgRef_FASTCALL(__pyx_args, 5);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  5:
         values[4] = __Pyx_ArgRef_FASTCALL(__pyx_args, 4);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  4:
         values[3] = __Pyx_ArgRef_FASTCALL(__pyx_args, 3);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  3:
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
       }
       const Py_ssize_t kwd_pos_args = __pyx_nargs;
-      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "play_full_game_cy", 0) < (0)) __PYX_ERR(0, 1888, __pyx_L3_error)
+      if (__Pyx_ParseKeywords(__pyx_kwds, __pyx_kwvalues, __pyx_pyargnames, 0, values, kwd_pos_args, __pyx_kwds_len, "play_full_game_cy", 0) < (0)) __PYX_ERR(0, 1886, __pyx_L3_error)
       if (!values[0]) values[0] = __Pyx_NewRef(((PyObject*)((PyObject*)__pyx_mstate_global->__pyx_n_u_medium)));
       if (!values[1]) values[1] = __Pyx_NewRef(((PyObject*)((PyObject*)__pyx_mstate_global->__pyx_n_u_medium)));
       if (!values[5]) values[5] = __Pyx_NewRef(((PyObject*)((PyObject*)__pyx_mstate_global->__pyx_n_u_hard)));
       if (!values[7]) values[7] = __Pyx_NewRef(((PyObject *)((PyObject*)__pyx_mstate_global->__pyx_int_0)));
       if (!values[8]) values[8] = __Pyx_NewRef(((PyObject*)((PyObject*)__pyx_mstate_global->__pyx_n_u_algorithm)));
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1898
+      /* "dama/ai/algorithmic/_fast_search.pyx":1896
  *     object opening_seed = 0,
  *     str trajectory_source = 'algorithm',
  *     object game_id = None,             # <<<<<<<<<<<<<<
@@ -16049,43 +16007,43 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
       switch (__pyx_nargs) {
         case 10:
         values[9] = __Pyx_ArgRef_FASTCALL(__pyx_args, 9);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[9])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[9])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  9:
         values[8] = __Pyx_ArgRef_FASTCALL(__pyx_args, 8);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[8])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[8])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  8:
         values[7] = __Pyx_ArgRef_FASTCALL(__pyx_args, 7);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[7])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[7])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  7:
         values[6] = __Pyx_ArgRef_FASTCALL(__pyx_args, 6);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[6])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  6:
         values[5] = __Pyx_ArgRef_FASTCALL(__pyx_args, 5);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[5])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  5:
         values[4] = __Pyx_ArgRef_FASTCALL(__pyx_args, 4);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[4])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  4:
         values[3] = __Pyx_ArgRef_FASTCALL(__pyx_args, 3);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[3])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  3:
         values[2] = __Pyx_ArgRef_FASTCALL(__pyx_args, 2);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[2])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  2:
         values[1] = __Pyx_ArgRef_FASTCALL(__pyx_args, 1);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[1])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  1:
         values[0] = __Pyx_ArgRef_FASTCALL(__pyx_args, 0);
-        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1888, __pyx_L3_error)
+        if (!CYTHON_ASSUME_SAFE_MACROS && unlikely(!values[0])) __PYX_ERR(0, 1886, __pyx_L3_error)
         CYTHON_FALLTHROUGH;
         case  0: break;
         default: goto __pyx_L5_argtuple_error;
@@ -16100,23 +16058,23 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
     __pyx_v_p1_difficulty = ((PyObject*)values[0]);
     __pyx_v_p2_difficulty = ((PyObject*)values[1]);
     if (values[2]) {
-      __pyx_v_max_moves = __Pyx_PyLong_As_int(values[2]); if (unlikely((__pyx_v_max_moves == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1891, __pyx_L3_error)
+      __pyx_v_max_moves = __Pyx_PyLong_As_int(values[2]); if (unlikely((__pyx_v_max_moves == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1889, __pyx_L3_error)
     } else {
       __pyx_v_max_moves = ((int)((int)0x64));
     }
     if (values[3]) {
-      __pyx_v_noise_prob = __Pyx_PyFloat_AsDouble(values[3]); if (unlikely((__pyx_v_noise_prob == (double)-1) && PyErr_Occurred())) __PYX_ERR(0, 1892, __pyx_L3_error)
+      __pyx_v_noise_prob = __Pyx_PyFloat_AsDouble(values[3]); if (unlikely((__pyx_v_noise_prob == (double)-1) && PyErr_Occurred())) __PYX_ERR(0, 1890, __pyx_L3_error)
     } else {
       __pyx_v_noise_prob = ((double)((double)0.1));
     }
     if (values[4]) {
-      __pyx_v_start_player = __Pyx_PyLong_As_int(values[4]); if (unlikely((__pyx_v_start_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1893, __pyx_L3_error)
+      __pyx_v_start_player = __Pyx_PyLong_As_int(values[4]); if (unlikely((__pyx_v_start_player == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1891, __pyx_L3_error)
     } else {
       __pyx_v_start_player = ((int)((int)1));
     }
     __pyx_v_teacher_difficulty = ((PyObject*)values[5]);
     if (values[6]) {
-      __pyx_v_opening_plies = __Pyx_PyLong_As_int(values[6]); if (unlikely((__pyx_v_opening_plies == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1895, __pyx_L3_error)
+      __pyx_v_opening_plies = __Pyx_PyLong_As_int(values[6]); if (unlikely((__pyx_v_opening_plies == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1893, __pyx_L3_error)
     } else {
       __pyx_v_opening_plies = ((int)((int)0));
     }
@@ -16126,7 +16084,7 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   }
   goto __pyx_L6_skip;
   __pyx_L5_argtuple_error:;
-  __Pyx_RaiseArgtupleInvalid("play_full_game_cy", 0, 0, 10, __pyx_nargs); __PYX_ERR(0, 1888, __pyx_L3_error)
+  __Pyx_RaiseArgtupleInvalid("play_full_game_cy", 0, 0, 10, __pyx_nargs); __PYX_ERR(0, 1886, __pyx_L3_error)
   __pyx_L6_skip:;
   goto __pyx_L4_argument_unpacking_done;
   __pyx_L3_error:;
@@ -16137,15 +16095,15 @@ PyObject *__pyx_args, PyObject *__pyx_kwds
   __Pyx_RefNannyFinishContext();
   return NULL;
   __pyx_L4_argument_unpacking_done:;
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_p1_difficulty), (&PyUnicode_Type), 1, "p1_difficulty", 1))) __PYX_ERR(0, 1889, __pyx_L1_error)
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_p2_difficulty), (&PyUnicode_Type), 1, "p2_difficulty", 1))) __PYX_ERR(0, 1890, __pyx_L1_error)
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_teacher_difficulty), (&PyUnicode_Type), 1, "teacher_difficulty", 1))) __PYX_ERR(0, 1894, __pyx_L1_error)
-  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_trajectory_source), (&PyUnicode_Type), 1, "trajectory_source", 1))) __PYX_ERR(0, 1897, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_p1_difficulty), (&PyUnicode_Type), 1, "p1_difficulty", 1))) __PYX_ERR(0, 1887, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_p2_difficulty), (&PyUnicode_Type), 1, "p2_difficulty", 1))) __PYX_ERR(0, 1888, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_teacher_difficulty), (&PyUnicode_Type), 1, "teacher_difficulty", 1))) __PYX_ERR(0, 1892, __pyx_L1_error)
+  if (unlikely(!__Pyx_ArgTypeTest(((PyObject *)__pyx_v_trajectory_source), (&PyUnicode_Type), 1, "trajectory_source", 1))) __PYX_ERR(0, 1895, __pyx_L1_error)
   __pyx_r = __pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_game_cy(__pyx_self, __pyx_v_p1_difficulty, __pyx_v_p2_difficulty, __pyx_v_max_moves, __pyx_v_noise_prob, __pyx_v_start_player, __pyx_v_teacher_difficulty, __pyx_v_opening_plies, __pyx_v_opening_seed, __pyx_v_trajectory_source, __pyx_v_game_id);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1888
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1886
+ * 
+ * 
  * def play_full_game_cy(             # <<<<<<<<<<<<<<
  *     str p1_difficulty = 'medium',
  *     str p2_difficulty = 'medium',
@@ -16232,20 +16190,20 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   int __pyx_clineno = 0;
   __Pyx_RefNannySetupContext("play_full_game_cy", 0);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1910
+  /* "dama/ai/algorithmic/_fast_search.pyx":1908
  *         'num_moves', 'p1_captures', 'p2_captures', 'final_state' (compact dict).
  *     """
  *     import random as _rng             # <<<<<<<<<<<<<<
- *
+ * 
  *     cdef signed char board[64]
 */
-  __pyx_t_2 = __Pyx_Import(__pyx_mstate_global->__pyx_n_u_random, 0, 0, NULL, 0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1910, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_Import(__pyx_mstate_global->__pyx_n_u_random, 0, 0, NULL, 0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1908, __pyx_L1_error)
   __pyx_t_1 = __pyx_t_2;
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v__rng = __pyx_t_1;
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1917
+  /* "dama/ai/algorithmic/_fast_search.pyx":1915
  *     cdef Rules rules
  *     cdef int player, move_num, i
  *     cdef int teacher_idx = 0, played_idx = 0, apply_idx = 0             # <<<<<<<<<<<<<<
@@ -16256,7 +16214,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_v_played_idx = 0;
   __pyx_v_apply_idx = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1918
+  /* "dama/ai/algorithmic/_fast_search.pyx":1916
  *     cdef int player, move_num, i
  *     cdef int teacher_idx = 0, played_idx = 0, apply_idx = 0
  *     cdef int teacher_best_idx = 0, behavior_best_idx = 0             # <<<<<<<<<<<<<<
@@ -16266,7 +16224,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_v_teacher_best_idx = 0;
   __pyx_v_behavior_best_idx = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1919
+  /* "dama/ai/algorithmic/_fast_search.pyx":1917
  *     cdef int teacher_idx = 0, played_idx = 0, apply_idx = 0
  *     cdef int teacher_best_idx = 0, behavior_best_idx = 0
  *     cdef int opening_i, opening_index, applied_opening_plies = 0             # <<<<<<<<<<<<<<
@@ -16275,7 +16233,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   __pyx_v_applied_opening_plies = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1921
+  /* "dama/ai/algorithmic/_fast_search.pyx":1919
  *     cdef int opening_i, opening_index, applied_opening_plies = 0
  *     cdef SearchState teacher_ss, behavior_ss
  *     cdef int p1_caps = 0, p2_caps = 0             # <<<<<<<<<<<<<<
@@ -16285,7 +16243,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_v_p1_caps = 0;
   __pyx_v_p2_caps = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1922
+  /* "dama/ai/algorithmic/_fast_search.pyx":1920
  *     cdef SearchState teacher_ss, behavior_ss
  *     cdef int p1_caps = 0, p2_caps = 0
  *     cdef bint game_over = False             # <<<<<<<<<<<<<<
@@ -16294,7 +16252,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   __pyx_v_game_over = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1923
+  /* "dama/ai/algorithmic/_fast_search.pyx":1921
  *     cdef int p1_caps = 0, p2_caps = 0
  *     cdef bint game_over = False
  *     cdef bint was_exploration = False             # <<<<<<<<<<<<<<
@@ -16303,18 +16261,18 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   __pyx_v_was_exploration = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1929
+  /* "dama/ai/algorithmic/_fast_search.pyx":1927
  *     cdef object behavior_rng
- *
+ * 
  *     if teacher_difficulty != 'hard':             # <<<<<<<<<<<<<<
  *         raise ValueError("play_full_game_cy requires teacher_difficulty='hard'")
  *     if opening_plies < 0:
 */
-  __pyx_t_3 = (__Pyx_PyUnicode_Equals(__pyx_v_teacher_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_NE)); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 1929, __pyx_L1_error)
+  __pyx_t_3 = (__Pyx_PyUnicode_Equals(__pyx_v_teacher_difficulty, __pyx_mstate_global->__pyx_n_u_hard, Py_NE)); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 1927, __pyx_L1_error)
   if (unlikely(__pyx_t_3)) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1930
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1928
+ * 
  *     if teacher_difficulty != 'hard':
  *         raise ValueError("play_full_game_cy requires teacher_difficulty='hard'")             # <<<<<<<<<<<<<<
  *     if opening_plies < 0:
@@ -16326,23 +16284,23 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       PyObject *__pyx_callargs[2] = {__pyx_t_4, __pyx_mstate_global->__pyx_kp_u_play_full_game_cy_requires_teach};
       __pyx_t_1 = __Pyx_PyObject_FastCall((PyObject*)(((PyTypeObject*)PyExc_ValueError)), __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (__pyx_t_5*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
       __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
-      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1930, __pyx_L1_error)
+      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1928, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
     }
     __Pyx_Raise(__pyx_t_1, 0, 0, 0);
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-    __PYX_ERR(0, 1930, __pyx_L1_error)
+    __PYX_ERR(0, 1928, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1929
+    /* "dama/ai/algorithmic/_fast_search.pyx":1927
  *     cdef object behavior_rng
- *
+ * 
  *     if teacher_difficulty != 'hard':             # <<<<<<<<<<<<<<
  *         raise ValueError("play_full_game_cy requires teacher_difficulty='hard'")
  *     if opening_plies < 0:
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1931
+  /* "dama/ai/algorithmic/_fast_search.pyx":1929
  *     if teacher_difficulty != 'hard':
  *         raise ValueError("play_full_game_cy requires teacher_difficulty='hard'")
  *     if opening_plies < 0:             # <<<<<<<<<<<<<<
@@ -16352,7 +16310,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_t_3 = (__pyx_v_opening_plies < 0);
   if (unlikely(__pyx_t_3)) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1932
+    /* "dama/ai/algorithmic/_fast_search.pyx":1930
  *         raise ValueError("play_full_game_cy requires teacher_difficulty='hard'")
  *     if opening_plies < 0:
  *         raise ValueError("opening_plies must be non-negative")             # <<<<<<<<<<<<<<
@@ -16365,14 +16323,14 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       PyObject *__pyx_callargs[2] = {__pyx_t_4, __pyx_mstate_global->__pyx_kp_u_opening_plies_must_be_non_negati};
       __pyx_t_1 = __Pyx_PyObject_FastCall((PyObject*)(((PyTypeObject*)PyExc_ValueError)), __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (__pyx_t_5*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
       __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
-      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1932, __pyx_L1_error)
+      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1930, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
     }
     __Pyx_Raise(__pyx_t_1, 0, 0, 0);
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-    __PYX_ERR(0, 1932, __pyx_L1_error)
+    __PYX_ERR(0, 1930, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1931
+    /* "dama/ai/algorithmic/_fast_search.pyx":1929
  *     if teacher_difficulty != 'hard':
  *         raise ValueError("play_full_game_cy requires teacher_difficulty='hard'")
  *     if opening_plies < 0:             # <<<<<<<<<<<<<<
@@ -16381,12 +16339,12 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1933
+  /* "dama/ai/algorithmic/_fast_search.pyx":1931
  *     if opening_plies < 0:
  *         raise ValueError("opening_plies must be non-negative")
  *     if noise_prob < 0.0 or noise_prob > 1.0:             # <<<<<<<<<<<<<<
  *         raise ValueError("noise_prob must be between 0 and 1")
- *
+ * 
 */
   __pyx_t_6 = (__pyx_v_noise_prob < 0.0);
   if (!__pyx_t_6) {
@@ -16399,11 +16357,11 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_L6_bool_binop_done:;
   if (unlikely(__pyx_t_3)) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1934
+    /* "dama/ai/algorithmic/_fast_search.pyx":1932
  *         raise ValueError("opening_plies must be non-negative")
  *     if noise_prob < 0.0 or noise_prob > 1.0:
  *         raise ValueError("noise_prob must be between 0 and 1")             # <<<<<<<<<<<<<<
- *
+ * 
  *     rules = _load_rules()
 */
     __pyx_t_4 = NULL;
@@ -16412,51 +16370,51 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       PyObject *__pyx_callargs[2] = {__pyx_t_4, __pyx_mstate_global->__pyx_kp_u_noise_prob_must_be_between_0_and};
       __pyx_t_1 = __Pyx_PyObject_FastCall((PyObject*)(((PyTypeObject*)PyExc_ValueError)), __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (__pyx_t_5*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
       __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
-      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1934, __pyx_L1_error)
+      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1932, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
     }
     __Pyx_Raise(__pyx_t_1, 0, 0, 0);
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-    __PYX_ERR(0, 1934, __pyx_L1_error)
+    __PYX_ERR(0, 1932, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1933
+    /* "dama/ai/algorithmic/_fast_search.pyx":1931
  *     if opening_plies < 0:
  *         raise ValueError("opening_plies must be non-negative")
  *     if noise_prob < 0.0 or noise_prob > 1.0:             # <<<<<<<<<<<<<<
  *         raise ValueError("noise_prob must be between 0 and 1")
- *
+ * 
 */
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1936
+  /* "dama/ai/algorithmic/_fast_search.pyx":1934
  *         raise ValueError("noise_prob must be between 0 and 1")
- *
+ * 
  *     rules = _load_rules()             # <<<<<<<<<<<<<<
  *     init_standard_board(board)
  *     player = start_player
 */
-  __pyx_t_7 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1936, __pyx_L1_error)
+  __pyx_t_7 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__load_rules(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1934, __pyx_L1_error)
   __pyx_v_rules = __pyx_t_7;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1937
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1935
+ * 
  *     rules = _load_rules()
  *     init_standard_board(board)             # <<<<<<<<<<<<<<
  *     player = start_player
- *
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search_init_standard_board(__pyx_v_board);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1938
+  /* "dama/ai/algorithmic/_fast_search.pyx":1936
  *     rules = _load_rules()
  *     init_standard_board(board)
  *     player = start_player             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Opening actions are legal and deterministic for a supplied seed. They
 */
   __pyx_v_player = __pyx_v_start_player;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1942
+  /* "dama/ai/algorithmic/_fast_search.pyx":1940
  *     # Opening actions are legal and deterministic for a supplied seed. They
  *     # alter only trajectory setup and are not emitted as training records.
  *     opening_rng = _rng.Random(opening_seed)             # <<<<<<<<<<<<<<
@@ -16470,13 +16428,13 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     PyObject *__pyx_callargs[2] = {__pyx_t_4, __pyx_v_opening_seed};
     __pyx_t_1 = __Pyx_PyObject_FastCallMethod((PyObject*)__pyx_mstate_global->__pyx_n_u_Random, __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (1*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
     __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
-    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1942, __pyx_L1_error)
+    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1940, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
   }
   __pyx_v_opening_rng = __pyx_t_1;
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1943
+  /* "dama/ai/algorithmic/_fast_search.pyx":1941
  *     # alter only trajectory setup and are not emitted as training records.
  *     opening_rng = _rng.Random(opening_seed)
  *     behavior_rng = _rng.Random(             # <<<<<<<<<<<<<<
@@ -16486,32 +16444,32 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_t_4 = __pyx_v__rng;
   __Pyx_INCREF(__pyx_t_4);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1944
+  /* "dama/ai/algorithmic/_fast_search.pyx":1942
  *     opening_rng = _rng.Random(opening_seed)
  *     behavior_rng = _rng.Random(
  *         (int(opening_seed or 0) ^ 0x6A09E667F3BCC909) & ((1 << 64) - 1))             # <<<<<<<<<<<<<<
  *     for opening_i in range(opening_plies):
  *         moves.count = 0
 */
-  __pyx_t_3 = __Pyx_PyObject_IsTrue(__pyx_v_opening_seed); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 1944, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyObject_IsTrue(__pyx_v_opening_seed); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 1942, __pyx_L1_error)
   if (!__pyx_t_3) {
   } else {
     __Pyx_INCREF(__pyx_v_opening_seed);
     __pyx_t_8 = __pyx_v_opening_seed;
     goto __pyx_L8_bool_binop_done;
   }
-  __pyx_t_9 = __Pyx_PyLong_From_long(0); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1944, __pyx_L1_error)
+  __pyx_t_9 = __Pyx_PyLong_From_long(0); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1942, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_9);
   __pyx_t_8 = __pyx_t_9;
   __pyx_t_9 = 0;
   __pyx_L8_bool_binop_done:;
-  __pyx_t_9 = __Pyx_PyNumber_Int(__pyx_t_8); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1944, __pyx_L1_error)
+  __pyx_t_9 = __Pyx_PyNumber_Int(__pyx_t_8); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1942, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_9);
   __Pyx_DECREF(__pyx_t_8); __pyx_t_8 = 0;
-  __pyx_t_8 = PyNumber_Xor(__pyx_t_9, __pyx_mstate_global->__pyx_int_0x6a09e667f3bcc909); if (unlikely(!__pyx_t_8)) __PYX_ERR(0, 1944, __pyx_L1_error)
+  __pyx_t_8 = PyNumber_Xor(__pyx_t_9, __pyx_mstate_global->__pyx_int_0x6a09e667f3bcc909); if (unlikely(!__pyx_t_8)) __PYX_ERR(0, 1942, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_8);
   __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
-  __pyx_t_9 = PyNumber_And(__pyx_t_8, __pyx_mstate_global->__pyx_int_0xffffffffffffffff); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1944, __pyx_L1_error)
+  __pyx_t_9 = PyNumber_And(__pyx_t_8, __pyx_mstate_global->__pyx_int_0xffffffffffffffff); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 1942, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_9);
   __Pyx_DECREF(__pyx_t_8); __pyx_t_8 = 0;
   __pyx_t_5 = 0;
@@ -16520,13 +16478,13 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_1 = __Pyx_PyObject_FastCallMethod((PyObject*)__pyx_mstate_global->__pyx_n_u_Random, __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (1*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
     __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
     __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
-    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1943, __pyx_L1_error)
+    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1941, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
   }
   __pyx_v_behavior_rng = __pyx_t_1;
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1945
+  /* "dama/ai/algorithmic/_fast_search.pyx":1943
  *     behavior_rng = _rng.Random(
  *         (int(opening_seed or 0) ^ 0x6A09E667F3BCC909) & ((1 << 64) - 1))
  *     for opening_i in range(opening_plies):             # <<<<<<<<<<<<<<
@@ -16538,7 +16496,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   for (__pyx_t_12 = 0; __pyx_t_12 < __pyx_t_11; __pyx_t_12+=1) {
     __pyx_v_opening_i = __pyx_t_12;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1946
+    /* "dama/ai/algorithmic/_fast_search.pyx":1944
  *         (int(opening_seed or 0) ^ 0x6A09E667F3BCC909) & ((1 << 64) - 1))
  *     for opening_i in range(opening_plies):
  *         moves.count = 0             # <<<<<<<<<<<<<<
@@ -16547,7 +16505,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_v_moves.count = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1947
+    /* "dama/ai/algorithmic/_fast_search.pyx":1945
  *     for opening_i in range(opening_plies):
  *         moves.count = 0
  *         generate_all_moves_c(board, player, &rules, &moves)             # <<<<<<<<<<<<<<
@@ -16556,7 +16514,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(__pyx_v_board, __pyx_v_player, (&__pyx_v_rules), (&__pyx_v_moves));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1948
+    /* "dama/ai/algorithmic/_fast_search.pyx":1946
  *         moves.count = 0
  *         generate_all_moves_c(board, player, &rules, &moves)
  *         if moves.count == 0:             # <<<<<<<<<<<<<<
@@ -16566,7 +16524,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_3 = (__pyx_v_moves.count == 0);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1949
+      /* "dama/ai/algorithmic/_fast_search.pyx":1947
  *         generate_all_moves_c(board, player, &rules, &moves)
  *         if moves.count == 0:
  *             game_over = True             # <<<<<<<<<<<<<<
@@ -16575,7 +16533,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
       __pyx_v_game_over = 1;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1950
+      /* "dama/ai/algorithmic/_fast_search.pyx":1948
  *         if moves.count == 0:
  *             game_over = True
  *             break             # <<<<<<<<<<<<<<
@@ -16584,7 +16542,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
       goto __pyx_L11_break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1948
+      /* "dama/ai/algorithmic/_fast_search.pyx":1946
  *         moves.count = 0
  *         generate_all_moves_c(board, player, &rules, &moves)
  *         if moves.count == 0:             # <<<<<<<<<<<<<<
@@ -16593,7 +16551,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1951
+    /* "dama/ai/algorithmic/_fast_search.pyx":1949
  *             game_over = True
  *             break
  *         opening_index = opening_rng.randrange(moves.count)             # <<<<<<<<<<<<<<
@@ -16602,7 +16560,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_t_9 = __pyx_v_opening_rng;
     __Pyx_INCREF(__pyx_t_9);
-    __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_moves.count); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1951, __pyx_L1_error)
+    __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_moves.count); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1949, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_4);
     __pyx_t_5 = 0;
     {
@@ -16610,14 +16568,14 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       __pyx_t_1 = __Pyx_PyObject_FastCallMethod((PyObject*)__pyx_mstate_global->__pyx_n_u_randrange, __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (1*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
       __Pyx_XDECREF(__pyx_t_9); __pyx_t_9 = 0;
       __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
-      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1951, __pyx_L1_error)
+      if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1949, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
     }
-    __pyx_t_13 = __Pyx_PyLong_As_int(__pyx_t_1); if (unlikely((__pyx_t_13 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1951, __pyx_L1_error)
+    __pyx_t_13 = __Pyx_PyLong_As_int(__pyx_t_1); if (unlikely((__pyx_t_13 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 1949, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
     __pyx_v_opening_index = __pyx_t_13;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1952
+    /* "dama/ai/algorithmic/_fast_search.pyx":1950
  *             break
  *         opening_index = opening_rng.randrange(moves.count)
  *         if moves.moves[opening_index].num_captures > 0:             # <<<<<<<<<<<<<<
@@ -16627,7 +16585,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_3 = ((__pyx_v_moves.moves[__pyx_v_opening_index]).num_captures > 0);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1953
+      /* "dama/ai/algorithmic/_fast_search.pyx":1951
  *         opening_index = opening_rng.randrange(moves.count)
  *         if moves.moves[opening_index].num_captures > 0:
  *             if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
@@ -16637,7 +16595,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       __pyx_t_3 = (__pyx_v_player == 1);
       if (__pyx_t_3) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1954
+        /* "dama/ai/algorithmic/_fast_search.pyx":1952
  *         if moves.moves[opening_index].num_captures > 0:
  *             if player == PLAYER_ONE:
  *                 p1_caps += moves.moves[opening_index].num_captures             # <<<<<<<<<<<<<<
@@ -16646,7 +16604,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
         __pyx_v_p1_caps = (__pyx_v_p1_caps + (__pyx_v_moves.moves[__pyx_v_opening_index]).num_captures);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":1953
+        /* "dama/ai/algorithmic/_fast_search.pyx":1951
  *         opening_index = opening_rng.randrange(moves.count)
  *         if moves.moves[opening_index].num_captures > 0:
  *             if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
@@ -16656,7 +16614,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
         goto __pyx_L14;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1956
+      /* "dama/ai/algorithmic/_fast_search.pyx":1954
  *                 p1_caps += moves.moves[opening_index].num_captures
  *             else:
  *                 p2_caps += moves.moves[opening_index].num_captures             # <<<<<<<<<<<<<<
@@ -16668,7 +16626,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       }
       __pyx_L14:;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1952
+      /* "dama/ai/algorithmic/_fast_search.pyx":1950
  *             break
  *         opening_index = opening_rng.randrange(moves.count)
  *         if moves.moves[opening_index].num_captures > 0:             # <<<<<<<<<<<<<<
@@ -16677,7 +16635,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1957
+    /* "dama/ai/algorithmic/_fast_search.pyx":1955
  *             else:
  *                 p2_caps += moves.moves[opening_index].num_captures
  *         apply_move_c(board, new_board, &moves.moves[opening_index], player)             # <<<<<<<<<<<<<<
@@ -16686,7 +16644,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(__pyx_v_board, __pyx_v_new_board, (&(__pyx_v_moves.moves[__pyx_v_opening_index])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1958
+    /* "dama/ai/algorithmic/_fast_search.pyx":1956
  *                 p2_caps += moves.moves[opening_index].num_captures
  *         apply_move_c(board, new_board, &moves.moves[opening_index], player)
  *         memcpy(board, new_board, 64)             # <<<<<<<<<<<<<<
@@ -16695,45 +16653,45 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     (void)(memcpy(__pyx_v_board, __pyx_v_new_board, 64));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1959
+    /* "dama/ai/algorithmic/_fast_search.pyx":1957
  *         apply_move_c(board, new_board, &moves.moves[opening_index], player)
  *         memcpy(board, new_board, 64)
  *         player = opponent(player)             # <<<<<<<<<<<<<<
  *         applied_opening_plies += 1
- *
+ * 
 */
     __pyx_v_player = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(__pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1960
+    /* "dama/ai/algorithmic/_fast_search.pyx":1958
  *         memcpy(board, new_board, 64)
  *         player = opponent(player)
  *         applied_opening_plies += 1             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Allocate TT once; bump generation once at game start. During the game,
 */
     __pyx_v_applied_opening_plies = (__pyx_v_applied_opening_plies + 1);
   }
   __pyx_L11_break:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1966
+  /* "dama/ai/algorithmic/_fast_search.pyx":1964
  *     # move N's search overlap with move N+1's search tree. Same generation
  *     # means entries from prior moves in THIS game are accepted (free hits).
  *     _ensure_tt()             # <<<<<<<<<<<<<<
  *     global _tt_generation
  *     _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
 */
-  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1966, __pyx_L1_error)
+  __pyx_f_4dama_2ai_11algorithmic_12_fast_search__ensure_tt(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1964, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1968
+  /* "dama/ai/algorithmic/_fast_search.pyx":1966
  *     _ensure_tt()
  *     global _tt_generation
  *     _tt_generation = (_tt_generation + 1) & TT_GEN_MASK             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Compute initial hash and initialize killer/history tables.
 */
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation = ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation + 1) & 63);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1973
+  /* "dama/ai/algorithmic/_fast_search.pyx":1971
  *     # Killers and history persist across moves within a game  moves that
  *     # cause cutoffs at ply N tend to be good at the same ply in later positions.
  *     h = compute_hash(board, player)             # <<<<<<<<<<<<<<
@@ -16742,48 +16700,48 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   __pyx_v_h = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_compute_hash(__pyx_v_board, __pyx_v_player);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1974
+  /* "dama/ai/algorithmic/_fast_search.pyx":1972
  *     # cause cutoffs at ply N tend to be good at the same ply in later positions.
  *     h = compute_hash(board, player)
  *     _init_search_tables(&teacher_ss)             # <<<<<<<<<<<<<<
  *     _init_search_tables(&behavior_ss)
- *
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_search_tables((&__pyx_v_teacher_ss));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1975
+  /* "dama/ai/algorithmic/_fast_search.pyx":1973
  *     h = compute_hash(board, player)
  *     _init_search_tables(&teacher_ss)
  *     _init_search_tables(&behavior_ss)             # <<<<<<<<<<<<<<
- *
+ * 
  *     cdef list entries = []
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_search_tables((&__pyx_v_behavior_ss));
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1977
+  /* "dama/ai/algorithmic/_fast_search.pyx":1975
  *     _init_search_tables(&behavior_ss)
- *
+ * 
  *     cdef list entries = []             # <<<<<<<<<<<<<<
  *     cdef list moves_list
  *     cdef dict state_dict
 */
-  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1977, __pyx_L1_error)
+  __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1975, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
   __pyx_v_entries = ((PyObject*)__pyx_t_1);
   __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1980
+  /* "dama/ai/algorithmic/_fast_search.pyx":1978
  *     cdef list moves_list
  *     cdef dict state_dict
  *     cdef int actual_moves = 0             # <<<<<<<<<<<<<<
  *     cdef str cur_diff
- *
+ * 
 */
   __pyx_v_actual_moves = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1983
+  /* "dama/ai/algorithmic/_fast_search.pyx":1981
  *     cdef str cur_diff
- *
+ * 
  *     for move_num in range(max_moves):             # <<<<<<<<<<<<<<
  *         # Generate legal moves in C
  *         moves.count = 0
@@ -16793,27 +16751,27 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   for (__pyx_t_12 = 0; __pyx_t_12 < __pyx_t_11; __pyx_t_12+=1) {
     __pyx_v_move_num = __pyx_t_12;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1985
+    /* "dama/ai/algorithmic/_fast_search.pyx":1983
  *     for move_num in range(max_moves):
  *         # Generate legal moves in C
  *         moves.count = 0             # <<<<<<<<<<<<<<
  *         generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
 */
     __pyx_v_moves.count = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1986
+    /* "dama/ai/algorithmic/_fast_search.pyx":1984
  *         # Generate legal moves in C
  *         moves.count = 0
  *         generate_all_moves_c(board, player, &rules, &moves)             # <<<<<<<<<<<<<<
- *
+ * 
  *         if moves.count == 0:
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(__pyx_v_board, __pyx_v_player, (&__pyx_v_rules), (&__pyx_v_moves));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1988
+    /* "dama/ai/algorithmic/_fast_search.pyx":1986
  *         generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
  *         if moves.count == 0:             # <<<<<<<<<<<<<<
  *             game_over = True
  *             break
@@ -16821,83 +16779,83 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_3 = (__pyx_v_moves.count == 0);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1989
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":1987
+ * 
  *         if moves.count == 0:
  *             game_over = True             # <<<<<<<<<<<<<<
  *             break
- *
+ * 
 */
       __pyx_v_game_over = 1;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1990
+      /* "dama/ai/algorithmic/_fast_search.pyx":1988
  *         if moves.count == 0:
  *             game_over = True
  *             break             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Convert board and moves to Python dicts for replay recording
 */
       goto __pyx_L16_break;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1988
+      /* "dama/ai/algorithmic/_fast_search.pyx":1986
  *         generate_all_moves_c(board, player, &rules, &moves)
- *
+ * 
  *         if moves.count == 0:             # <<<<<<<<<<<<<<
  *             game_over = True
  *             break
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1993
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":1991
+ * 
  *         # Convert board and moves to Python dicts for replay recording
  *         state_dict = board_to_compact_dict(             # <<<<<<<<<<<<<<
  *             board, player, applied_opening_plies + move_num)
  *         moves_list = []
 */
-    __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact_dict(__pyx_v_board, __pyx_v_player, (__pyx_v_applied_opening_plies + __pyx_v_move_num)); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1993, __pyx_L1_error)
+    __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact_dict(__pyx_v_board, __pyx_v_player, (__pyx_v_applied_opening_plies + __pyx_v_move_num)); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1991, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
     __Pyx_XDECREF_SET(__pyx_v_state_dict, ((PyObject*)__pyx_t_1));
     __pyx_t_1 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1995
+    /* "dama/ai/algorithmic/_fast_search.pyx":1993
  *         state_dict = board_to_compact_dict(
  *             board, player, applied_opening_plies + move_num)
  *         moves_list = []             # <<<<<<<<<<<<<<
  *         for i in range(moves.count):
  *             moves_list.append(cmove_to_dict(&moves.moves[i]))
 */
-    __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1995, __pyx_L1_error)
+    __pyx_t_1 = PyList_New(0); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1993, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
     __Pyx_XDECREF_SET(__pyx_v_moves_list, ((PyObject*)__pyx_t_1));
     __pyx_t_1 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":1996
+    /* "dama/ai/algorithmic/_fast_search.pyx":1994
  *             board, player, applied_opening_plies + move_num)
  *         moves_list = []
  *         for i in range(moves.count):             # <<<<<<<<<<<<<<
  *             moves_list.append(cmove_to_dict(&moves.moves[i]))
- *
+ * 
 */
     __pyx_t_13 = __pyx_v_moves.count;
     __pyx_t_14 = __pyx_t_13;
     for (__pyx_t_15 = 0; __pyx_t_15 < __pyx_t_14; __pyx_t_15+=1) {
       __pyx_v_i = __pyx_t_15;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":1997
+      /* "dama/ai/algorithmic/_fast_search.pyx":1995
  *         moves_list = []
  *         for i in range(moves.count):
  *             moves_list.append(cmove_to_dict(&moves.moves[i]))             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Search the hard teacher for every non-forced position. Behavior and
 */
-      __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_i]))); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1997, __pyx_L1_error)
+      __pyx_t_1 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_cmove_to_dict((&(__pyx_v_moves.moves[__pyx_v_i]))); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 1995, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_1);
-      __pyx_t_16 = __Pyx_PyList_Append(__pyx_v_moves_list, __pyx_t_1); if (unlikely(__pyx_t_16 == ((int)-1))) __PYX_ERR(0, 1997, __pyx_L1_error)
+      __pyx_t_16 = __Pyx_PyList_Append(__pyx_v_moves_list, __pyx_t_1); if (unlikely(__pyx_t_16 == ((int)-1))) __PYX_ERR(0, 1995, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2001
+    /* "dama/ai/algorithmic/_fast_search.pyx":1999
  *         # Search the hard teacher for every non-forced position. Behavior and
  *         # exploration choose played_idx independently from teacher_idx.
  *         if moves.count == 1:             # <<<<<<<<<<<<<<
@@ -16907,7 +16865,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_3 = (__pyx_v_moves.count == 1);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2002
+      /* "dama/ai/algorithmic/_fast_search.pyx":2000
  *         # exploration choose played_idx independently from teacher_idx.
  *         if moves.count == 1:
  *             teacher_idx = 0             # <<<<<<<<<<<<<<
@@ -16916,7 +16874,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
       __pyx_v_teacher_idx = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2003
+      /* "dama/ai/algorithmic/_fast_search.pyx":2001
  *         if moves.count == 1:
  *             teacher_idx = 0
  *             played_idx = 0             # <<<<<<<<<<<<<<
@@ -16925,7 +16883,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
       __pyx_v_played_idx = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2004
+      /* "dama/ai/algorithmic/_fast_search.pyx":2002
  *             teacher_idx = 0
  *             played_idx = 0
  *             apply_idx = 0             # <<<<<<<<<<<<<<
@@ -16934,7 +16892,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
       __pyx_v_apply_idx = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2005
+      /* "dama/ai/algorithmic/_fast_search.pyx":2003
  *             played_idx = 0
  *             apply_idx = 0
  *             was_exploration = False             # <<<<<<<<<<<<<<
@@ -16943,7 +16901,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
       __pyx_v_was_exploration = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2001
+      /* "dama/ai/algorithmic/_fast_search.pyx":1999
  *         # Search the hard teacher for every non-forced position. Behavior and
  *         # exploration choose played_idx independently from teacher_idx.
  *         if moves.count == 1:             # <<<<<<<<<<<<<<
@@ -16953,12 +16911,12 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       goto __pyx_L20;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2007
+    /* "dama/ai/algorithmic/_fast_search.pyx":2005
  *             was_exploration = False
  *         else:
  *             cur_diff = p1_difficulty if player == PLAYER_ONE else p2_difficulty             # <<<<<<<<<<<<<<
  *             was_exploration = behavior_rng.random() < noise_prob
- *
+ * 
 */
     /*else*/ {
       __pyx_t_3 = (__pyx_v_player == 1);
@@ -16972,11 +16930,11 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       __Pyx_XDECREF_SET(__pyx_v_cur_diff, ((PyObject*)__pyx_t_1));
       __pyx_t_1 = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2008
+      /* "dama/ai/algorithmic/_fast_search.pyx":2006
  *         else:
  *             cur_diff = p1_difficulty if player == PLAYER_ONE else p2_difficulty
  *             was_exploration = behavior_rng.random() < noise_prob             # <<<<<<<<<<<<<<
- *
+ * 
  *             if not was_exploration and cur_diff != 'hard':
 */
       __pyx_t_4 = __pyx_v_behavior_rng;
@@ -16986,21 +16944,21 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
         PyObject *__pyx_callargs[2] = {__pyx_t_4, NULL};
         __pyx_t_1 = __Pyx_PyObject_FastCallMethod((PyObject*)__pyx_mstate_global->__pyx_n_u_random, __pyx_callargs+__pyx_t_5, (1-__pyx_t_5) | (1*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
         __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
-        if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2008, __pyx_L1_error)
+        if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2006, __pyx_L1_error)
         __Pyx_GOTREF(__pyx_t_1);
       }
-      __pyx_t_4 = PyFloat_FromDouble(__pyx_v_noise_prob); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 2008, __pyx_L1_error)
+      __pyx_t_4 = PyFloat_FromDouble(__pyx_v_noise_prob); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 2006, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_4);
-      __pyx_t_9 = PyObject_RichCompare(__pyx_t_1, __pyx_t_4, Py_LT); __Pyx_XGOTREF(__pyx_t_9); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2008, __pyx_L1_error)
+      __pyx_t_9 = PyObject_RichCompare(__pyx_t_1, __pyx_t_4, Py_LT); __Pyx_XGOTREF(__pyx_t_9); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2006, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
       __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
-      __pyx_t_3 = __Pyx_PyObject_IsTrue(__pyx_t_9); if (unlikely((__pyx_t_3 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2008, __pyx_L1_error)
+      __pyx_t_3 = __Pyx_PyObject_IsTrue(__pyx_t_9); if (unlikely((__pyx_t_3 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2006, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
       __pyx_v_was_exploration = __pyx_t_3;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2010
+      /* "dama/ai/algorithmic/_fast_search.pyx":2008
  *             was_exploration = behavior_rng.random() < noise_prob
- *
+ * 
  *             if not was_exploration and cur_diff != 'hard':             # <<<<<<<<<<<<<<
  *                 # Keep non-hard behavior searches isolated from the hard
  *                 # teacher's transposition-table generation.
@@ -17011,12 +16969,12 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
         __pyx_t_3 = __pyx_t_6;
         goto __pyx_L22_bool_binop_done;
       }
-      __pyx_t_6 = (__Pyx_PyUnicode_Equals(__pyx_v_cur_diff, __pyx_mstate_global->__pyx_n_u_hard, Py_NE)); if (unlikely((__pyx_t_6 < 0))) __PYX_ERR(0, 2010, __pyx_L1_error)
+      __pyx_t_6 = (__Pyx_PyUnicode_Equals(__pyx_v_cur_diff, __pyx_mstate_global->__pyx_n_u_hard, Py_NE)); if (unlikely((__pyx_t_6 < 0))) __PYX_ERR(0, 2008, __pyx_L1_error)
       __pyx_t_3 = __pyx_t_6;
       __pyx_L22_bool_binop_done:;
       if (__pyx_t_3) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2013
+        /* "dama/ai/algorithmic/_fast_search.pyx":2011
  *                 # Keep non-hard behavior searches isolated from the hard
  *                 # teacher's transposition-table generation.
  *                 _tt_generation = (_tt_generation + 1) & TT_GEN_MASK             # <<<<<<<<<<<<<<
@@ -17025,26 +16983,26 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
         __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation = ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation + 1) & 63);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2014
+        /* "dama/ai/algorithmic/_fast_search.pyx":2012
  *                 # teacher's transposition-table generation.
  *                 _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
  *                 _copy_move_list(&moves, &behavior_moves)             # <<<<<<<<<<<<<<
  *                 behavior_best_idx = _search_game_move(
  *                     board, player, &behavior_moves, &rules,
 */
-        __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_move_list((&__pyx_v_moves), (&__pyx_v_behavior_moves)); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 2014, __pyx_L1_error)
+        __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_move_list((&__pyx_v_moves), (&__pyx_v_behavior_moves)); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 2012, __pyx_L1_error)
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2015
+        /* "dama/ai/algorithmic/_fast_search.pyx":2013
  *                 _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
  *                 _copy_move_list(&moves, &behavior_moves)
  *                 behavior_best_idx = _search_game_move(             # <<<<<<<<<<<<<<
  *                     board, player, &behavior_moves, &rules,
  *                     &behavior_ss, h, cur_diff)
 */
-        __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(__pyx_v_board, __pyx_v_player, (&__pyx_v_behavior_moves), (&__pyx_v_rules), (&__pyx_v_behavior_ss), __pyx_v_h, __pyx_v_cur_diff); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2015, __pyx_L1_error)
+        __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(__pyx_v_board, __pyx_v_player, (&__pyx_v_behavior_moves), (&__pyx_v_rules), (&__pyx_v_behavior_ss), __pyx_v_h, __pyx_v_cur_diff); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2013, __pyx_L1_error)
         __pyx_v_behavior_best_idx = __pyx_t_13;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2018
+        /* "dama/ai/algorithmic/_fast_search.pyx":2016
  *                     board, player, &behavior_moves, &rules,
  *                     &behavior_ss, h, cur_diff)
  *                 behavior_move = behavior_moves.moves[behavior_best_idx]             # <<<<<<<<<<<<<<
@@ -17053,83 +17011,83 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
         __pyx_v_behavior_move = (__pyx_v_behavior_moves.moves[__pyx_v_behavior_best_idx]);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2019
+        /* "dama/ai/algorithmic/_fast_search.pyx":2017
  *                     &behavior_ss, h, cur_diff)
  *                 behavior_move = behavior_moves.moves[behavior_best_idx]
  *                 played_idx = _find_cmove_index(&moves, &behavior_move)             # <<<<<<<<<<<<<<
  *                 _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
- *
+ * 
 */
-        __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index((&__pyx_v_moves), (&__pyx_v_behavior_move)); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2019, __pyx_L1_error)
+        __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index((&__pyx_v_moves), (&__pyx_v_behavior_move)); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2017, __pyx_L1_error)
         __pyx_v_played_idx = __pyx_t_13;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2020
+        /* "dama/ai/algorithmic/_fast_search.pyx":2018
  *                 behavior_move = behavior_moves.moves[behavior_best_idx]
  *                 played_idx = _find_cmove_index(&moves, &behavior_move)
  *                 _tt_generation = (_tt_generation + 1) & TT_GEN_MASK             # <<<<<<<<<<<<<<
- *
+ * 
  *             _copy_move_list(&moves, &teacher_moves)
 */
         __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation = ((__pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation + 1) & 63);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2010
+        /* "dama/ai/algorithmic/_fast_search.pyx":2008
  *             was_exploration = behavior_rng.random() < noise_prob
- *
+ * 
  *             if not was_exploration and cur_diff != 'hard':             # <<<<<<<<<<<<<<
  *                 # Keep non-hard behavior searches isolated from the hard
  *                 # teacher's transposition-table generation.
 */
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2022
+      /* "dama/ai/algorithmic/_fast_search.pyx":2020
  *                 _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
- *
+ * 
  *             _copy_move_list(&moves, &teacher_moves)             # <<<<<<<<<<<<<<
  *             teacher_best_idx = _search_game_move(
  *                 board, player, &teacher_moves, &rules,
 */
-      __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_move_list((&__pyx_v_moves), (&__pyx_v_teacher_moves)); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 2022, __pyx_L1_error)
+      __pyx_f_4dama_2ai_11algorithmic_12_fast_search__copy_move_list((&__pyx_v_moves), (&__pyx_v_teacher_moves)); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 2020, __pyx_L1_error)
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2023
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":2021
+ * 
  *             _copy_move_list(&moves, &teacher_moves)
  *             teacher_best_idx = _search_game_move(             # <<<<<<<<<<<<<<
  *                 board, player, &teacher_moves, &rules,
  *                 &teacher_ss, h, 'hard')
 */
-      __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(__pyx_v_board, __pyx_v_player, (&__pyx_v_teacher_moves), (&__pyx_v_rules), (&__pyx_v_teacher_ss), __pyx_v_h, __pyx_mstate_global->__pyx_n_u_hard); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2023, __pyx_L1_error)
+      __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__search_game_move(__pyx_v_board, __pyx_v_player, (&__pyx_v_teacher_moves), (&__pyx_v_rules), (&__pyx_v_teacher_ss), __pyx_v_h, __pyx_mstate_global->__pyx_n_u_hard); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2021, __pyx_L1_error)
       __pyx_v_teacher_best_idx = __pyx_t_13;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2026
+      /* "dama/ai/algorithmic/_fast_search.pyx":2024
  *                 board, player, &teacher_moves, &rules,
  *                 &teacher_ss, h, 'hard')
  *             teacher_move = teacher_moves.moves[teacher_best_idx]             # <<<<<<<<<<<<<<
  *             teacher_idx = _find_cmove_index(&moves, &teacher_move)
- *
+ * 
 */
       __pyx_v_teacher_move = (__pyx_v_teacher_moves.moves[__pyx_v_teacher_best_idx]);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2027
+      /* "dama/ai/algorithmic/_fast_search.pyx":2025
  *                 &teacher_ss, h, 'hard')
  *             teacher_move = teacher_moves.moves[teacher_best_idx]
  *             teacher_idx = _find_cmove_index(&moves, &teacher_move)             # <<<<<<<<<<<<<<
- *
+ * 
  *             if was_exploration:
 */
-      __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index((&__pyx_v_moves), (&__pyx_v_teacher_move)); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2027, __pyx_L1_error)
+      __pyx_t_13 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__find_cmove_index((&__pyx_v_moves), (&__pyx_v_teacher_move)); if (unlikely(__pyx_t_13 == ((int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2025, __pyx_L1_error)
       __pyx_v_teacher_idx = __pyx_t_13;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2029
+      /* "dama/ai/algorithmic/_fast_search.pyx":2027
  *             teacher_idx = _find_cmove_index(&moves, &teacher_move)
- *
+ * 
  *             if was_exploration:             # <<<<<<<<<<<<<<
  *                 played_idx = behavior_rng.randrange(moves.count)
  *             elif cur_diff == 'hard':
 */
       if (__pyx_v_was_exploration) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2030
- *
+        /* "dama/ai/algorithmic/_fast_search.pyx":2028
+ * 
  *             if was_exploration:
  *                 played_idx = behavior_rng.randrange(moves.count)             # <<<<<<<<<<<<<<
  *             elif cur_diff == 'hard':
@@ -17137,7 +17095,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
         __pyx_t_4 = __pyx_v_behavior_rng;
         __Pyx_INCREF(__pyx_t_4);
-        __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_moves.count); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2030, __pyx_L1_error)
+        __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_moves.count); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2028, __pyx_L1_error)
         __Pyx_GOTREF(__pyx_t_1);
         __pyx_t_5 = 0;
         {
@@ -17145,16 +17103,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
           __pyx_t_9 = __Pyx_PyObject_FastCallMethod((PyObject*)__pyx_mstate_global->__pyx_n_u_randrange, __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (1*__Pyx_PY_VECTORCALL_ARGUMENTS_OFFSET));
           __Pyx_XDECREF(__pyx_t_4); __pyx_t_4 = 0;
           __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-          if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2030, __pyx_L1_error)
+          if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2028, __pyx_L1_error)
           __Pyx_GOTREF(__pyx_t_9);
         }
-        __pyx_t_13 = __Pyx_PyLong_As_int(__pyx_t_9); if (unlikely((__pyx_t_13 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2030, __pyx_L1_error)
+        __pyx_t_13 = __Pyx_PyLong_As_int(__pyx_t_9); if (unlikely((__pyx_t_13 == (int)-1) && PyErr_Occurred())) __PYX_ERR(0, 2028, __pyx_L1_error)
         __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
         __pyx_v_played_idx = __pyx_t_13;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2029
+        /* "dama/ai/algorithmic/_fast_search.pyx":2027
  *             teacher_idx = _find_cmove_index(&moves, &teacher_move)
- *
+ * 
  *             if was_exploration:             # <<<<<<<<<<<<<<
  *                 played_idx = behavior_rng.randrange(moves.count)
  *             elif cur_diff == 'hard':
@@ -17162,26 +17120,26 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
         goto __pyx_L24;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2031
+      /* "dama/ai/algorithmic/_fast_search.pyx":2029
  *             if was_exploration:
  *                 played_idx = behavior_rng.randrange(moves.count)
  *             elif cur_diff == 'hard':             # <<<<<<<<<<<<<<
  *                 played_idx = teacher_idx
  *             apply_idx = played_idx
 */
-      __pyx_t_3 = (__Pyx_PyUnicode_Equals(__pyx_v_cur_diff, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 2031, __pyx_L1_error)
+      __pyx_t_3 = (__Pyx_PyUnicode_Equals(__pyx_v_cur_diff, __pyx_mstate_global->__pyx_n_u_hard, Py_EQ)); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 2029, __pyx_L1_error)
       if (__pyx_t_3) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2032
+        /* "dama/ai/algorithmic/_fast_search.pyx":2030
  *                 played_idx = behavior_rng.randrange(moves.count)
  *             elif cur_diff == 'hard':
  *                 played_idx = teacher_idx             # <<<<<<<<<<<<<<
  *             apply_idx = played_idx
- *
+ * 
 */
         __pyx_v_played_idx = __pyx_v_teacher_idx;
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2031
+        /* "dama/ai/algorithmic/_fast_search.pyx":2029
  *             if was_exploration:
  *                 played_idx = behavior_rng.randrange(moves.count)
  *             elif cur_diff == 'hard':             # <<<<<<<<<<<<<<
@@ -17191,19 +17149,19 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       }
       __pyx_L24:;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2033
+      /* "dama/ai/algorithmic/_fast_search.pyx":2031
  *             elif cur_diff == 'hard':
  *                 played_idx = teacher_idx
  *             apply_idx = played_idx             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Track captures for the played action.
 */
       __pyx_v_apply_idx = __pyx_v_played_idx;
     }
     __pyx_L20:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2036
- *
+    /* "dama/ai/algorithmic/_fast_search.pyx":2034
+ * 
  *         # Track captures for the played action.
  *         if moves.moves[apply_idx].num_captures > 0:             # <<<<<<<<<<<<<<
  *             if player == PLAYER_ONE:
@@ -17212,7 +17170,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_3 = ((__pyx_v_moves.moves[__pyx_v_apply_idx]).num_captures > 0);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2037
+      /* "dama/ai/algorithmic/_fast_search.pyx":2035
  *         # Track captures for the played action.
  *         if moves.moves[apply_idx].num_captures > 0:
  *             if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
@@ -17222,7 +17180,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       __pyx_t_3 = (__pyx_v_player == 1);
       if (__pyx_t_3) {
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2038
+        /* "dama/ai/algorithmic/_fast_search.pyx":2036
  *         if moves.moves[apply_idx].num_captures > 0:
  *             if player == PLAYER_ONE:
  *                 p1_caps += moves.moves[apply_idx].num_captures             # <<<<<<<<<<<<<<
@@ -17231,7 +17189,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
         __pyx_v_p1_caps = (__pyx_v_p1_caps + (__pyx_v_moves.moves[__pyx_v_apply_idx]).num_captures);
 
-        /* "dama/ai/algorithmic/_fast_search.pyx":2037
+        /* "dama/ai/algorithmic/_fast_search.pyx":2035
  *         # Track captures for the played action.
  *         if moves.moves[apply_idx].num_captures > 0:
  *             if player == PLAYER_ONE:             # <<<<<<<<<<<<<<
@@ -17241,11 +17199,11 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
         goto __pyx_L26;
       }
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2040
+      /* "dama/ai/algorithmic/_fast_search.pyx":2038
  *                 p1_caps += moves.moves[apply_idx].num_captures
  *             else:
  *                 p2_caps += moves.moves[apply_idx].num_captures             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Record the hard teacher label and separate behavior action.
 */
       /*else*/ {
@@ -17253,8 +17211,8 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       }
       __pyx_L26:;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2036
- *
+      /* "dama/ai/algorithmic/_fast_search.pyx":2034
+ * 
  *         # Track captures for the played action.
  *         if moves.moves[apply_idx].num_captures > 0:             # <<<<<<<<<<<<<<
  *             if player == PLAYER_ONE:
@@ -17262,60 +17220,60 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2044
+    /* "dama/ai/algorithmic/_fast_search.pyx":2042
  *         # Record the hard teacher label and separate behavior action.
  *         entry_d = {
  *             'state': state_dict,             # <<<<<<<<<<<<<<
  *             'legal_moves': moves_list,
  *             'chosen_index': teacher_idx,
 */
-    __pyx_t_9 = __Pyx_PyDict_NewPresized(10); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    __pyx_t_9 = __Pyx_PyDict_NewPresized(10); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2042, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_9);
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_state, __pyx_v_state_dict) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_state, __pyx_v_state_dict) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2045
+    /* "dama/ai/algorithmic/_fast_search.pyx":2043
  *         entry_d = {
  *             'state': state_dict,
  *             'legal_moves': moves_list,             # <<<<<<<<<<<<<<
  *             'chosen_index': teacher_idx,
  *             'played_index': played_idx,
 */
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_legal_moves, __pyx_v_moves_list) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_legal_moves, __pyx_v_moves_list) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2046
+    /* "dama/ai/algorithmic/_fast_search.pyx":2044
  *             'state': state_dict,
  *             'legal_moves': moves_list,
  *             'chosen_index': teacher_idx,             # <<<<<<<<<<<<<<
  *             'played_index': played_idx,
  *             'trajectory_source': trajectory_source,
 */
-    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_teacher_idx); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2046, __pyx_L1_error)
+    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_teacher_idx); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2044, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_chosen_index, __pyx_t_1) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_chosen_index, __pyx_t_1) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2047
+    /* "dama/ai/algorithmic/_fast_search.pyx":2045
  *             'legal_moves': moves_list,
  *             'chosen_index': teacher_idx,
  *             'played_index': played_idx,             # <<<<<<<<<<<<<<
  *             'trajectory_source': trajectory_source,
  *             'was_exploration': bool(was_exploration),
 */
-    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_played_idx); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2047, __pyx_L1_error)
+    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_played_idx); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2045, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_played_index, __pyx_t_1) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_played_index, __pyx_t_1) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2048
+    /* "dama/ai/algorithmic/_fast_search.pyx":2046
  *             'chosen_index': teacher_idx,
  *             'played_index': played_idx,
  *             'trajectory_source': trajectory_source,             # <<<<<<<<<<<<<<
  *             'was_exploration': bool(was_exploration),
  *             'teacher_difficulty': teacher_difficulty,
 */
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_trajectory_source, __pyx_v_trajectory_source) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_trajectory_source, __pyx_v_trajectory_source) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2049
+    /* "dama/ai/algorithmic/_fast_search.pyx":2047
  *             'played_index': played_idx,
  *             'trajectory_source': trajectory_source,
  *             'was_exploration': bool(was_exploration),             # <<<<<<<<<<<<<<
@@ -17323,37 +17281,37 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
  *             'opening_plies': applied_opening_plies,
 */
     __pyx_t_3 = __pyx_v_was_exploration;
-    __pyx_t_1 = __Pyx_PyBool_FromLong((!(!__pyx_t_3))); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2049, __pyx_L1_error)
+    __pyx_t_1 = __Pyx_PyBool_FromLong((!(!__pyx_t_3))); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2047, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_was_exploration, __pyx_t_1) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_was_exploration, __pyx_t_1) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2050
+    /* "dama/ai/algorithmic/_fast_search.pyx":2048
  *             'trajectory_source': trajectory_source,
  *             'was_exploration': bool(was_exploration),
  *             'teacher_difficulty': teacher_difficulty,             # <<<<<<<<<<<<<<
  *             'opening_plies': applied_opening_plies,
  *             'result': 0,
 */
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_teacher_difficulty, __pyx_v_teacher_difficulty) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_teacher_difficulty, __pyx_v_teacher_difficulty) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2051
+    /* "dama/ai/algorithmic/_fast_search.pyx":2049
  *             'was_exploration': bool(was_exploration),
  *             'teacher_difficulty': teacher_difficulty,
  *             'opening_plies': applied_opening_plies,             # <<<<<<<<<<<<<<
  *             'result': 0,
  *             'score': 0.0,
 */
-    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_applied_opening_plies); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2051, __pyx_L1_error)
+    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_applied_opening_plies); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2049, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_opening_plies, __pyx_t_1) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_opening_plies, __pyx_t_1) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
-    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_float_0_0) < (0)) __PYX_ERR(0, 2044, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_0) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
+    if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_score, __pyx_mstate_global->__pyx_float_0_0) < (0)) __PYX_ERR(0, 2042, __pyx_L1_error)
     __Pyx_XDECREF_SET(__pyx_v_entry_d, __pyx_t_9);
     __pyx_t_9 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2055
+    /* "dama/ai/algorithmic/_fast_search.pyx":2053
  *             'score': 0.0,
  *         }
  *         if game_id is not None:             # <<<<<<<<<<<<<<
@@ -17363,19 +17321,19 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_3 = (__pyx_v_game_id != Py_None);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2056
+      /* "dama/ai/algorithmic/_fast_search.pyx":2054
  *         }
  *         if game_id is not None:
  *             entry_d['game_id'] = str(game_id)             # <<<<<<<<<<<<<<
  *         entries.append(entry_d)
- *
+ * 
 */
-      __pyx_t_9 = __Pyx_PyObject_Unicode(__pyx_v_game_id); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2056, __pyx_L1_error)
+      __pyx_t_9 = __Pyx_PyObject_Unicode(__pyx_v_game_id); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2054, __pyx_L1_error)
       __Pyx_GOTREF(__pyx_t_9);
-      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_game_id, __pyx_t_9) < 0))) __PYX_ERR(0, 2056, __pyx_L1_error)
+      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_game_id, __pyx_t_9) < 0))) __PYX_ERR(0, 2054, __pyx_L1_error)
       __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2055
+      /* "dama/ai/algorithmic/_fast_search.pyx":2053
  *             'score': 0.0,
  *         }
  *         if game_id is not None:             # <<<<<<<<<<<<<<
@@ -17384,16 +17342,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2057
+    /* "dama/ai/algorithmic/_fast_search.pyx":2055
  *         if game_id is not None:
  *             entry_d['game_id'] = str(game_id)
  *         entries.append(entry_d)             # <<<<<<<<<<<<<<
- *
+ * 
  *         # Apply move in C (board  new_board, then copy back)
 */
-    __pyx_t_16 = __Pyx_PyList_Append(__pyx_v_entries, __pyx_v_entry_d); if (unlikely(__pyx_t_16 == ((int)-1))) __PYX_ERR(0, 2057, __pyx_L1_error)
+    __pyx_t_16 = __Pyx_PyList_Append(__pyx_v_entries, __pyx_v_entry_d); if (unlikely(__pyx_t_16 == ((int)-1))) __PYX_ERR(0, 2055, __pyx_L1_error)
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2061
+    /* "dama/ai/algorithmic/_fast_search.pyx":2059
  *         # Apply move in C (board  new_board, then copy back)
  *         # apply_idx refers to the original, unmodified move list.
  *         h = _hash_after_move(h, board, &moves.moves[apply_idx], player)             # <<<<<<<<<<<<<<
@@ -17402,7 +17360,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_v_h = __pyx_f_4dama_2ai_11algorithmic_12_fast_search__hash_after_move(__pyx_v_h, __pyx_v_board, (&(__pyx_v_moves.moves[__pyx_v_apply_idx])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2062
+    /* "dama/ai/algorithmic/_fast_search.pyx":2060
  *         # apply_idx refers to the original, unmodified move list.
  *         h = _hash_after_move(h, board, &moves.moves[apply_idx], player)
  *         apply_move_c(board, new_board, &moves.moves[apply_idx], player)             # <<<<<<<<<<<<<<
@@ -17411,7 +17369,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_apply_move_c(__pyx_v_board, __pyx_v_new_board, (&(__pyx_v_moves.moves[__pyx_v_apply_idx])), __pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2063
+    /* "dama/ai/algorithmic/_fast_search.pyx":2061
  *         h = _hash_after_move(h, board, &moves.moves[apply_idx], player)
  *         apply_move_c(board, new_board, &moves.moves[apply_idx], player)
  *         memcpy(board, new_board, 64)             # <<<<<<<<<<<<<<
@@ -17420,28 +17378,28 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     (void)(memcpy(__pyx_v_board, __pyx_v_new_board, 64));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2064
+    /* "dama/ai/algorithmic/_fast_search.pyx":2062
  *         apply_move_c(board, new_board, &moves.moves[apply_idx], player)
  *         memcpy(board, new_board, 64)
  *         player = opponent(player)             # <<<<<<<<<<<<<<
  *         actual_moves += 1
- *
+ * 
 */
     __pyx_v_player = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(__pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2065
+    /* "dama/ai/algorithmic/_fast_search.pyx":2063
  *         memcpy(board, new_board, 64)
  *         player = opponent(player)
  *         actual_moves += 1             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Determine winner
 */
     __pyx_v_actual_moves = (__pyx_v_actual_moves + 1);
   }
   __pyx_L16_break:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2068
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":2066
+ * 
  *     # Determine winner
  *     cdef int winner_int = 0  # 0 = no winner (draw)             # <<<<<<<<<<<<<<
  *     if game_over:
@@ -17449,7 +17407,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   __pyx_v_winner_int = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2069
+  /* "dama/ai/algorithmic/_fast_search.pyx":2067
  *     # Determine winner
  *     cdef int winner_int = 0  # 0 = no winner (draw)
  *     if game_over:             # <<<<<<<<<<<<<<
@@ -17458,7 +17416,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   if (__pyx_v_game_over) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2071
+    /* "dama/ai/algorithmic/_fast_search.pyx":2069
  *     if game_over:
  *         # Current player had no moves  opponent wins
  *         winner_int = opponent(player)             # <<<<<<<<<<<<<<
@@ -17467,7 +17425,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_v_winner_int = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(__pyx_v_player);
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2069
+    /* "dama/ai/algorithmic/_fast_search.pyx":2067
  *     # Determine winner
  *     cdef int winner_int = 0  # 0 = no winner (draw)
  *     if game_over:             # <<<<<<<<<<<<<<
@@ -17477,7 +17435,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     goto __pyx_L28;
   }
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2072
+  /* "dama/ai/algorithmic/_fast_search.pyx":2070
  *         # Current player had no moves  opponent wins
  *         winner_int = opponent(player)
  *     elif actual_moves >= max_moves:             # <<<<<<<<<<<<<<
@@ -17487,7 +17445,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_t_3 = (__pyx_v_actual_moves >= __pyx_v_max_moves);
   if (__pyx_t_3) {
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2074
+    /* "dama/ai/algorithmic/_fast_search.pyx":2072
  *     elif actual_moves >= max_moves:
  *         # Max moves reached  check if current player is stuck
  *         moves.count = 0             # <<<<<<<<<<<<<<
@@ -17496,7 +17454,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_v_moves.count = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2075
+    /* "dama/ai/algorithmic/_fast_search.pyx":2073
  *         # Max moves reached  check if current player is stuck
  *         moves.count = 0
  *         generate_all_moves_c(board, player, &rules, &moves)             # <<<<<<<<<<<<<<
@@ -17505,35 +17463,35 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
     __pyx_f_4dama_2ai_11algorithmic_12_fast_search_generate_all_moves_c(__pyx_v_board, __pyx_v_player, (&__pyx_v_rules), (&__pyx_v_moves));
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2076
+    /* "dama/ai/algorithmic/_fast_search.pyx":2074
  *         moves.count = 0
  *         generate_all_moves_c(board, player, &rules, &moves)
  *         if moves.count == 0:             # <<<<<<<<<<<<<<
  *             winner_int = opponent(player)
- *
+ * 
 */
     __pyx_t_3 = (__pyx_v_moves.count == 0);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2077
+      /* "dama/ai/algorithmic/_fast_search.pyx":2075
  *         generate_all_moves_c(board, player, &rules, &moves)
  *         if moves.count == 0:
  *             winner_int = opponent(player)             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Set results for each entry
 */
       __pyx_v_winner_int = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_opponent(__pyx_v_player);
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2076
+      /* "dama/ai/algorithmic/_fast_search.pyx":2074
  *         moves.count = 0
  *         generate_all_moves_c(board, player, &rules, &moves)
  *         if moves.count == 0:             # <<<<<<<<<<<<<<
  *             winner_int = opponent(player)
- *
+ * 
 */
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2072
+    /* "dama/ai/algorithmic/_fast_search.pyx":2070
  *         # Current player had no moves  opponent wins
  *         winner_int = opponent(player)
  *     elif actual_moves >= max_moves:             # <<<<<<<<<<<<<<
@@ -17543,8 +17501,8 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   }
   __pyx_L28:;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2080
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":2078
+ * 
  *     # Set results for each entry
  *     winner_py = winner_int if winner_int != 0 else None             # <<<<<<<<<<<<<<
  *     for entry_d in entries:
@@ -17552,7 +17510,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
 */
   __pyx_t_3 = (__pyx_v_winner_int != 0);
   if (__pyx_t_3) {
-    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_winner_int); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2080, __pyx_L1_error)
+    __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_winner_int); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2078, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
     __pyx_t_9 = __pyx_t_1;
     __pyx_t_1 = 0;
@@ -17563,7 +17521,7 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   __pyx_v_winner_py = __pyx_t_9;
   __pyx_t_9 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2081
+  /* "dama/ai/algorithmic/_fast_search.pyx":2079
  *     # Set results for each entry
  *     winner_py = winner_int if winner_int != 0 else None
  *     for entry_d in entries:             # <<<<<<<<<<<<<<
@@ -17576,33 +17534,33 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     {
       Py_ssize_t __pyx_temp = __Pyx_PyList_GET_SIZE(__pyx_t_9);
       #if !CYTHON_ASSUME_SAFE_SIZE
-      if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 2081, __pyx_L1_error)
+      if (unlikely((__pyx_temp < 0))) __PYX_ERR(0, 2079, __pyx_L1_error)
       #endif
       if (__pyx_t_17 >= __pyx_temp) break;
     }
     __pyx_t_1 = __Pyx_PyList_GET_ITEM_REF(__pyx_t_9, __pyx_t_17, __Pyx_ReferenceSharing_OwnStrongReference);
     ++__pyx_t_17;
-    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2081, __pyx_L1_error)
+    if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2079, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
     __Pyx_XDECREF_SET(__pyx_v_entry_d, __pyx_t_1);
     __pyx_t_1 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2082
+    /* "dama/ai/algorithmic/_fast_search.pyx":2080
  *     winner_py = winner_int if winner_int != 0 else None
  *     for entry_d in entries:
  *         turn = entry_d['state']['turn']             # <<<<<<<<<<<<<<
  *         if winner_int == 0:
  *             entry_d['result'] = 0  # Draw
 */
-    __pyx_t_1 = __Pyx_PyObject_Dict_GetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_state); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2082, __pyx_L1_error)
+    __pyx_t_1 = __Pyx_PyObject_Dict_GetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_state); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2080, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_1);
-    __pyx_t_4 = __Pyx_PyObject_Dict_GetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_turn); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 2082, __pyx_L1_error)
+    __pyx_t_4 = __Pyx_PyObject_Dict_GetItem(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_turn); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 2080, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_4);
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
     __Pyx_XDECREF_SET(__pyx_v_turn, __pyx_t_4);
     __pyx_t_4 = 0;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2083
+    /* "dama/ai/algorithmic/_fast_search.pyx":2081
  *     for entry_d in entries:
  *         turn = entry_d['state']['turn']
  *         if winner_int == 0:             # <<<<<<<<<<<<<<
@@ -17612,16 +17570,16 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
     __pyx_t_3 = (__pyx_v_winner_int == 0);
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2084
+      /* "dama/ai/algorithmic/_fast_search.pyx":2082
  *         turn = entry_d['state']['turn']
  *         if winner_int == 0:
  *             entry_d['result'] = 0  # Draw             # <<<<<<<<<<<<<<
  *         elif turn == winner_int:
  *             entry_d['result'] = 1  # Win
 */
-      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_0) < 0))) __PYX_ERR(0, 2084, __pyx_L1_error)
+      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_0) < 0))) __PYX_ERR(0, 2082, __pyx_L1_error)
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2083
+      /* "dama/ai/algorithmic/_fast_search.pyx":2081
  *     for entry_d in entries:
  *         turn = entry_d['state']['turn']
  *         if winner_int == 0:             # <<<<<<<<<<<<<<
@@ -17631,31 +17589,31 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       goto __pyx_L32;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2085
+    /* "dama/ai/algorithmic/_fast_search.pyx":2083
  *         if winner_int == 0:
  *             entry_d['result'] = 0  # Draw
  *         elif turn == winner_int:             # <<<<<<<<<<<<<<
  *             entry_d['result'] = 1  # Win
  *         else:
 */
-    __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_winner_int); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 2085, __pyx_L1_error)
+    __pyx_t_4 = __Pyx_PyLong_From_int(__pyx_v_winner_int); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 2083, __pyx_L1_error)
     __Pyx_GOTREF(__pyx_t_4);
-    __pyx_t_1 = PyObject_RichCompare(__pyx_v_turn, __pyx_t_4, Py_EQ); __Pyx_XGOTREF(__pyx_t_1); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2085, __pyx_L1_error)
+    __pyx_t_1 = PyObject_RichCompare(__pyx_v_turn, __pyx_t_4, Py_EQ); __Pyx_XGOTREF(__pyx_t_1); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2083, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
-    __pyx_t_3 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 2085, __pyx_L1_error)
+    __pyx_t_3 = __Pyx_PyObject_IsTrue(__pyx_t_1); if (unlikely((__pyx_t_3 < 0))) __PYX_ERR(0, 2083, __pyx_L1_error)
     __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
     if (__pyx_t_3) {
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2086
+      /* "dama/ai/algorithmic/_fast_search.pyx":2084
  *             entry_d['result'] = 0  # Draw
  *         elif turn == winner_int:
  *             entry_d['result'] = 1  # Win             # <<<<<<<<<<<<<<
  *         else:
  *             entry_d['result'] = -1  # Loss
 */
-      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_1) < 0))) __PYX_ERR(0, 2086, __pyx_L1_error)
+      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_1) < 0))) __PYX_ERR(0, 2084, __pyx_L1_error)
 
-      /* "dama/ai/algorithmic/_fast_search.pyx":2085
+      /* "dama/ai/algorithmic/_fast_search.pyx":2083
  *         if winner_int == 0:
  *             entry_d['result'] = 0  # Draw
  *         elif turn == winner_int:             # <<<<<<<<<<<<<<
@@ -17665,19 +17623,19 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
       goto __pyx_L32;
     }
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2088
+    /* "dama/ai/algorithmic/_fast_search.pyx":2086
  *             entry_d['result'] = 1  # Win
  *         else:
  *             entry_d['result'] = -1  # Loss             # <<<<<<<<<<<<<<
- *
+ * 
  *     # Final state for scoring
 */
     /*else*/ {
-      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_neg_1) < 0))) __PYX_ERR(0, 2088, __pyx_L1_error)
+      if (unlikely((PyObject_SetItem(__pyx_v_entry_d, __pyx_mstate_global->__pyx_n_u_result, __pyx_mstate_global->__pyx_int_neg_1) < 0))) __PYX_ERR(0, 2086, __pyx_L1_error)
     }
     __pyx_L32:;
 
-    /* "dama/ai/algorithmic/_fast_search.pyx":2081
+    /* "dama/ai/algorithmic/_fast_search.pyx":2079
  *     # Set results for each entry
  *     winner_py = winner_int if winner_int != 0 else None
  *     for entry_d in entries:             # <<<<<<<<<<<<<<
@@ -17687,109 +17645,109 @@ static PyObject *__pyx_pf_4dama_2ai_11algorithmic_12_fast_search_14play_full_gam
   }
   __Pyx_DECREF(__pyx_t_9); __pyx_t_9 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2091
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":2089
+ * 
  *     # Final state for scoring
  *     final_state_dict = board_to_compact_dict(             # <<<<<<<<<<<<<<
  *         board, player, applied_opening_plies + actual_moves)
- *
+ * 
 */
-  __pyx_t_9 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact_dict(__pyx_v_board, __pyx_v_player, (__pyx_v_applied_opening_plies + __pyx_v_actual_moves)); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2091, __pyx_L1_error)
+  __pyx_t_9 = __pyx_f_4dama_2ai_11algorithmic_12_fast_search_board_to_compact_dict(__pyx_v_board, __pyx_v_player, (__pyx_v_applied_opening_plies + __pyx_v_actual_moves)); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2089, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_9);
   __pyx_v_final_state_dict = ((PyObject*)__pyx_t_9);
   __pyx_t_9 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2094
+  /* "dama/ai/algorithmic/_fast_search.pyx":2092
  *         board, player, applied_opening_plies + actual_moves)
- *
+ * 
  *     return {             # <<<<<<<<<<<<<<
  *         'entries': entries,
  *         'winner': winner_py,
 */
   __Pyx_XDECREF(__pyx_r);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2095
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":2093
+ * 
  *     return {
  *         'entries': entries,             # <<<<<<<<<<<<<<
  *         'winner': winner_py,
  *         'num_moves': actual_moves,
 */
-  __pyx_t_9 = __Pyx_PyDict_NewPresized(7); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  __pyx_t_9 = __Pyx_PyDict_NewPresized(7); if (unlikely(!__pyx_t_9)) __PYX_ERR(0, 2093, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_9);
-  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_entries, __pyx_v_entries) < (0)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_entries, __pyx_v_entries) < (0)) __PYX_ERR(0, 2093, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2096
+  /* "dama/ai/algorithmic/_fast_search.pyx":2094
  *     return {
  *         'entries': entries,
  *         'winner': winner_py,             # <<<<<<<<<<<<<<
  *         'num_moves': actual_moves,
  *         'opening_plies': applied_opening_plies,
 */
-  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_winner, __pyx_v_winner_py) < (0)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_winner, __pyx_v_winner_py) < (0)) __PYX_ERR(0, 2093, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2097
+  /* "dama/ai/algorithmic/_fast_search.pyx":2095
  *         'entries': entries,
  *         'winner': winner_py,
  *         'num_moves': actual_moves,             # <<<<<<<<<<<<<<
  *         'opening_plies': applied_opening_plies,
  *         'p1_captures': p1_caps,
 */
-  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_actual_moves); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2097, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_actual_moves); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2095, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_num_moves, __pyx_t_1) < (0)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_num_moves, __pyx_t_1) < (0)) __PYX_ERR(0, 2093, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2098
+  /* "dama/ai/algorithmic/_fast_search.pyx":2096
  *         'winner': winner_py,
  *         'num_moves': actual_moves,
  *         'opening_plies': applied_opening_plies,             # <<<<<<<<<<<<<<
  *         'p1_captures': p1_caps,
  *         'p2_captures': p2_caps,
 */
-  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_applied_opening_plies); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2098, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_applied_opening_plies); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2096, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_opening_plies, __pyx_t_1) < (0)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_opening_plies, __pyx_t_1) < (0)) __PYX_ERR(0, 2093, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2099
+  /* "dama/ai/algorithmic/_fast_search.pyx":2097
  *         'num_moves': actual_moves,
  *         'opening_plies': applied_opening_plies,
  *         'p1_captures': p1_caps,             # <<<<<<<<<<<<<<
  *         'p2_captures': p2_caps,
  *         'final_state': final_state_dict,
 */
-  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_p1_caps); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2099, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_p1_caps); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2097, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_p1_captures, __pyx_t_1) < (0)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_p1_captures, __pyx_t_1) < (0)) __PYX_ERR(0, 2093, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2100
+  /* "dama/ai/algorithmic/_fast_search.pyx":2098
  *         'opening_plies': applied_opening_plies,
  *         'p1_captures': p1_caps,
  *         'p2_captures': p2_caps,             # <<<<<<<<<<<<<<
  *         'final_state': final_state_dict,
  *     }
 */
-  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_p2_caps); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2100, __pyx_L1_error)
+  __pyx_t_1 = __Pyx_PyLong_From_int(__pyx_v_p2_caps); if (unlikely(!__pyx_t_1)) __PYX_ERR(0, 2098, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_1);
-  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_p2_captures, __pyx_t_1) < (0)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_p2_captures, __pyx_t_1) < (0)) __PYX_ERR(0, 2093, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":2101
+  /* "dama/ai/algorithmic/_fast_search.pyx":2099
  *         'p1_captures': p1_caps,
  *         'p2_captures': p2_caps,
  *         'final_state': final_state_dict,             # <<<<<<<<<<<<<<
  *     }
 */
-  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_final_state, __pyx_v_final_state_dict) < (0)) __PYX_ERR(0, 2095, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_9, __pyx_mstate_global->__pyx_n_u_final_state, __pyx_v_final_state_dict) < (0)) __PYX_ERR(0, 2093, __pyx_L1_error)
   __pyx_r = ((PyObject*)__pyx_t_9);
   __pyx_t_9 = 0;
   goto __pyx_L0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1888
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1886
+ * 
+ * 
  * def play_full_game_cy(             # <<<<<<<<<<<<<<
  *     str p1_difficulty = 'medium',
  *     str p2_difficulty = 'medium',
@@ -18136,7 +18094,7 @@ static CYTHON_SMALL_CODE int __pyx_pymod_exec__fast_search(PyObject *__pyx_pyini
         Py_FatalError("failed to import 'refnanny' module");
   }
   #endif
-
+  
 __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
   __Pyx_init_runtime_version();
   if (__Pyx_check_binary_version(__PYX_LIMITED_VERSION_HEX, __Pyx_get_runtime_version(), CYTHON_COMPILING_IN_LIMITED_API) < (0)) __PYX_ERR(0, 1, __pyx_L1_error)
@@ -18174,7 +18132,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":112
  * cdef int ALL_DC[4]
- *
+ * 
  * FWD_P1_DR[0] = 1; FWD_P1_DC[0] = -1             # <<<<<<<<<<<<<<
  * FWD_P1_DR[1] = 1; FWD_P1_DC[1] = 1
  * FWD_P2_DR[0] = -1; FWD_P2_DC[0] = -1
@@ -18183,7 +18141,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
   (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_FWD_P1_DC[0]) = -1;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":113
- *
+ * 
  * FWD_P1_DR[0] = 1; FWD_P1_DC[0] = -1
  * FWD_P1_DR[1] = 1; FWD_P1_DC[1] = 1             # <<<<<<<<<<<<<<
  * FWD_P2_DR[0] = -1; FWD_P2_DC[0] = -1
@@ -18237,7 +18195,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
  * ALL_DR[1] = -1; ALL_DC[1] = 1
  * ALL_DR[2] = 1;  ALL_DC[2] = -1             # <<<<<<<<<<<<<<
  * ALL_DR[3] = 1;  ALL_DC[3] = 1
- *
+ * 
 */
   (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_ALL_DR[2]) = 1;
   (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_ALL_DC[2]) = -1;
@@ -18246,7 +18204,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
  * ALL_DR[1] = -1; ALL_DC[1] = 1
  * ALL_DR[2] = 1;  ALL_DC[2] = -1
  * ALL_DR[3] = 1;  ALL_DC[3] = 1             # <<<<<<<<<<<<<<
- *
+ * 
  * #  Evaluation weights
 */
   (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_ALL_DR[3]) = 1;
@@ -18254,37 +18212,37 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
 
   /* "dama/ai/algorithmic/_fast_search.pyx":153
  *             CENTER_DIST[r * 8 + c] = 7 - <int>(fabs(3.5 - r) + fabs(3.5 - c))
- *
+ * 
  * _init_center()             # <<<<<<<<<<<<<<
- *
+ * 
  * # Precomputed dark square indices  only dark squares ((r+c)%2==1) can hold
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_center(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 153, __pyx_L1_error)
 
   /* "dama/ai/algorithmic/_fast_search.pyx":174
  *                 i += 1
- *
+ * 
  * _init_dark_sq()             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_dark_sq(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 174, __pyx_L1_error)
 
   /* "dama/ai/algorithmic/_fast_search.pyx":194
  *         EVAL_P1[P2_KING][sq] = -W_KING - center - (W_BACK_RANK if r == 7 else 0)
- *
+ * 
  * _init_eval_table()             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_eval_table();
 
   /* "dama/ai/algorithmic/_fast_search.pyx":222
  *                 LMR_TABLE[d][m] = r
- *
+ * 
  * _init_lmr_table()             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_lmr_table();
 
@@ -18320,7 +18278,7 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
  * LMP_TABLE[2] = 8
  * LMP_TABLE[3] = 12             # <<<<<<<<<<<<<<
  * LMP_TABLE[4] = 16
- *
+ * 
 */
   (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_LMP_TABLE[3]) = 12;
 
@@ -18328,13 +18286,13 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
  * LMP_TABLE[2] = 8
  * LMP_TABLE[3] = 12
  * LMP_TABLE[4] = 16             # <<<<<<<<<<<<<<
- *
- *
+ * 
+ * 
 */
   (__pyx_v_4dama_2ai_11algorithmic_12_fast_search_LMP_TABLE[4]) = 16;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":274
- *
+ * 
  * # Module-level TT allocated on first use (persists across searches within a process).
  * cdef TTEntry *_tt_table = NULL             # <<<<<<<<<<<<<<
  * # Generation counter: incremented on each fast_search() call. Entries with a
@@ -18346,84 +18304,84 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
  * # 256-search-old entry passes the generation check, which is harmless (just a
  * # rare false TT hit that the hash verification catches).
  * cdef unsigned char _tt_generation = 0             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef void _init_zobrist():
 */
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__tt_generation = 0;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":294
  *     ZOBRIST_SIDE = state
- *
+ * 
  * _init_zobrist()             # <<<<<<<<<<<<<<
- *
+ * 
  * cdef void _ensure_tt():
 */
   __pyx_f_4dama_2ai_11algorithmic_12_fast_search__init_zobrist(); if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 294, __pyx_L1_error)
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1416
+  /* "dama/ai/algorithmic/_fast_search.pyx":1414
  * # Rules are constant during a training session (never change at runtime).
  * # Invalidated to None on module reload (fresh import).
  * cdef bint _rules_cached = False             # <<<<<<<<<<<<<<
  * cdef Rules _cached_rules
- *
+ * 
 */
   __pyx_v_4dama_2ai_11algorithmic_12_fast_search__rules_cached = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1437
+  /* "dama/ai/algorithmic/_fast_search.pyx":1435
  * #
- *
+ * 
  * def _fast_evaluate_static(object state) -> float:             # <<<<<<<<<<<<<<
  *     """Expose the compiled static evaluator for reference-parity tests."""
  *     cdef signed char board[64]
 */
-  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1437, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1435, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_float) < (0)) __PYX_ERR(0, 1437, __pyx_L1_error)
-  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static, 0, __pyx_mstate_global->__pyx_n_u_fast_evaluate_static, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[0])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1437, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_float) < (0)) __PYX_ERR(0, 1435, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_1_fast_evaluate_static, 0, __pyx_mstate_global->__pyx_n_u_fast_evaluate_static, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[0])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1435, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_3);
   #endif
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_3, __pyx_t_2);
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_fast_evaluate_static, __pyx_t_3) < (0)) __PYX_ERR(0, 1437, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_fast_evaluate_static, __pyx_t_3) < (0)) __PYX_ERR(0, 1435, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1447
+  /* "dama/ai/algorithmic/_fast_search.pyx":1445
  *     object state,
  *     str difficulty = 'medium',
  *     double time_budget_override = 0.0,             # <<<<<<<<<<<<<<
  *     int max_depth_override = 0,
  * ) -> dict:
 */
-  __pyx_t_3 = PyFloat_FromDouble(((double)0.0)); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1447, __pyx_L1_error)
+  __pyx_t_3 = PyFloat_FromDouble(((double)0.0)); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1445, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1448
+  /* "dama/ai/algorithmic/_fast_search.pyx":1446
  *     str difficulty = 'medium',
  *     double time_budget_override = 0.0,
  *     int max_depth_override = 0,             # <<<<<<<<<<<<<<
  * ) -> dict:
  *     """Run iterative-deepening alpha-beta search entirely in C.
 */
-  __pyx_t_2 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1448, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1446, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1444
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1442
+ * 
+ * 
  * def fast_search(             # <<<<<<<<<<<<<<
  *     object state,
  *     str difficulty = 'medium',
 */
-  __pyx_t_4 = PyTuple_Pack(3, ((PyObject*)__pyx_mstate_global->__pyx_n_u_medium), __pyx_t_3, __pyx_t_2); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1444, __pyx_L1_error)
+  __pyx_t_4 = PyTuple_Pack(3, ((PyObject*)__pyx_mstate_global->__pyx_n_u_medium), __pyx_t_3, __pyx_t_2); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1442, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_4);
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1444, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1442, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_dict) < (0)) __PYX_ERR(0, 1444, __pyx_L1_error)
-  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_3fast_search, 0, __pyx_mstate_global->__pyx_n_u_fast_search, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[1])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1444, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_dict) < (0)) __PYX_ERR(0, 1442, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_3fast_search, 0, __pyx_mstate_global->__pyx_n_u_fast_search, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[1])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1442, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_3);
@@ -18432,166 +18390,166 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_3, __pyx_t_2);
   __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_fast_search, __pyx_t_3) < (0)) __PYX_ERR(0, 1444, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_fast_search, __pyx_t_3) < (0)) __PYX_ERR(0, 1442, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1603
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1601
+ * 
+ * 
  * def fast_generate_moves(object state) -> list:             # <<<<<<<<<<<<<<
  *     """Generate all legal moves for a GameState. Returns list of move dicts."""
  *     cdef signed char board[64]
 */
-  __pyx_t_3 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1603, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1601, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
-  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_list) < (0)) __PYX_ERR(0, 1603, __pyx_L1_error)
-  __pyx_t_2 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves, 0, __pyx_mstate_global->__pyx_n_u_fast_generate_moves, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[2])); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1603, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_list) < (0)) __PYX_ERR(0, 1601, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_5fast_generate_moves, 0, __pyx_mstate_global->__pyx_n_u_fast_generate_moves, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[2])); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1601, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_2);
   #endif
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_2, __pyx_t_3);
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_fast_generate_moves, __pyx_t_2) < (0)) __PYX_ERR(0, 1603, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_fast_generate_moves, __pyx_t_2) < (0)) __PYX_ERR(0, 1601, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1633
+  /* "dama/ai/algorithmic/_fast_search.pyx":1631
  * # Cython access via <const char*>.
- *
+ * 
  * def init_board_bytes() -> bytes:             # <<<<<<<<<<<<<<
  *     """Return the standard starting position as 64 raw bytes."""
  *     cdef signed char board[64]
 */
-  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1633, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1631, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_bytes) < (0)) __PYX_ERR(0, 1633, __pyx_L1_error)
-  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_7init_board_bytes, 0, __pyx_mstate_global->__pyx_n_u_init_board_bytes, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[3])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1633, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_bytes) < (0)) __PYX_ERR(0, 1631, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_7init_board_bytes, 0, __pyx_mstate_global->__pyx_n_u_init_board_bytes, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[3])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1631, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_3);
   #endif
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_3, __pyx_t_2);
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_init_board_bytes, __pyx_t_3) < (0)) __PYX_ERR(0, 1633, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_init_board_bytes, __pyx_t_3) < (0)) __PYX_ERR(0, 1631, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1640
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1638
+ * 
+ * 
  * def gen_moves_from_board(bytes board_bytes, int player) -> list:             # <<<<<<<<<<<<<<
  *     """Generate all legal moves from raw board bytes. Returns list of move dicts.
- *
+ * 
 */
-  __pyx_t_3 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1640, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1638, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
-  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_list) < (0)) __PYX_ERR(0, 1640, __pyx_L1_error)
-  __pyx_t_2 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board, 0, __pyx_mstate_global->__pyx_n_u_gen_moves_from_board, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[4])); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1640, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_list) < (0)) __PYX_ERR(0, 1638, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_9gen_moves_from_board, 0, __pyx_mstate_global->__pyx_n_u_gen_moves_from_board, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[4])); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1638, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_2);
   #endif
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_2, __pyx_t_3);
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_gen_moves_from_board, __pyx_t_2) < (0)) __PYX_ERR(0, 1640, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_gen_moves_from_board, __pyx_t_2) < (0)) __PYX_ERR(0, 1638, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1664
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1662
+ * 
+ * 
  * def apply_move_board(bytes board_bytes, int player, dict move_dict) -> tuple:             # <<<<<<<<<<<<<<
  *     """Apply a move dict to raw board bytes. Returns (new_board_bytes, new_player, num_captures).
- *
+ * 
 */
-  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1664, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1662, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
-  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_tuple) < (0)) __PYX_ERR(0, 1664, __pyx_L1_error)
-  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board, 0, __pyx_mstate_global->__pyx_n_u_apply_move_board, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[5])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1664, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_2, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_tuple) < (0)) __PYX_ERR(0, 1662, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_11apply_move_board, 0, __pyx_mstate_global->__pyx_n_u_apply_move_board, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[5])); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1662, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_3);
   #endif
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_3, __pyx_t_2);
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_apply_move_board, __pyx_t_3) < (0)) __PYX_ERR(0, 1664, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_apply_move_board, __pyx_t_3) < (0)) __PYX_ERR(0, 1662, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1702
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1700
+ * 
+ * 
  * def board_bytes_to_compact(bytes board_bytes, int player, int move_count) -> dict:             # <<<<<<<<<<<<<<
  *     """Convert raw board bytes to compact dict for replay recording."""
  *     cdef signed char board[64]
 */
-  __pyx_t_3 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1702, __pyx_L1_error)
+  __pyx_t_3 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1700, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
-  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_dict) < (0)) __PYX_ERR(0, 1702, __pyx_L1_error)
-  __pyx_t_2 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact, 0, __pyx_mstate_global->__pyx_n_u_board_bytes_to_compact, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[6])); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1702, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_3, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_dict) < (0)) __PYX_ERR(0, 1700, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_13board_bytes_to_compact, 0, __pyx_mstate_global->__pyx_n_u_board_bytes_to_compact, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[6])); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1700, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_2);
   #endif
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_2, __pyx_t_3);
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_board_bytes_to_compact, __pyx_t_2) < (0)) __PYX_ERR(0, 1702, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_board_bytes_to_compact, __pyx_t_2) < (0)) __PYX_ERR(0, 1700, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1891
+  /* "dama/ai/algorithmic/_fast_search.pyx":1889
  *     str p1_difficulty = 'medium',
  *     str p2_difficulty = 'medium',
  *     int max_moves = 100,             # <<<<<<<<<<<<<<
  *     double noise_prob = 0.1,
  *     int start_player = 1,
 */
-  __pyx_t_2 = __Pyx_PyLong_From_int(((int)0x64)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1891, __pyx_L1_error)
+  __pyx_t_2 = __Pyx_PyLong_From_int(((int)0x64)); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 1889, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_2);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1892
+  /* "dama/ai/algorithmic/_fast_search.pyx":1890
  *     str p2_difficulty = 'medium',
  *     int max_moves = 100,
  *     double noise_prob = 0.1,             # <<<<<<<<<<<<<<
  *     int start_player = 1,
  *     str teacher_difficulty = 'hard',
 */
-  __pyx_t_3 = PyFloat_FromDouble(((double)0.1)); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1892, __pyx_L1_error)
+  __pyx_t_3 = PyFloat_FromDouble(((double)0.1)); if (unlikely(!__pyx_t_3)) __PYX_ERR(0, 1890, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_3);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1893
+  /* "dama/ai/algorithmic/_fast_search.pyx":1891
  *     int max_moves = 100,
  *     double noise_prob = 0.1,
  *     int start_player = 1,             # <<<<<<<<<<<<<<
  *     str teacher_difficulty = 'hard',
  *     int opening_plies = 0,
 */
-  __pyx_t_4 = __Pyx_PyLong_From_int(((int)1)); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1893, __pyx_L1_error)
+  __pyx_t_4 = __Pyx_PyLong_From_int(((int)1)); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1891, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_4);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1895
+  /* "dama/ai/algorithmic/_fast_search.pyx":1893
  *     int start_player = 1,
  *     str teacher_difficulty = 'hard',
  *     int opening_plies = 0,             # <<<<<<<<<<<<<<
  *     object opening_seed = 0,
  *     str trajectory_source = 'algorithm',
 */
-  __pyx_t_5 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1895, __pyx_L1_error)
+  __pyx_t_5 = __Pyx_PyLong_From_int(((int)0)); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1893, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_5);
 
-  /* "dama/ai/algorithmic/_fast_search.pyx":1888
- *
- *
+  /* "dama/ai/algorithmic/_fast_search.pyx":1886
+ * 
+ * 
  * def play_full_game_cy(             # <<<<<<<<<<<<<<
  *     str p1_difficulty = 'medium',
  *     str p2_difficulty = 'medium',
 */
-  __pyx_t_6 = PyTuple_Pack(10, ((PyObject*)__pyx_mstate_global->__pyx_n_u_medium), ((PyObject*)__pyx_mstate_global->__pyx_n_u_medium), __pyx_t_2, __pyx_t_3, __pyx_t_4, ((PyObject*)__pyx_mstate_global->__pyx_n_u_hard), __pyx_t_5, ((PyObject*)__pyx_mstate_global->__pyx_int_0), ((PyObject*)__pyx_mstate_global->__pyx_n_u_algorithm), Py_None); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1888, __pyx_L1_error)
+  __pyx_t_6 = PyTuple_Pack(10, ((PyObject*)__pyx_mstate_global->__pyx_n_u_medium), ((PyObject*)__pyx_mstate_global->__pyx_n_u_medium), __pyx_t_2, __pyx_t_3, __pyx_t_4, ((PyObject*)__pyx_mstate_global->__pyx_n_u_hard), __pyx_t_5, ((PyObject*)__pyx_mstate_global->__pyx_int_0), ((PyObject*)__pyx_mstate_global->__pyx_n_u_algorithm), Py_None); if (unlikely(!__pyx_t_6)) __PYX_ERR(0, 1886, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_6);
   __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
   __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
   __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
   __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-  __pyx_t_5 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1888, __pyx_L1_error)
+  __pyx_t_5 = __Pyx_PyDict_NewPresized(1); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 1886, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_5);
-  if (PyDict_SetItem(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_dict) < (0)) __PYX_ERR(0, 1888, __pyx_L1_error)
-  __pyx_t_4 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy, 0, __pyx_mstate_global->__pyx_n_u_play_full_game_cy, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[7])); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1888, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_t_5, __pyx_mstate_global->__pyx_n_u_return, __pyx_mstate_global->__pyx_n_u_dict) < (0)) __PYX_ERR(0, 1886, __pyx_L1_error)
+  __pyx_t_4 = __Pyx_CyFunction_New(&__pyx_mdef_4dama_2ai_11algorithmic_12_fast_search_15play_full_game_cy, 0, __pyx_mstate_global->__pyx_n_u_play_full_game_cy, NULL, __pyx_mstate_global->__pyx_n_u_dama_ai_algorithmic__fast_search, __pyx_mstate_global->__pyx_d, ((PyObject *)__pyx_mstate_global->__pyx_codeobj_tab[7])); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1886, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_4);
   #if CYTHON_COMPILING_IN_CPYTHON && PY_VERSION_HEX >= 0x030E0000
   PyUnstable_Object_EnableDeferredRefcount(__pyx_t_4);
@@ -18600,13 +18558,13 @@ __Pyx_RefNannySetupContext("PyInit__fast_search", 0);
   __Pyx_CyFunction_SetAnnotationsDict(__pyx_t_4, __pyx_t_5);
   __Pyx_DECREF(__pyx_t_6); __pyx_t_6 = 0;
   __Pyx_DECREF(__pyx_t_5); __pyx_t_5 = 0;
-  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_play_full_game_cy, __pyx_t_4) < (0)) __PYX_ERR(0, 1888, __pyx_L1_error)
+  if (PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_u_play_full_game_cy, __pyx_t_4) < (0)) __PYX_ERR(0, 1886, __pyx_L1_error)
   __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
 
   /* "dama/ai/algorithmic/_fast_search.pyx":1
  * # cython: boundscheck=False, wraparound=False, cdivision=True, language_level=3             # <<<<<<<<<<<<<<
  * """Cython-accelerated alpha-beta search for Filipino Dama.
- *
+ * 
 */
   __pyx_t_4 = __Pyx_PyDict_NewPresized(0); if (unlikely(!__pyx_t_4)) __PYX_ERR(0, 1, __pyx_L1_error)
   __Pyx_GOTREF(__pyx_t_4);
@@ -18831,42 +18789,42 @@ static int __Pyx_CreateCodeObjects(__pyx_mstatetype *__pyx_mstate) {
   PyObject* tuple_dedup_map = PyDict_New();
   if (unlikely(!tuple_dedup_map)) return -1;
   {
-    const __Pyx_PyCode_New_function_description descr = {1, 0, 0, 2, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1437};
+    const __Pyx_PyCode_New_function_description descr = {1, 0, 0, 2, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1435};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_state, __pyx_mstate->__pyx_n_u_board};
     __pyx_mstate_global->__pyx_codeobj_tab[0] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_fast_evaluate_static, __pyx_mstate->__pyx_kp_b_iso88591_1_q_q_QgS_a, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[0])) goto bad;
   }
   {
-    const __Pyx_PyCode_New_function_description descr = {4, 0, 0, 27, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1444};
+    const __Pyx_PyCode_New_function_description descr = {4, 0, 0, 27, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1442};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_state, __pyx_mstate->__pyx_n_u_difficulty, __pyx_mstate->__pyx_n_u_time_budget_override, __pyx_mstate->__pyx_n_u_max_depth_override, __pyx_mstate->__pyx_n_u_board, __pyx_mstate->__pyx_n_u_player, __pyx_mstate->__pyx_n_u_time_budget, __pyx_mstate->__pyx_n_u_deadline, __pyx_mstate->__pyx_n_u_max_depth, __pyx_mstate->__pyx_n_u_moves, __pyx_mstate->__pyx_n_u_ss, __pyx_mstate->__pyx_n_u_rules, __pyx_mstate->__pyx_n_u_best_idx, __pyx_mstate->__pyx_n_u_best_depth, __pyx_mstate->__pyx_n_u_idx, __pyx_mstate->__pyx_n_u_depth, __pyx_mstate->__pyx_n_u_h, __pyx_mstate->__pyx_n_u_tt_from, __pyx_mstate->__pyx_n_u_tt_to, __pyx_mstate->__pyx_n_u_d_score, __pyx_mstate->__pyx_n_u_d_alpha, __pyx_mstate->__pyx_n_u_d_beta, __pyx_mstate->__pyx_n_u_tmp_move, __pyx_mstate->__pyx_n_u_prev_score, __pyx_mstate->__pyx_n_u_asp_delta, __pyx_mstate->__pyx_n_u_asp_alpha, __pyx_mstate->__pyx_n_u_asp_beta};
     __pyx_mstate_global->__pyx_codeobj_tab[1] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_fast_search, __pyx_mstate->__pyx_kp_b_iso88591_Ba_a_Cq_a_Cq_a_Cq_a_a_A_A_Cq_A, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[1])) goto bad;
   }
   {
-    const __Pyx_PyCode_New_function_description descr = {1, 0, 0, 7, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1603};
+    const __Pyx_PyCode_New_function_description descr = {1, 0, 0, 7, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1601};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_state, __pyx_mstate->__pyx_n_u_board, __pyx_mstate->__pyx_n_u_player, __pyx_mstate->__pyx_n_u_moves, __pyx_mstate->__pyx_n_u_rules, __pyx_mstate->__pyx_n_u_i, __pyx_mstate->__pyx_n_u_result};
     __pyx_mstate_global->__pyx_codeobj_tab[2] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_fast_generate_moves, __pyx_mstate->__pyx_kp_b_iso88591_q_q_S_a_Kq_Q_U_5_gQm1AU_1, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[2])) goto bad;
   }
   {
-    const __Pyx_PyCode_New_function_description descr = {0, 0, 0, 1, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1633};
+    const __Pyx_PyCode_New_function_description descr = {0, 0, 0, 1, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1631};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_board};
     __pyx_mstate_global->__pyx_codeobj_tab[3] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_init_board_bytes, __pyx_mstate->__pyx_kp_b_iso88591_q_G6_1, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[3])) goto bad;
   }
   {
-    const __Pyx_PyCode_New_function_description descr = {2, 0, 0, 7, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1640};
+    const __Pyx_PyCode_New_function_description descr = {2, 0, 0, 7, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1638};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_board_bytes, __pyx_mstate->__pyx_n_u_player, __pyx_mstate->__pyx_n_u_board, __pyx_mstate->__pyx_n_u_moves, __pyx_mstate->__pyx_n_u_rules, __pyx_mstate->__pyx_n_u_i, __pyx_mstate->__pyx_n_u_result};
     __pyx_mstate_global->__pyx_codeobj_tab[4] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_gen_moves_from_board, __pyx_mstate->__pyx_kp_b_iso88591_1_7_A_Kq_Q_U_5_gQm1AU_1, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[4])) goto bad;
   }
   {
-    const __Pyx_PyCode_New_function_description descr = {3, 0, 0, 11, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1664};
+    const __Pyx_PyCode_New_function_description descr = {3, 0, 0, 11, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1662};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_board_bytes, __pyx_mstate->__pyx_n_u_player, __pyx_mstate->__pyx_n_u_move_dict, __pyx_mstate->__pyx_n_u_board, __pyx_mstate->__pyx_n_u_new_board, __pyx_mstate->__pyx_n_u_cmove, __pyx_mstate->__pyx_n_u_i, __pyx_mstate->__pyx_n_u_n, __pyx_mstate->__pyx_n_u_path, __pyx_mstate->__pyx_n_u_captures, __pyx_mstate->__pyx_n_u_new_player};
     __pyx_mstate_global->__pyx_codeobj_tab[5] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_apply_move_board, __pyx_mstate->__pyx_kp_b_iso88591_Gq_7_A_9AQ_1A_Q_U_1_WAU_ar_WAU, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[5])) goto bad;
   }
   {
-    const __Pyx_PyCode_New_function_description descr = {3, 0, 0, 4, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1702};
+    const __Pyx_PyCode_New_function_description descr = {3, 0, 0, 4, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1700};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_board_bytes, __pyx_mstate->__pyx_n_u_player, __pyx_mstate->__pyx_n_u_move_count, __pyx_mstate->__pyx_n_u_board};
     __pyx_mstate_global->__pyx_codeobj_tab[6] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_board_bytes_to_compact, __pyx_mstate->__pyx_kp_b_iso88591_MQ_7_A, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[6])) goto bad;
   }
   {
-    const __Pyx_PyCode_New_function_description descr = {10, 0, 0, 49, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1888};
+    const __Pyx_PyCode_New_function_description descr = {10, 0, 0, 49, (unsigned int)(CO_OPTIMIZED|CO_NEWLOCALS), 1886};
     PyObject* const varnames[] = {__pyx_mstate->__pyx_n_u_p1_difficulty, __pyx_mstate->__pyx_n_u_p2_difficulty, __pyx_mstate->__pyx_n_u_max_moves, __pyx_mstate->__pyx_n_u_noise_prob, __pyx_mstate->__pyx_n_u_start_player, __pyx_mstate->__pyx_n_u_teacher_difficulty, __pyx_mstate->__pyx_n_u_opening_plies, __pyx_mstate->__pyx_n_u_opening_seed, __pyx_mstate->__pyx_n_u_trajectory_source, __pyx_mstate->__pyx_n_u_game_id, __pyx_mstate->__pyx_n_u_rng, __pyx_mstate->__pyx_n_u_board, __pyx_mstate->__pyx_n_u_new_board, __pyx_mstate->__pyx_n_u_moves, __pyx_mstate->__pyx_n_u_teacher_moves, __pyx_mstate->__pyx_n_u_behavior_moves, __pyx_mstate->__pyx_n_u_rules, __pyx_mstate->__pyx_n_u_player, __pyx_mstate->__pyx_n_u_move_num, __pyx_mstate->__pyx_n_u_i, __pyx_mstate->__pyx_n_u_teacher_idx, __pyx_mstate->__pyx_n_u_played_idx, __pyx_mstate->__pyx_n_u_apply_idx, __pyx_mstate->__pyx_n_u_teacher_best_idx, __pyx_mstate->__pyx_n_u_behavior_best_idx, __pyx_mstate->__pyx_n_u_opening_i, __pyx_mstate->__pyx_n_u_opening_index, __pyx_mstate->__pyx_n_u_applied_opening_plies, __pyx_mstate->__pyx_n_u_teacher_ss, __pyx_mstate->__pyx_n_u_behavior_ss, __pyx_mstate->__pyx_n_u_p1_caps, __pyx_mstate->__pyx_n_u_p2_caps, __pyx_mstate->__pyx_n_u_game_over, __pyx_mstate->__pyx_n_u_was_exploration, __pyx_mstate->__pyx_n_u_h, __pyx_mstate->__pyx_n_u_teacher_move, __pyx_mstate->__pyx_n_u_behavior_move, __pyx_mstate->__pyx_n_u_opening_rng, __pyx_mstate->__pyx_n_u_behavior_rng, __pyx_mstate->__pyx_n_u_entries, __pyx_mstate->__pyx_n_u_moves_list, __pyx_mstate->__pyx_n_u_state_dict, __pyx_mstate->__pyx_n_u_actual_moves, __pyx_mstate->__pyx_n_u_cur_diff, __pyx_mstate->__pyx_n_u_entry_d, __pyx_mstate->__pyx_n_u_winner_int, __pyx_mstate->__pyx_n_u_winner_py, __pyx_mstate->__pyx_n_u_turn, __pyx_mstate->__pyx_n_u_final_state_dict};
     __pyx_mstate_global->__pyx_codeobj_tab[7] = __Pyx_PyCode_New(descr, varnames, __pyx_mstate->__pyx_kp_u_dama_ai_algorithmic__fast_search_2, __pyx_mstate->__pyx_n_u_play_full_game_cy, __pyx_mstate->__pyx_kp_b_iso88591_7q_q_A_Q_j_Rq_j_D_b_j_Kq_q_Q_gQ, tuple_dedup_map); if (unlikely(!__pyx_mstate_global->__pyx_codeobj_tab[7])) goto bad;
   }
@@ -18881,12 +18839,12 @@ static int __Pyx_CreateCodeObjects(__pyx_mstatetype *__pyx_mstate) {
 static int __Pyx_InitGlobals(void) {
   /* PythonCompatibility.init */
   if (likely(__Pyx_init_co_variables() == 0)); else
-
+  
   if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1, __pyx_L1_error)
 
   /* CommonTypesMetaclass.init */
   if (likely(__pyx_CommonTypesMetaclass_init(__pyx_m) == 0)); else
-
+  
   if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1, __pyx_L1_error)
 
   /* CachedMethodType.init */
@@ -18900,12 +18858,12 @@ static int __Pyx_InitGlobals(void) {
       }
   } // error handling follows
   #endif
-
+  
   if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1, __pyx_L1_error)
 
   /* CythonFunctionShared.init */
   if (likely(__pyx_CyFunction_init(__pyx_m) == 0)); else
-
+  
   if (unlikely(PyErr_Occurred())) __PYX_ERR(0, 1, __pyx_L1_error)
 
   return 0;
@@ -19679,7 +19637,7 @@ static PyObject* __Pyx_Unpacked___Pyx_PyLong_MultiplyObjC(PyObject *op1, PyObjec
             llx = lla * llb;
             return PyLong_FromLongLong(llx);
         }
-
+    
 }
 #endif
 static PyObject* __Pyx_Float___Pyx_PyLong_MultiplyObjC(PyObject *float_val, long intval, int zerodivision_check) {
@@ -19687,7 +19645,7 @@ static PyObject* __Pyx_Float___Pyx_PyLong_MultiplyObjC(PyObject *float_val, long
     const long b = intval;
     double a = __Pyx_PyFloat_AS_DOUBLE(float_val);
         double result;
-
+        
         result = ((double)a) * (double)b;
         return PyFloat_FromDouble(result);
 }

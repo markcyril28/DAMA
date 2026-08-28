@@ -500,17 +500,19 @@ cdef inline void _add_simple_move(
 # Every ancestor's captured piece remains removed until its recursive call
 # returns, so the mutated board is the captured-square set.  The starting
 # square is likewise path[0]; carrying either state separately only enlarges
-# this hot recursive call frame.
+# this hot recursive call frame.  Recursive paths use flat 0..63 squares so
+# each step writes and passes one coordinate stream instead of separate rows
+# and columns; final CMove emission expands them back to the public layout.
 
 cdef int _generate_captures_recursive(
     signed char *board, int r, int c, int piece, int player,
     int capture_value,
-    int *path_r, int *path_c, int path_len,
-    int *cap_r, int *cap_c, int num_caps,
+    int *path_sq, int path_len,
+    int *cap_sq, int num_caps,
     Rules *rules, CMoveList *out
 ) noexcept nogil:
     """Recursively generate capture sequences. Returns count found."""
-    cdef int d, cr, cc, lr, lc
+    cdef int d, cr, cc, lr, lc, landing_sq
     cdef int found = 0
     cdef int captured_piece, further, next_capture_value
     cdef int *dirs_r
@@ -524,8 +526,8 @@ cdef int _generate_captures_recursive(
             found += _flying_king_capture(
                 board, r, c, piece, player,
                 dirs_r[d], dirs_c[d],
-                capture_value, path_r, path_c, path_len,
-                cap_r, cap_c, num_caps, rules, out
+                capture_value, path_sq, path_len,
+                cap_sq, num_caps, rules, out
             )
         else:
             cr = r + dirs_r[d]
@@ -538,14 +540,13 @@ cdef int _generate_captures_recursive(
             captured_piece = cell(board, cr, cc)
             if not is_opponent(captured_piece, player):
                 continue
+            landing_sq = lr * 8 + lc
             if cell(board, lr, lc) != EMPTY:
-                if not (lr == path_r[0] and lc == path_c[0]):
+                if landing_sq != path_sq[0]:
                     continue
 
-            path_r[path_len] = lr
-            path_c[path_len] = lc
-            cap_r[num_caps] = cr
-            cap_c[num_caps] = cc
+            path_sq[path_len] = landing_sq
+            cap_sq[num_caps] = cr * 8 + cc
             next_capture_value = (
                 capture_value + (W_KING if is_king(captured_piece) else W_MAN)
             )
@@ -557,8 +558,8 @@ cdef int _generate_captures_recursive(
             further = _generate_captures_recursive(
                 board, lr, lc, piece, player,
                 next_capture_value,
-                path_r, path_c, path_len + 1,
-                cap_r, cap_c, num_caps + 1,
+                path_sq, path_len + 1,
+                cap_sq, num_caps + 1,
                 rules, out
             )
 
@@ -571,8 +572,8 @@ cdef int _generate_captures_recursive(
             else:
                 if out.count < MAX_MOVES:
                     _copy_capture_move(
-                        out, path_r, path_c, path_len + 1,
-                        cap_r, cap_c, num_caps + 1,
+                        out, path_sq, path_len + 1,
+                        cap_sq, num_caps + 1,
                         not is_king(piece) and lr == promotion_row(player),
                         next_capture_value,
                     )
@@ -585,14 +586,14 @@ cdef int _flying_king_capture(
     signed char *board, int r, int c, int piece, int player,
     int dr, int dc,
     int capture_value,
-    int *path_r, int *path_c, int path_len,
-    int *cap_r, int *cap_c, int num_caps,
+    int *path_sq, int path_len,
+    int *cap_sq, int num_caps,
     Rules *rules, CMoveList *out
 ) noexcept nogil:
     """Generate captures for a flying king along one diagonal."""
     cdef int sr, sc, dist, found = 0
     cdef int scan_piece
-    cdef int lr, lc, land_dist, further
+    cdef int lr, lc, land_dist, further, landing_sq
     cdef int captured_piece, next_capture_value
 
     dist = 1
@@ -612,18 +613,17 @@ cdef int _flying_king_capture(
                 lc = sc + land_dist * dc
                 if not in_bounds(lr, lc):
                     break
+                landing_sq = lr * 8 + lc
                 if cell(board, lr, lc) != EMPTY:
-                    if lr == path_r[0] and lc == path_c[0]:
+                    if landing_sq == path_sq[0]:
                         pass
                     else:
                         break
 
                 if (cell(board, lr, lc) == EMPTY
-                        or (lr == path_r[0] and lc == path_c[0])):
-                    path_r[path_len] = lr
-                    path_c[path_len] = lc
-                    cap_r[num_caps] = sr
-                    cap_c[num_caps] = sc
+                        or landing_sq == path_sq[0]):
+                    path_sq[path_len] = landing_sq
+                    cap_sq[num_caps] = sr * 8 + sc
                     next_capture_value = (
                         capture_value
                         + (W_KING if is_king(captured_piece) else W_MAN)
@@ -636,8 +636,8 @@ cdef int _flying_king_capture(
                     further = _generate_captures_recursive(
                         board, lr, lc, piece, player,
                         next_capture_value,
-                        path_r, path_c, path_len + 1,
-                        cap_r, cap_c, num_caps + 1,
+                        path_sq, path_len + 1,
+                        cap_sq, num_caps + 1,
                         rules, out
                     )
 
@@ -650,8 +650,8 @@ cdef int _flying_king_capture(
                     else:
                         if out.count < MAX_MOVES:
                             _copy_capture_move(
-                                out, path_r, path_c, path_len + 1,
-                                cap_r, cap_c, num_caps + 1, 0,
+                                out, path_sq, path_len + 1,
+                                cap_sq, num_caps + 1, 0,
                                 next_capture_value)
                             found += 1
 
@@ -664,22 +664,22 @@ cdef int _flying_king_capture(
 
 cdef inline void _copy_capture_move(
     CMoveList *out,
-    int *path_r, int *path_c, int path_len,
-    int *cap_r, int *cap_c, int num_caps,
+    int *path_sq, int path_len,
+    int *cap_sq, int num_caps,
     bint promo, int capture_value
 ) noexcept nogil:
     cdef CMove *m = &out.moves[out.count]
     cdef int i
     m.path_len = path_len
     for i in range(path_len):
-        m.path_r[i] = path_r[i]
-        m.path_c[i] = path_c[i]
+        m.path_r[i] = path_sq[i] >> 3
+        m.path_c[i] = path_sq[i] & 7
     m.num_captures = num_caps
     for i in range(num_caps):
-        m.cap_r[i] = cap_r[i]
-        m.cap_c[i] = cap_c[i]
-    m.from_sq = path_r[0] * 8 + path_c[0]
-    m.to_sq = path_r[path_len - 1] * 8 + path_c[path_len - 1]
+        m.cap_r[i] = cap_sq[i] >> 3
+        m.cap_c[i] = cap_sq[i] & 7
+    m.from_sq = path_sq[0]
+    m.to_sq = path_sq[path_len - 1]
     _set_move_metadata(m, promo, capture_value)
     out.count += 1
 
@@ -688,16 +688,14 @@ cdef void generate_captures(
     signed char *board, int r, int c, int piece, int player,
     Rules *rules, CMoveList *out
 ) noexcept nogil:
-    cdef int path_r[MAX_PATH]
-    cdef int path_c[MAX_PATH]
-    cdef int cap_r[MAX_CAPTURES]
-    cdef int cap_c[MAX_CAPTURES]
+    cdef int path_sq[MAX_PATH]
+    cdef int cap_sq[MAX_CAPTURES]
 
-    path_r[0] = r; path_c[0] = c
+    path_sq[0] = r * 8 + c
 
     _generate_captures_recursive(
         board, r, c, piece, player,
-        0, path_r, path_c, 1, cap_r, cap_c, 0,
+        0, path_sq, 1, cap_sq, 0,
         rules, out
     )
 
