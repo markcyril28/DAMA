@@ -782,6 +782,7 @@ class TrainingConfig:
     ram_cache_enabled: bool = True
     ram_cache_threshold_gb: float = 8.0
     ram_cache_file: Optional[str] = None
+    ram_cache_compress: bool = False
     replay_max_entries: int = 100000  # Max entries to sample from replay buffer per epoch
     clear_replay_after_load: bool = False  # Delete replay files after loading into memory
     max_moves_per_sample: int = 32  # Padding width for move features (max legal moves ~20)
@@ -795,6 +796,8 @@ class TrainingConfig:
     frozen_suite_size: int = 5000
     frozen_suite_seed: int = 20260819
     frozen_suite_auto_create: bool = False
+    validation_tensor_cache_file: Optional[str] = None
+    validation_tensor_cache_compress: bool = False
     teacher_agreement_threshold: float = 0.50
     snapshot_enabled: bool = False
     snapshot_root: str = 'data/corpus_snapshots'
@@ -1284,6 +1287,10 @@ class Trainer:
         self._preloaded_snapshot_dataset: Optional[CachedTensorDataset] = None
         self._preloaded_snapshot_cache_metadata: Optional[dict] = None
         self._preloaded_snapshot_cache_checked = False
+        # The held-out tensor cache is a separate, source-verified warm-start
+        # artifact.  It is consumed only by the initial immutable split.
+        self._preloaded_validation_dataset: Optional[CachedTensorDataset] = None
+        self._preloaded_validation_cache_metadata: Optional[dict] = None
         # Per-file durable replay-cycle maxima.  Replay shards are immutable
         # for normal operation, so avoid reparsing every line on each cycle;
         # stat identity invalidates entries after a rewrite or append.
@@ -2692,6 +2699,162 @@ class Trainer:
             digest.update(b"\n")
         return digest.hexdigest()
 
+    @staticmethod
+    def _manifest_cache_digest(manifest: Mapping[str, Any]) -> str:
+        """Return the exact manifest identity used by a derived tensor cache."""
+
+        payload = json.dumps(
+            dict(manifest), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _validated_validation_leakage(
+        value: Any,
+        entry_count: int,
+    ) -> Optional[dict]:
+        """Validate cached leakage accounting before publishing it as evidence."""
+
+        if not isinstance(value, Mapping):
+            return None
+        ledger_enabled = value.get("ledger_enabled")
+        if not isinstance(ledger_enabled, bool):
+            return None
+        normalized = {"ledger_enabled": ledger_enabled}
+        for field in (
+            "all_time_trained_state_count",
+            "removed_validation_entry_count",
+            "removed_validation_state_count",
+            "retained_validation_entry_count",
+        ):
+            raw_value = value.get(field)
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, int)
+                or raw_value < 0
+            ):
+                return None
+            normalized[field] = int(raw_value)
+        if normalized["retained_validation_entry_count"] != int(entry_count):
+            return None
+        if (
+            normalized["removed_validation_state_count"]
+            > normalized["removed_validation_entry_count"]
+        ):
+            return None
+        return normalized
+
+    def _validation_tensor_cache_metadata(self, context) -> Optional[dict]:
+        """Return a complete source key for the immutable held-out tensors.
+
+        ``prepare_split`` verifies every validation shard, the canonical state
+        set, frozen-suite exclusions, and the canonical trained ledger before
+        this helper is reached.  The cache can therefore eliminate only the
+        repeat JSON/materialization and tensorization work on a warm relaunch.
+        """
+
+        cache_file = getattr(
+            self.config, "validation_tensor_cache_file", None)
+        manager = getattr(self, "_snapshot_manager", None)
+        ledger_digest_getter = getattr(
+            manager, "trained_ledger_source_sha256", None)
+        if (
+            self.config.policy_stage != "policy_only"
+            or not cache_file
+            or not callable(ledger_digest_getter)
+        ):
+            return None
+        ledger_digest = ledger_digest_getter()
+        if not isinstance(ledger_digest, str) or len(ledger_digest) != 64:
+            return None
+        try:
+            validation_manifest = context.validation_manifest
+            validation_keys = context.validation_keys
+        except AttributeError:
+            return None
+        if not isinstance(validation_manifest, Mapping):
+            return None
+        return {
+            "cache_version": 3,
+            "validation_tensor_cache_version": 1,
+            "validation_manifest_sha256": self._manifest_cache_digest(
+                validation_manifest),
+            "validation_exclusion_keys_sha256": self._snapshot_cache_key_digest(
+                validation_keys),
+            "trained_ledger_source_sha256": ledger_digest,
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+        }
+
+    def _load_matching_validation_tensor_cache(
+        self,
+        cache_metadata: Mapping[str, Any],
+    ) -> Optional[tuple[CachedTensorDataset, dict]]:
+        """Return a fully source-keyed held-out cache, or a safe miss."""
+
+        cache_file = getattr(
+            self.config, "validation_tensor_cache_file", None)
+        cached_dataset = load_matching_cached_tensor_dataset(
+            cache_file,
+            cache_metadata,
+            migrate_to_compressed=getattr(
+                self.config, "validation_tensor_cache_compress", False),
+        )
+        if cached_dataset is None:
+            return None
+        leakage = self._validated_validation_leakage(
+            cached_dataset.metadata.get("validation_leakage"),
+            len(cached_dataset),
+        )
+        if leakage is None:
+            print(
+                "Validation tensor cache lacks valid leakage accounting; "
+                "rebuilding cache."
+            )
+            return None
+        return cached_dataset, leakage
+
+    def _save_validation_tensor_cache(
+        self,
+        dataset: CachedTensorDataset,
+        cache_metadata: Mapping[str, Any],
+    ) -> None:
+        """Best-effort persist of already-verified immutable validation tensors."""
+
+        cache_file = getattr(
+            self.config, "validation_tensor_cache_file", None)
+        if not cache_file:
+            return
+        leakage = self._validated_validation_leakage(
+            getattr(self, "_active_snapshot_manifest", {}).get(
+                "validation_leakage"),
+            len(dataset),
+        )
+        if leakage is None:
+            print(
+                "Warning: immutable validation leakage accounting was invalid; "
+                "not caching held-out tensors."
+            )
+            return
+        metadata = {
+            **dict(cache_metadata),
+            "entry_count": len(dataset),
+            "validation_leakage": leakage,
+        }
+        try:
+            dataset.save(
+                str(cache_file),
+                metadata=metadata,
+                compress=getattr(
+                    self.config, "validation_tensor_cache_compress", False),
+            )
+            print("Saved source-verified validation tensor cache.")
+        except Exception as exc:
+            # The cache is an accelerator.  A failed write must leave the
+            # verified in-memory validation dataset usable for this session.
+            print(f"Warning: could not save validation tensor cache: {exc}")
+
     def _snapshot_train_cache_metadata(
         self,
         manifest: Mapping[str, Any],
@@ -2748,6 +2911,8 @@ class Trainer:
         self._preloaded_snapshot_dataset = None
         self._preloaded_snapshot_cache_metadata = None
         self._preloaded_snapshot_cache_checked = False
+        self._preloaded_validation_dataset = None
+        self._preloaded_validation_cache_metadata = None
         if self._snapshot_manager is not None:
             behavior_step = int(self.step)
             teacher, noise, generation = self._corpus_settings(
@@ -2850,7 +3015,27 @@ class Trainer:
                     decision.manifest_path,
                     max_train_entries=self.config.replay_max_entries,
                 )
-                validation_entries = manager.load_validation_entries(split_context)
+                validation_cache_metadata = (
+                    self._validation_tensor_cache_metadata(split_context))
+                cached_validation = (
+                    self._load_matching_validation_tensor_cache(
+                        validation_cache_metadata)
+                    if validation_cache_metadata is not None else None
+                )
+                if cached_validation is not None:
+                    validation_dataset, validation_leakage = cached_validation
+                    # The cache is only accepted after prepare_split's source
+                    # verification.  Restore the accounting the materializer
+                    # would have attached to the activated manifest.
+                    split_context.manifest["validation_leakage"] = (
+                        validation_leakage)
+                    self._preloaded_validation_dataset = validation_dataset
+                    validation_entries = []
+                else:
+                    validation_entries = manager.load_validation_entries(
+                        split_context)
+                    self._preloaded_validation_cache_metadata = (
+                        validation_cache_metadata)
                 manifest = split_context.manifest
                 cache_metadata = self._snapshot_train_cache_metadata(
                     manifest, split_context.validation_keys)
@@ -2858,7 +3043,11 @@ class Trainer:
                 if cache_metadata is not None:
                     self._preloaded_snapshot_cache_checked = True
                     cached_dataset = load_matching_cached_tensor_dataset(
-                        self.config.ram_cache_file, cache_metadata)
+                        self.config.ram_cache_file,
+                        cache_metadata,
+                        migrate_to_compressed=getattr(
+                            self.config, "ram_cache_compress", False),
+                    )
                     if cached_dataset is not None:
                         self._preloaded_snapshot_dataset = cached_dataset
                         train_entries = []
@@ -2975,8 +3164,27 @@ class Trainer:
             f"SHA-256 {manifest['suite_sha256'][:12]}"
         )
 
-    def _set_validation_entries(self, entries) -> None:
+    def _set_validation_entries(
+        self,
+        entries,
+        *,
+        preloaded_dataset: Optional[CachedTensorDataset] = None,
+        cache_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Publish immutable validation tensors from entries or a verified cache."""
+
         self._validation_entries = list(entries)
+        if preloaded_dataset is not None:
+            if self._validation_entries:
+                raise RuntimeError(
+                    "Preloaded validation tensors cannot accompany replay entries"
+                )
+            self._validation_dataloader = preloaded_dataset
+            print(
+                f"Immutable validation entries: {len(preloaded_dataset):,} "
+                "from source-verified tensor cache"
+            )
+            return
         if not self._validation_entries:
             self._validation_dataloader = None
             return
@@ -2999,6 +3207,9 @@ class Trainer:
                 max_moves_per_sample=self.config.max_moves_per_sample,
                 show_progress=True,
             )
+            if cache_metadata is not None:
+                self._save_validation_tensor_cache(
+                    self._validation_dataloader, cache_metadata)
         print(
             f"Immutable validation entries: {len(self._validation_entries):,} "
             "from held-out replay files"
@@ -6617,12 +6828,21 @@ class Trainer:
         preloaded_dataset = self._preloaded_snapshot_dataset
         preloaded_cache_metadata = self._preloaded_snapshot_cache_metadata
         preloaded_cache_checked = self._preloaded_snapshot_cache_checked
+        preloaded_validation_dataset = self._preloaded_validation_dataset
+        preloaded_validation_cache_metadata = (
+            self._preloaded_validation_cache_metadata)
         # The cache belongs only to this initial window.  Clear the hand-off so
         # alternate/background refresh paths cannot accidentally reuse it.
         self._preloaded_snapshot_dataset = None
         self._preloaded_snapshot_cache_metadata = None
         self._preloaded_snapshot_cache_checked = False
-        self._set_validation_entries(validation_entries)
+        self._preloaded_validation_dataset = None
+        self._preloaded_validation_cache_metadata = None
+        self._set_validation_entries(
+            validation_entries,
+            preloaded_dataset=preloaded_validation_dataset,
+            cache_metadata=preloaded_validation_cache_metadata,
+        )
         train_entry_count = (
             len(preloaded_dataset)
             if preloaded_dataset is not None else len(train_entries)
@@ -6703,6 +6923,7 @@ class Trainer:
                 use_ram_cache=self.config.ram_cache_enabled,
                 ram_threshold_gb=self.config.ram_cache_threshold_gb,
                 cache_file=self.config.ram_cache_file,
+                compress_cache=getattr(self.config, 'ram_cache_compress', False),
                 device=self.device,
                 capacity=self.config.replay_max_entries if _simultaneous else 0,
                 max_moves_per_sample=self.config.max_moves_per_sample,
@@ -7519,6 +7740,8 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         ram_cache_enabled=dataloader_cfg.get('ram_cache', {}).get('enabled', True),
         ram_cache_threshold_gb=dataloader_cfg.get('ram_cache', {}).get('threshold_gb', 8.0),
         ram_cache_file=dataloader_cfg.get('ram_cache', {}).get('cache_file'),
+        ram_cache_compress=bool(
+            dataloader_cfg.get('ram_cache', {}).get('compress', False)),
         replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
         clear_replay_after_load=dataloader_cfg.get('clear_replay_after_load', False),
         max_moves_per_sample=dataloader_cfg.get('max_moves_per_sample', 32),
@@ -7533,6 +7756,9 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         frozen_suite_size=int(validation_cfg.get('frozen_suite_size', 5000)),
         frozen_suite_seed=int(validation_cfg.get('frozen_suite_seed', 20260819)),
         frozen_suite_auto_create=bool(validation_cfg.get('auto_create_suite', False)),
+        validation_tensor_cache_file=validation_cfg.get('tensor_cache_file'),
+        validation_tensor_cache_compress=bool(
+            validation_cfg.get('tensor_cache_compress', False)),
         teacher_agreement_threshold=float(
             validation_cfg.get('teacher_agreement_threshold', 0.50)),
         snapshot_enabled=bool(snapshot_cfg.get('enabled', False)),
