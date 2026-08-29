@@ -802,6 +802,34 @@ cdef void apply_move_c(
     new_board[move.to_sq] = piece
 
 
+cdef inline signed char _apply_move_inplace(
+    signed char *board, CMove *move, signed char *captured_pieces
+) noexcept nogil:
+    """Apply one search move in place and retain the pieces needed for undo."""
+    cdef int i
+    cdef signed char piece = board[move.from_sq]
+
+    for i in range(move.num_captures):
+        captured_pieces[i] = board[move.cap_sq[i]]
+        board[move.cap_sq[i]] = EMPTY
+    board[move.from_sq] = EMPTY
+    board[move.to_sq] = promote_piece(piece) if _move_promotes(move) else piece
+    return piece
+
+
+cdef inline void _undo_move_inplace(
+    signed char *board, CMove *move, signed char piece,
+    signed char *captured_pieces
+) noexcept nogil:
+    """Restore the exact parent board after ``_apply_move_inplace``."""
+    cdef int i
+
+    board[move.to_sq] = EMPTY
+    board[move.from_sq] = piece
+    for i in range(move.num_captures):
+        board[move.cap_sq[i]] = captured_pieces[i]
+
+
 cdef inline int _current_piece_count(
     unsigned int piece_counts, int player
 ) noexcept nogil:
@@ -859,7 +887,8 @@ cdef float quiescence(
     """
     cdef float stand_pat, score
     cdef CMoveList captures
-    cdef signed char new_board[64]
+    cdef signed char captured_pieces[MAX_CAPTURES]
+    cdef signed char moved_piece
     cdef unsigned long long child_h
     cdef unsigned int child_piece_counts
     cdef int i, j, opp
@@ -920,14 +949,17 @@ cdef float quiescence(
         if stand_pat + cap_gain + DELTA_MARGIN <= alpha:
             continue  # This capture can't raise alpha — prune it
 
-        apply_move_c(board, new_board, &captures.moves[i], player)
         child_h = _hash_after_move(h, board, &captures.moves[i], player)
         child_piece_counts = _piece_counts_after_move(
             piece_counts, player, &captures.moves[i])
+        moved_piece = _apply_move_inplace(
+            board, &captures.moves[i], captured_pieces)
 
-        score = -quiescence(new_board, opp, -beta, -alpha,
+        score = -quiescence(board, opp, -beta, -alpha,
                             rules, ss, child_h, child_piece_counts,
                             qs_depth - 1)
+        _undo_move_inplace(
+            board, &captures.moves[i], moved_piece, captured_pieces)
 
         if ss.timeout:
             return 0.0
@@ -1173,7 +1205,8 @@ cdef float alphabeta(
 ) noexcept nogil:
     """Negamax alpha-beta with TT, NMP, PVS, LMR, LMP, IID, countermove, killers, history, and futility pruning."""
     cdef CMoveList moves
-    cdef signed char new_board[64]
+    cdef signed char captured_pieces[MAX_CAPTURES]
+    cdef signed char moved_piece
     cdef float score, best, orig_alpha, static_eval, null_score
     cdef int i, j, opp, tt_flag, reduced, nmp_R, lmp_limit
     cdef unsigned long long child_h, null_h
@@ -1295,7 +1328,6 @@ cdef float alphabeta(
                 and best > -9000):  # Don't prune if we haven't found any good move yet
             continue
 
-        apply_move_c(board, new_board, &moves.moves[i], player)
         # Incremental hash update (O(captures) not O(64))
         child_h = _hash_after_move(h, board, &moves.moves[i], player)
         child_piece_counts = _piece_counts_after_move(
@@ -1304,10 +1336,12 @@ cdef float alphabeta(
         # Precomputed from/to for countermove passing to child
         mv_from = moves.moves[i].from_sq
         mv_to = moves.moves[i].to_sq
+        moved_piece = _apply_move_inplace(
+            board, &moves.moves[i], captured_pieces)
 
         if i == 0:
             # First move (expected best): full window, full depth
-            score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+            score = -alphabeta(board, opp, depth - 1, -beta, -alpha,
                                rules, ss, child_h, child_piece_counts, ply + 1,
                                True, mv_from, mv_to)
         else:
@@ -1320,15 +1354,18 @@ cdef float alphabeta(
                 reduced = LMR_TABLE[depth][i] if depth < LMR_MAX_D and i < LMR_MAX_M else 1
 
             # PVS + LMR: scout with null window at (potentially reduced) depth
-            score = -alphabeta(new_board, opp, depth - 1 - reduced,
+            score = -alphabeta(board, opp, depth - 1 - reduced,
                                -alpha - 1, -alpha,
                                rules, ss, child_h, child_piece_counts, ply + 1,
                                True, mv_from, mv_to)
             if score > alpha and not ss.timeout:
                 # Promising — re-search at full depth, full window
-                score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+                score = -alphabeta(board, opp, depth - 1, -beta, -alpha,
                                    rules, ss, child_h, child_piece_counts,
                                    ply + 1, True, mv_from, mv_to)
+
+        _undo_move_inplace(
+            board, &moves.moves[i], moved_piece, captured_pieces)
 
         if ss.timeout:
             return 0.0
@@ -1404,7 +1441,8 @@ cdef int search_root(
     cdef float score
     cdef int best_idx = 0
     cdef int i, opp
-    cdef signed char new_board[64]
+    cdef signed char captured_pieces[MAX_CAPTURES]
+    cdef signed char moved_piece
     cdef unsigned long long child_h
     cdef unsigned int child_piece_counts
     cdef int mv_from, mv_to
@@ -1412,26 +1450,30 @@ cdef int search_root(
     opp = opponent(player)
 
     for i in range(moves.count):
-        apply_move_c(board, new_board, &moves.moves[i], player)
         child_h = _hash_after_move(h, board, &moves.moves[i], player)
         child_piece_counts = _piece_counts_after_move(
             piece_counts, player, &moves.moves[i])
         mv_from = moves.moves[i].from_sq
         mv_to = moves.moves[i].to_sq
+        moved_piece = _apply_move_inplace(
+            board, &moves.moves[i], captured_pieces)
 
         if i == 0:
-            score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+            score = -alphabeta(board, opp, depth - 1, -beta, -alpha,
                                rules, ss, child_h, child_piece_counts, 1,
                                True, mv_from, mv_to)
         else:
             # PVS: null window scout
-            score = -alphabeta(new_board, opp, depth - 1, -alpha - 1, -alpha,
+            score = -alphabeta(board, opp, depth - 1, -alpha - 1, -alpha,
                                rules, ss, child_h, child_piece_counts, 1,
                                True, mv_from, mv_to)
             if score > alpha and score < beta and not ss.timeout:
-                score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
+                score = -alphabeta(board, opp, depth - 1, -beta, -alpha,
                                    rules, ss, child_h, child_piece_counts, 1,
                                    True, mv_from, mv_to)
+
+        _undo_move_inplace(
+            board, &moves.moves[i], moved_piece, captured_pieces)
 
         if ss.timeout:
             ss.root_score = best_score
