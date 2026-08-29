@@ -67,15 +67,16 @@ DEF MAX_PLY = 32
 DEF NUM_KILLERS = 2
 
 cdef struct CMove:
-    int path_r[MAX_PATH]
-    int path_c[MAX_PATH]
+    int path_sq[MAX_PATH]
     int path_len
-    int cap_r[MAX_CAPTURES]
-    int cap_c[MAX_CAPTURES]
+    int cap_sq[MAX_CAPTURES]
     int num_captures
     int metadata              # bit 0: promotion, upper bits: captured material
-    int from_sq               # path_r[0]*8 + path_c[0], precomputed at generation
-    int to_sq                 # path_r[path_len-1]*8 + path_c[path_len-1]
+    int from_sq               # path_sq[0], precomputed at generation
+    int to_sq                 # path_sq[path_len-1], precomputed at generation
+    # Keep the measured 140-byte layout while isolating the representation
+    # change from cache-footprint effects. A later size change needs its own A/B.
+    int _padding[15]
 
 cdef struct CMoveList:
     CMove moves[MAX_MOVES]
@@ -299,19 +300,24 @@ cdef void _ensure_tt():
     if _tt_table == NULL:
         _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))
 
-cdef inline unsigned long long compute_hash(
-    signed char *board, int player
+cdef inline unsigned long long compute_hash_and_counts(
+    signed char *board, int player, unsigned int *piece_counts
 ) noexcept nogil:
-    """Compute full Zobrist hash for a board position."""
+    """Compute the root Zobrist hash and both piece counts in one board scan."""
     cdef unsigned long long h = 0
-    cdef int i, sq, piece
+    cdef int i, sq, piece, p1_count = 0, p2_count = 0
     for i in range(NUM_DARK_SQ):
         sq = DARK_SQ[i]
         piece = board[sq]
         if piece != EMPTY:
             h = h ^ ZOBRIST_PIECES[piece][sq]
+            if piece == P1_MAN or piece == P1_KING:
+                p1_count += 1
+            else:
+                p2_count += 1
     if player == PLAYER_TWO:
         h = h ^ ZOBRIST_SIDE
+    piece_counts[0] = <unsigned int>(p1_count | (p2_count << 8))
     return h
 
 cdef inline void tt_store(
@@ -486,12 +492,12 @@ cdef inline void _add_simple_move(
     CMoveList *out, int sr, int sc, int er, int ec, bint promo
 ) noexcept nogil:
     cdef CMove *m = &out.moves[out.count]
-    m.path_r[0] = sr; m.path_c[0] = sc
-    m.path_r[1] = er; m.path_c[1] = ec
+    m.path_sq[0] = sr * 8 + sc
+    m.path_sq[1] = er * 8 + ec
     m.path_len = 2
     m.num_captures = 0
-    m.from_sq = sr * 8 + sc
-    m.to_sq = er * 8 + ec
+    m.from_sq = m.path_sq[0]
+    m.to_sq = m.path_sq[1]
     _set_move_metadata(m, promo, 0)
     out.count += 1
 
@@ -499,16 +505,17 @@ cdef inline void _add_simple_move(
 # ── Capture generation (recursive, in-place mutation with undo) ──
 # Every ancestor's captured piece remains removed until its recursive call
 # returns, so the mutated board is the captured-square set.  The starting
-# square is likewise path[0]; carrying either state separately only enlarges
-# this hot recursive call frame.  Recursive paths use flat 0..63 squares so
+# square is likewise path[0], and capture count is always path_len - 1; carrying
+# any of that state separately enlarges the hot frame. Flat 0..63 paths mean
 # each step writes and passes one coordinate stream instead of separate rows
-# and columns; final CMove emission expands them back to the public layout.
+# and columns. CMove retains those flat squares through search and expands them
+# only at the Python serialization boundary.
 
 cdef int _generate_captures_recursive(
     signed char *board, int r, int c, int piece, int player,
     int capture_value,
     int *path_sq, int path_len,
-    int *cap_sq, int num_caps,
+    int *cap_sq,
     Rules *rules, CMoveList *out
 ) noexcept nogil:
     """Recursively generate capture sequences. Returns count found."""
@@ -527,7 +534,7 @@ cdef int _generate_captures_recursive(
                 board, r, c, piece, player,
                 dirs_r[d], dirs_c[d],
                 capture_value, path_sq, path_len,
-                cap_sq, num_caps, rules, out
+                cap_sq, rules, out
             )
         else:
             cr = r + dirs_r[d]
@@ -546,7 +553,7 @@ cdef int _generate_captures_recursive(
                     continue
 
             path_sq[path_len] = landing_sq
-            cap_sq[num_caps] = cr * 8 + cc
+            cap_sq[path_len - 1] = cr * 8 + cc
             next_capture_value = (
                 capture_value + (W_KING if is_king(captured_piece) else W_MAN)
             )
@@ -559,7 +566,7 @@ cdef int _generate_captures_recursive(
                 board, lr, lc, piece, player,
                 next_capture_value,
                 path_sq, path_len + 1,
-                cap_sq, num_caps + 1,
+                cap_sq,
                 rules, out
             )
 
@@ -573,7 +580,7 @@ cdef int _generate_captures_recursive(
                 if out.count < MAX_MOVES:
                     _copy_capture_move(
                         out, path_sq, path_len + 1,
-                        cap_sq, num_caps + 1,
+                        cap_sq,
                         not is_king(piece) and lr == promotion_row(player),
                         next_capture_value,
                     )
@@ -587,7 +594,7 @@ cdef int _flying_king_capture(
     int dr, int dc,
     int capture_value,
     int *path_sq, int path_len,
-    int *cap_sq, int num_caps,
+    int *cap_sq,
     Rules *rules, CMoveList *out
 ) noexcept nogil:
     """Generate captures for a flying king along one diagonal."""
@@ -623,7 +630,7 @@ cdef int _flying_king_capture(
                 if (cell(board, lr, lc) == EMPTY
                         or landing_sq == path_sq[0]):
                     path_sq[path_len] = landing_sq
-                    cap_sq[num_caps] = sr * 8 + sc
+                    cap_sq[path_len - 1] = sr * 8 + sc
                     next_capture_value = (
                         capture_value
                         + (W_KING if is_king(captured_piece) else W_MAN)
@@ -637,7 +644,7 @@ cdef int _flying_king_capture(
                         board, lr, lc, piece, player,
                         next_capture_value,
                         path_sq, path_len + 1,
-                        cap_sq, num_caps + 1,
+                        cap_sq,
                         rules, out
                     )
 
@@ -651,7 +658,7 @@ cdef int _flying_king_capture(
                         if out.count < MAX_MOVES:
                             _copy_capture_move(
                                 out, path_sq, path_len + 1,
-                                cap_sq, num_caps + 1, 0,
+                                cap_sq, 0,
                                 next_capture_value)
                             found += 1
 
@@ -665,19 +672,15 @@ cdef int _flying_king_capture(
 cdef inline void _copy_capture_move(
     CMoveList *out,
     int *path_sq, int path_len,
-    int *cap_sq, int num_caps,
+    int *cap_sq,
     bint promo, int capture_value
 ) noexcept nogil:
     cdef CMove *m = &out.moves[out.count]
-    cdef int i
+    cdef int num_caps = path_len - 1
     m.path_len = path_len
-    for i in range(path_len):
-        m.path_r[i] = path_sq[i] >> 3
-        m.path_c[i] = path_sq[i] & 7
+    memcpy(m.path_sq, path_sq, path_len * sizeof(int))
     m.num_captures = num_caps
-    for i in range(num_caps):
-        m.cap_r[i] = cap_sq[i] >> 3
-        m.cap_c[i] = cap_sq[i] & 7
+    memcpy(m.cap_sq, cap_sq, num_caps * sizeof(int))
     m.from_sq = path_sq[0]
     m.to_sq = path_sq[path_len - 1]
     _set_move_metadata(m, promo, capture_value)
@@ -695,7 +698,7 @@ cdef void generate_captures(
 
     _generate_captures_recursive(
         board, r, c, piece, player,
-        0, path_sq, 1, cap_sq, 0,
+        0, path_sq, 1, cap_sq,
         rules, out
     )
 
@@ -715,7 +718,10 @@ cdef void generate_all_moves_c(
     involves diagonal sliding — more expensive than the extra dark-square scan.
     At 10M+ nodes per hard game, this saves significant move-gen time.
     """
-    cdef int piece, i, sq
+    cdef int piece, i, j, sq
+    cdef int own_count = 0
+    cdef int own_indices[NUM_DARK_SQ]
+    cdef signed char own_pieces[NUM_DARK_SQ]
 
     # Append directly into the caller's list.  The previous implementation
     # built separate ~18 KiB capture and simple lists in every search frame,
@@ -731,6 +737,13 @@ cdef void generate_all_moves_c(
         if piece == EMPTY or not is_player(piece, player):
             continue
         generate_captures(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
+        # Retain the first scan's own-piece lookup only while simple moves can
+        # still be needed. Once a forced capture is found, every remaining
+        # cache write is dead because the function returns after this pass.
+        if not rules.forced_capture or out.count == 0:
+            own_indices[own_count] = i
+            own_pieces[own_count] = piece
+            own_count += 1
 
     # Early exit: forced capture with captures found — skip simple moves entirely
     if rules.forced_capture and out.count > 0:
@@ -739,11 +752,9 @@ cdef void generate_all_moves_c(
     # Pass 2: append simple moves after captures.  With forced capture enabled,
     # reaching this point means out.count is zero.  With it disabled, the
     # capture-first ordering is identical to the former merge step.
-    for i in range(NUM_DARK_SQ):
-        sq = DARK_SQ[i]
-        piece = board[sq]
-        if piece == EMPTY or not is_player(piece, player):
-            continue
+    for j in range(own_count):
+        i = own_indices[j]
+        piece = own_pieces[j]
         generate_simple_moves(board, DARK_SQ_R[i], DARK_SQ_C[i], piece, player, rules, out)
 
 
@@ -779,18 +790,33 @@ cdef inline bint _has_pieces(signed char *board, int player) noexcept nogil:
 cdef void apply_move_c(
     signed char *board, signed char *new_board, CMove *move, int player
 ) noexcept nogil:
-    cdef int sr, sc, er, ec, i, piece
+    cdef int i, piece
 
     memcpy(new_board, board, 64)
-    sr = move.path_r[0]; sc = move.path_c[0]
-    er = move.path_r[move.path_len - 1]; ec = move.path_c[move.path_len - 1]
-    piece = new_board[sr * 8 + sc]
+    piece = new_board[move.from_sq]
     for i in range(move.num_captures):
-        new_board[move.cap_r[i] * 8 + move.cap_c[i]] = EMPTY
-    new_board[sr * 8 + sc] = EMPTY
+        new_board[move.cap_sq[i]] = EMPTY
+    new_board[move.from_sq] = EMPTY
     if _move_promotes(move):
         piece = promote_piece(piece)
-    new_board[er * 8 + ec] = piece
+    new_board[move.to_sq] = piece
+
+
+cdef inline int _current_piece_count(
+    unsigned int piece_counts, int player
+) noexcept nogil:
+    if player == PLAYER_ONE:
+        return <int>(piece_counts & 0xFF)
+    return <int>((piece_counts >> 8) & 0xFF)
+
+
+cdef inline unsigned int _piece_counts_after_move(
+    unsigned int piece_counts, int player, CMove *move
+) noexcept nogil:
+    """Subtract captured pieces from the packed P1/P2 root counts."""
+    if player == PLAYER_ONE:
+        return piece_counts - (<unsigned int>move.num_captures << 8)
+    return piece_counts - <unsigned int>move.num_captures
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -815,7 +841,8 @@ DEF MAX_QS_DEPTH = 6
 
 cdef float quiescence(
     signed char *board, int player, float alpha, float beta,
-    Rules *rules, SearchState *ss, unsigned long long h, int qs_depth
+    Rules *rules, SearchState *ss, unsigned long long h,
+    unsigned int piece_counts, int qs_depth
 ) noexcept nogil:
     """Quiescence search: extend search with captures until position is quiet.
 
@@ -834,6 +861,7 @@ cdef float quiescence(
     cdef CMoveList captures
     cdef signed char new_board[64]
     cdef unsigned long long child_h
+    cdef unsigned int child_piece_counts
     cdef int i, j, opp
 
     ss.nodes += 1
@@ -844,7 +872,7 @@ cdef float quiescence(
             return 0.0
 
     # Terminal detection: if current player has no pieces, they lost
-    if not _has_pieces(board, player):
+    if _current_piece_count(piece_counts, player) == 0:
         return -10000.0
 
     # Stand-pat: use material+positional eval (no mobility — too expensive)
@@ -881,7 +909,7 @@ cdef float quiescence(
         # Delta prune: estimate maximum material gain from this capture
         cap_gain = 0
         for j in range(captures.moves[i].num_captures):
-            cap_sq_dp = captures.moves[i].cap_r[j] * 8 + captures.moves[i].cap_c[j]
+            cap_sq_dp = captures.moves[i].cap_sq[j]
             if is_king(board[cap_sq_dp]):
                 cap_gain += W_KING
             else:
@@ -894,9 +922,12 @@ cdef float quiescence(
 
         apply_move_c(board, new_board, &captures.moves[i], player)
         child_h = _hash_after_move(h, board, &captures.moves[i], player)
+        child_piece_counts = _piece_counts_after_move(
+            piece_counts, player, &captures.moves[i])
 
         score = -quiescence(new_board, opp, -beta, -alpha,
-                            rules, ss, child_h, qs_depth - 1)
+                            rules, ss, child_h, child_piece_counts,
+                            qs_depth - 1)
 
         if ss.timeout:
             return 0.0
@@ -919,22 +950,24 @@ cdef struct SearchState:
     bint timeout
     float root_score         # Best score from most recent search_root call
     # Killer moves: 2 per ply (moves that caused beta cutoffs)
-    int killers_from[MAX_PLY][NUM_KILLERS]
-    int killers_to[MAX_PLY][NUM_KILLERS]
+    signed char killers_from[MAX_PLY][NUM_KILLERS]
+    signed char killers_to[MAX_PLY][NUM_KILLERS]
     # History heuristic: history[from_sq][to_sq] — cutoff frequency
-    int history[64][64]
+    short history[64][64]
     # Countermove heuristic: when opponent plays prev_from→prev_to, the
     # stored response move is a good candidate (caused cutoffs historically).
-    int countermove_from[64][64]
-    int countermove_to[64][64]
+    signed char countermove_from[64][64]
+    signed char countermove_to[64][64]
 
 cdef inline void _init_search_tables(SearchState *ss) noexcept nogil:
     """Zero killer, history, and countermove tables for a new search."""
-    memset(ss.killers_from, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))  # -1
-    memset(ss.killers_to, 0xFF, MAX_PLY * NUM_KILLERS * sizeof(int))
-    memset(ss.history, 0, 64 * 64 * sizeof(int))
-    memset(ss.countermove_from, 0xFF, 64 * 64 * sizeof(int))  # -1
-    memset(ss.countermove_to, 0xFF, 64 * 64 * sizeof(int))
+    memset(ss.killers_from, 0xFF,
+           MAX_PLY * NUM_KILLERS * sizeof(signed char))  # -1
+    memset(ss.killers_to, 0xFF,
+           MAX_PLY * NUM_KILLERS * sizeof(signed char))
+    memset(ss.history, 0, 64 * 64 * sizeof(short))
+    memset(ss.countermove_from, 0xFF, 64 * 64 * sizeof(signed char))  # -1
+    memset(ss.countermove_to, 0xFF, 64 * 64 * sizeof(signed char))
 
 
 cdef inline void _store_killer(SearchState *ss, int ply, CMove *m) noexcept nogil:
@@ -1010,7 +1043,7 @@ cdef inline unsigned long long _hash_after_move(
 
     # Remove captured pieces
     for i in range(m.num_captures):
-        cap_sq = m.cap_r[i] * 8 + m.cap_c[i]
+        cap_sq = m.cap_sq[i]
         cap_piece = board[cap_sq]
         h = h ^ ZOBRIST_PIECES[cap_piece][cap_sq]
 
@@ -1045,14 +1078,28 @@ cdef void _order_moves_full(
 ) noexcept nogil:
     """Enhanced move ordering: TT > captures (by value) > killers > countermove > history > position."""
     cdef int i, j
-    cdef int scores[MAX_MOVES]
-    cdef int s, from_sq, to_sq, k
+    cdef int s, from_sq, to_sq
     cdef CMove temp
+    cdef bint already_sorted = True
+    cdef int killer0_from = -1, killer0_to = -1
+    cdef int killer1_from = -1, killer1_to = -1
+    cdef int counter_from = -1, counter_to = -1
 
-    # Defensive clamp: scores[] holds MAX_MOVES entries, so a corrupt or
+    # Defensive clamp: CMoveList holds MAX_MOVES entries, so a corrupt or
     # oversized count would read/write out of bounds (boundscheck off).
     if moves.count > MAX_MOVES:
         moves.count = MAX_MOVES
+
+    # These heuristic entries are invariant across the whole move list. Load
+    # them once instead of re-addressing SearchState for every quiet move.
+    if ply < MAX_PLY:
+        killer0_from = ss.killers_from[ply][0]
+        killer0_to = ss.killers_to[ply][0]
+        killer1_from = ss.killers_from[ply][1]
+        killer1_to = ss.killers_to[ply][1]
+    if prev_from >= 0:
+        counter_from = ss.countermove_from[prev_from][prev_to]
+        counter_to = ss.countermove_to[prev_from][prev_to]
 
     for i in range(moves.count):
         from_sq = moves.moves[i].from_sq
@@ -1060,7 +1107,11 @@ cdef void _order_moves_full(
 
         # TT move: absolute highest priority — search this first
         if tt_from >= 0 and from_sq == tt_from and to_sq == tt_to:
-            scores[i] = 50000
+            moves.moves[i]._padding[0] = 50000
+            if (i > 0
+                    and moves.moves[i - 1]._padding[0]
+                    < moves.moves[i]._padding[0]):
+                already_sorted = False
             continue
 
         s = 0
@@ -1070,18 +1121,14 @@ cdef void _order_moves_full(
             s = 20000 + _move_capture_value(&moves.moves[i])
         else:
             # Killer move bonus
-            if ply < MAX_PLY:
-                for k in range(NUM_KILLERS):
-                    if (ss.killers_from[ply][k] == from_sq and
-                            ss.killers_to[ply][k] == to_sq):
-                        s = 15000
-                        break
+            if ((killer0_from == from_sq and killer0_to == to_sq)
+                    or (killer1_from == from_sq and killer1_to == to_sq)):
+                s = 15000
             # Countermove bonus: if opponent just played prev_from→prev_to,
             # the stored response that previously caused a cutoff gets priority.
-            if s == 0 and prev_from >= 0:
-                if (ss.countermove_from[prev_from][prev_to] == from_sq and
-                        ss.countermove_to[prev_from][prev_to] == to_sq):
-                    s = 12000
+            if (s == 0 and counter_from == from_sq
+                    and counter_to == to_sq):
+                s = 12000
             # History heuristic for quiet moves
             if s == 0:
                 s = ss.history[from_sq][to_sq]
@@ -1092,26 +1139,36 @@ cdef void _order_moves_full(
 
         # Center bias (precomputed lookup — no FP math)
         s += CENTER_DIST[to_sq]
-        scores[i] = s
+        moves.moves[i]._padding[0] = s
+        if i > 0 and moves.moves[i - 1]._padding[0] < s:
+            already_sorted = False
+
+    # Move generation and earlier TT iterations often leave the list in the
+    # exact stable order required below. Avoid shifting 140-byte CMove records
+    # when the insertion sort would perform no useful work. Keep the one-move
+    # path identical to the measured baseline.
+    if moves.count > 1 and already_sorted:
+        return
 
     # Insertion sort — O(n) best case on nearly-ordered input (common with
     # TT/killer pre-ordering), O(n²) worst case. Better than selection sort
-    # for the typical 10-20 move lists in Dama.
+    # for the typical 10-20 move lists in Dama. The transient score rides in a
+    # reserved word that the existing whole-CMove shifts already copy, avoiding
+    # a separate score array and duplicate score-shift traffic.
     for i in range(1, moves.count):
-        s = scores[i]
         temp = moves.moves[i]
+        s = temp._padding[0]
         j = i - 1
-        while j >= 0 and scores[j] < s:
-            scores[j + 1] = scores[j]
+        while j >= 0 and moves.moves[j]._padding[0] < s:
             moves.moves[j + 1] = moves.moves[j]
             j -= 1
-        scores[j + 1] = s
         moves.moves[j + 1] = temp
 
 
 cdef float alphabeta(
     signed char *board, int player, int depth, float alpha, float beta,
-    Rules *rules, SearchState *ss, unsigned long long h, int ply,
+    Rules *rules, SearchState *ss, unsigned long long h,
+    unsigned int piece_counts, int ply,
     bint allow_null, int prev_from, int prev_to
 ) noexcept nogil:
     """Negamax alpha-beta with TT, NMP, PVS, LMR, LMP, IID, countermove, killers, history, and futility pruning."""
@@ -1120,6 +1177,7 @@ cdef float alphabeta(
     cdef float score, best, orig_alpha, static_eval, null_score
     cdef int i, j, opp, tt_flag, reduced, nmp_R, lmp_limit
     cdef unsigned long long child_h, null_h
+    cdef unsigned int child_piece_counts
     cdef bint futility_ok
     cdef int tt_from_sq, tt_to_sq, best_move_idx
     cdef int best_from_sq, best_to_sq
@@ -1134,7 +1192,9 @@ cdef float alphabeta(
             return 0.0
 
     if depth == 0:
-        return quiescence(board, player, alpha, beta, rules, ss, h, MAX_QS_DEPTH)
+        return quiescence(
+            board, player, alpha, beta, rules, ss, h, piece_counts,
+            MAX_QS_DEPTH)
 
     # ── TT probe ──
     orig_alpha = alpha
@@ -1151,7 +1211,9 @@ cdef float alphabeta(
     # effective. Cost: one depth-(depth-3) search. Payoff: better move
     # ordering reduces the full-depth tree by 20-40% at these depths.
     if tt_from_sq < 0 and depth >= 6 and not ss.timeout:
-        alphabeta(board, player, depth - 3, alpha, beta, rules, ss, h, ply, True, prev_from, prev_to)
+        alphabeta(
+            board, player, depth - 3, alpha, beta, rules, ss, h,
+            piece_counts, ply, True, prev_from, prev_to)
         if _tt_table != NULL and not ss.timeout:
             _iid_alpha = -100000.0; _iid_beta = 100000.0
             tt_probe(h, 0, &_iid_score, &_iid_alpha, &_iid_beta,
@@ -1177,11 +1239,12 @@ cdef float alphabeta(
     if (allow_null and depth >= 4
             and not (alpha > 9000 or alpha < -9000)
             and moves.moves[0].num_captures == 0
-            and _count_player_pieces(board, player) >= 4):
+            and _current_piece_count(piece_counts, player) >= 4):
         nmp_R = 2 + depth // 6  # Adaptive reduction: deeper → more aggressive
         null_h = h ^ ZOBRIST_SIDE
         null_score = -alphabeta(board, opp, depth - 1 - nmp_R, -beta, -beta + 1,
-                                rules, ss, null_h, ply + 1, False, -1, -1)
+                                rules, ss, null_h, piece_counts, ply + 1,
+                                False, -1, -1)
         if not ss.timeout and null_score >= beta:
             # Don't trust mate scores from null move
             if null_score >= 9000:
@@ -1235,6 +1298,8 @@ cdef float alphabeta(
         apply_move_c(board, new_board, &moves.moves[i], player)
         # Incremental hash update (O(captures) not O(64))
         child_h = _hash_after_move(h, board, &moves.moves[i], player)
+        child_piece_counts = _piece_counts_after_move(
+            piece_counts, player, &moves.moves[i])
 
         # Precomputed from/to for countermove passing to child
         mv_from = moves.moves[i].from_sq
@@ -1243,7 +1308,8 @@ cdef float alphabeta(
         if i == 0:
             # First move (expected best): full window, full depth
             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
-                               rules, ss, child_h, ply + 1, True, mv_from, mv_to)
+                               rules, ss, child_h, child_piece_counts, ply + 1,
+                               True, mv_from, mv_to)
         else:
             # Graduated LMR: reduce depth for late quiet moves using precomputed
             # table. Later moves at deeper depths get stronger reductions.
@@ -1256,11 +1322,13 @@ cdef float alphabeta(
             # PVS + LMR: scout with null window at (potentially reduced) depth
             score = -alphabeta(new_board, opp, depth - 1 - reduced,
                                -alpha - 1, -alpha,
-                               rules, ss, child_h, ply + 1, True, mv_from, mv_to)
+                               rules, ss, child_h, child_piece_counts, ply + 1,
+                               True, mv_from, mv_to)
             if score > alpha and not ss.timeout:
                 # Promising — re-search at full depth, full window
                 score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
-                                   rules, ss, child_h, ply + 1, True, mv_from, mv_to)
+                                   rules, ss, child_h, child_piece_counts,
+                                   ply + 1, True, mv_from, mv_to)
 
         if ss.timeout:
             return 0.0
@@ -1325,7 +1393,8 @@ cdef bint _check_deadline(SearchState *ss) noexcept nogil:
 cdef int search_root(
     signed char *board, int player, CMoveList *moves, int depth,
     float alpha, float beta,
-    Rules *rules, SearchState *ss, unsigned long long h
+    Rules *rules, SearchState *ss, unsigned long long h,
+    unsigned int piece_counts
 ) noexcept nogil:
     """Search at root level with PVS. Returns index of best move.
 
@@ -1337,6 +1406,7 @@ cdef int search_root(
     cdef int i, opp
     cdef signed char new_board[64]
     cdef unsigned long long child_h
+    cdef unsigned int child_piece_counts
     cdef int mv_from, mv_to
 
     opp = opponent(player)
@@ -1344,19 +1414,24 @@ cdef int search_root(
     for i in range(moves.count):
         apply_move_c(board, new_board, &moves.moves[i], player)
         child_h = _hash_after_move(h, board, &moves.moves[i], player)
+        child_piece_counts = _piece_counts_after_move(
+            piece_counts, player, &moves.moves[i])
         mv_from = moves.moves[i].from_sq
         mv_to = moves.moves[i].to_sq
 
         if i == 0:
             score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
-                               rules, ss, child_h, 1, True, mv_from, mv_to)
+                               rules, ss, child_h, child_piece_counts, 1,
+                               True, mv_from, mv_to)
         else:
             # PVS: null window scout
             score = -alphabeta(new_board, opp, depth - 1, -alpha - 1, -alpha,
-                               rules, ss, child_h, 1, True, mv_from, mv_to)
+                               rules, ss, child_h, child_piece_counts, 1,
+                               True, mv_from, mv_to)
             if score > alpha and score < beta and not ss.timeout:
                 score = -alphabeta(new_board, opp, depth - 1, -beta, -alpha,
-                                   rules, ss, child_h, 1, True, mv_from, mv_to)
+                                   rules, ss, child_h, child_piece_counts, 1,
+                                   True, mv_from, mv_to)
 
         if ss.timeout:
             ss.root_score = best_score
@@ -1384,11 +1459,13 @@ cdef dict cmove_to_dict(CMove *m):
     """
     cdef list path = []
     cdef list captures = []
-    cdef int i
+    cdef int i, sq
     for i in range(m.path_len):
-        path.append((m.path_r[i], m.path_c[i]))
+        sq = m.path_sq[i]
+        path.append((sq >> 3, sq & 7))
     for i in range(m.num_captures):
-        captures.append((m.cap_r[i], m.cap_c[i]))
+        sq = m.cap_sq[i]
+        captures.append((sq >> 3, sq & 7))
     return {
         "path": path,
         "captures": captures,
@@ -1490,6 +1567,7 @@ def fast_search(
         max_depth = 5
 
     cdef unsigned long long h
+    cdef unsigned int piece_counts
 
     _load_board(state, board)
     player = int(state.current_player)
@@ -1532,7 +1610,7 @@ def fast_search(
     # generation is deterministic, TT probes have hash verification).
     with nogil:
         # Compute initial Zobrist hash and initialize killer/history tables
-        h = compute_hash(board, player)
+        h = compute_hash_and_counts(board, player, &piece_counts)
         _init_search_tables(&ss)
 
         # Order moves using full heuristic (TT move from prior searches + killers + history)
@@ -1555,7 +1633,8 @@ def fast_search(
             if depth < 5:
                 # Full window for shallow depths
                 idx = search_root(board, player, &moves, depth,
-                                  -100000.0, 100000.0, &rules, &ss, h)
+                                  -100000.0, 100000.0, &rules, &ss, h,
+                                  piece_counts)
             else:
                 # Aspiration window with progressive widening on fail
                 asp_delta = 75.0  # ~3/4 man value
@@ -1563,7 +1642,8 @@ def fast_search(
                     asp_alpha = prev_score - asp_delta
                     asp_beta = prev_score + asp_delta
                     idx = search_root(board, player, &moves, depth,
-                                      asp_alpha, asp_beta, &rules, &ss, h)
+                                      asp_alpha, asp_beta, &rules, &ss, h,
+                                      piece_counts)
                     if ss.timeout:
                         break
                     if ss.root_score > asp_alpha and ss.root_score < asp_beta:
@@ -1574,7 +1654,8 @@ def fast_search(
                         # Window is wide enough — fall back to full window
                         ss.timeout = False
                         idx = search_root(board, player, &moves, depth,
-                                          -100000.0, 100000.0, &rules, &ss, h)
+                                          -100000.0, 100000.0, &rules, &ss, h,
+                                          piece_counts)
                         break
 
             if not ss.timeout:
@@ -1680,14 +1761,14 @@ def apply_move_board(bytes board_bytes, int player, dict move_dict) -> tuple:
     n = len(path)
     cmove.path_len = n
     for i in range(n):
-        cmove.path_r[i] = path[i][0]
-        cmove.path_c[i] = path[i][1]
+        cmove.path_sq[i] = path[i][0] * 8 + path[i][1]
+    cmove.from_sq = cmove.path_sq[0]
+    cmove.to_sq = cmove.path_sq[n - 1]
 
     captures = move_dict['captures']
     cmove.num_captures = len(captures)
     for i in range(cmove.num_captures):
-        cmove.cap_r[i] = captures[i][0]
-        cmove.cap_c[i] = captures[i][1]
+        cmove.cap_sq[i] = captures[i][0] * 8 + captures[i][1]
 
     _set_move_metadata(&cmove, bool(move_dict['promotion']), 0)
 
@@ -1778,12 +1859,10 @@ cdef inline bint _same_cmove(CMove *left, CMove *right):
             or _move_promotes(left) != _move_promotes(right)):
         return False
     for i in range(left.path_len):
-        if (left.path_r[i] != right.path_r[i]
-                or left.path_c[i] != right.path_c[i]):
+        if left.path_sq[i] != right.path_sq[i]:
             return False
     for i in range(left.num_captures):
-        if (left.cap_r[i] != right.cap_r[i]
-                or left.cap_c[i] != right.cap_c[i]):
+        if left.cap_sq[i] != right.cap_sq[i]:
             return False
     return True
 
@@ -1803,6 +1882,7 @@ cdef int _search_game_move(
     Rules *rules,
     SearchState *ss,
     unsigned long long h,
+    unsigned int piece_counts,
     str difficulty,
 ):
     """Search one move in a mutable move-list copy and return its final index."""
@@ -1845,7 +1925,8 @@ cdef int _search_game_move(
         ss.timeout = False
         if depth < 5:
             idx = search_root(board, player, moves, depth,
-                              -100000.0, 100000.0, rules, ss, h)
+                              -100000.0, 100000.0, rules, ss, h,
+                              piece_counts)
         else:
             aspiration_delta = 50.0
             aspiration_alpha = previous_score - aspiration_delta
@@ -1853,7 +1934,7 @@ cdef int _search_game_move(
             while True:
                 idx = search_root(board, player, moves, depth,
                                   aspiration_alpha, aspiration_beta,
-                                  rules, ss, h)
+                                  rules, ss, h, piece_counts)
                 if ss.timeout:
                     break
                 if (ss.root_score > aspiration_alpha
@@ -1863,7 +1944,8 @@ cdef int _search_game_move(
                 if aspiration_delta >= 5000.0:
                     ss.timeout = False
                     idx = search_root(board, player, moves, depth,
-                                      -100000.0, 100000.0, rules, ss, h)
+                                      -100000.0, 100000.0, rules, ss, h,
+                                      piece_counts)
                     break
                 if ss.root_score <= aspiration_alpha:
                     aspiration_alpha = previous_score - aspiration_delta
@@ -1920,6 +2002,7 @@ def play_full_game_cy(
     cdef bint game_over = False
     cdef bint was_exploration = False
     cdef unsigned long long h
+    cdef unsigned int piece_counts
     cdef CMove teacher_move, behavior_move
     cdef object opening_rng
     cdef object behavior_rng
@@ -1968,7 +2051,7 @@ def play_full_game_cy(
     # Compute initial hash and initialize killer/history tables.
     # Killers and history persist across moves within a game — moves that
     # cause cutoffs at ply N tend to be good at the same ply in later positions.
-    h = compute_hash(board, player)
+    h = compute_hash_and_counts(board, player, &piece_counts)
     _init_search_tables(&teacher_ss)
     _init_search_tables(&behavior_ss)
 
@@ -2012,7 +2095,7 @@ def play_full_game_cy(
                 _copy_move_list(&moves, &behavior_moves)
                 behavior_best_idx = _search_game_move(
                     board, player, &behavior_moves, &rules,
-                    &behavior_ss, h, cur_diff)
+                    &behavior_ss, h, piece_counts, cur_diff)
                 behavior_move = behavior_moves.moves[behavior_best_idx]
                 played_idx = _find_cmove_index(&moves, &behavior_move)
                 _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
@@ -2020,7 +2103,7 @@ def play_full_game_cy(
             _copy_move_list(&moves, &teacher_moves)
             teacher_best_idx = _search_game_move(
                 board, player, &teacher_moves, &rules,
-                &teacher_ss, h, 'hard')
+                &teacher_ss, h, piece_counts, 'hard')
             teacher_move = teacher_moves.moves[teacher_best_idx]
             teacher_idx = _find_cmove_index(&moves, &teacher_move)
 
@@ -2057,6 +2140,8 @@ def play_full_game_cy(
         # Apply move in C (board → new_board, then copy back)
         # apply_idx refers to the original, unmodified move list.
         h = _hash_after_move(h, board, &moves.moves[apply_idx], player)
+        piece_counts = _piece_counts_after_move(
+            piece_counts, player, &moves.moves[apply_idx])
         apply_move_c(board, new_board, &moves.moves[apply_idx], player)
         memcpy(board, new_board, 64)
         player = opponent(player)
