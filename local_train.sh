@@ -438,6 +438,7 @@ for name in (
     "dama.ai.algorithmic._fast_search",
     "dama.ai.ml._fast_encode",
     "dama.ai.ml._fast_score",
+    "dama.ai.ml._fast_stat",
 ):
     try:
         importlib.import_module(name)
