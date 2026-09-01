@@ -25,13 +25,27 @@ from pathlib import Path
 import random
 import re
 import shutil
+import stat as stat_module
 import sys
 import tempfile
 import threading
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from time import perf_counter_ns
+from typing import (
+    AbstractSet,
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from .move_encoder import ENCODING_VERSION
-from .replay import ReplayEntry
+from .replay import ReplayEntry, _json_loads as _replay_json_loads
 from . import run_status
 
 
@@ -72,11 +86,29 @@ _LEDGER_FINGERPRINT_BYTES = 8
 _MANIFEST_HASH_WORKERS = 8
 _PARALLEL_MANIFEST_HASH_MIN_BYTES = 64 * 1024 * 1024
 
+# drvfs serves independent stat requests with high latency.  Admission reads
+# 61 replay and 27 hold-out identities several times to preserve its fail-closed
+# transaction boundary, so overlap those metadata requests without changing
+# which fields are checked.  Small directories stay synchronous to avoid pool
+# setup overhead in tests and non-production corpora.
+_METADATA_STAT_WORKERS = 8
+_PARALLEL_METADATA_STAT_MIN_FILES = 8
+_METADATA_STAT_PROBE_FILES = 4
+_PARALLEL_METADATA_STAT_MIN_PROBE_NS = 1_000_000
+_METADATA_STAT_STRATEGY_CACHE_MAX = 64
+_METADATA_STAT_STRATEGY_LOCK = threading.Lock()
+_METADATA_STAT_PARALLEL_BY_PARENT: "OrderedDict[str, bool]" = OrderedDict()
+
 # ``gzip.GzipFile`` text iteration pays substantial per-line overhead for the
 # fixed-width canonical-key files on drvfs.  Small key files can instead take
 # gzip's whole-member C path, while the cap keeps the much larger all-time
 # ledger and any unexpectedly large artifact on the streaming path.
 _STATE_KEYS_BULK_READ_MAX_BYTES = 64 * 1024 * 1024
+# A live snapshot manager repeatedly needs exactly two immutable key sets:
+# the active training snapshot and the append-only validation manifest.  Keep
+# only those two decompressed members process-local.  A larger bound spends
+# scarce trainer RAM on historical snapshots that admission never revisits.
+_STATE_KEY_FILE_CACHE_MAX = 2
 
 
 def _posix_relpath(target: Path, start: Path) -> str:
@@ -105,7 +137,19 @@ CANONICAL_RULES_ID = "filipino-dama-default-v1"
 # persisted alongside a corpus or snapshot.  The identity includes both the
 # pathname and the filesystem identity/metadata so replacing, truncating, or
 # appending to a replay file naturally evicts the old entry.
+# Two bounds, because the entries differ by four orders of magnitude.  A
+# per-file analysis retains every canonical state key of its shard (about
+# 6 MB retained for a 14.9 MB, 14K-record shard), so it stays tightly bounded.  A digest or a
+# contract audit is a few hundred bytes, and one admission check touches the
+# whole replay window plus every held-out shard (61 + 27 = 88 identities on
+# the c174k window): under the shared 64-entry bound that cyclic access
+# pattern evicted every entry before its next use, so every self-play cycle
+# re-hashed all 88 shards (1.33 GB through drvfs, 12.3 s of a 12.9 s
+# admission check; Journal Pass 182).  Size the small caches for the window,
+# the hold-out, and a snapshot verification together, with headroom.
 _REPLAY_FILE_CACHE_MAX = 64
+_REPLAY_DIGEST_CACHE_MAX = 1024
+_REPLAY_IDENTITY_MAP_MAX = max(_REPLAY_FILE_CACHE_MAX, _REPLAY_DIGEST_CACHE_MAX)
 _REPLAY_CACHE_LOCK = threading.RLock()
 _REPLAY_ANALYSIS_CACHE: "OrderedDict[tuple, _ReplayFileAnalysis]" = OrderedDict()
 _REPLAY_HASH_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
@@ -143,9 +187,45 @@ class _ReplayFileAnalysis:
     malformed_records: int
     forced_move_count: int
     state_counts: Mapping[str, int]
+    # Empty for a proven uniform-cycle shard: ``uniform_generation_cycle``
+    # then applies to every key in ``state_counts``.  Mixed and legacy shards
+    # retain the exact per-state mapping.
     state_cycles: Mapping[str, frozenset[str]]
+    uniform_generation_cycle: Optional[str]
     source_counts: Mapping[str, int]
     game_sources: Mapping[str, str]
+
+
+@dataclass
+class _ReplayWindowAnalysis:
+    """Exact rolling aggregate for the production replay-window shape.
+
+    ReplayWriter closes one uniquely named shard per generation cycle.  When
+    every shard proves that shape, a new self-play cycle normally replaces one
+    file in the rolling window.  Retaining the two aggregate counters lets the
+    next admission update only those changed shards instead of merging every
+    canonical state in the other 55 unchanged files again.
+    """
+
+    ordered_identities: Tuple[tuple, ...]
+    analyses: Dict[tuple, _ReplayFileAnalysis]
+    state_counts: Counter[str]
+    state_file_counts: Counter[str]
+    source_counts: Counter[str]
+    records: int
+    malformed_records: int
+    forced_move_count: int
+    cross_file_repeated_state_count: int
+    cross_file_duplicate_record_count: int
+    # The active snapshot key set is a cached frozenset and normally remains
+    # unchanged across many rejected self-play cycles.  Retain freshness
+    # against that exact immutable object so a one-shard replay rotation only
+    # updates keys from the removed and added shards.  Mutable predecessor sets
+    # never populate this reference and therefore keep the unrestricted full
+    # difference on every call.
+    freshness_reference: Optional[AbstractSet[str]]
+    fresh_state_keys: Set[str]
+    fresh_record_count: int
 
 
 @dataclass
@@ -167,12 +247,12 @@ class _SnapshotSplitContext:
     max_train_entries: int
 
 
-def _replay_file_identity(path: Path) -> _ReplayFileIdentity:
-    """Return an identity that changes for normal in-place/replacement edits."""
+def _replay_file_identity_from_stat(
+    path: Path, stat_result: os.stat_result,
+) -> _ReplayFileIdentity:
+    """Build the canonical cache identity from one already-completed stat."""
 
-    path = Path(path)
-    resolved = str(path.resolve())
-    stat_result = path.stat()
+    resolved = os.path.abspath(str(Path(path)))
     return _ReplayFileIdentity(
         resolved_path=resolved,
         st_dev=int(stat_result.st_dev),
@@ -182,14 +262,108 @@ def _replay_file_identity(path: Path) -> _ReplayFileIdentity:
     )
 
 
+def _replay_file_identity(path: Path) -> _ReplayFileIdentity:
+    """Return an identity that changes for normal in-place/replacement edits.
+
+    The pathname component is the absolute, normalised spelling the caller
+    used, not a symlink-resolved one: ``Path.resolve()`` lstat()s every path
+    component and cost 1.3-4.5 ms per call on drvfs, about 200 calls per
+    self-play cycle (Journal Pass 182), while the device, inode, size, and
+    mtime fields are what actually guard against a stale entry.  Two
+    spellings of one file would simply hold two self-consistent entries.
+    """
+
+    path = Path(path)
+    return _replay_file_identity_from_stat(path, path.stat())
+
+
+def _directory_entry_stat(
+    entry: Any,
+) -> Tuple[Any, Optional[os.stat_result], Optional[OSError]]:
+    """Return one directory entry's metadata without losing its exception."""
+
+    try:
+        return entry, entry.stat(), None
+    except OSError as exc:
+        return entry, None, exc
+
+
+def _directory_entry_stats(
+    entries: Sequence[Any],
+) -> List[Tuple[Any, Optional[os.stat_result], Optional[OSError]]]:
+    """Read independent directory-entry identities with bounded concurrency."""
+
+    entries = list(entries)
+    if len(entries) < _PARALLEL_METADATA_STAT_MIN_FILES:
+        return [_directory_entry_stat(entry) for entry in entries]
+    parent_key: Optional[str] = None
+    try:
+        parents = {
+            os.path.abspath(os.path.dirname(os.fspath(entry.path)))
+            for entry in entries
+        }
+        if len(parents) == 1:
+            parent_key = parents.pop()
+    except (AttributeError, TypeError):
+        pass
+    parallel: Optional[bool] = None
+    if parent_key is not None:
+        with _METADATA_STAT_STRATEGY_LOCK:
+            parallel = _METADATA_STAT_PARALLEL_BY_PARENT.get(parent_key)
+            if parallel is not None:
+                _METADATA_STAT_PARALLEL_BY_PARENT.move_to_end(parent_key)
+    if parallel is False:
+        return [_directory_entry_stat(entry) for entry in entries]
+    if parallel is True:
+        workers = min(_METADATA_STAT_WORKERS, len(entries))
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="corpus-metadata",
+        ) as pool:
+            return list(pool.map(_directory_entry_stat, entries))
+    # A thread pool is a large regression on a low-latency local filesystem
+    # (the server profile normally uses one), while drvfs metadata is slow
+    # enough to benefit by an order of magnitude.  Time a small prefix from
+    # this exact directory instead of hardcoding a platform or mount name.
+    probe_count = min(_METADATA_STAT_PROBE_FILES, len(entries))
+    started_ns = perf_counter_ns()
+    prefix = [
+        _directory_entry_stat(entry) for entry in entries[:probe_count]
+    ]
+    parallel = (
+        perf_counter_ns() - started_ns
+        >= _PARALLEL_METADATA_STAT_MIN_PROBE_NS
+    )
+    if parent_key is not None:
+        with _METADATA_STAT_STRATEGY_LOCK:
+            _METADATA_STAT_PARALLEL_BY_PARENT[parent_key] = parallel
+            _METADATA_STAT_PARALLEL_BY_PARENT.move_to_end(parent_key)
+            while (len(_METADATA_STAT_PARALLEL_BY_PARENT)
+                   > _METADATA_STAT_STRATEGY_CACHE_MAX):
+                _METADATA_STAT_PARALLEL_BY_PARENT.popitem(last=False)
+    if not parallel:
+        return prefix + [
+            _directory_entry_stat(entry) for entry in entries[probe_count:]
+        ]
+    workers = min(_METADATA_STAT_WORKERS, len(entries) - probe_count)
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="corpus-metadata",
+    ) as pool:
+        remainder = list(pool.map(
+            _directory_entry_stat, entries[probe_count:]))
+    return prefix + remainder
+
+
 def _cache_touch(
     cache: "OrderedDict[tuple, Any]", key: tuple, value: Any,
+    bound: int = _REPLAY_FILE_CACHE_MAX,
 ) -> None:
     """Insert an item and enforce the process-local LRU bound."""
 
     cache[key] = value
     cache.move_to_end(key)
-    while len(cache) > _REPLAY_FILE_CACHE_MAX:
+    while len(cache) > bound:
         cache.popitem(last=False)
 
 
@@ -207,12 +381,12 @@ def _cache_prepare_identity(identity: _ReplayFileIdentity) -> tuple:
                 if audit_key[0] == previous:
                     _REPLAY_AUDIT_CACHE.pop(audit_key, None)
         _REPLAY_LATEST_IDENTITY[path_key] = identity_key
-        if len(_REPLAY_LATEST_IDENTITY) > _REPLAY_FILE_CACHE_MAX:
+        if len(_REPLAY_LATEST_IDENTITY) > _REPLAY_IDENTITY_MAP_MAX:
             active = set(_REPLAY_ANALYSIS_CACHE)
             active.update(_REPLAY_HASH_CACHE)
             active.update(key[0] for key in _REPLAY_AUDIT_CACHE)
             for stale_path, stale_identity in tuple(_REPLAY_LATEST_IDENTITY.items()):
-                if len(_REPLAY_LATEST_IDENTITY) <= _REPLAY_FILE_CACHE_MAX:
+                if len(_REPLAY_LATEST_IDENTITY) <= _REPLAY_IDENTITY_MAP_MAX:
                     break
                 if stale_path != path_key and stale_identity not in active:
                     _REPLAY_LATEST_IDENTITY.pop(stale_path, None)
@@ -227,6 +401,8 @@ def _clear_replay_file_cache() -> None:
         _REPLAY_HASH_CACHE.clear()
         _REPLAY_AUDIT_CACHE.clear()
         _REPLAY_LATEST_IDENTITY.clear()
+    with _METADATA_STAT_STRATEGY_LOCK:
+        _METADATA_STAT_PARALLEL_BY_PARENT.clear()
 
 
 def _rotate(position: Sequence[int]) -> Tuple[int, int]:
@@ -285,11 +461,12 @@ def _sha256_file_uncached(path: Path) -> str:
     return digest.hexdigest()
 
 
-def replay_file_sha256(path: Path) -> str:
-    """Return a replay-file digest, reusing only a still-identical file."""
+def _replay_file_sha256_for_identity(
+    path: Path, identity: _ReplayFileIdentity,
+) -> str:
+    """Return a digest using an identity already verified by the caller."""
 
     path = Path(path)
-    identity = _replay_file_identity(path)
     identity_key = _cache_prepare_identity(identity)
     with _REPLAY_CACHE_LOCK:
         cached = _REPLAY_HASH_CACHE.get(identity_key)
@@ -304,8 +481,94 @@ def replay_file_sha256(path: Path) -> str:
         unchanged = False
     if unchanged:
         with _REPLAY_CACHE_LOCK:
-            _cache_touch(_REPLAY_HASH_CACHE, identity_key, digest)
+            _cache_touch(
+                _REPLAY_HASH_CACHE, identity_key, digest,
+                _REPLAY_DIGEST_CACHE_MAX)
     return digest
+
+
+def replay_file_sha256(path: Path) -> str:
+    """Return a replay-file digest, reusing only a still-identical file."""
+
+    path = Path(path)
+    return _replay_file_sha256_for_identity(
+        path, _replay_file_identity(path))
+
+
+def _policy_replay_audit_result(
+    records: int,
+    game_sources: Mapping[str, str],
+    errors: Counter[str],
+    *,
+    complete: bool = False,
+) -> Dict[str, Any]:
+    """Finalize the repaired replay-contract verdict for one file."""
+
+    source_games = Counter(game_sources.values())
+    if complete and not errors:
+        # A completed self-play cycle writes exactly one replay file whose
+        # trajectories are an exact 70/30 algorithm/current-model split.  A
+        # fully-parsed file that misses the ratio is a partial cycle: the
+        # process died mid-generation, so the trainer's in-process quarantine
+        # never ran.  Reject that one incomplete file.
+        algorithm = source_games.get("algorithm", 0)
+        model = source_games.get("current_model", 0)
+        if algorithm + model == 0 or algorithm * 3 != model * 7:
+            errors["unbalanced_policy_trajectory_split"] += 1
+    return {
+        "contract_version": POLICY_REPLAY_CONTRACT_VERSION,
+        "valid": records > 0 and not errors,
+        "records": records,
+        "game_count": len(game_sources),
+        "source_game_counts": dict(sorted(source_games.items())),
+        "errors": dict(sorted(errors.items())),
+    }
+
+
+def _audit_policy_replay_entry(
+    entry: Mapping[str, Any],
+    allowed: Set[int],
+    game_sources: Dict[str, str],
+    errors: Counter[str],
+) -> None:
+    """Accumulate the exact repaired replay-contract checks for one row."""
+
+    legal_moves = entry.get("legal_moves")
+    if not isinstance(legal_moves, list) or not legal_moves:
+        errors["missing_legal_moves"] += 1
+        return
+    for key in (
+        "chosen_index",
+        "played_index",
+        "trajectory_source",
+        "was_exploration",
+        "teacher_difficulty",
+        "opening_plies",
+        "game_id",
+    ):
+        if key not in entry:
+            errors[f"missing_{key}"] += 1
+    chosen = entry.get("chosen_index")
+    played = entry.get("played_index")
+    if not isinstance(chosen, int) or not 0 <= chosen < len(legal_moves):
+        errors["invalid_teacher_index"] += 1
+    if not isinstance(played, int) or not 0 <= played < len(legal_moves):
+        errors["invalid_played_index"] += 1
+    if entry.get("teacher_difficulty") != "hard":
+        errors["non_hard_teacher"] += 1
+    source = entry.get("trajectory_source")
+    if source not in {"algorithm", "current_model"}:
+        errors["invalid_trajectory_source"] += 1
+    opening = entry.get("opening_plies")
+    if allowed and opening not in allowed:
+        errors["opening_outside_configured_suite"] += 1
+    game_id = entry.get("game_id")
+    if not isinstance(game_id, str) or not game_id:
+        errors["invalid_game_id"] += 1
+    elif source in {"algorithm", "current_model"}:
+        previous = game_sources.setdefault(game_id, source)
+        if previous != source:
+            errors["game_has_multiple_sources"] += 1
 
 
 def _audit_policy_replay_file_uncached(
@@ -325,75 +588,60 @@ def _audit_policy_replay_file_uncached(
     game_sources: Dict[str, str] = {}
     records = 0
 
-    def _result(complete: bool = False) -> Dict[str, Any]:
-        source_games = Counter(game_sources.values())
-        if complete and not errors:
-            # A completed self-play cycle writes exactly one replay file whose
-            # trajectories are an exact 70/30 algorithm/current-model split.  A
-            # fully-parsed file that misses the ratio is a partial cycle: the
-            # process died mid-generation, so the trainer's in-process
-            # quarantine (discard_current_file) never ran.  Admitting it drags
-            # the whole corpus off contract and, because the file is never
-            # rewritten, wedges every later run behind the same aggregate
-            # error.  Reject the one bad file instead.
-            algorithm = source_games.get("algorithm", 0)
-            model = source_games.get("current_model", 0)
-            if algorithm + model == 0 or algorithm * 3 != model * 7:
-                errors["unbalanced_policy_trajectory_split"] += 1
-        return {
-            "contract_version": POLICY_REPLAY_CONTRACT_VERSION,
-            "valid": records > 0 and not errors,
-            "records": records,
-            "game_count": len(game_sources),
-            "source_game_counts": dict(sorted(source_games.items())),
-            "errors": dict(sorted(errors.items())),
-        }
-
     for entry in _iter_entry_dicts(path):
         records += 1
-        legal_moves = entry.get("legal_moves")
-        if not isinstance(legal_moves, list) or not legal_moves:
-            errors["missing_legal_moves"] += 1
-        else:
-            for key in (
-                "chosen_index",
-                "played_index",
-                "trajectory_source",
-                "was_exploration",
-                "teacher_difficulty",
-                "opening_plies",
-                "game_id",
-            ):
-                if key not in entry:
-                    errors[f"missing_{key}"] += 1
-            chosen = entry.get("chosen_index")
-            played = entry.get("played_index")
-            if not isinstance(chosen, int) or not 0 <= chosen < len(legal_moves):
-                errors["invalid_teacher_index"] += 1
-            if not isinstance(played, int) or not 0 <= played < len(legal_moves):
-                errors["invalid_played_index"] += 1
-            if entry.get("teacher_difficulty") != "hard":
-                errors["non_hard_teacher"] += 1
-            source = entry.get("trajectory_source")
-            if source not in {"algorithm", "current_model"}:
-                errors["invalid_trajectory_source"] += 1
-            opening = entry.get("opening_plies")
-            if allowed and opening not in allowed:
-                errors["opening_outside_configured_suite"] += 1
-            game_id = entry.get("game_id")
-            if not isinstance(game_id, str) or not game_id:
-                errors["invalid_game_id"] += 1
-            elif source in {"algorithm", "current_model"}:
-                previous = game_sources.setdefault(game_id, source)
-                if previous != source:
-                    errors["game_has_multiple_sources"] += 1
+        _audit_policy_replay_entry(entry, allowed, game_sources, errors)
         # No rejected file can become admissible by scanning more records.
         # Return after the first observed contract error, including the useful
         # count of records consumed and the exact error categories found.
         if errors:
-            return _result()
+            return _policy_replay_audit_result(
+                records, game_sources, errors)
 
-    return _result(complete=True)
+    return _policy_replay_audit_result(
+        records, game_sources, errors, complete=True)
+
+
+def _audit_policy_replay_file_for_identity(
+    path: Path,
+    allowed_opening_plies: Sequence[int],
+    identity: _ReplayFileIdentity,
+) -> Dict[str, Any]:
+    """Audit a replay file using an identity already verified by the caller."""
+
+    path = Path(path)
+    identity_key = _cache_prepare_identity(identity)
+    allowed_values = tuple(int(value) for value in allowed_opening_plies)
+    allowed_key = tuple(sorted(set(allowed_values)))
+    cache_key = (identity_key, allowed_key)
+    with _REPLAY_CACHE_LOCK:
+        cached = _REPLAY_AUDIT_CACHE.get(cache_key)
+        if cached is not None:
+            _REPLAY_AUDIT_CACHE.move_to_end(cache_key)
+            return copy.deepcopy(cached)
+
+    # The active admission path needs both the contract verdict and the exact
+    # diversity analysis for every valid shard.  Build both during this one
+    # JSON decode instead of parsing every cold shard again in
+    # analyze_replay_files().  A rejected shard still stops at its first
+    # contract error and publishes no partial analysis.
+    analysis, result = _read_replay_file_analysis_and_audit(
+        path, identity_key, allowed_values)
+    try:
+        unchanged = _replay_file_identity(path).as_key() == identity_key
+    except OSError:
+        unchanged = False
+    if unchanged:
+        with _REPLAY_CACHE_LOCK:
+            _cache_touch(
+                _REPLAY_AUDIT_CACHE, cache_key, copy.deepcopy(result),
+                _REPLAY_DIGEST_CACHE_MAX)
+            if analysis is not None and analysis.malformed_records == 0:
+                _cache_touch(_REPLAY_ANALYSIS_CACHE, identity_key, analysis)
+                _cache_touch(
+                    _REPLAY_HASH_CACHE, identity_key, analysis.sha256,
+                    _REPLAY_DIGEST_CACHE_MAX)
+    return result
 
 
 def audit_policy_replay_file(
@@ -404,32 +652,13 @@ def audit_policy_replay_file(
 
     path = Path(path)
     try:
-        identity_key = _cache_prepare_identity(_replay_file_identity(path))
+        identity = _replay_file_identity(path)
     except OSError:
         # Preserve the underlying iterator/open error for missing paths and
         # test doubles that intentionally do not exist on disk.
         return _audit_policy_replay_file_uncached(path, allowed_opening_plies)
-    allowed_values = tuple(int(value) for value in allowed_opening_plies)
-    allowed_key = tuple(sorted(set(allowed_values)))
-    cache_key = (identity_key, allowed_key)
-    with _REPLAY_CACHE_LOCK:
-        cached = _REPLAY_AUDIT_CACHE.get(cache_key)
-        if cached is not None:
-            _REPLAY_AUDIT_CACHE.move_to_end(cache_key)
-            return copy.deepcopy(cached)
-
-    # JSON/iterator errors deliberately bypass the cache.  A contract-invalid
-    # result is safe to cache as a negative result, but malformed input never
-    # becomes a reusable valid audit entry.
-    result = _audit_policy_replay_file_uncached(path, allowed_values)
-    try:
-        unchanged = _replay_file_identity(path).as_key() == identity_key
-    except OSError:
-        unchanged = False
-    if unchanged:
-        with _REPLAY_CACHE_LOCK:
-            _cache_touch(_REPLAY_AUDIT_CACHE, cache_key, copy.deepcopy(result))
-    return result
+    return _audit_policy_replay_file_for_identity(
+        path, allowed_opening_plies, identity)
 
 
 def _iter_entry_dicts(path: Path) -> Iterator[dict]:
@@ -438,7 +667,7 @@ def _iter_entry_dicts(path: Path) -> Iterator[dict]:
             if not line.strip():
                 continue
             try:
-                value = json.loads(line)
+                value = _replay_json_loads(line)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Invalid replay JSON at {path}:{line_number}") from exc
             if not isinstance(value, dict):
@@ -446,25 +675,107 @@ def _iter_entry_dicts(path: Path) -> Iterator[dict]:
             yield value
 
 
-def _read_replay_file_analysis(
-    path: Path, identity_key: tuple,
-) -> _ReplayFileAnalysis:
-    """Build exact per-file facts without publishing a partial cache entry."""
+def _iter_entry_dicts_with_digest(
+    path: Path, digest: Any,
+) -> Iterator[dict]:
+    """Yield replay objects while hashing the exact bytes already being read.
+
+    The ordinary iterator stays text based for its many legacy callers.  The
+    cold analysis path also needs the shard SHA-256, so its binary iterator
+    updates the digest from each large input block before decoding its complete
+    lines.  Fully consuming this iterator therefore hashes every byte, including
+    blank lines, original newline bytes, and an unterminated final line, without
+    a second file read.
+    """
+
+    def decode_line(raw_line: bytes, line_number: int) -> Optional[dict]:
+        if not raw_line.strip():
+            return None
+        try:
+            value = _replay_json_loads(raw_line)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Invalid replay JSON at {path}:{line_number}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"Replay entry is not an object at {path}:{line_number}")
+        return value
+
+    # BufferedReader's per-line binary iterator is exceptionally slow on
+    # drvfs.  Read and hash large blocks, carrying only the unfinished final
+    # line into the next block.  Splitting on LF preserves normal JSONL and
+    # CRLF JSONL semantics; the retained CR is valid trailing JSON whitespace.
+    path = Path(path)
+    chunk_bytes = 1024 * 1024
+    pending = b""
+    line_number = 0
+    with path.open("rb", buffering=chunk_bytes) as handle:
+        while True:
+            chunk = handle.read(chunk_bytes)
+            if not chunk:
+                break
+            digest.update(chunk)
+            lines = (pending + chunk).split(b"\n")
+            pending = lines.pop()
+            for raw_line in lines:
+                line_number += 1
+                value = decode_line(raw_line, line_number)
+                if value is not None:
+                    yield value
+        if pending:
+            line_number += 1
+            value = decode_line(pending, line_number)
+            if value is not None:
+                yield value
+
+
+def _scan_replay_file_analysis(
+    path: Path,
+    identity_key: tuple,
+    audit_opening_plies: Optional[Sequence[int]] = None,
+) -> Tuple[Optional[_ReplayFileAnalysis], Optional[Dict[str, Any]]]:
+    """Build analysis and, when requested, the policy audit in one decode.
+
+    Contract-invalid files preserve the audit's fail-fast behavior and return
+    no analysis, so a prefix can never enter the reusable analysis cache.
+    """
 
     path = Path(path)
     state_counts: Counter[str] = Counter()
-    state_cycles: Dict[str, Set[str]] = defaultdict(set)
+    # ReplayWriter normally closes one shard per cycle.  Keep that common case
+    # compact while scanning: ``None`` means every valid record seen so far had
+    # the same cycle id, so ``state_counts`` itself proves which states observed
+    # it.  The first missing provenance creates only a set of observed keys;
+    # the full per-key map is materialized only if a second cycle actually
+    # appears in the same shard.
+    state_cycles: Optional[Dict[str, Set[str]]] = None
+    single_cycle_id: Optional[str] = None
+    single_cycle_state_keys: Optional[Set[str]] = None
     source_counts: Counter[str] = Counter()
     game_sources: Dict[str, str] = {}
     forced = 0
     malformed = 0
     total = 0
+    audit_enabled = audit_opening_plies is not None
+    audit_allowed = {
+        int(value) for value in (audit_opening_plies or ())}
+    audit_errors: Counter[str] = Counter()
+    audit_game_sources: Dict[str, str] = {}
+    audit_records = 0
 
-    # Hash and semantic parsing are intentionally done as one uncached build;
-    # the result is published only after both complete and the file identity
-    # is checked again by the caller.
-    file_hash = _sha256_file_uncached(path)
-    for entry in _iter_entry_dicts(path):
+    # Hash the exact bytes consumed by semantic parsing.  The result is
+    # published only after both complete and the file identity is checked again
+    # by the caller.  Contract-invalid files return before a complete digest is
+    # available and publish neither a hash nor a partial analysis.
+    file_digest = hashlib.sha256()
+    for entry in _iter_entry_dicts_with_digest(path, file_digest):
+        if audit_enabled:
+            audit_records += 1
+            _audit_policy_replay_entry(
+                entry, audit_allowed, audit_game_sources, audit_errors)
+            if audit_errors:
+                return None, _policy_replay_audit_result(
+                    audit_records, audit_game_sources, audit_errors)
         try:
             key = canonical_state_key(entry["state"])
             legal_moves = entry["legal_moves"]
@@ -472,11 +783,36 @@ def _read_replay_file_analysis(
             malformed += 1
             continue
         total += 1
-        state_counts[key] += 1
         game_id = entry.get("game_id")
         cycle_match = re.match(r"^cycle-([^ -]+)-", str(game_id or ""))
         if cycle_match:
-            state_cycles[key].add(cycle_match.group(1))
+            cycle_id = cycle_match.group(1)
+            if state_cycles is not None:
+                state_cycles[key].add(cycle_id)
+            elif single_cycle_id is None:
+                single_cycle_id = cycle_id
+                if single_cycle_state_keys is not None:
+                    single_cycle_state_keys.add(key)
+            elif cycle_id == single_cycle_id:
+                if single_cycle_state_keys is not None:
+                    single_cycle_state_keys.add(key)
+            else:
+                state_cycles = defaultdict(set)
+                previously_observed = (
+                    state_counts.keys()
+                    if single_cycle_state_keys is None
+                    else single_cycle_state_keys
+                )
+                for observed_key in previously_observed:
+                    state_cycles[observed_key].add(single_cycle_id)
+                state_cycles[key].add(cycle_id)
+                single_cycle_state_keys = None
+        elif state_cycles is None and single_cycle_state_keys is None:
+            # All earlier valid records carried ``single_cycle_id`` (or this is
+            # the first valid record).  Snapshot their keys only when missing
+            # provenance makes that proof insufficient.
+            single_cycle_state_keys = set(state_counts)
+        state_counts[key] += 1
         if len(legal_moves) == 1:
             forced += 1
         source_counts[str(entry.get("trajectory_source", "legacy"))] += 1
@@ -484,24 +820,84 @@ def _read_replay_file_analysis(
         if isinstance(game_id, str) and game_id and isinstance(source, str):
             game_sources[game_id] = source
 
-    return _ReplayFileAnalysis(
+    file_hash = file_digest.hexdigest()
+    uniform_generation_cycle = None
+    if state_cycles is not None:
+        frozen_state_cycles = {
+            key: frozenset(value) for key, value in state_cycles.items()}
+    elif (
+        single_cycle_id is not None
+        and (
+            single_cycle_state_keys is None
+            or len(single_cycle_state_keys) == len(state_counts)
+        )
+    ):
+        # Every canonical state observed the shard's one cycle.  The analyzer
+        # expands this single id only if an ambiguous multi-file fallback needs
+        # it, avoiding one set plus one frozenset per state in the live cache.
+        uniform_generation_cycle = single_cycle_id
+        frozen_state_cycles = {}
+    elif single_cycle_id is not None:
+        shared_cycle = frozenset((single_cycle_id,))
+        frozen_state_cycles = {
+            key: shared_cycle for key in (single_cycle_state_keys or ())}
+    else:
+        frozen_state_cycles = {}
+    analysis = _ReplayFileAnalysis(
         identity=identity_key,
         sha256=file_hash,
         records=total,
         malformed_records=malformed,
         forced_move_count=forced,
         state_counts=dict(state_counts),
-        state_cycles={key: frozenset(value) for key, value in state_cycles.items()},
+        state_cycles=frozen_state_cycles,
+        # ReplayWriter closes one shard per completed generation cycle.  Record
+        # that fact only when the contents prove it: every valid canonical state
+        # must carry the same one cycle id.  Mixed or legacy shards store None
+        # and retain the general merge path.
+        uniform_generation_cycle=uniform_generation_cycle,
         source_counts=dict(source_counts),
         game_sources=dict(game_sources),
     )
+    audit = None
+    if audit_enabled:
+        audit = _policy_replay_audit_result(
+            audit_records, audit_game_sources, audit_errors, complete=True)
+        if not audit["valid"]:
+            return None, audit
+    return analysis, audit
 
 
-def _cached_replay_file_analysis(path: Path) -> _ReplayFileAnalysis:
-    """Load exact file facts from the bounded cache or build them once."""
+def _read_replay_file_analysis(
+    path: Path, identity_key: tuple,
+) -> _ReplayFileAnalysis:
+    """Build exact per-file facts without publishing a partial cache entry."""
+
+    analysis, _audit = _scan_replay_file_analysis(path, identity_key)
+    assert analysis is not None
+    return analysis
+
+
+def _read_replay_file_analysis_and_audit(
+    path: Path,
+    identity_key: tuple,
+    allowed_opening_plies: Sequence[int],
+) -> Tuple[Optional[_ReplayFileAnalysis], Dict[str, Any]]:
+    """Build a fail-closed policy audit and complete analysis together."""
+
+    analysis, audit = _scan_replay_file_analysis(
+        path, identity_key, allowed_opening_plies)
+    assert audit is not None
+    return analysis, audit
+
+
+def _cached_replay_file_analysis_for_identity(
+    path: Path, identity: _ReplayFileIdentity,
+) -> _ReplayFileAnalysis:
+    """Load exact file facts using an identity already verified by the caller."""
 
     path = Path(path)
-    identity_key = _cache_prepare_identity(_replay_file_identity(path))
+    identity_key = _cache_prepare_identity(identity)
     with _REPLAY_CACHE_LOCK:
         cached = _REPLAY_ANALYSIS_CACHE.get(identity_key)
         if cached is not None:
@@ -520,8 +916,18 @@ def _cached_replay_file_analysis(path: Path) -> _ReplayFileAnalysis:
     if unchanged and analysis.malformed_records == 0:
         with _REPLAY_CACHE_LOCK:
             _cache_touch(_REPLAY_ANALYSIS_CACHE, identity_key, analysis)
-            _cache_touch(_REPLAY_HASH_CACHE, identity_key, analysis.sha256)
+            _cache_touch(
+                _REPLAY_HASH_CACHE, identity_key, analysis.sha256,
+                _REPLAY_DIGEST_CACHE_MAX)
     return analysis
+
+
+def _cached_replay_file_analysis(path: Path) -> _ReplayFileAnalysis:
+    """Load exact file facts from the bounded cache or build them once."""
+
+    path = Path(path)
+    return _cached_replay_file_analysis_for_identity(
+        path, _replay_file_identity(path))
 
 
 def _state_set_digest(state_keys: Iterable[str]) -> str:
@@ -535,19 +941,42 @@ def _state_set_digest(state_keys: Iterable[str]) -> str:
 def analyze_replay_files(
     files: Sequence[Path],
     previous_state_keys: Optional[Set[str]] = None,
+    *,
+    include_state_digest: bool = True,
+    _file_identities: Optional[Mapping[Path, _ReplayFileIdentity]] = None,
 ) -> Tuple[Dict[str, Any], Set[str]]:
     """Measure exact replay diversity and freshness across a file set.
 
     Time complexity is O(r log u) because the final fingerprint sorts ``u``
     unique keys. Space complexity is O(u + r_source), where ``r_source`` is
     the bounded set of source labels.
+
+    ``include_state_digest=False`` reports ``state_set_sha256`` as ``None``.
+    It exists for the one caller that fingerprints a different key set (the
+    post-deduplication training set) and overwrites the field anyway:
+    sorting and hashing the ~636K pre-dedup keys of the c174k window costs
+    about 0.4 s on every self-play cycle for a value nobody reads
+    (Journal Pass 182).  Every other caller keeps the digest.  The private
+    identity map lets one fail-closed admission transaction reuse its initial
+    metadata snapshot; ordinary callers still stat each source themselves.
     """
 
     previous = previous_state_keys or set()
-    unique_keys: Set[str] = set()
     state_counts: Counter[str] = Counter()
-    state_files: Dict[str, Set[str]] = defaultdict(set)
-    state_cycles: Dict[str, Set[str]] = defaultdict(set)
+    unique_keys: Set[str] = set()
+    # Production replay basenames are unique.  In that common case, set
+    # intersection finds the relatively small cross-file overlap in C and a
+    # repeated-key set replaces a 636K-entry per-state file counter.  The
+    # general path retains exact historical semantics for callers that supply
+    # two different paths with the same basename: those paths count as one
+    # logical file for the cross-file metrics.
+    unique_file_names = len({Path(path).name for path in files}) == len(files)
+    repeated_file_keys: Set[str] = set()
+    state_file_counts: Counter[str] = Counter()
+    name_states: Dict[str, List[Mapping[str, int]]] = {}
+    cycle_analyses: List[_ReplayFileAnalysis] = []
+    uniform_cycle_ids: List[str] = []
+    all_uniform_cycles = True
     source_counts: Counter[str] = Counter()
     game_sources: Dict[str, str] = {}
     forced = 0
@@ -556,7 +985,13 @@ def analyze_replay_files(
 
     for path in files:
         path = Path(path)
-        analysis = _cached_replay_file_analysis(path)
+        identity = (
+            _file_identities.get(path)
+            if _file_identities is not None else None)
+        analysis = (
+            _cached_replay_file_analysis_for_identity(path, identity)
+            if identity is not None
+            else _cached_replay_file_analysis(path))
         total += analysis.records
         malformed += analysis.malformed_records
         forced += analysis.forced_move_count
@@ -564,32 +999,78 @@ def analyze_replay_files(
         # Updating in caller-provided file order preserves the original
         # last-write-wins behavior when a game ID appears in multiple files.
         game_sources.update(analysis.game_sources)
-        for key, count in analysis.state_counts.items():
-            state_counts[key] += count
-            unique_keys.add(key)
-            state_files[key].add(path.name)
-        for key, cycles in analysis.state_cycles.items():
-            state_cycles[key].update(cycles)
+        file_states = analysis.state_counts
+        state_counts.update(file_states)
+        if unique_file_names:
+            repeated_file_keys.update(unique_keys.intersection(file_states))
+            unique_keys.update(file_states)
+        else:
+            unique_keys.update(file_states)
+            counted = name_states.get(path.name)
+            if counted is None:
+                name_states[path.name] = [file_states]
+                state_file_counts.update(file_states.keys())
+            else:
+                state_file_counts.update(
+                    key for key in file_states
+                    if not any(key in earlier for earlier in counted)
+                )
+                counted.append(file_states)
+        cycle_analyses.append(analysis)
+        if analysis.uniform_generation_cycle is None:
+            all_uniform_cycles = False
+        else:
+            uniform_cycle_ids.append(analysis.uniform_generation_cycle)
 
     new_unique = unique_keys.difference(previous)
-    fresh_records = sum(
-        count for key, count in state_counts.items() if key not in previous
-    )
-    cross_file_states = sum(1 for names in state_files.values() if len(names) > 1)
-    cross_file_unique_states = sum(1 for names in state_files.values() if len(names) == 1)
-    cross_file_duplicate_records = sum(
-        max(0, state_counts[state_key] - 1)
-        for state_key, names in state_files.items() if len(names) > 1
-    )
-    cycle_observed_states = {
-        key: cycles for key, cycles in state_cycles.items() if cycles
-    }
-    cross_cycle_states = sum(
-        1 for cycles in cycle_observed_states.values() if len(cycles) > 1
-    )
-    cross_cycle_unique_states = sum(
-        1 for cycles in cycle_observed_states.values() if len(cycles) == 1
-    )
+    # ``new_unique`` already embodies the membership test against ``previous``;
+    # iterating only that normally-small set avoids re-testing every standing
+    # state to calculate the fresh-record rate.
+    fresh_records = sum(state_counts[key] for key in new_unique)
+    if unique_file_names:
+        cross_file_states = len(repeated_file_keys)
+        cross_file_duplicate_records = sum(
+            state_counts[state_key] - 1 for state_key in repeated_file_keys)
+    else:
+        cross_file_states = sum(
+            1 for names in state_file_counts.values() if names > 1)
+        cross_file_duplicate_records = sum(
+            state_counts[state_key] - 1
+            for state_key, names in state_file_counts.items() if names > 1)
+    cross_file_unique_states = len(unique_keys) - cross_file_states
+
+    if (unique_file_names
+            and all_uniform_cycles
+            and len(set(uniform_cycle_ids)) == len(uniform_cycle_ids)):
+        # Each state is observed in its shard's sole cycle, and no two shards
+        # share a cycle.  A state is therefore a cross-cycle repeat exactly when
+        # it is already known to repeat across files.  This is the live corpus
+        # shape and avoids rebuilding a 636K-entry cycle dictionary per check.
+        cycle_observed_state_count = len(unique_keys)
+        cross_cycle_states = len(repeated_file_keys)
+    else:
+        state_cycles: Dict[str, frozenset[str]] = {}
+        for analysis in cycle_analyses:
+            if analysis.uniform_generation_cycle is not None:
+                shared_cycle = frozenset((analysis.uniform_generation_cycle,))
+                file_cycles = (
+                    (key, shared_cycle) for key in analysis.state_counts)
+            else:
+                file_cycles = analysis.state_cycles.items()
+            for key, cycles in file_cycles:
+                known = state_cycles.get(key)
+                if known is None:
+                    state_cycles[key] = cycles
+                elif known is not cycles and not cycles <= known:
+                    state_cycles[key] = known | cycles
+        cycle_observed_state_count = 0
+        cross_cycle_states = 0
+        for cycles in state_cycles.values():
+            if cycles:
+                cycle_observed_state_count += 1
+                if len(cycles) > 1:
+                    cross_cycle_states += 1
+    cross_cycle_unique_states = cycle_observed_state_count - cross_cycle_states
     metrics = {
         "records": total,
         "malformed_records": malformed,
@@ -605,19 +1086,20 @@ def analyze_replay_files(
         "cross_file_unique_state_rate": (
             cross_file_unique_states / len(unique_keys) if unique_keys else 0.0
         ),
-        "cross_cycle_observed_state_count": len(cycle_observed_states),
+        "cross_cycle_observed_state_count": cycle_observed_state_count,
         "cross_cycle_repeated_state_count": cross_cycle_states,
         "cross_cycle_unique_state_count": cross_cycle_unique_states,
         "cross_cycle_unique_state_rate": (
-            cross_cycle_unique_states / len(cycle_observed_states)
-            if cycle_observed_states else 0.0
+            cross_cycle_unique_states / cycle_observed_state_count
+            if cycle_observed_state_count else 0.0
         ),
         "new_unique_state_count": len(new_unique),
         "fresh_unique_state_rate": (len(new_unique) / len(unique_keys)) if unique_keys else 0.0,
         "fresh_record_rate": (fresh_records / total) if total else 0.0,
         "source_counts": dict(sorted(source_counts.items())),
         "source_game_counts": dict(sorted(Counter(game_sources.values()).items())),
-        "state_set_sha256": _state_set_digest(unique_keys),
+        "state_set_sha256": (
+            _state_set_digest(unique_keys) if include_state_digest else None),
     }
     return metrics, unique_keys
 
@@ -872,6 +1354,19 @@ class CorpusSnapshotManager:
             Path(value) for value in trained_ledger_seed_roots)
         self._lineage_base_cache: Optional[Tuple[Path, dict, Set[str]]] = None
         self._trained_ledger_cache: Optional[Tuple[Set[str], Set[int]]] = None
+        # Immutable manifest key files otherwise get decompressed, parsed and
+        # fingerprinted again after every self-play cycle.  Entries are keyed
+        # by the same stat identity as the replay caches, so a replacement or
+        # ordinary in-place edit misses naturally.  The retained frozenset
+        # cannot be corrupted by a caller.
+        self._state_key_file_cache: (
+            "OrderedDict[tuple, Tuple[frozenset[str], str]]"
+        ) = OrderedDict()
+        # One manager follows one live rolling window.  Under ReplayWriter's
+        # proven one-file-per-cycle shape, retain its exact aggregate so the
+        # next admission merges only added/removed shards.  Any mixed-cycle,
+        # duplicate-name, or duplicate-cycle window bypasses and clears it.
+        self._replay_window_analysis: Optional[_ReplayWindowAnalysis] = None
         # Set only after the canonical gzip ledger has been read and verified.
         # Consumers use this as a source identity for derived caches, never as
         # a substitute for the ledger's own verification.
@@ -906,26 +1401,377 @@ class CorpusSnapshotManager:
     def trained_ledger_dir(self) -> Path:
         return self.snapshot_root / "ledger"
 
-    def replay_files(self) -> List[Path]:
-        return sorted(
-            (path for path in self.replay_dir.glob("replay_*.jsonl") if path.is_file()),
-            key=lambda path: (path.stat().st_mtime_ns, path.name),
-        )
+    def _replay_files_with_identities(
+        self,
+    ) -> Tuple[List[Path], Dict[Path, _ReplayFileIdentity]]:
+        """Scan the replay window once and retain each file's exact identity.
 
-    def eligible_replay_files(self) -> Tuple[List[Path], Dict[str, dict]]:
-        """Return repaired-contract files and rejection diagnostics."""
-        files = self.replay_files()
+        ``Path.glob`` followed by ``is_file`` and a sorting ``stat`` performed
+        two metadata round trips per shard on drvfs.  ``DirEntry`` reuses the
+        directory scan's metadata, and the returned identities can serve the
+        audit, digest, and analysis phases of one admission transaction.  The
+        caller must recheck them before publishing any decision.
+        """
+
+        records: List[Tuple[int, str, Path, _ReplayFileIdentity]] = []
+        try:
+            entries = os.scandir(self.replay_dir)
+        except FileNotFoundError:
+            return [], {}
+        candidates = []
+        with entries:
+            for entry in entries:
+                name = entry.name
+                if not name.startswith("replay_") or not name.endswith(".jsonl"):
+                    continue
+                candidates.append(entry)
+        for entry, stat_result, error in _directory_entry_stats(candidates):
+            if (error is not None or stat_result is None
+                    or not stat_module.S_ISREG(stat_result.st_mode)):
+                continue
+            name = entry.name
+            path = Path(entry.path)
+            identity = _replay_file_identity_from_stat(path, stat_result)
+            records.append((identity.st_mtime_ns, name, path, identity))
+        records.sort(key=lambda record: (record[0], record[1]))
+        files = [record[2] for record in records]
+        return files, {record[2]: record[3] for record in records}
+
+    def replay_files(self) -> List[Path]:
+        files, _identities = self._replay_files_with_identities()
+        return files
+
+    def _eligible_replay_files_with_identities(
+        self,
+    ) -> Tuple[List[Path], Dict[str, dict], Dict[Path, _ReplayFileIdentity]]:
+        """Return contract-valid files plus their initial stat identities."""
+
+        files, identities = self._replay_files_with_identities()
         if not self.enforce_policy_contract:
-            return files, {}
+            return files, {}, identities
         eligible = []
         rejected = {}
         for path in files:
-            audit = audit_policy_replay_file(path, self.allowed_opening_plies)
+            audit = _audit_policy_replay_file_for_identity(
+                path, self.allowed_opening_plies, identities[path])
             if audit["valid"]:
                 eligible.append(path)
             else:
                 rejected[path.name] = audit
+        return eligible, rejected, identities
+
+    def eligible_replay_files(self) -> Tuple[List[Path], Dict[str, dict]]:
+        """Return repaired-contract files and rejection diagnostics."""
+        eligible, rejected, _identities = (
+            self._eligible_replay_files_with_identities())
         return eligible, rejected
+
+    @staticmethod
+    def _verify_replay_file_identities(
+        identities: Mapping[Path, _ReplayFileIdentity],
+    ) -> None:
+        """Fail closed if any shard changed during an admission transaction.
+
+        Replay shards normally share one directory.  A separate ``Path.stat``
+        for each file turns the mandatory final transaction check into dozens
+        of drvfs metadata round trips.  Scan each parent once and reuse the
+        ``DirEntry`` metadata, while retaining the exact path, device, inode,
+        size, and nanosecond-mtime comparison for every observed shard.
+        """
+
+        by_parent: Dict[Path, Dict[str, Tuple[Path, _ReplayFileIdentity]]] = {}
+        for observed_path, expected in identities.items():
+            path = Path(observed_path)
+            by_parent.setdefault(path.parent, {})[path.name] = (path, expected)
+
+        for parent, expected_by_name in by_parent.items():
+            try:
+                entries = os.scandir(parent)
+            except OSError as exc:
+                path = next(iter(expected_by_name.values()))[0]
+                raise RuntimeError(
+                    f"Replay file disappeared during corpus analysis: {path}"
+                ) from exc
+            remaining = dict(expected_by_name)
+            matched = []
+            with entries:
+                for entry in entries:
+                    observed = remaining.pop(entry.name, None)
+                    if observed is None:
+                        continue
+                    path, expected = observed
+                    matched.append((entry, path, expected))
+            if remaining:
+                path = next(iter(remaining.values()))[0]
+                raise RuntimeError(
+                    f"Replay file disappeared during corpus analysis: {path}"
+                )
+            stats = _directory_entry_stats(
+                [entry for entry, _path, _expected in matched])
+            for (_entry, path, expected), (_, stat_result, error) in zip(
+                matched, stats,
+            ):
+                if error is not None or stat_result is None:
+                    raise RuntimeError(
+                        "Replay file disappeared during corpus analysis: "
+                        f"{path}"
+                    ) from error
+                actual = _replay_file_identity_from_stat(path, stat_result)
+                if actual != expected:
+                    raise RuntimeError(
+                        f"Replay file changed during corpus analysis: {path}"
+                    )
+
+    @staticmethod
+    def _build_replay_window_analysis(
+        analyses: Sequence[_ReplayFileAnalysis],
+    ) -> _ReplayWindowAnalysis:
+        """Build the exact aggregate once using Counter's bulk update path."""
+
+        state_counts: Counter[str] = Counter()
+        state_file_counts: Counter[str] = Counter()
+        source_counts: Counter[str] = Counter()
+        records = 0
+        malformed = 0
+        forced = 0
+        for analysis in analyses:
+            state_counts.update(analysis.state_counts)
+            state_file_counts.update(analysis.state_counts.keys())
+            source_counts.update(analysis.source_counts)
+            records += analysis.records
+            malformed += analysis.malformed_records
+            forced += analysis.forced_move_count
+        repeated = {
+            key for key, file_count in state_file_counts.items()
+            if file_count > 1
+        }
+        return _ReplayWindowAnalysis(
+            ordered_identities=tuple(analysis.identity for analysis in analyses),
+            analyses={analysis.identity: analysis for analysis in analyses},
+            state_counts=state_counts,
+            state_file_counts=state_file_counts,
+            source_counts=source_counts,
+            records=records,
+            malformed_records=malformed,
+            forced_move_count=forced,
+            cross_file_repeated_state_count=len(repeated),
+            cross_file_duplicate_record_count=sum(
+                state_counts[key] - 1 for key in repeated),
+            freshness_reference=None,
+            fresh_state_keys=set(),
+            fresh_record_count=0,
+        )
+
+    @staticmethod
+    def _update_replay_window_analysis(
+        window: _ReplayWindowAnalysis,
+        analysis: _ReplayFileAnalysis,
+        direction: int,
+    ) -> None:
+        """Add or remove one shard while retaining exact cross-file metrics."""
+
+        if direction not in (-1, 1):
+            raise ValueError("direction must be -1 or 1")
+        for key, file_records in analysis.state_counts.items():
+            old_files = window.state_file_counts.get(key, 0)
+            old_records = window.state_counts.get(key, 0)
+            new_files = old_files + direction
+            new_records = old_records + direction * file_records
+            if new_files < 0 or new_records < 0:
+                raise RuntimeError("Rolling replay aggregate underflow")
+
+            freshness_reference = window.freshness_reference
+            if freshness_reference is not None and key not in freshness_reference:
+                window.fresh_record_count += direction * file_records
+                if window.fresh_record_count < 0:
+                    raise RuntimeError(
+                        "Rolling replay fresh-record aggregate underflow")
+                if old_files == 0 and new_files > 0:
+                    window.fresh_state_keys.add(key)
+                elif old_files > 0 and new_files == 0:
+                    window.fresh_state_keys.discard(key)
+
+            old_duplicate_records = (
+                old_records - 1 if old_files > 1 else 0)
+            new_duplicate_records = (
+                new_records - 1 if new_files > 1 else 0)
+            window.cross_file_duplicate_record_count += (
+                new_duplicate_records - old_duplicate_records)
+            if old_files > 1:
+                window.cross_file_repeated_state_count -= 1
+            if new_files > 1:
+                window.cross_file_repeated_state_count += 1
+
+            if new_files:
+                window.state_file_counts[key] = new_files
+                window.state_counts[key] = new_records
+            else:
+                if new_records:
+                    raise RuntimeError(
+                        "Rolling replay aggregate lost its final file before "
+                        "its final record")
+                window.state_file_counts.pop(key, None)
+                window.state_counts.pop(key, None)
+
+        for source, count in analysis.source_counts.items():
+            updated = window.source_counts.get(source, 0) + direction * count
+            if updated < 0:
+                raise RuntimeError("Rolling replay source aggregate underflow")
+            if updated:
+                window.source_counts[source] = updated
+            else:
+                window.source_counts.pop(source, None)
+        window.records += direction * analysis.records
+        window.malformed_records += direction * analysis.malformed_records
+        window.forced_move_count += direction * analysis.forced_move_count
+
+    @staticmethod
+    def _refresh_replay_window_freshness(
+        window: _ReplayWindowAnalysis,
+        previous_state_keys: AbstractSet[str],
+    ) -> None:
+        """Rebuild exact freshness when the immutable predecessor changes.
+
+        Production snapshot keys come from ``_cached_state_key_file`` as a
+        frozenset, so object identity is a safe O(1) cache key.  A mutable set
+        could change without its identity changing; deliberately leave the
+        reference unset for that input and rebuild on every call.
+        """
+
+        fresh_state_keys = window.state_counts.keys() - previous_state_keys
+        window.fresh_state_keys = fresh_state_keys
+        window.fresh_record_count = sum(
+            window.state_counts[key] for key in fresh_state_keys)
+        window.freshness_reference = (
+            previous_state_keys
+            if isinstance(previous_state_keys, frozenset)
+            else None
+        )
+
+    def _analyze_replay_window(
+        self,
+        files: Sequence[Path],
+        previous_state_keys: AbstractSet[str],
+        identities: Mapping[Path, _ReplayFileIdentity],
+    ) -> Tuple[Dict[str, Any], AbstractSet[str], Set[str]]:
+        """Incrementally analyze ReplayWriter's proven rolling-window shape.
+
+        The general analyzer remains the oracle and fallback.  This path is
+        entered only when basenames are unique, every shard proves one cycle,
+        and cycle ids are unique across the window.  Those facts make
+        cross-cycle repetition identical to cross-file repetition.  Any
+        ambiguous or legacy input clears the rolling aggregate and runs the
+        unrestricted implementation.  The third result is the exact
+        pre-validation fresh-state set already needed for replay metrics, so
+        the admission caller can exclude held-out states from that small set
+        instead of repeating a full difference over the training set.
+        """
+
+        paths = [Path(path) for path in files]
+        unique_names = len({path.name for path in paths}) == len(paths)
+        analyses = [
+            _cached_replay_file_analysis_for_identity(path, identities[path])
+            for path in paths
+        ]
+        cycle_ids = [analysis.uniform_generation_cycle for analysis in analyses]
+        exact_rolling_shape = (
+            bool(analyses)
+            and unique_names
+            and all(cycle_id is not None for cycle_id in cycle_ids)
+            and len(set(cycle_ids)) == len(cycle_ids)
+        )
+        if not exact_rolling_shape:
+            self._replay_window_analysis = None
+            metrics, unique_keys = analyze_replay_files(
+                paths,
+                previous_state_keys,
+                include_state_digest=False,
+                _file_identities=identities,
+            )
+            return (
+                metrics,
+                unique_keys,
+                unique_keys.difference(previous_state_keys),
+            )
+
+        ordered_identities = tuple(analysis.identity for analysis in analyses)
+        current = {analysis.identity: analysis for analysis in analyses}
+        window = self._replay_window_analysis
+        if window is None:
+            window = self._build_replay_window_analysis(analyses)
+            self._replay_window_analysis = window
+        else:
+            # Invalidate before applying a rotation if the predecessor changed.
+            # The post-update rebuild below then derives freshness from the
+            # completed window rather than incrementally mutating stale facts.
+            if window.freshness_reference is not previous_state_keys:
+                window.freshness_reference = None
+            old_ids = set(window.analyses)
+            new_ids = set(current)
+            removed_ids = old_ids.difference(new_ids)
+            added_ids = new_ids.difference(old_ids)
+            # Bulk Counter updates are faster for a wholesale replacement;
+            # the incremental path is for the ordinary one-shard rotation.
+            if len(removed_ids) + len(added_ids) > max(8, len(analyses) // 2):
+                window = self._build_replay_window_analysis(analyses)
+                self._replay_window_analysis = window
+            else:
+                for identity in removed_ids:
+                    self._update_replay_window_analysis(
+                        window, window.analyses[identity], -1)
+                for identity in added_ids:
+                    self._update_replay_window_analysis(
+                        window, current[identity], 1)
+                window.ordered_identities = ordered_identities
+                window.analyses = current
+
+        # The Counter's key view is set-like and remains valid until the next
+        # call.  The admission caller immediately derives its own train set, so
+        # copying all ~636K keys here would add allocation without ownership.
+        unique_keys = window.state_counts.keys()
+        if window.freshness_reference is not previous_state_keys:
+            self._refresh_replay_window_freshness(
+                window, previous_state_keys)
+        new_unique = window.fresh_state_keys
+        fresh_records = window.fresh_record_count
+        unique_count = len(unique_keys)
+        cross_file_states = window.cross_file_repeated_state_count
+        cross_file_unique_states = unique_count - cross_file_states
+        game_sources: Dict[str, str] = {}
+        for identity in ordered_identities:
+            game_sources.update(current[identity].game_sources)
+        metrics = {
+            "records": window.records,
+            "malformed_records": window.malformed_records,
+            "unique_state_count": unique_count,
+            "unique_state_rate": (
+                unique_count / window.records if window.records else 0.0),
+            "forced_move_count": window.forced_move_count,
+            "forced_move_rate": (
+                window.forced_move_count / window.records
+                if window.records else 0.0),
+            "cross_file_repeated_state_count": cross_file_states,
+            "cross_file_unique_state_count": cross_file_unique_states,
+            "cross_file_duplicate_record_count": (
+                window.cross_file_duplicate_record_count),
+            "cross_file_unique_state_rate": (
+                cross_file_unique_states / unique_count if unique_count else 0.0),
+            "cross_cycle_observed_state_count": unique_count,
+            "cross_cycle_repeated_state_count": cross_file_states,
+            "cross_cycle_unique_state_count": cross_file_unique_states,
+            "cross_cycle_unique_state_rate": (
+                cross_file_unique_states / unique_count if unique_count else 0.0),
+            "new_unique_state_count": len(new_unique),
+            "fresh_unique_state_rate": (
+                len(new_unique) / unique_count if unique_count else 0.0),
+            "fresh_record_rate": (
+                fresh_records / window.records if window.records else 0.0),
+            "source_counts": dict(sorted(window.source_counts.items())),
+            "source_game_counts": dict(sorted(
+                Counter(game_sources.values()).items())),
+            "state_set_sha256": None,
+        }
+        return metrics, unique_keys, new_unique
 
     def current_manifest_path(self) -> Optional[Path]:
         if not self.current_pointer.exists():
@@ -939,6 +1785,45 @@ class CorpusSnapshotManager:
     def _load_manifest(self, path: Path) -> dict:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
+
+    def _cached_state_key_file(
+        self, path: Path,
+    ) -> Tuple[frozenset[str], str]:
+        """Return immutable canonical keys and their digest for one file.
+
+        The file remains the source of truth.  Publication waits for an
+        unchanged post-read identity, while the two-entry LRU merely avoids
+        rebuilding the same verified snapshot and hold-out sets on every
+        admission check.
+        """
+
+        path = Path(path)
+        identity_key = _replay_file_identity(path).as_key()
+        cached = self._state_key_file_cache.get(identity_key)
+        if cached is not None:
+            self._state_key_file_cache.move_to_end(identity_key)
+            return cached
+
+        keys = frozenset(_read_state_keys(path))
+        result = (keys, _state_set_digest(keys))
+        try:
+            unchanged = _replay_file_identity(path).as_key() == identity_key
+        except OSError:
+            unchanged = False
+        if unchanged:
+            # Remove an older generation of this pathname immediately instead
+            # of retaining it until the global size bound happens to evict it.
+            resolved_path = identity_key[0]
+            for previous in tuple(self._state_key_file_cache):
+                if previous[0] == resolved_path and previous != identity_key:
+                    self._state_key_file_cache.pop(previous, None)
+            _cache_touch(
+                self._state_key_file_cache,
+                identity_key,
+                result,
+                _STATE_KEY_FILE_CACHE_MAX,
+            )
+        return result
 
     def snapshot_matches_settings(
         self,
@@ -983,7 +1868,8 @@ class CorpusSnapshotManager:
         # launcher stores ``files\\replay_*.jsonl``.  On WSL that is one filename
         # containing a backslash, so every stored shard "fails integrity
         # verification" while sitting untouched on disk right next to the manifest.
-        file_checks: List[Tuple[Path, str]] = []
+        parsed_file_checks: List[Tuple[Path, int, str]] = []
+        paths_by_parent: Dict[Path, Dict[str, Path]] = {}
         total_size = 0
         for record in manifest.get("files", []):
             try:
@@ -994,16 +1880,71 @@ class CorpusSnapshotManager:
                 raise RuntimeError(
                     f"Corpus manifest has an invalid file record: {manifest_path}"
                 ) from exc
-            if not stored.is_file() or stored.stat().st_size != expected_size:
+            parsed_file_checks.append((stored, expected_size, expected_sha256))
+            paths_by_parent.setdefault(stored.parent, {})[
+                os.path.normcase(stored.name)
+            ] = stored
+            total_size += expected_size
+
+        # A manifest normally stores every shard below one ``files``
+        # directory.  Independent ``Path.is_file()``, ``Path.stat()``, and
+        # digest-cache identity calls turned each warm verification into three
+        # metadata round trips per shard on drvfs.  Enumerate each parent once,
+        # retain the exact stat identity, and pass it into the existing digest
+        # cache.  Missing, non-file, replaced, resized, or normally edited
+        # shards still fail closed through the same identity fields.
+        identities: Dict[Path, _ReplayFileIdentity] = {}
+        for parent, expected_by_name in paths_by_parent.items():
+            try:
+                entries = os.scandir(parent)
+            except OSError as exc:
+                stored = next(iter(expected_by_name.values()))
+                raise RuntimeError(
+                    f"Corpus snapshot file failed integrity verification: {stored}"
+                ) from exc
+            remaining = dict(expected_by_name)
+            matched = []
+            with entries:
+                for entry in entries:
+                    stored = remaining.pop(os.path.normcase(entry.name), None)
+                    if stored is None:
+                        continue
+                    matched.append((entry, stored))
+            if remaining:
+                stored = next(iter(remaining.values()))
                 raise RuntimeError(
                     f"Corpus snapshot file failed integrity verification: {stored}"
                 )
-            file_checks.append((stored, expected_sha256))
-            total_size += expected_size
+            stats = _directory_entry_stats(
+                [entry for entry, _stored in matched])
+            for (_entry, stored), (_, stat_result, error) in zip(matched, stats):
+                if (error is not None or stat_result is None
+                        or not stat_module.S_ISREG(stat_result.st_mode)):
+                    raise RuntimeError(
+                        "Corpus snapshot file failed integrity "
+                        f"verification: {stored}"
+                    ) from error
+                identities[stored] = _replay_file_identity_from_stat(
+                    stored, stat_result)
 
-        def _verify_digest(check: Tuple[Path, str]) -> Tuple[Path, bool]:
-            stored, expected_sha256 = check
-            return stored, replay_file_sha256(stored) == expected_sha256
+        file_checks: List[Tuple[Path, str, _ReplayFileIdentity]] = []
+        for stored, expected_size, expected_sha256 in parsed_file_checks:
+            identity = identities.get(stored)
+            if identity is None or identity.st_size != expected_size:
+                raise RuntimeError(
+                    f"Corpus snapshot file failed integrity verification: {stored}"
+                )
+            file_checks.append((stored, expected_sha256, identity))
+
+        def _verify_digest(
+            check: Tuple[Path, str, _ReplayFileIdentity],
+        ) -> Tuple[Path, bool]:
+            stored, expected_sha256, identity = check
+            return (
+                stored,
+                _replay_file_sha256_for_identity(stored, identity)
+                == expected_sha256,
+            )
 
         if (
             len(file_checks) > 1
@@ -1030,6 +1971,19 @@ class CorpusSnapshotManager:
                         f"verification: {stored}"
                     )
 
+        # A cache hit does not reopen the shard, so close the interval between
+        # the directory snapshot and the digest verdict with one more batched
+        # identity check.  This preserves fail-closed behavior if a shard is
+        # replaced or edited while verification is in progress without
+        # restoring one independent stat call per path.
+        try:
+            self._verify_replay_file_identities(identities)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Corpus snapshot file failed integrity verification: "
+                f"{manifest_path}"
+            ) from exc
+
         state_keys_name = manifest.get("state_keys_file")
         if not isinstance(state_keys_name, str) or not state_keys_name:
             raise RuntimeError(
@@ -1040,11 +1994,12 @@ class CorpusSnapshotManager:
             raise RuntimeError(
                 f"Corpus canonical-state key file is missing: {state_keys_path}"
             )
-        state_keys = _read_state_keys(state_keys_path)
+        state_keys, actual_state_digest = self._cached_state_key_file(
+            state_keys_path)
         expected_state_digest = manifest.get("metrics", {}).get(
             "state_set_sha256"
         )
-        if expected_state_digest != _state_set_digest(state_keys):
+        if expected_state_digest != actual_state_digest:
             raise RuntimeError(
                 f"Corpus canonical-state fingerprint is invalid: {manifest_path}"
             )
@@ -1704,6 +2659,21 @@ class CorpusSnapshotManager:
         manifest_path = self.validation_manifest_path
         validation_dir = manifest_path.parent
         held_names = {str(record["name"]) for record in manifest.get("files", [])}
+        # Check the quota against the optimistic candidate set before scanning
+        # the all-time trained ledger and retained snapshot manifests.  If no
+        # growth is possible even when every unheld live shard is eligible,
+        # the leakage filter cannot change that verdict.  This is the steady
+        # state once the append-only hold-out reaches its file ceiling.
+        present_held = sum(1 for path in files if path.name in held_names)
+        unheld_files = sum(1 for path in files if path.name not in held_names)
+        if self._validation_growth_quota(
+            total_files=len(files),
+            held=present_held,
+            candidates=unheld_files,
+            all_time_held=len(held_names),
+        ) <= 0:
+            return None
+
         trained_names = self._trained_shard_names()
         candidates = sorted(
             (path for path in files
@@ -1713,7 +2683,6 @@ class CorpusSnapshotManager:
         # The quota is measured against still-present held shards, so a hold-out
         # whose files have rotated out of the replay window is not counted as if
         # it still covered the live corpus.
-        present_held = sum(1 for path in files if path.name in held_names)
         add_count = self._validation_growth_quota(
             total_files=len(files),
             held=present_held,
@@ -2000,7 +2969,8 @@ class CorpusSnapshotManager:
     ) -> SnapshotDecision:
         """Admit a new immutable snapshot if its fresh-state gate passes."""
 
-        files, rejected_files = self.eligible_replay_files()
+        files, rejected_files, replay_identities = (
+            self._eligible_replay_files_with_identities())
         if not files:
             raise RuntimeError(
                 "No replay files satisfy the repaired policy-distillation contract"
@@ -2012,25 +2982,36 @@ class CorpusSnapshotManager:
         file_records = []
         train_files = []
         for path in files:
-            file_hash = replay_file_sha256(path)
+            identity = replay_identities[path]
+            file_hash = _replay_file_sha256_for_identity(path, identity)
             if file_hash in validation_hashes:
                 continue
             train_files.append(path)
             file_records.append({
                 "name": path.name,
                 "sha256": file_hash,
-                "size_bytes": path.stat().st_size,
+                "size_bytes": identity.st_size,
             })
         if not train_files:
             raise RuntimeError("No replay files remain after the immutable validation split")
 
         current_path = self.current_manifest_path()
         previous_keys: Set[str] = set()
+        previous_keys_digest: Optional[str] = None
         previous_fingerprint = None
         previous_source = None
         if current_path is not None:
             current = self._load_manifest(current_path)
-            previous_keys = _read_state_keys(current_path.parent / current["state_keys_file"])
+            previous_keys, previous_keys_digest = self._cached_state_key_file(
+                current_path.parent / current["state_keys_file"])
+            recorded_previous_digest = current.get("metrics", {}).get(
+                "state_set_sha256")
+            if (recorded_previous_digest is not None
+                    and recorded_previous_digest != previous_keys_digest):
+                raise RuntimeError(
+                    "Corpus canonical-state fingerprint is invalid: "
+                    f"{current_path}"
+                )
             previous_fingerprint = current.get("fingerprint")
             previous_source = "current_snapshot"
         else:
@@ -2043,13 +3024,32 @@ class CorpusSnapshotManager:
             if base is not None:
                 _base_path, base_manifest, base_keys = base
                 previous_keys = base_keys
+                previous_keys_digest = str(
+                    base_manifest["metrics"]["state_set_sha256"])
                 previous_fingerprint = base_manifest.get("fingerprint")
                 previous_source = "lineage_base"
 
-        metrics, all_train_keys = analyze_replay_files(train_files, previous_keys)
-        leakage_keys = all_train_keys.intersection(validation_keys)
-        train_keys = all_train_keys.difference(validation_keys)
-        new_keys = train_keys.difference(previous_keys)
+        # The digest of the pre-deduplication key set is never read: the
+        # manifest fingerprints ``train_keys`` (post-dedup) below.
+        metrics, all_train_keys, pre_validation_new_keys = (
+            self._analyze_replay_window(
+                train_files,
+                previous_keys,
+                replay_identities,
+            )
+        )
+        train_keys = all_train_keys - validation_keys
+        # ``train_keys`` is the exact complement of the validation overlap
+        # inside ``all_train_keys``.  Derive the overlap cardinality from those
+        # two sets instead of materializing a second, otherwise-unused set of
+        # every excluded key on each recurring admission check.
+        validation_overlap_count = len(all_train_keys) - len(train_keys)
+        # _analyze_replay_window already derived ``all_train_keys -
+        # previous_keys`` for its exact pre-validation novelty metrics.  Set
+        # difference is associative here, so excluding validation from that
+        # much smaller fresh set is exactly equivalent to walking every
+        # post-exclusion training key against the predecessor again.
+        new_keys = pre_validation_new_keys.difference(validation_keys)
         fresh_rate = (len(new_keys) / len(train_keys)) if train_keys else 0.0
         # Audit Suggestion 9.  A growth event moves a whole *fresh* shard out of
         # training -- _grow_validation can only choose never-trained shards, by
@@ -2073,13 +3073,18 @@ class CorpusSnapshotManager:
             "fresh_states_transferred_to_holdout": len(withheld_fresh),
             "fresh_unique_state_rate_without_holdout_growth": (
                 counterfactual_fresh_rate),
-            "validation_overlap_state_count_removed": len(leakage_keys),
+            "validation_overlap_state_count_removed": validation_overlap_count,
             "external_validation_state_count": len(
                 self.external_validation_state_keys),
             "post_dedup_unique_state_count": len(train_keys),
             "fresh_unique_state_count": len(new_keys),
             "fresh_unique_state_rate": fresh_rate,
-            "state_set_sha256": _state_set_digest(train_keys),
+            # A rejected candidate is not a durable corpus artifact.  Defer its
+            # O(u log u) sorted digest until the gate can admit it.  An exact
+            # unchanged candidate reuses the already-verified predecessor
+            # digest below, while every admitted snapshot still derives and
+            # persists its digest from the post-deduplication training keys.
+            "state_set_sha256": None,
             "rejected_replay_files": rejected_files,
         })
         source_games = metrics.get("source_game_counts", {})
@@ -2109,30 +3114,15 @@ class CorpusSnapshotManager:
                 f"trajectory contract: {algorithm_games}/{model_games}{detail}"
             )
 
-        fingerprint_payload = {
-            "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            "encoding_version": ENCODING_VERSION,
-            "rules_id": CANONICAL_RULES_ID,
-            "files": file_records,
-            "state_set_sha256": metrics["state_set_sha256"],
-            "teacher_settings": dict(teacher_settings),
-            "noise_settings": dict(noise_settings),
-            "generation_settings": dict(generation_settings),
-        }
-        fingerprint = hashlib.sha256(
-            json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        # Audit, digest, and diversity work above intentionally shares one
+        # metadata snapshot.  Recheck every observed shard before using those
+        # results for any decision, so an append, replacement, or deletion
+        # during the transaction fails closed instead of publishing mixed data.
+        self._verify_replay_file_identities(replay_identities)
 
-        if previous_fingerprint == fingerprint:
-            return SnapshotDecision(False, "unchanged", current_path, metrics)
-        # A missing CURRENT pointer used to disable the freshness gate silently:
-        # the guard below reads ``current_path is not None``, so a lost pointer
-        # made every candidate admissible and reported a 100% fresh rate that is
-        # only an artifact of an empty previous-key set.  snapshot_v000012 in the
-        # policy-distillation namespace was admitted exactly that way.  A genuine
-        # first admission has no snapshots at all and must still be allowed;
-        # a pointer that vanished while snapshots exist is corruption, and this
-        # gate fails closed like every other integrity check in this module.
+        # A lost pointer must fail before any early freshness return.  Otherwise
+        # a stale candidate could hide the lineage corruption merely by missing
+        # the admission threshold.
         if current_path is None and previous_source is None and self._snapshot_dirs():
             raise RuntimeError(
                 "Corpus snapshot pointer is missing while "
@@ -2151,6 +3141,43 @@ class CorpusSnapshotManager:
                 f"Freshness reads {fresh_rate:.2%}; without the transfer it "
                 f"would read {counterfactual_fresh_rate:.2%}."
             )
+
+        candidate_matches_previous_keys = (
+            previous_source is not None
+            and len(train_keys) == len(previous_keys)
+            and not new_keys
+        )
+        if (previous_source is not None
+                and fresh_rate < self.min_fresh_fraction
+                and not candidate_matches_previous_keys):
+            return SnapshotDecision(
+                False,
+                f"fresh_unique_state_rate {fresh_rate:.6f} is below {self.min_fresh_fraction:.6f}",
+                current_path,
+                metrics,
+            )
+
+        if candidate_matches_previous_keys and previous_keys_digest is not None:
+            metrics["state_set_sha256"] = previous_keys_digest
+        else:
+            metrics["state_set_sha256"] = _state_set_digest(train_keys)
+
+        fingerprint_payload = {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "encoding_version": ENCODING_VERSION,
+            "rules_id": CANONICAL_RULES_ID,
+            "files": file_records,
+            "state_set_sha256": metrics["state_set_sha256"],
+            "teacher_settings": dict(teacher_settings),
+            "noise_settings": dict(noise_settings),
+            "generation_settings": dict(generation_settings),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        if previous_fingerprint == fingerprint:
+            return SnapshotDecision(False, "unchanged", current_path, metrics)
         if previous_source is not None and fresh_rate < self.min_fresh_fraction:
             return SnapshotDecision(
                 False,
