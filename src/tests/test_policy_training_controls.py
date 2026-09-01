@@ -21,6 +21,43 @@ from dama.ai.ml.trainer import (
 )
 
 
+def test_algorithm_opening_schedule_rotates_full_strata_across_cycles() -> None:
+    choices = (2, 4, 6, 8)
+    algorithm_indices = range(72, 72 + 168)
+
+    per_cycle = []
+    for cycle_id in range(577, 581):
+        seed_base = 20260819 + cycle_id * 1_000_003
+        assigned = [
+            trainer_module._training_opening_assignment(
+                choices,
+                seed_base,
+                game_index,
+                cycle_rotation=cycle_id,
+            )
+            for game_index in algorithm_indices
+        ]
+        per_cycle.append(assigned)
+        assert {
+            depth: sum(value[0] == depth for value in assigned)
+            for depth in choices
+        } == {depth: 42 for depth in choices}
+        assert [value[1] for value in assigned] == [
+            seed_base + game_index for game_index in algorithm_indices
+        ]
+
+    for offset in range(168):
+        assert {
+            per_cycle[cycle][offset][0] for cycle in range(4)
+        } == set(choices)
+
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig()
+    holder.step = 0
+    generation = Trainer._corpus_settings(holder)[2]
+    assert generation["algorithm_opening_schedule"] == "cycle_rotated_v1"
+
+
 def test_selfplay_executor_shutdown_captures_workers_before_nonblocking_shutdown() -> None:
     class _Process:
         def __init__(self, alive: bool) -> None:
