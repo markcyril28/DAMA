@@ -57,6 +57,13 @@ extensions = [
     ),
 ]
 
+# The corpus metadata helper uses POSIX stat(2) plus C11 threads. Native
+# Windows keeps the exact ThreadPoolExecutor fallback in corpus.py.
+if platform.system() != "Windows":
+    extensions.append(
+        Extension("dama.ai.ml._fast_stat", sources=["dama/ai/ml/_fast_stat.pyx"])
+    )
+
 ext_modules = cythonize(
     extensions,
     compiler_directives={
@@ -81,4 +88,3 @@ for _ext in ext_modules:
             ("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
 
 setup(ext_modules=ext_modules)
-
