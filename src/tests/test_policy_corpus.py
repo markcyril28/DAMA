@@ -399,6 +399,45 @@ def test_validation_holdout_grows_append_only_toward_configured_share(
     assert len(reloaded["files"]) == len(manifest["files"])
 
 
+def test_warm_validation_verification_skips_redundant_existence_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening the manifest and key member already proves they exist."""
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(
+            replay_dir / f"replay_{index:02d}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir), str(snapshot_root),
+        validation_fraction=0.25, split_seed=5,
+    )
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    manifest, state_keys = manager._ensure_validation(files)
+    manifest_path = manager.validation_manifest_path
+    key_path = manifest_path.parent / manifest["state_keys_file"]
+    real_exists = Path.exists
+    real_is_file = Path.is_file
+
+    def guarded_exists(path):
+        if path == manifest_path:
+            raise AssertionError("validation manifest received a pre-open stat")
+        return real_exists(path)
+
+    def guarded_is_file(path):
+        if path == key_path:
+            raise AssertionError("state-key member received a pre-cache stat")
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "exists", guarded_exists)
+    monkeypatch.setattr(Path, "is_file", guarded_is_file)
+    reloaded, reloaded_keys = manager._ensure_validation(files)
+    assert reloaded == manifest
+    assert reloaded_keys == state_keys
+
+
 def test_validation_growth_never_releases_a_held_file(tmp_path: Path) -> None:
     """States may move train -> validation, never the reverse."""
     replay_dir = tmp_path / "replay"
@@ -500,6 +539,28 @@ def test_windows_written_relative_paths_still_resolve(tmp_path: Path) -> None:
     decision = manager.consider_snapshot(settings, noise, generation)
     assert not decision.admitted
     assert "below" in decision.reason
+
+
+def test_current_pointer_lookup_opens_without_redundant_exists_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_root = tmp_path / "snapshots"
+    target = snapshot_root / "snapshot_v000001" / "manifest.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("{}", encoding="utf-8")
+    pointer = snapshot_root / "CURRENT"
+    pointer.write_text("snapshot_v000001/manifest.json\n", encoding="utf-8")
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"), str(snapshot_root))
+    real_exists = Path.exists
+
+    def guarded_exists(path):
+        if path == pointer:
+            raise AssertionError("CURRENT received a pre-read stat")
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", guarded_exists)
+    assert manager.current_manifest_path() == target
 
 
 def test_lost_current_pointer_fails_closed_instead_of_skipping_freshness_gate(
@@ -1213,6 +1274,7 @@ def test_large_manifest_hashes_in_parallel_and_still_fail_closed(
     )
 
     bad_path = next(iter(expected))
+    manager._manifest_integrity_identity_cache.clear()
     monkeypatch.setattr(
         corpus,
         "_replay_file_sha256_for_identity",
@@ -1239,10 +1301,94 @@ def test_large_manifest_hashes_in_parallel_and_still_fail_closed(
         "_replay_file_sha256_for_identity",
         replace_during_cached_hash,
     )
+    manager._manifest_integrity_identity_cache.clear()
     with pytest.raises(RuntimeError, match="failed integrity verification"):
         manager._verify_manifest_integrity(
             decision.manifest_path, manifest, "training_snapshot")
     assert replaced
+
+
+def test_warm_manifest_integrity_uses_one_fail_closed_identity_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fully verified immutable declaration needs one later recheck."""
+    from dama.ai.ml import corpus
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    decision = manager.consider_snapshot(
+        {"difficulty": "hard"},
+        {"played_action_probability": 0.10},
+        {"algorithm_fraction": 0.70, "model_fraction": 0.30},
+    )
+    assert decision.manifest_path is not None
+    manifest = json.loads(decision.manifest_path.read_text(encoding="utf-8"))
+    expected_keys = manager._verify_manifest_integrity(
+        decision.manifest_path, manifest, "training_snapshot")
+
+    files_dir = decision.manifest_path.parent / "files"
+    scan_calls = []
+    real_scandir = corpus.os.scandir
+
+    def counted_scandir(path):
+        scan_calls.append(Path(path))
+        return real_scandir(path)
+
+    def unexpected_digest(_path, _identity):
+        raise AssertionError("unchanged verified shard was re-digested")
+
+    monkeypatch.setattr(corpus.os, "scandir", counted_scandir)
+    monkeypatch.setattr(
+        corpus, "_replay_file_sha256_for_identity", unexpected_digest)
+    assert manager._verify_manifest_integrity(
+        decision.manifest_path, manifest, "training_snapshot") == expected_keys
+    assert scan_calls == [files_dir]
+
+
+def test_warm_manifest_integrity_reverifies_changed_identity(
+    tmp_path: Path,
+) -> None:
+    """A changed identity falls back to full digests before it is accepted."""
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    decision = manager.consider_snapshot(
+        {"difficulty": "hard"},
+        {"played_action_probability": 0.10},
+        {"algorithm_fraction": 0.70, "model_fraction": 0.30},
+    )
+    assert decision.manifest_path is not None
+    manifest = json.loads(decision.manifest_path.read_text(encoding="utf-8"))
+    expected_keys = manager._verify_manifest_integrity(
+        decision.manifest_path, manifest, "training_snapshot")
+    stored = decision.manifest_path.parent / manifest["files"][0]["path"]
+
+    replacement = stored.with_suffix(".replacement")
+    replacement.write_bytes(stored.read_bytes())
+    replacement.replace(stored)
+    assert manager._verify_manifest_integrity(
+        decision.manifest_path, manifest, "training_snapshot") == expected_keys
+
+    stored.write_bytes(stored.read_bytes() + b"tampered")
+    with pytest.raises(RuntimeError, match="failed integrity verification"):
+        manager._verify_manifest_integrity(
+            decision.manifest_path, manifest, "training_snapshot")
 
 
 def test_malformed_replay_json_is_never_cached(
