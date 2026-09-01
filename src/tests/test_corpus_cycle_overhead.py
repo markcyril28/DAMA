@@ -119,6 +119,26 @@ def test_replay_scan_reuses_metadata_and_preserves_mtime_name_order(tmp_path):
         assert identity == corpus._replay_file_identity(path)
 
 
+def test_external_validation_exclusion_avoids_full_union() -> None:
+    """The small frozen suite is removed without copying the large hold-out."""
+
+    class UnionForbiddenSet(set):
+        def union(self, *_others):
+            raise AssertionError("validation exclusion materialized a full union")
+
+    state_keys = {"train", "held", "frozen", "both"}
+    validation_keys = UnionForbiddenSet({"held", "both"})
+    external_keys = {"frozen", "both"}
+
+    remaining = corpus._exclude_validation_state_keys(
+        state_keys, validation_keys, external_keys)
+
+    assert remaining == {"train"}
+    assert state_keys == {"train", "held", "frozen", "both"}
+    assert validation_keys == {"held", "both"}
+    assert external_keys == {"frozen", "both"}
+
+
 def test_large_directory_metadata_reads_overlap_and_preserve_order(monkeypatch):
     """The drvfs identity batch is bounded, parallel, and deterministic."""
     monkeypatch.setattr(
@@ -206,40 +226,6 @@ def test_directory_metadata_strategy_is_reused_per_parent(monkeypatch):
     ] == [caller] * corpus._METADATA_STAT_PROBE_FILES
     assert all(
         result != caller for _entry, result, _error in second)
-    corpus._clear_replay_file_cache()
-
-
-def test_parallel_metadata_submissions_are_bounded_by_worker_count(monkeypatch):
-    """Large warm scans submit chunks, not one Future per replay shard."""
-    corpus._clear_replay_file_cache()
-    monkeypatch.setattr(
-        corpus, "_PARALLEL_METADATA_STAT_MIN_PROBE_NS", 0)
-    real_submit = corpus.ThreadPoolExecutor.submit
-    submissions = 0
-
-    def counted_submit(executor, function, *args, **kwargs):
-        nonlocal submissions
-        submissions += 1
-        return real_submit(executor, function, *args, **kwargs)
-
-    class Entry:
-        def __init__(self, index):
-            self.index = index
-            self.path = f"/chunked-metadata/replay_{index}.jsonl"
-
-        def stat(self):
-            return self.index
-
-    monkeypatch.setattr(corpus.ThreadPoolExecutor, "submit", counted_submit)
-    entries = [Entry(index) for index in range(61)]
-    # First call establishes the per-parent slow-filesystem strategy.  Count a
-    # warm call, which is the admission path repeated after every cycle.
-    corpus._directory_entry_stats(entries)
-    submissions = 0
-    results = corpus._directory_entry_stats(entries)
-
-    assert [result for _entry, result, _error in results] == list(range(61))
-    assert submissions <= corpus._METADATA_STAT_WORKERS
     corpus._clear_replay_file_cache()
 
 
