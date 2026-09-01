@@ -14,7 +14,6 @@ from __future__ import annotations
 from array import array
 from collections import Counter, defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -99,7 +98,6 @@ _PARALLEL_METADATA_STAT_MIN_PROBE_NS = 1_000_000
 _METADATA_STAT_STRATEGY_CACHE_MAX = 64
 _METADATA_STAT_STRATEGY_LOCK = threading.Lock()
 _METADATA_STAT_PARALLEL_BY_PARENT: "OrderedDict[str, bool]" = OrderedDict()
-_CORPUS_IO_EXECUTOR_LOCAL = threading.local()
 
 # ``gzip.GzipFile`` text iteration pays substantial per-line overhead for the
 # fixed-width canonical-key files on drvfs.  Small key files can instead take
@@ -290,61 +288,6 @@ def _directory_entry_stat(
         return entry, None, exc
 
 
-def _thread_map_in_order(
-    function: Any,
-    values: Sequence[Any],
-    *,
-    max_workers: int,
-    thread_name_prefix: str,
-) -> List[Any]:
-    """Map I/O in order, reusing the current admission's bounded executor."""
-
-    values = list(values)
-    if not values:
-        return []
-    workers = min(max(1, int(max_workers)), len(values))
-    holder = getattr(_CORPUS_IO_EXECUTOR_LOCAL, "holder", None)
-    if holder is not None:
-        if not holder:
-            holder.append(ThreadPoolExecutor(
-                max_workers=max(
-                    _METADATA_STAT_WORKERS, _MANIFEST_HASH_WORKERS),
-                thread_name_prefix="corpus-io",
-            ))
-        return list(holder[0].map(function, values))
-    with ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix=thread_name_prefix,
-    ) as pool:
-        return list(pool.map(function, values))
-
-
-@contextmanager
-def _corpus_io_executor_scope() -> Iterator[None]:
-    """Reuse worker threads within one admission, then close before self-play.
-
-    The trainer creates a fork-based process pool at the start of every
-    self-play cycle.  Keeping threads alive across ``consider_snapshot`` would
-    make that fork unsafe, so this scope is deliberately transaction-local and
-    shuts its lazily-created executor down on every return or exception.
-    """
-
-    existing = getattr(_CORPUS_IO_EXECUTOR_LOCAL, "holder", None)
-    if existing is not None:
-        yield
-        return
-    holder: List[ThreadPoolExecutor] = []
-    _CORPUS_IO_EXECUTOR_LOCAL.holder = holder
-    try:
-        yield
-    finally:
-        try:
-            if holder:
-                holder[0].shutdown(wait=True)
-        finally:
-            del _CORPUS_IO_EXECUTOR_LOCAL.holder
-
-
 def _directory_entry_stats(
     entries: Sequence[Any],
 ) -> List[Tuple[Any, Optional[os.stat_result], Optional[OSError]]]:
@@ -373,12 +316,11 @@ def _directory_entry_stats(
         return [_directory_entry_stat(entry) for entry in entries]
     if parallel is True:
         workers = min(_METADATA_STAT_WORKERS, len(entries))
-        return _thread_map_in_order(
-            _directory_entry_stat,
-            entries,
+        with ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix="corpus-metadata",
-        )
+        ) as pool:
+            return list(pool.map(_directory_entry_stat, entries))
     # A thread pool is a large regression on a low-latency local filesystem
     # (the server profile normally uses one), while drvfs metadata is slow
     # enough to benefit by an order of magnitude.  Time a small prefix from
@@ -404,12 +346,12 @@ def _directory_entry_stats(
             _directory_entry_stat(entry) for entry in entries[probe_count:]
         ]
     workers = min(_METADATA_STAT_WORKERS, len(entries) - probe_count)
-    remainder = _thread_map_in_order(
-        _directory_entry_stat,
-        entries[probe_count:],
+    with ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix="corpus-metadata",
-    )
+    ) as pool:
+        remainder = list(pool.map(
+            _directory_entry_stat, entries[probe_count:]))
     return prefix + remainder
 
 
@@ -509,6 +451,24 @@ def canonical_state_key(state: Mapping[str, Any]) -> str:
     """Return the SHA-256 key for a canonical compact state."""
 
     return hashlib.sha256(canonical_state_payload(state)).hexdigest()
+
+
+def _exclude_validation_state_keys(
+    state_keys: AbstractSet[str],
+    validation_keys: AbstractSet[str],
+    external_validation_keys: AbstractSet[str],
+) -> Set[str]:
+    """Return trainable keys without materializing the full exclusion union.
+
+    The immutable hold-out contains hundreds of thousands of keys while the
+    frozen external suite contains 5,000.  Building their union duplicates the
+    large set on every admission check.  Subtract the hold-out once, then remove
+    the small external suite in place.  This is exactly ``S - (V | E)``.
+    """
+
+    remaining = state_keys - validation_keys
+    remaining.difference_update(external_validation_keys)
+    return remaining
 
 
 def _sha256_file_uncached(path: Path) -> str:
@@ -2009,18 +1969,17 @@ class CorpusSnapshotManager:
             and total_size >= _PARALLEL_MANIFEST_HASH_MIN_BYTES
         ):
             workers = min(_MANIFEST_HASH_WORKERS, len(file_checks))
-            digest_results = _thread_map_in_order(
-                _verify_digest,
-                file_checks,
+            with ThreadPoolExecutor(
                 max_workers=workers,
                 thread_name_prefix="corpus-integrity",
-            )
-            for stored, matches in digest_results:
-                if not matches:
-                    raise RuntimeError(
-                        "Corpus snapshot file failed integrity "
-                        f"verification: {stored}"
-                    )
+            ) as pool:
+                digest_results = pool.map(_verify_digest, file_checks)
+                for stored, matches in digest_results:
+                    if not matches:
+                        raise RuntimeError(
+                            "Corpus snapshot file failed integrity "
+                            f"verification: {stored}"
+                        )
         else:
             for check in file_checks:
                 stored, matches = _verify_digest(check)
@@ -3026,21 +2985,6 @@ class CorpusSnapshotManager:
         noise_settings: Mapping[str, Any],
         generation_settings: Mapping[str, Any],
     ) -> SnapshotDecision:
-        """Run one admission transaction with one fork-safe I/O executor."""
-
-        with _corpus_io_executor_scope():
-            return self._consider_snapshot_impl(
-                teacher_settings,
-                noise_settings,
-                generation_settings,
-            )
-
-    def _consider_snapshot_impl(
-        self,
-        teacher_settings: Mapping[str, Any],
-        noise_settings: Mapping[str, Any],
-        generation_settings: Mapping[str, Any],
-    ) -> SnapshotDecision:
         """Admit a new immutable snapshot if its fresh-state gate passes."""
 
         files, rejected_files, replay_identities = (
@@ -3050,7 +2994,6 @@ class CorpusSnapshotManager:
                 "No replay files satisfy the repaired policy-distillation contract"
             )
         validation_manifest, validation_keys = self._ensure_validation(files)
-        validation_keys = validation_keys.union(self.external_validation_state_keys)
         validation_hashes = {record["sha256"] for record in validation_manifest["files"]}
 
         file_records = []
@@ -3112,7 +3055,11 @@ class CorpusSnapshotManager:
                 replay_identities,
             )
         )
-        train_keys = all_train_keys - validation_keys
+        train_keys = _exclude_validation_state_keys(
+            all_train_keys,
+            validation_keys,
+            self.external_validation_state_keys,
+        )
         # ``train_keys`` is the exact complement of the validation overlap
         # inside ``all_train_keys``.  Derive the overlap cardinality from those
         # two sets instead of materializing a second, otherwise-unused set of
@@ -3123,7 +3070,11 @@ class CorpusSnapshotManager:
         # difference is associative here, so excluding validation from that
         # much smaller fresh set is exactly equivalent to walking every
         # post-exclusion training key against the predecessor again.
-        new_keys = pre_validation_new_keys.difference(validation_keys)
+        new_keys = _exclude_validation_state_keys(
+            pre_validation_new_keys,
+            validation_keys,
+            self.external_validation_state_keys,
+        )
         fresh_rate = (len(new_keys) / len(train_keys)) if train_keys else 0.0
         # Audit Suggestion 9.  A growth event moves a whole *fresh* shard out of
         # training -- _grow_validation can only choose never-trained shards, by
