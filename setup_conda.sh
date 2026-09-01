@@ -93,8 +93,8 @@ if [[ "$INSTALL_MATPLOTLIB" = true ]]; then
 fi
 
 echo ""
-echo "Installing Cython for accelerated preprocessing..."
-pip install cython
+echo "Installing Cython and orjson for accelerated preprocessing..."
+pip install cython orjson
 
 echo ""
 echo "Installing nvidia-ml-py for fast GPU monitoring (thermal/utilization)..."
@@ -162,6 +162,7 @@ echo "Python: $(python --version)"
 python -c "import torch; print('PyTorch version:', torch.__version__)"
 python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 python -c "import torch; print('CUDA version:', torch.version.cuda if torch.cuda.is_available() else 'N/A')"
+python -c "import orjson; print('orjson version:', orjson.__version__)"
 python -c "from PyQt6.QtCore import QT_VERSION_STR; print('Qt GUI available:', QT_VERSION_STR)"
 
 # WSL detection and hints
