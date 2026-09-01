@@ -123,10 +123,28 @@ from . import checkpoint_acceptance as checkpoint_acceptance_tasks
 # P5 unreachable even after a valid promotion and acceptance.
 _ACCEPTANCE_OPENING_SUITE_SIZE = ACCEPTANCE_GAMES_PER_OPPONENT // 2
 
+# Rotate the algorithm arm's stratified opening-depth assignment across
+# generation cycles. Each cycle still uses every configured depth equally,
+# while each difficulty/start-side slot sees all depths over four cycles.
+_ALGORITHM_OPENING_SCHEDULE = "cycle_rotated_v1"
+
 
 def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
     """Assign every teacher difficulty to both player positions."""
     return [(p1, p2) for p1 in difficulties for p2 in difficulties]
+
+
+def _training_opening_assignment(
+    opening_choices: tuple[int, ...],
+    opening_seed_base: int,
+    game_index: int,
+    *,
+    cycle_rotation: int = 0,
+) -> tuple[int, int]:
+    """Return one stratified opening while keeping its seed slot stable."""
+
+    choice_index = (game_index + cycle_rotation) % len(opening_choices)
+    return int(opening_choices[choice_index]), opening_seed_base + game_index
 
 
 def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
@@ -1247,7 +1265,14 @@ class Trainer:
         self._build_scheduler()
 
         self.replay_buffer = ReplayBuffer(
-            config.replay_dir, max_files=config.replay_max_files)
+            config.replay_dir,
+            max_files=config.replay_max_files,
+            # Snapshot training consumes closed shards through the verified
+            # corpus manager, never ReplayBuffer.load_all_entries().  Releasing
+            # their Python object graphs is essential on the 24 GB local host.
+            # See Journal Pass 183.
+            cache_written_entries=not config.snapshot_enabled,
+        )
 
         # Training state
         self.step = 0
@@ -2649,6 +2674,7 @@ class Trainer:
             'model_fraction': self.config.trajectory_model_fraction,
             'opening_plies': list(self.config.selfplay_opening_plies),
             'opening_seed': self.config.selfplay_opening_seed,
+            'algorithm_opening_schedule': _ALGORITHM_OPENING_SCHEDULE,
             'max_moves': self.config.selfplay_max_moves,
             'algorithm_difficulties': list(self.config.selfplay_difficulties),
             'algo_vs_algo_difficulties': list(
@@ -4673,10 +4699,14 @@ class Trainer:
             int(self.config.selfplay_opening_seed) + cycle_id * 1_000_003)
         task_order_rng = random.Random(opening_seed_base ^ 0xBB67AE8584CAA73B)
 
-        def _opening_for(game_index: int) -> tuple[int, int]:
-            return (
-                int(opening_choices[game_index % len(opening_choices)]),
-                opening_seed_base + game_index,
+        def _opening_for(
+            game_index: int, *, rotate_algorithm: bool = False
+        ) -> tuple[int, int]:
+            return _training_opening_assignment(
+                opening_choices,
+                opening_seed_base,
+                game_index,
+                cycle_rotation=cycle_id if rotate_algorithm else 0,
             )
 
         opponent_focus = self.config.selfplay_opponent_focus
@@ -4841,8 +4871,14 @@ class Trainer:
 
             all_algo_tasks = [
                 task + (
-                    _opening_for(len(all_ml_tasks) + index)[0],
-                    _opening_for(len(all_ml_tasks) + index)[1],
+                    _opening_for(
+                        len(all_ml_tasks) + index,
+                        rotate_algorithm=True,
+                    )[0],
+                    _opening_for(
+                        len(all_ml_tasks) + index,
+                        rotate_algorithm=True,
+                    )[1],
                     'algorithm',
                     f"cycle-{cycle_id:06d}-algorithm-{index:06d}",
                     self.config.teacher_difficulty,
