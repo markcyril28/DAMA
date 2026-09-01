@@ -105,8 +105,8 @@ if [[ "$INSTALL_MATPLOTLIB" = true ]]; then
 fi
 
 echo ""
-echo "Installing Cython for accelerated preprocessing..."
-pip install cython
+echo "Installing Cython and orjson for accelerated preprocessing..."
+pip install cython orjson
 
 echo ""
 echo "Installing nvidia-ml-py for fast GPU monitoring (thermal/utilization)..."
@@ -144,6 +144,7 @@ python -c "import torch; print('ROCm/HIP available:', torch.cuda.is_available())
 python -c "import torch; print('Device count:', torch.cuda.device_count() if torch.cuda.is_available() else 0)"
 python -c "import torch; print('Device name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
 python -c "import torch; print('ROCm version:', torch.version.hip if hasattr(torch.version, 'hip') else 'N/A')"
+python -c "import orjson; print('orjson version:', orjson.__version__)"
 
 # ROCm environment hints
 echo ""
