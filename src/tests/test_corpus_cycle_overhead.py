@@ -132,8 +132,11 @@ def test_external_validation_exclusion_avoids_full_union() -> None:
 
     remaining = corpus._exclude_validation_state_keys(
         state_keys, validation_keys, external_keys)
+    overlap_count = corpus._validation_overlap_state_count(
+        state_keys, validation_keys, external_keys)
 
     assert remaining == {"train"}
+    assert overlap_count == 3
     assert state_keys == {"train", "held", "frozen", "both"}
     assert validation_keys == {"held", "both"}
     assert external_keys == {"frozen", "both"}
@@ -841,6 +844,71 @@ def test_rolling_freshness_rebuilds_for_changed_or_mutable_predecessor(shards):
         files, mutable, identities)
     assert fresh == keys - mutable
     assert window.freshness_reference is None
+
+
+def test_rolling_validation_overlap_updates_with_one_shard_rotation(
+    shards, monkeypatch,
+):
+    """Immutable exclusions advance inside the existing rolling shard walk."""
+
+    manager = corpus.CorpusSnapshotManager(
+        str(shards[0].parent), str(shards[0].parent / "snapshots"))
+    identities = {path: corpus._replay_file_identity(path) for path in shards[:7]}
+    previous = frozenset(
+        corpus.canonical_state_key(_state(index)) for index in range(3))
+    _metrics, first_keys, first_fresh = manager._analyze_replay_window(
+        shards[:6], previous, identities)
+    ordered = sorted(first_keys)
+    validation = frozenset(ordered[::3])
+    external = frozenset(ordered[1::5])
+    first_expected = (
+        corpus._validation_overlap_state_count(
+            first_keys, validation, external),
+        corpus._validation_overlap_state_count(
+            first_fresh, validation, external),
+    )
+    assert manager._rolling_validation_overlap_counts(
+        validation, external) == first_expected
+
+    def unexpected_rebuild(*_args, **_kwargs):
+        raise AssertionError("one-shard rotation rebuilt full overlap counts")
+
+    monkeypatch.setattr(
+        corpus, "_validation_overlap_state_count", unexpected_rebuild)
+    _metrics, second_keys, second_fresh = manager._analyze_replay_window(
+        shards[1:7], previous, identities)
+    actual = manager._rolling_validation_overlap_counts(validation, external)
+    exclusion = validation | external
+    assert actual == (
+        len(second_keys & exclusion),
+        len(second_fresh & exclusion),
+    )
+
+
+def test_rolling_validation_overlap_never_reuses_mutable_inputs(shards):
+    """In-place exclusion edits always force an exact cardinality rebuild."""
+
+    manager = corpus.CorpusSnapshotManager(
+        str(shards[0].parent), str(shards[0].parent / "snapshots"))
+    files = shards[:6]
+    identities = {path: corpus._replay_file_identity(path) for path in files}
+    previous = frozenset()
+    _metrics, keys, fresh = manager._analyze_replay_window(
+        files, previous, identities)
+    ordered = sorted(keys)
+    validation = {ordered[0]}
+    external = {ordered[1]}
+
+    assert manager._rolling_validation_overlap_counts(
+        validation, external) == (2, 2)
+    validation.add(ordered[2])
+    external.add(ordered[3])
+    assert manager._rolling_validation_overlap_counts(
+        validation, external) == (4, 4)
+    window = manager._replay_window_analysis
+    assert window is not None
+    assert window.exclusion_validation_reference is None
+    assert window.exclusion_external_reference is None
 
 
 def test_rolling_window_analysis_falls_back_for_duplicate_cycle_ids(
