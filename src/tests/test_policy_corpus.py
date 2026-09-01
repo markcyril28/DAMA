@@ -89,7 +89,9 @@ def test_whole_file_split_has_no_canonical_state_overlap(tmp_path: Path) -> None
     assert len(validation) % 2 == 0
 
 
-def test_snapshot_gate_accepts_exact_half_fresh_and_preserves_prior(tmp_path: Path) -> None:
+def test_snapshot_gate_accepts_exact_half_fresh_and_preserves_prior(
+    tmp_path: Path, monkeypatch,
+) -> None:
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir()
     snapshot_root = tmp_path / "snapshots"
@@ -132,10 +134,23 @@ def test_snapshot_gate_accepts_exact_half_fresh_and_preserves_prior(tmp_path: Pa
     assert first.manifest_path.read_bytes() == first_manifest_before
 
     _write_replay(replay_dir / "replay_02_0.jsonl", [_entry(300)])
+    from dama.ai.ml import corpus
+
+    complement_calls = 0
+    original_exclude = corpus._exclude_validation_state_keys
+
+    def counted_exclude(*args, **kwargs):
+        nonlocal complement_calls
+        complement_calls += 1
+        return original_exclude(*args, **kwargs)
+
+    monkeypatch.setattr(
+        corpus, "_exclude_validation_state_keys", counted_exclude)
     rejected = manager.consider_snapshot(settings, noise, generation)
     assert not rejected.admitted
     assert "below" in rejected.reason
     assert rejected.manifest_path == second.manifest_path
+    assert complement_calls == 0
 
 
 def _admit_series(
