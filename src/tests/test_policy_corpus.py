@@ -1,5 +1,6 @@
-import json
 import gzip
+import hashlib
+import json
 from pathlib import Path
 import threading
 
@@ -748,6 +749,36 @@ def test_holdout_growth_is_bounded_by_the_file_ceiling(tmp_path: Path) -> None:
     assert len(manifest["files"]) <= HOLDOUT_FILE_CEILING * target
 
 
+def test_ceiling_bound_holdout_skips_trained_shard_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound hold-out has no eligibility question left to answer."""
+    from dama.ai.ml.corpus import HOLDOUT_FILE_CEILING
+
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    # Four live files target one held file and cap the append-only manifest at
+    # three.  Rotate all three historical held shards out so only the ceiling,
+    # rather than present-file coverage, closes the growth quota.
+    manifest = {
+        "files": [
+            {"name": f"held_old_{index}.jsonl"}
+            for index in range(HOLDOUT_FILE_CEILING)
+        ]
+    }
+    files = [tmp_path / f"replay_live_{index}.jsonl" for index in range(4)]
+
+    def fail_if_scanned() -> set[str]:
+        raise AssertionError("ceiling-bound growth scanned trained shards")
+
+    monkeypatch.setattr(manager, "_trained_shard_names", fail_if_scanned)
+    assert manager._grow_validation(manifest, files) is None
+
+
 def test_snapshot_load_removes_validation_overlap(tmp_path: Path) -> None:
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir()
@@ -777,6 +808,10 @@ def test_snapshot_load_removes_validation_overlap(tmp_path: Path) -> None:
     assert manifest["admission"]["passed"] is True
     assert manifest["metrics"]["forced_move_rate"] >= 0.0
     assert manifest["metrics"]["external_validation_state_count"] == 1
+    assert manifest["metrics"]["validation_overlap_state_count_removed"] == (
+        manifest["metrics"]["unique_state_count"]
+        - manifest["metrics"]["post_dedup_unique_state_count"]
+    )
 
 
 def test_snapshot_settings_match_rejects_previous_stage_contract(
@@ -1018,16 +1053,16 @@ def test_replay_analysis_cache_matches_cold_scan_and_skips_reparse(
     previous = {canonical_state_key(shared)}
     cold = corpus.analyze_replay_files([left, right], previous)
 
-    original_iterator = corpus._iter_entry_dicts
+    original_iterator = corpus._iter_entry_dicts_with_digest
 
-    def fail_if_reparsed(_path):
+    def fail_if_reparsed(_path, _digest):
         raise AssertionError("unchanged replay file was reparsed")
 
-    monkeypatch.setattr(corpus, "_iter_entry_dicts", fail_if_reparsed)
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", fail_if_reparsed)
     warm = corpus.analyze_replay_files([left, right], previous)
 
     assert warm == cold
-    monkeypatch.setattr(corpus, "_iter_entry_dicts", original_iterator)
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", original_iterator)
 
 
 def test_replay_analysis_cache_invalidates_on_file_mutation(
@@ -1041,19 +1076,19 @@ def test_replay_analysis_cache_invalidates_on_file_mutation(
     cold_before = corpus.analyze_replay_files([path])
 
     _write_replay(path, [_entry(0), _entry(20, forced=True)])
-    original_iterator = corpus._iter_entry_dicts
+    original_iterator = corpus._iter_entry_dicts_with_digest
     parse_count = 0
 
-    def counted_iterator(file_path):
+    def counted_iterator(file_path, digest):
         nonlocal parse_count
         parse_count += 1
-        yield from original_iterator(file_path)
+        yield from original_iterator(file_path, digest)
 
-    monkeypatch.setattr(corpus, "_iter_entry_dicts", counted_iterator)
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", counted_iterator)
     warm_after_mutation = corpus.analyze_replay_files([path])
     assert parse_count == 1
 
-    monkeypatch.setattr(corpus, "_iter_entry_dicts", original_iterator)
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", original_iterator)
     corpus._clear_replay_file_cache()
     cold_after_mutation = corpus.analyze_replay_files([path])
 
@@ -1091,7 +1126,7 @@ def test_replay_hash_cache_reuses_and_invalidates_by_file_identity(
 def test_large_manifest_hashes_in_parallel_and_still_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Independent shard reads overlap without weakening digest checks."""
+    """One directory scan feeds overlapping hashes without weakening checks."""
     from dama.ai.ml import corpus
 
     replay_dir = tmp_path / "replay"
@@ -1123,9 +1158,17 @@ def test_large_manifest_hashes_in_parallel_and_still_fail_closed(
     calls = 0
     active = 0
     peak_active = 0
+    identities = {}
+    scan_calls = []
+    real_scandir = corpus.os.scandir
 
-    def coordinated_hash(path: Path) -> str:
+    def counted_scandir(path):
+        scan_calls.append(Path(path))
+        return real_scandir(path)
+
+    def coordinated_hash(path: Path, identity) -> str:
         nonlocal calls, active, peak_active
+        identities[path] = identity
         with lock:
             calls += 1
             ordinal = calls
@@ -1139,22 +1182,52 @@ def test_large_manifest_hashes_in_parallel_and_still_fail_closed(
             with lock:
                 active -= 1
 
-    monkeypatch.setattr(corpus, "replay_file_sha256", coordinated_hash)
+    monkeypatch.setattr(corpus.os, "scandir", counted_scandir)
+    monkeypatch.setattr(
+        corpus, "_replay_file_sha256_for_identity", coordinated_hash)
     verified = manager._verify_manifest_integrity(
         decision.manifest_path, manifest, "training_snapshot")
     assert verified
     assert calls == len(expected)
     assert peak_active >= 2
+    assert scan_calls == [decision.manifest_path.parent / "files"] * 2
+    assert set(identities) == set(expected)
+    assert all(
+        identity == corpus._replay_file_identity(path)
+        for path, identity in identities.items()
+    )
 
     bad_path = next(iter(expected))
     monkeypatch.setattr(
         corpus,
-        "replay_file_sha256",
-        lambda path: "0" * 64 if path == bad_path else expected[path],
+        "_replay_file_sha256_for_identity",
+        lambda path, _identity: (
+            "0" * 64 if path == bad_path else expected[path]),
     )
     with pytest.raises(RuntimeError, match="failed integrity verification"):
         manager._verify_manifest_integrity(
             decision.manifest_path, manifest, "training_snapshot")
+
+    replaced = False
+
+    def replace_during_cached_hash(path: Path, _identity) -> str:
+        nonlocal replaced
+        if path == bad_path and not replaced:
+            replacement = path.with_suffix(".replacement")
+            replacement.write_bytes(path.read_bytes())
+            replacement.replace(path)
+            replaced = True
+        return expected[path]
+
+    monkeypatch.setattr(
+        corpus,
+        "_replay_file_sha256_for_identity",
+        replace_during_cached_hash,
+    )
+    with pytest.raises(RuntimeError, match="failed integrity verification"):
+        manager._verify_manifest_integrity(
+            decision.manifest_path, manifest, "training_snapshot")
+    assert replaced
 
 
 def test_malformed_replay_json_is_never_cached(
@@ -1169,15 +1242,15 @@ def test_malformed_replay_json_is_never_cached(
     with pytest.raises(ValueError, match="Invalid replay JSON"):
         corpus.analyze_replay_files([path])
 
-    original_iterator = corpus._iter_entry_dicts
+    original_iterator = corpus._iter_entry_dicts_with_digest
     parse_count = 0
 
-    def counted_iterator(file_path):
+    def counted_iterator(file_path, digest):
         nonlocal parse_count
         parse_count += 1
-        yield from original_iterator(file_path)
+        yield from original_iterator(file_path, digest)
 
-    monkeypatch.setattr(corpus, "_iter_entry_dicts", counted_iterator)
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", counted_iterator)
     with pytest.raises(ValueError, match="Invalid replay JSON"):
         corpus.analyze_replay_files([path])
     assert parse_count == 1
@@ -1197,15 +1270,15 @@ def test_semantically_malformed_replay_is_not_cached(
     first, _ = corpus.analyze_replay_files([path])
     assert first["malformed_records"] == 1
 
-    original_iterator = corpus._iter_entry_dicts
+    original_iterator = corpus._iter_entry_dicts_with_digest
     parse_count = 0
 
-    def counted_iterator(file_path):
+    def counted_iterator(file_path, digest):
         nonlocal parse_count
         parse_count += 1
-        yield from original_iterator(file_path)
+        yield from original_iterator(file_path, digest)
 
-    monkeypatch.setattr(corpus, "_iter_entry_dicts", counted_iterator)
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", counted_iterator)
     second, _ = corpus.analyze_replay_files([path])
     assert second == first
     assert parse_count == 1
@@ -1221,12 +1294,150 @@ def test_replay_audit_cache_reuses_unchanged_file(
     _write_replay(path, [_contract_entry(1, "algorithm", "audit-1")])
     cold = corpus.audit_policy_replay_file(path, (2, 4, 6, 8))
 
-    def fail_if_reparsed(_path):
+    def fail_if_reparsed(_path, _digest):
         raise AssertionError("unchanged replay file was reparsed")
 
-    monkeypatch.setattr(corpus, "_iter_entry_dicts", fail_if_reparsed)
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", fail_if_reparsed)
     warm = corpus.audit_policy_replay_file(path, (2, 4, 6, 8))
     assert warm == cold
+
+
+def test_replay_audit_populates_analysis_cache_in_same_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold contract check must supply the later diversity analysis."""
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_fused.jsonl"
+    entries = [
+        _contract_entry(
+            index,
+            "algorithm" if index < 7 else "current_model",
+            f"fused-{index}",
+        )
+        for index in range(10)
+    ]
+    _write_replay(path, entries)
+
+    original_iterator = corpus._iter_entry_dicts_with_digest
+    original_hash = corpus._sha256_file_uncached
+    parse_calls = 0
+    hash_calls = 0
+
+    def counted_iterator(file_path, digest):
+        nonlocal parse_calls
+        parse_calls += 1
+        yield from original_iterator(file_path, digest)
+
+    def counted_hash(file_path):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(file_path)
+
+    monkeypatch.setattr(corpus, "_iter_entry_dicts_with_digest", counted_iterator)
+    monkeypatch.setattr(corpus, "_sha256_file_uncached", counted_hash)
+
+    audit = corpus.audit_policy_replay_file(path, (2, 4, 6, 8))
+    metrics, keys = corpus.analyze_replay_files([path])
+    digest = corpus.replay_file_sha256(path)
+
+    assert audit["valid"]
+    assert audit["records"] == 10
+    assert audit["source_game_counts"] == {
+        "algorithm": 7, "current_model": 3}
+    assert metrics["records"] == 10
+    assert metrics["malformed_records"] == 0
+    assert metrics["source_game_counts"] == audit["source_game_counts"]
+    assert metrics["state_set_sha256"] == corpus._state_set_digest(keys)
+    assert len(digest) == 64
+    assert parse_calls == 1, "analysis reparsed a contract-valid shard"
+    assert hash_calls == 0, "analysis or digest lookup re-read the shard"
+
+
+def test_fused_audit_digest_matches_exact_jsonl_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one-pass digest covers original bytes, not normalized text."""
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_exact_bytes.jsonl"
+    entries = [
+        _contract_entry(
+            index,
+            "algorithm" if index < 7 else "current_model",
+            f"exact-α-{index}",
+        )
+        for index in range(10)
+    ]
+    # Cross the reader's 1 MiB block boundary inside one JSON record.
+    entries[0]["game_id"] = "exact-long-" + ("x" * (1024 * 1024))
+    raw_lines = [
+        json.dumps(entry, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        for entry in entries
+    ]
+    payload = b"\r\n" + b"\r\n".join(raw_lines[:-1]) + b"\r\n" + raw_lines[-1]
+    path.write_bytes(payload)
+
+    def forbid_second_read(_path):
+        raise AssertionError("fused analysis performed a separate digest read")
+
+    monkeypatch.setattr(corpus, "_sha256_file_uncached", forbid_second_read)
+    audit = corpus.audit_policy_replay_file(path, (2, 4, 6, 8))
+
+    assert audit["valid"]
+    assert corpus.replay_file_sha256(path) == hashlib.sha256(payload).hexdigest()
+    assert corpus.analyze_replay_files([path])[0]["records"] == 10
+
+
+def test_replay_iterators_share_the_accelerated_json_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both corpus readers must route decoding through replay's codec."""
+    from dama.ai.ml import corpus
+
+    path = tmp_path / "replay_shared_codec.jsonl"
+    entry = _contract_entry(1, "algorithm", "shared-codec")
+    path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    argument_types = []
+
+    def tracked_loads(payload):
+        argument_types.append(type(payload))
+        return json.loads(payload)
+
+    monkeypatch.setattr(corpus, "_replay_json_loads", tracked_loads)
+    assert list(corpus._iter_entry_dicts(path)) == [entry]
+    digest = hashlib.sha256()
+    assert list(corpus._iter_entry_dicts_with_digest(path, digest)) == [entry]
+    assert argument_types == [str, bytes]
+    assert digest.hexdigest() == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_fused_audit_rejects_without_publishing_partial_analysis(
+    tmp_path: Path,
+) -> None:
+    """The fused reader keeps the original first-error fail-closed boundary."""
+    from dama.ai.ml import corpus
+
+    corpus._clear_replay_file_cache()
+    path = tmp_path / "replay_invalid_fused.jsonl"
+    valid = _contract_entry(1, "algorithm", "fused-valid")
+    invalid = _contract_entry(2, "algorithm", "fused-invalid")
+    invalid["chosen_index"] = 999
+    path.write_text(
+        json.dumps(valid) + "\n" + json.dumps(invalid) + "\nnot-json\n",
+        encoding="utf-8",
+    )
+
+    result = corpus.audit_policy_replay_file(path, (2, 4, 6, 8))
+    identity = corpus._replay_file_identity(path).as_key()
+
+    assert not result["valid"]
+    assert result["records"] == 2
+    assert result["errors"] == {"invalid_teacher_index": 1}
+    assert identity not in corpus._REPLAY_ANALYSIS_CACHE
+    assert identity not in corpus._REPLAY_HASH_CACHE
 
 
 def test_legacy_replay_audit_fails_fast(monkeypatch):
