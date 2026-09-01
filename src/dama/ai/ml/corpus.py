@@ -48,6 +48,13 @@ from .move_encoder import ENCODING_VERSION
 from .replay import ReplayEntry, _json_loads as _replay_json_loads
 from . import run_status
 
+try:
+    from ._fast_stat import stat_paths as _fast_stat_paths
+    _HAS_FAST_STAT = True
+except ImportError:  # pragma: no cover - exercised on unbuilt/native Windows trees
+    _fast_stat_paths = None
+    _HAS_FAST_STAT = False
+
 
 SNAPSHOT_SCHEMA_VERSION = 1
 # Upper bound on hold-out shards as a multiple of the configured target.
@@ -96,12 +103,20 @@ _MANIFEST_INTEGRITY_IDENTITY_CACHE_MAX = 2
 # which fields are checked.  Small directories stay synchronous to avoid pool
 # setup overhead in tests and non-production corpora.
 _METADATA_STAT_WORKERS = 8
+# Native C11 threads carry no Future objects and all join before return, so the
+# slow drvfs batch benefits from a wider fan-out than the Python pool. Direct
+# 61 plus 27 shard controls place the knee at 32 threads; the Python fallback
+# remains at the measured eight-worker optimum.
+_NATIVE_METADATA_STAT_WORKERS = 32
 _PARALLEL_METADATA_STAT_MIN_FILES = 8
 _METADATA_STAT_PROBE_FILES = 4
 _PARALLEL_METADATA_STAT_MIN_PROBE_NS = 1_000_000
 _METADATA_STAT_STRATEGY_CACHE_MAX = 64
 _METADATA_STAT_STRATEGY_LOCK = threading.Lock()
 _METADATA_STAT_PARALLEL_BY_PARENT: "OrderedDict[str, bool]" = OrderedDict()
+# Probe-only switch used by mirrored performance controls. Production keeps
+# the compiled batch enabled whenever it imported successfully.
+_FAST_METADATA_STAT_ENABLED = True
 
 # ``gzip.GzipFile`` text iteration pays substantial per-line overhead for the
 # fixed-width canonical-key files on drvfs.  Small key files can instead take
@@ -179,6 +194,17 @@ class _ReplayFileIdentity:
             self.st_size,
             self.st_mtime_ns,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _FastStatResult:
+    """Subset of ``os.stat_result`` consumed by corpus identity checks."""
+
+    st_mode: int
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int
 
 
 @dataclass(frozen=True)
@@ -292,13 +318,64 @@ def _replay_file_identity(path: Path) -> _ReplayFileIdentity:
 
 def _directory_entry_stat(
     entry: Any,
-) -> Tuple[Any, Optional[os.stat_result], Optional[OSError]]:
+) -> Tuple[Any, Optional[Any], Optional[OSError]]:
     """Return one directory entry's metadata without losing its exception."""
 
     try:
         return entry, entry.stat(), None
     except OSError as exc:
         return entry, None, exc
+
+
+def _native_directory_entry_stats(
+    entries: Sequence[Any], workers: int,
+) -> Optional[List[Tuple[Any, Optional[Any], Optional[OSError]]]]:
+    """Run one exact native stat batch, or decline to the Python fallback."""
+
+    if (
+        not _FAST_METADATA_STAT_ENABLED
+        or _fast_stat_paths is None
+        or not all(isinstance(entry, os.DirEntry) for entry in entries)
+    ):
+        return None
+    try:
+        raw_results = _fast_stat_paths(
+            [entry.path for entry in entries],
+            min(_NATIVE_METADATA_STAT_WORKERS, len(entries)),
+        )
+    except Exception:
+        # This extension is an acceleration only. A missing or broken build
+        # must preserve the existing exact Python path rather than weakening
+        # corpus verification or preventing a launch.
+        return None
+    if len(raw_results) != len(entries):
+        return None
+    results = []
+    for entry, (fields, error_number) in zip(entries, raw_results):
+        if error_number:
+            error = OSError(
+                int(error_number), os.strerror(int(error_number)), entry.path)
+            results.append((entry, None, error))
+        elif fields is None or len(fields) != 5:
+            return None
+        else:
+            results.append((entry, _FastStatResult(*map(int, fields)), None))
+    return results
+
+
+def _parallel_directory_entry_stats(
+    entries: Sequence[Any], workers: int,
+) -> List[Tuple[Any, Optional[Any], Optional[OSError]]]:
+    """Overlap a proven-slow metadata batch through native or Python threads."""
+
+    native = _native_directory_entry_stats(entries, workers)
+    if native is not None:
+        return native
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="corpus-metadata",
+    ) as pool:
+        return list(pool.map(_directory_entry_stat, entries))
 
 
 def _directory_entry_stats(
@@ -329,11 +406,7 @@ def _directory_entry_stats(
         return [_directory_entry_stat(entry) for entry in entries]
     if parallel is True:
         workers = min(_METADATA_STAT_WORKERS, len(entries))
-        with ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="corpus-metadata",
-        ) as pool:
-            return list(pool.map(_directory_entry_stat, entries))
+        return _parallel_directory_entry_stats(entries, workers)
     # A thread pool is a large regression on a low-latency local filesystem
     # (the server profile normally uses one), while drvfs metadata is slow
     # enough to benefit by an order of magnitude.  Time a small prefix from
@@ -359,12 +432,8 @@ def _directory_entry_stats(
             _directory_entry_stat(entry) for entry in entries[probe_count:]
         ]
     workers = min(_METADATA_STAT_WORKERS, len(entries) - probe_count)
-    with ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="corpus-metadata",
-    ) as pool:
-        remainder = list(pool.map(
-            _directory_entry_stat, entries[probe_count:]))
+    remainder = _parallel_directory_entry_stats(
+        entries[probe_count:], workers)
     return prefix + remainder
 
 
@@ -1945,6 +2014,32 @@ class CorpusSnapshotManager:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
 
+    def _load_current_manifest(self) -> Tuple[Optional[Path], Optional[dict]]:
+        """Resolve CURRENT and load its regular-file target in one open.
+
+        ``current_manifest_path()`` must remain a path-only public lookup, so it
+        uses ``is_file()`` before returning. Admission immediately opened that
+        path again to parse it, paying a redundant metadata round trip on
+        drvfs. Opening the target and checking the opened descriptor preserves
+        the missing and non-regular target semantics without a separate path
+        stat or a path-check/open race.
+        """
+
+        try:
+            relative = self.current_pointer.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None, None
+        if not relative:
+            return None, None
+        path = self.snapshot_root / _read_relpath(relative)
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    return None, None
+                return path, json.load(handle)
+        except (FileNotFoundError, IsADirectoryError):
+            return None, None
+
     def _cached_state_key_file(
         self, path: Path,
     ) -> Tuple[frozenset[str], str]:
@@ -2195,13 +2290,14 @@ class CorpusSnapshotManager:
                 "Corpus snapshot file failed integrity verification: "
                 f"{manifest_path}"
             ) from exc
+        state_keys = self._verify_manifest_state_keys(manifest_path, manifest)
         _cache_touch(
             self._manifest_integrity_identity_cache,
             manifest_cache_key,
             dict(identities),
             _MANIFEST_INTEGRITY_IDENTITY_CACHE_MAX,
         )
-        return self._verify_manifest_state_keys(manifest_path, manifest)
+        return state_keys
 
     # ------------------------------------------------------------------
     # Rebuilt lineage: an explicit, verified external predecessor
@@ -3195,13 +3291,13 @@ class CorpusSnapshotManager:
         if not train_files:
             raise RuntimeError("No replay files remain after the immutable validation split")
 
-        current_path = self.current_manifest_path()
+        current_path, current = self._load_current_manifest()
         previous_keys: Set[str] = set()
         previous_keys_digest: Optional[str] = None
         previous_fingerprint = None
         previous_source = None
         if current_path is not None:
-            current = self._load_manifest(current_path)
+            assert current is not None
             previous_keys, previous_keys_digest = self._cached_state_key_file(
                 current_path.parent / current["state_keys_file"])
             recorded_previous_digest = current.get("metrics", {}).get(
