@@ -209,6 +209,40 @@ def test_directory_metadata_strategy_is_reused_per_parent(monkeypatch):
     corpus._clear_replay_file_cache()
 
 
+def test_parallel_metadata_submissions_are_bounded_by_worker_count(monkeypatch):
+    """Large warm scans submit chunks, not one Future per replay shard."""
+    corpus._clear_replay_file_cache()
+    monkeypatch.setattr(
+        corpus, "_PARALLEL_METADATA_STAT_MIN_PROBE_NS", 0)
+    real_submit = corpus.ThreadPoolExecutor.submit
+    submissions = 0
+
+    def counted_submit(executor, function, *args, **kwargs):
+        nonlocal submissions
+        submissions += 1
+        return real_submit(executor, function, *args, **kwargs)
+
+    class Entry:
+        def __init__(self, index):
+            self.index = index
+            self.path = f"/chunked-metadata/replay_{index}.jsonl"
+
+        def stat(self):
+            return self.index
+
+    monkeypatch.setattr(corpus.ThreadPoolExecutor, "submit", counted_submit)
+    entries = [Entry(index) for index in range(61)]
+    # First call establishes the per-parent slow-filesystem strategy.  Count a
+    # warm call, which is the admission path repeated after every cycle.
+    corpus._directory_entry_stats(entries)
+    submissions = 0
+    results = corpus._directory_entry_stats(entries)
+
+    assert [result for _entry, result, _error in results] == list(range(61))
+    assert submissions <= corpus._METADATA_STAT_WORKERS
+    corpus._clear_replay_file_cache()
+
+
 def test_admission_identity_snapshot_recheck_fails_closed_on_replacement(tmp_path):
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir()
