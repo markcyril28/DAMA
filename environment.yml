@@ -14,4 +14,5 @@ dependencies:
     - pytest  # For running tests
     - setproctitle  # Renames the trainer process for htop/btop visibility (PROCESS_TITLE env)
     - plotly  # Interactive HTML training-progress plot (plot_training.py)
+    - orjson  # Rust-backed JSONL codec for replay write and corpus admission throughput
     # PyTorch for the server GPU is installed separately via setup_conda_server.sh
