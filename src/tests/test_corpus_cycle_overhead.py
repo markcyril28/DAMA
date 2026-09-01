@@ -14,6 +14,7 @@ never re-hashes or re-audits an unchanged file, that the analysis cache still
 honours its own bound, and that a replaced file still evicts its stale entry.
 """
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -230,6 +231,82 @@ def test_directory_metadata_strategy_is_reused_per_parent(monkeypatch):
     assert all(
         result != caller for _entry, result, _error in second)
     corpus._clear_replay_file_cache()
+
+
+@pytest.mark.skipif(
+    not corpus._HAS_FAST_STAT,
+    reason="compiled POSIX metadata accelerator is not built",
+)
+def test_native_metadata_batch_matches_stat_and_preserves_errors(
+    tmp_path, monkeypatch,
+):
+    """The compiled batch returns exact stat fields, order, and errno."""
+
+    paths = []
+    for index in range(12):
+        path = tmp_path / f"replay_{index:02d}.jsonl"
+        path.write_text(f"{index}\n", encoding="utf-8")
+        paths.append(path)
+    with os.scandir(tmp_path) as iterator:
+        entries = sorted(iterator, key=lambda entry: entry.name)
+    missing_entry = entries[-1]
+    paths[-1].unlink()
+
+    real_fast_stat = corpus._fast_stat_paths
+    calls = []
+
+    def tracked_fast_stat(raw_paths, workers):
+        calls.append((list(raw_paths), workers))
+        return real_fast_stat(raw_paths, workers)
+
+    monkeypatch.setattr(corpus, "_fast_stat_paths", tracked_fast_stat)
+    monkeypatch.setattr(corpus, "_FAST_METADATA_STAT_ENABLED", True)
+    results = corpus._parallel_directory_entry_stats(entries, workers=8)
+
+    assert calls == [([entry.path for entry in entries], len(entries))]
+    assert [entry for entry, _result, _error in results] == entries
+    for entry, result, error in results[:-1]:
+        expected = os.stat(entry.path)
+        assert error is None
+        assert result == corpus._FastStatResult(
+            st_mode=expected.st_mode,
+            st_dev=expected.st_dev,
+            st_ino=expected.st_ino,
+            st_size=expected.st_size,
+            st_mtime_ns=expected.st_mtime_ns,
+        )
+    entry, result, error = results[-1]
+    assert entry is missing_entry
+    assert result is None
+    assert isinstance(error, FileNotFoundError)
+    assert error.errno == errno.ENOENT
+
+
+@pytest.mark.skipif(
+    not corpus._HAS_FAST_STAT,
+    reason="compiled POSIX metadata accelerator is not built",
+)
+def test_native_metadata_helpers_are_joined_before_return(tmp_path):
+    """No native helper thread may survive into the next self-play fork."""
+
+    task_dir = Path("/proc/self/task")
+    if not task_dir.is_dir():
+        pytest.skip("Linux task accounting is unavailable")
+    paths = []
+    for index in range(40):
+        path = tmp_path / f"replay_{index:02d}.jsonl"
+        path.write_text(f"{index}\n", encoding="utf-8")
+        paths.append(path)
+
+    before = {path.name for path in task_dir.iterdir()}
+    for _round in range(8):
+        results = corpus._fast_stat_paths(paths, 32)
+        assert len(results) == len(paths)
+        assert all(fields is not None and error == 0
+                   for fields, error in results)
+    after = {path.name for path in task_dir.iterdir()}
+
+    assert after == before
 
 
 def test_admission_identity_snapshot_recheck_fails_closed_on_replacement(tmp_path):
