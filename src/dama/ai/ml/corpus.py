@@ -14,6 +14,7 @@ from __future__ import annotations
 from array import array
 from collections import Counter, defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +99,7 @@ _PARALLEL_METADATA_STAT_MIN_PROBE_NS = 1_000_000
 _METADATA_STAT_STRATEGY_CACHE_MAX = 64
 _METADATA_STAT_STRATEGY_LOCK = threading.Lock()
 _METADATA_STAT_PARALLEL_BY_PARENT: "OrderedDict[str, bool]" = OrderedDict()
+_CORPUS_IO_EXECUTOR_LOCAL = threading.local()
 
 # ``gzip.GzipFile`` text iteration pays substantial per-line overhead for the
 # fixed-width canonical-key files on drvfs.  Small key files can instead take
@@ -295,36 +297,52 @@ def _thread_map_in_order(
     max_workers: int,
     thread_name_prefix: str,
 ) -> List[Any]:
-    """Map independent I/O in bounded chunks while preserving input order.
-
-    ``ThreadPoolExecutor.map`` submits one ``Future`` per value.  Corpus
-    admission maps 27 to 61 tiny metadata or warm digest-cache lookups at a
-    time, so future creation and condition-lock traffic can cost more than the
-    work itself.  One contiguous chunk per worker retains the same concurrency
-    and deterministic result order with at most ``max_workers`` submissions.
-    """
+    """Map I/O in order, reusing the current admission's bounded executor."""
 
     values = list(values)
     if not values:
         return []
     workers = min(max(1, int(max_workers)), len(values))
-    chunk_size = (len(values) + workers - 1) // workers
-    chunks = [
-        values[start:start + chunk_size]
-        for start in range(0, len(values), chunk_size)
-    ]
-
-    def _map_chunk(chunk: Sequence[Any]) -> List[Any]:
-        return [function(value) for value in chunk]
-
-    results: List[Any] = []
+    holder = getattr(_CORPUS_IO_EXECUTOR_LOCAL, "holder", None)
+    if holder is not None:
+        if not holder:
+            holder.append(ThreadPoolExecutor(
+                max_workers=max(
+                    _METADATA_STAT_WORKERS, _MANIFEST_HASH_WORKERS),
+                thread_name_prefix="corpus-io",
+            ))
+        return list(holder[0].map(function, values))
     with ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix=thread_name_prefix,
     ) as pool:
-        for chunk_results in pool.map(_map_chunk, chunks):
-            results.extend(chunk_results)
-    return results
+        return list(pool.map(function, values))
+
+
+@contextmanager
+def _corpus_io_executor_scope() -> Iterator[None]:
+    """Reuse worker threads within one admission, then close before self-play.
+
+    The trainer creates a fork-based process pool at the start of every
+    self-play cycle.  Keeping threads alive across ``consider_snapshot`` would
+    make that fork unsafe, so this scope is deliberately transaction-local and
+    shuts its lazily-created executor down on every return or exception.
+    """
+
+    existing = getattr(_CORPUS_IO_EXECUTOR_LOCAL, "holder", None)
+    if existing is not None:
+        yield
+        return
+    holder: List[ThreadPoolExecutor] = []
+    _CORPUS_IO_EXECUTOR_LOCAL.holder = holder
+    try:
+        yield
+    finally:
+        try:
+            if holder:
+                holder[0].shutdown(wait=True)
+        finally:
+            del _CORPUS_IO_EXECUTOR_LOCAL.holder
 
 
 def _directory_entry_stats(
@@ -3003,6 +3021,21 @@ class CorpusSnapshotManager:
         return max(versions, default=0) + 1
 
     def consider_snapshot(
+        self,
+        teacher_settings: Mapping[str, Any],
+        noise_settings: Mapping[str, Any],
+        generation_settings: Mapping[str, Any],
+    ) -> SnapshotDecision:
+        """Run one admission transaction with one fork-safe I/O executor."""
+
+        with _corpus_io_executor_scope():
+            return self._consider_snapshot_impl(
+                teacher_settings,
+                noise_settings,
+                generation_settings,
+            )
+
+    def _consider_snapshot_impl(
         self,
         teacher_settings: Mapping[str, Any],
         noise_settings: Mapping[str, Any],
