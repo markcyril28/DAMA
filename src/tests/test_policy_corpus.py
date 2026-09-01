@@ -563,6 +563,51 @@ def test_current_pointer_lookup_opens_without_redundant_exists_stat(
     assert manager.current_manifest_path() == target
 
 
+def test_snapshot_gate_loads_current_manifest_without_target_pre_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate opens CURRENT's target once and validates that descriptor."""
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(
+            replay_dir / f"replay_{index:02d}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir), str(snapshot_root),
+        validation_fraction=0.25, split_seed=5,
+    )
+    settings = ({"difficulty": "hard"}, {"noise": 0.1}, {"mix": "fixed"})
+    first = manager.consider_snapshot(*settings)
+    assert first.admitted
+    current_target = manager.current_manifest_path()
+    assert current_target is not None
+    real_is_file = Path.is_file
+
+    def guarded_is_file(path):
+        if path == current_target:
+            raise AssertionError("CURRENT target received a pre-open stat")
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", guarded_is_file)
+    second = manager.consider_snapshot(*settings)
+    assert not second.admitted
+    assert second.reason == "unchanged"
+
+
+def test_load_current_manifest_rejects_non_regular_target(tmp_path: Path) -> None:
+    snapshot_root = tmp_path / "snapshots"
+    target = snapshot_root / "snapshot_v000001" / "manifest.json"
+    target.mkdir(parents=True)
+    (snapshot_root / "CURRENT").write_text(
+        "snapshot_v000001/manifest.json\n", encoding="utf-8")
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"), str(snapshot_root))
+
+    assert manager._load_current_manifest() == (None, None)
+
+
 def test_lost_current_pointer_fails_closed_instead_of_skipping_freshness_gate(
     tmp_path: Path,
 ) -> None:
