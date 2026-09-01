@@ -85,6 +85,10 @@ _LEDGER_FINGERPRINT_BYTES = 8
 # tiny manifests synchronous so tests and small corpora do not pay pool setup.
 _MANIFEST_HASH_WORKERS = 8
 _PARALLEL_MANIFEST_HASH_MIN_BYTES = 64 * 1024 * 1024
+# One live manager repeatedly verifies the immutable hold-out and active
+# snapshot. Retain only their fully digest-verified shard identities so an
+# unchanged manifest can prove integrity with one final metadata transaction.
+_MANIFEST_INTEGRITY_IDENTITY_CACHE_MAX = 2
 
 # drvfs serves independent stat requests with high latency.  Admission reads
 # 61 replay and 27 hold-out identities several times to preserve its fail-closed
@@ -1411,6 +1415,13 @@ class CorpusSnapshotManager:
         self._state_key_file_cache: (
             "OrderedDict[tuple, Tuple[frozenset[str], str]]"
         ) = OrderedDict()
+        # A cache entry is published only after every declared shard digest and
+        # the closing identity transaction both pass. On the next load, one
+        # batched identity comparison proves that the same immutable bytes are
+        # still present; any mismatch falls back to the complete verifier.
+        self._manifest_integrity_identity_cache: (
+            "OrderedDict[tuple, Dict[Path, _ReplayFileIdentity]]"
+        ) = OrderedDict()
         # One manager follows one live rolling window.  Under ReplayWriter's
         # proven one-file-per-cycle shape, retain its exact aggregate so the
         # next admission merges only added/removed shards.  Any mixed-cycle,
@@ -1990,6 +2001,33 @@ class CorpusSnapshotManager:
             == dict(generation_settings)
         )
 
+    def _verify_manifest_state_keys(
+        self, manifest_path: Path, manifest: Mapping[str, Any],
+    ) -> Set[str]:
+        """Verify and return one manifest's canonical-state key member."""
+
+        state_keys_name = manifest.get("state_keys_file")
+        if not isinstance(state_keys_name, str) or not state_keys_name:
+            raise RuntimeError(
+                f"Corpus manifest has no canonical-state key file: {manifest_path}"
+            )
+        state_keys_path = manifest_path.parent / state_keys_name
+        try:
+            state_keys, actual_state_digest = self._cached_state_key_file(
+                state_keys_path)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Corpus canonical-state key file is missing: {state_keys_path}"
+            ) from exc
+        expected_state_digest = manifest.get("metrics", {}).get(
+            "state_set_sha256"
+        )
+        if expected_state_digest != actual_state_digest:
+            raise RuntimeError(
+                f"Corpus canonical-state fingerprint is invalid: {manifest_path}"
+            )
+        return state_keys
+
     def _verify_manifest_integrity(
         self,
         manifest_path: Path,
@@ -2010,6 +2048,32 @@ class CorpusSnapshotManager:
                     f"Corpus manifest uses {key}={manifest.get(key)!r}, "
                     f"expected {value!r}: {manifest_path}"
                 )
+
+        # The manifest is immutable JSON. A semantic content digest plus its
+        # path identifies the exact declaration that earned the cached shard
+        # identities. Recheck those identities once; a changed file takes the
+        # full digest path below, while an unchanged file cannot need a second
+        # scan around cache-only digest lookups.
+        manifest_cache_key = (
+            os.path.abspath(str(manifest_path)),
+            expected_kind,
+            hashlib.sha256(json.dumps(
+                manifest, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).digest(),
+        )
+        cached_identities = self._manifest_integrity_identity_cache.get(
+            manifest_cache_key)
+        if cached_identities is not None:
+            try:
+                self._verify_replay_file_identities(cached_identities)
+            except RuntimeError:
+                self._manifest_integrity_identity_cache.pop(
+                    manifest_cache_key, None)
+            else:
+                self._manifest_integrity_identity_cache.move_to_end(
+                    manifest_cache_key)
+                return self._verify_manifest_state_keys(
+                    manifest_path, manifest)
 
         # ``record["path"]`` is read through ``_read_relpath`` for the same
         # reason the CURRENT pointer is: a snapshot written by the native-Windows
@@ -2131,28 +2195,13 @@ class CorpusSnapshotManager:
                 "Corpus snapshot file failed integrity verification: "
                 f"{manifest_path}"
             ) from exc
-
-        state_keys_name = manifest.get("state_keys_file")
-        if not isinstance(state_keys_name, str) or not state_keys_name:
-            raise RuntimeError(
-                f"Corpus manifest has no canonical-state key file: {manifest_path}"
-            )
-        state_keys_path = manifest_path.parent / state_keys_name
-        try:
-            state_keys, actual_state_digest = self._cached_state_key_file(
-                state_keys_path)
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Corpus canonical-state key file is missing: {state_keys_path}"
-            ) from exc
-        expected_state_digest = manifest.get("metrics", {}).get(
-            "state_set_sha256"
+        _cache_touch(
+            self._manifest_integrity_identity_cache,
+            manifest_cache_key,
+            dict(identities),
+            _MANIFEST_INTEGRITY_IDENTITY_CACHE_MAX,
         )
-        if expected_state_digest != actual_state_digest:
-            raise RuntimeError(
-                f"Corpus canonical-state fingerprint is invalid: {manifest_path}"
-            )
-        return state_keys
+        return self._verify_manifest_state_keys(manifest_path, manifest)
 
     # ------------------------------------------------------------------
     # Rebuilt lineage: an explicit, verified external predecessor
