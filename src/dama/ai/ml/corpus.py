@@ -288,6 +288,45 @@ def _directory_entry_stat(
         return entry, None, exc
 
 
+def _thread_map_in_order(
+    function: Any,
+    values: Sequence[Any],
+    *,
+    max_workers: int,
+    thread_name_prefix: str,
+) -> List[Any]:
+    """Map independent I/O in bounded chunks while preserving input order.
+
+    ``ThreadPoolExecutor.map`` submits one ``Future`` per value.  Corpus
+    admission maps 27 to 61 tiny metadata or warm digest-cache lookups at a
+    time, so future creation and condition-lock traffic can cost more than the
+    work itself.  One contiguous chunk per worker retains the same concurrency
+    and deterministic result order with at most ``max_workers`` submissions.
+    """
+
+    values = list(values)
+    if not values:
+        return []
+    workers = min(max(1, int(max_workers)), len(values))
+    chunk_size = (len(values) + workers - 1) // workers
+    chunks = [
+        values[start:start + chunk_size]
+        for start in range(0, len(values), chunk_size)
+    ]
+
+    def _map_chunk(chunk: Sequence[Any]) -> List[Any]:
+        return [function(value) for value in chunk]
+
+    results: List[Any] = []
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix=thread_name_prefix,
+    ) as pool:
+        for chunk_results in pool.map(_map_chunk, chunks):
+            results.extend(chunk_results)
+    return results
+
+
 def _directory_entry_stats(
     entries: Sequence[Any],
 ) -> List[Tuple[Any, Optional[os.stat_result], Optional[OSError]]]:
@@ -316,11 +355,12 @@ def _directory_entry_stats(
         return [_directory_entry_stat(entry) for entry in entries]
     if parallel is True:
         workers = min(_METADATA_STAT_WORKERS, len(entries))
-        with ThreadPoolExecutor(
+        return _thread_map_in_order(
+            _directory_entry_stat,
+            entries,
             max_workers=workers,
             thread_name_prefix="corpus-metadata",
-        ) as pool:
-            return list(pool.map(_directory_entry_stat, entries))
+        )
     # A thread pool is a large regression on a low-latency local filesystem
     # (the server profile normally uses one), while drvfs metadata is slow
     # enough to benefit by an order of magnitude.  Time a small prefix from
@@ -346,12 +386,12 @@ def _directory_entry_stats(
             _directory_entry_stat(entry) for entry in entries[probe_count:]
         ]
     workers = min(_METADATA_STAT_WORKERS, len(entries) - probe_count)
-    with ThreadPoolExecutor(
+    remainder = _thread_map_in_order(
+        _directory_entry_stat,
+        entries[probe_count:],
         max_workers=workers,
         thread_name_prefix="corpus-metadata",
-    ) as pool:
-        remainder = list(pool.map(
-            _directory_entry_stat, entries[probe_count:]))
+    )
     return prefix + remainder
 
 
@@ -1951,17 +1991,18 @@ class CorpusSnapshotManager:
             and total_size >= _PARALLEL_MANIFEST_HASH_MIN_BYTES
         ):
             workers = min(_MANIFEST_HASH_WORKERS, len(file_checks))
-            with ThreadPoolExecutor(
+            digest_results = _thread_map_in_order(
+                _verify_digest,
+                file_checks,
                 max_workers=workers,
                 thread_name_prefix="corpus-integrity",
-            ) as pool:
-                digest_results = pool.map(_verify_digest, file_checks)
-                for stored, matches in digest_results:
-                    if not matches:
-                        raise RuntimeError(
-                            "Corpus snapshot file failed integrity "
-                            f"verification: {stored}"
-                        )
+            )
+            for stored, matches in digest_results:
+                if not matches:
+                    raise RuntimeError(
+                        "Corpus snapshot file failed integrity "
+                        f"verification: {stored}"
+                    )
         else:
             for check in file_checks:
                 stored, matches = _verify_digest(check)
