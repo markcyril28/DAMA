@@ -226,6 +226,15 @@ class _ReplayWindowAnalysis:
     freshness_reference: Optional[AbstractSet[str]]
     fresh_state_keys: Set[str]
     fresh_record_count: int
+    # Validation and frozen-suite exclusions are immutable for ordinary
+    # production cycles. Retain only their two exact cardinalities and update
+    # them inside the existing one-shard rotation walk. Mutable references or a
+    # changed predecessor deliberately invalidate this acceleration.
+    exclusion_validation_reference: Optional[AbstractSet[str]]
+    exclusion_external_reference: Optional[AbstractSet[str]]
+    exclusion_freshness_reference: Optional[AbstractSet[str]]
+    excluded_state_count: int
+    fresh_excluded_state_count: int
 
 
 @dataclass
@@ -469,6 +478,28 @@ def _exclude_validation_state_keys(
     remaining = state_keys - validation_keys
     remaining.difference_update(external_validation_keys)
     return remaining
+
+
+def _validation_overlap_state_count(
+    state_keys: AbstractSet[str],
+    validation_keys: AbstractSet[str],
+    external_validation_keys: AbstractSet[str],
+) -> int:
+    """Count excluded keys without copying the full trainable complement.
+
+    Most generated candidates are below the freshness gate and never become a
+    snapshot. Their exact post-exclusion cardinalities are still required for
+    the decision metrics, but their hundreds-of-thousands-entry training set is
+    not. Intersect the two validation sources with the candidate and merge the
+    much smaller overlap so keys present in both sources are counted once.
+    """
+
+    validation_overlap = validation_keys.intersection(state_keys)
+    external_only = external_validation_keys.difference(validation_keys)
+    return (
+        len(validation_overlap)
+        + len(external_only.intersection(state_keys))
+    )
 
 
 def _sha256_file_uncached(path: Path) -> str:
@@ -1348,7 +1379,7 @@ class CorpusSnapshotManager:
         self.grow_holdout = bool(grow_holdout)
         self.enforce_policy_contract = bool(enforce_policy_contract)
         self.allowed_opening_plies = tuple(int(value) for value in allowed_opening_plies)
-        self.external_validation_state_keys: Set[str] = set()
+        self.external_validation_state_keys: AbstractSet[str] = frozenset()
         self.validation_split_version = int(validation_split_version)
         # An explicit external predecessor.  snapshot_v000012 was admitted with
         # a lost CURRENT pointer, so its recorded 100% freshness was an artifact
@@ -1392,7 +1423,8 @@ class CorpusSnapshotManager:
 
     def set_external_validation_state_keys(self, state_keys: Iterable[str]) -> None:
         """Exclude a frozen external validation suite from every train snapshot."""
-        self.external_validation_state_keys = {str(key) for key in state_keys}
+        self.external_validation_state_keys = frozenset(
+            str(key) for key in state_keys)
 
     @property
     def current_pointer(self) -> Path:
@@ -1578,6 +1610,11 @@ class CorpusSnapshotManager:
             freshness_reference=None,
             fresh_state_keys=set(),
             fresh_record_count=0,
+            exclusion_validation_reference=None,
+            exclusion_external_reference=None,
+            exclusion_freshness_reference=None,
+            excluded_state_count=0,
+            fresh_excluded_state_count=0,
         )
 
     @staticmethod
@@ -1608,6 +1645,34 @@ class CorpusSnapshotManager:
                     window.fresh_state_keys.add(key)
                 elif old_files > 0 and new_files == 0:
                     window.fresh_state_keys.discard(key)
+
+            validation_reference = window.exclusion_validation_reference
+            external_reference = window.exclusion_external_reference
+            if (
+                validation_reference is not None
+                and external_reference is not None
+                and (key in validation_reference or key in external_reference)
+            ):
+                unique_delta = 0
+                if old_files == 0 and new_files > 0:
+                    unique_delta = 1
+                elif old_files > 0 and new_files == 0:
+                    unique_delta = -1
+                window.excluded_state_count += unique_delta
+                if (
+                    unique_delta
+                    and freshness_reference is not None
+                    and window.exclusion_freshness_reference
+                    is freshness_reference
+                    and key not in freshness_reference
+                ):
+                    window.fresh_excluded_state_count += unique_delta
+                if (
+                    window.excluded_state_count < 0
+                    or window.fresh_excluded_state_count < 0
+                ):
+                    raise RuntimeError(
+                        "Rolling replay validation-overlap aggregate underflow")
 
             old_duplicate_records = (
                 old_records - 1 if old_files > 1 else 0)
@@ -1665,6 +1730,69 @@ class CorpusSnapshotManager:
             if isinstance(previous_state_keys, frozenset)
             else None
         )
+        # The fresh exclusion count was derived against the old predecessor.
+        # The next overlap request rebuilds it once against this exact set.
+        window.exclusion_freshness_reference = None
+
+    @staticmethod
+    def _refresh_replay_window_exclusion_counts(
+        window: _ReplayWindowAnalysis,
+        validation_keys: AbstractSet[str],
+        external_validation_keys: AbstractSet[str],
+    ) -> Tuple[int, int]:
+        """Rebuild exact excluded-state counts and cache only immutable inputs."""
+
+        excluded = _validation_overlap_state_count(
+            window.state_counts.keys(),
+            validation_keys,
+            external_validation_keys,
+        )
+        fresh_excluded = _validation_overlap_state_count(
+            window.fresh_state_keys,
+            validation_keys,
+            external_validation_keys,
+        )
+        window.excluded_state_count = excluded
+        window.fresh_excluded_state_count = fresh_excluded
+        if (
+            isinstance(validation_keys, frozenset)
+            and isinstance(external_validation_keys, frozenset)
+            and window.freshness_reference is not None
+        ):
+            window.exclusion_validation_reference = validation_keys
+            window.exclusion_external_reference = external_validation_keys
+            window.exclusion_freshness_reference = window.freshness_reference
+        else:
+            # A mutable set can change without changing identity. It receives
+            # exact counts for this call but can never drive incremental reuse.
+            window.exclusion_validation_reference = None
+            window.exclusion_external_reference = None
+            window.exclusion_freshness_reference = None
+        return excluded, fresh_excluded
+
+    def _rolling_validation_overlap_counts(
+        self,
+        validation_keys: AbstractSet[str],
+        external_validation_keys: AbstractSet[str],
+    ) -> Optional[Tuple[int, int]]:
+        """Return overlap counts maintained by the proven rolling-window path."""
+
+        window = self._replay_window_analysis
+        if window is None:
+            return None
+        if (
+            window.exclusion_validation_reference is validation_keys
+            and window.exclusion_external_reference is external_validation_keys
+            and window.exclusion_freshness_reference
+            is window.freshness_reference
+            and window.freshness_reference is not None
+        ):
+            return (
+                window.excluded_state_count,
+                window.fresh_excluded_state_count,
+            )
+        return self._refresh_replay_window_exclusion_counts(
+            window, validation_keys, external_validation_keys)
 
     def _analyze_replay_window(
         self,
@@ -1724,6 +1852,7 @@ class CorpusSnapshotManager:
             # completed window rather than incrementally mutating stale facts.
             if window.freshness_reference is not previous_state_keys:
                 window.freshness_reference = None
+                window.exclusion_freshness_reference = None
             old_ids = set(window.analyses)
             new_ids = set(current)
             removed_ids = old_ids.difference(new_ids)
@@ -1792,9 +1921,10 @@ class CorpusSnapshotManager:
         return metrics, unique_keys, new_unique
 
     def current_manifest_path(self) -> Optional[Path]:
-        if not self.current_pointer.exists():
+        try:
+            relative = self.current_pointer.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
             return None
-        relative = self.current_pointer.read_text(encoding="utf-8").strip()
         if not relative:
             return None
         path = self.snapshot_root / _read_relpath(relative)
@@ -2008,12 +2138,13 @@ class CorpusSnapshotManager:
                 f"Corpus manifest has no canonical-state key file: {manifest_path}"
             )
         state_keys_path = manifest_path.parent / state_keys_name
-        if not state_keys_path.is_file():
+        try:
+            state_keys, actual_state_digest = self._cached_state_key_file(
+                state_keys_path)
+        except FileNotFoundError as exc:
             raise RuntimeError(
                 f"Corpus canonical-state key file is missing: {state_keys_path}"
-            )
-        state_keys, actual_state_digest = self._cached_state_key_file(
-            state_keys_path)
+            ) from exc
         expected_state_digest = manifest.get("metrics", {}).get(
             "state_set_sha256"
         )
@@ -2795,8 +2926,11 @@ class CorpusSnapshotManager:
         # than repeating the previous cycle's.
         self._last_holdout_growth = None
         manifest_path = self.validation_manifest_path
-        if manifest_path.exists():
+        try:
             manifest = self._load_manifest(manifest_path)
+        except FileNotFoundError:
+            manifest = None
+        if manifest is not None:
             split = manifest.get("split", {})
             state_keys = self._verify_manifest_integrity(
                 manifest_path, manifest, "immutable_validation"
@@ -3055,27 +3189,34 @@ class CorpusSnapshotManager:
                 replay_identities,
             )
         )
-        train_keys = _exclude_validation_state_keys(
-            all_train_keys,
-            validation_keys,
-            self.external_validation_state_keys,
-        )
-        # ``train_keys`` is the exact complement of the validation overlap
-        # inside ``all_train_keys``.  Derive the overlap cardinality from those
-        # two sets instead of materializing a second, otherwise-unused set of
-        # every excluded key on each recurring admission check.
-        validation_overlap_count = len(all_train_keys) - len(train_keys)
-        # _analyze_replay_window already derived ``all_train_keys -
-        # previous_keys`` for its exact pre-validation novelty metrics.  Set
-        # difference is associative here, so excluding validation from that
-        # much smaller fresh set is exactly equivalent to walking every
-        # post-exclusion training key against the predecessor again.
-        new_keys = _exclude_validation_state_keys(
-            pre_validation_new_keys,
-            validation_keys,
-            self.external_validation_state_keys,
-        )
-        fresh_rate = (len(new_keys) / len(train_keys)) if train_keys else 0.0
+        # A rejected candidate needs exact post-validation cardinalities, not
+        # a materialized training-key complement. Count the much smaller
+        # validation overlap first and defer construction of ``train_keys``
+        # until a candidate can reach a durable digest or snapshot write.
+        rolling_overlap_counts = self._rolling_validation_overlap_counts(
+            validation_keys, self.external_validation_state_keys)
+        if rolling_overlap_counts is None:
+            validation_overlap_count = _validation_overlap_state_count(
+                all_train_keys,
+                validation_keys,
+                self.external_validation_state_keys,
+            )
+            fresh_validation_overlap_count = _validation_overlap_state_count(
+                pre_validation_new_keys,
+                validation_keys,
+                self.external_validation_state_keys,
+            )
+        else:
+            (
+                validation_overlap_count,
+                fresh_validation_overlap_count,
+            ) = rolling_overlap_counts
+        train_key_count = len(all_train_keys) - validation_overlap_count
+        fresh_key_count = (
+            len(pre_validation_new_keys) - fresh_validation_overlap_count)
+        fresh_rate = (
+            fresh_key_count / train_key_count if train_key_count else 0.0)
+        train_keys: Optional[Set[str]] = None
         # Audit Suggestion 9.  A growth event moves a whole *fresh* shard out of
         # training -- _grow_validation can only choose never-trained shards, by
         # design, because a trained one would measure memorisation.  The
@@ -3084,11 +3225,25 @@ class CorpusSnapshotManager:
         # it here, where the previous corpus is in hand, and record it in the
         # manifest so a stalled admission is explainable from artifacts alone.
         growth = self._last_holdout_growth or {}
-        withheld = set(growth.get("added_state_keys", ())).difference(train_keys)
+        if growth:
+            # Hold-out growth is rare and needs the exact transferred set for
+            # its counterfactual. Preserve the original full-set calculation
+            # on that path; the ceiling-bound recurring path stays cardinality
+            # only until its freshness verdict.
+            train_keys = _exclude_validation_state_keys(
+                all_train_keys,
+                validation_keys,
+                self.external_validation_state_keys,
+            )
+            withheld = set(growth.get("added_state_keys", ())).difference(
+                train_keys)
+        else:
+            withheld = set()
         withheld_fresh = withheld.difference(previous_keys)
-        counterfactual_denominator = len(train_keys) + len(withheld)
+        counterfactual_denominator = train_key_count + len(withheld)
         counterfactual_fresh_rate = (
-            (len(new_keys) + len(withheld_fresh)) / counterfactual_denominator
+            (fresh_key_count + len(withheld_fresh))
+            / counterfactual_denominator
             if counterfactual_denominator else 0.0
         )
 
@@ -3101,8 +3256,8 @@ class CorpusSnapshotManager:
             "validation_overlap_state_count_removed": validation_overlap_count,
             "external_validation_state_count": len(
                 self.external_validation_state_keys),
-            "post_dedup_unique_state_count": len(train_keys),
-            "fresh_unique_state_count": len(new_keys),
+            "post_dedup_unique_state_count": train_key_count,
+            "fresh_unique_state_count": fresh_key_count,
             "fresh_unique_state_rate": fresh_rate,
             # A rejected candidate is not a durable corpus artifact.  Defer its
             # O(u log u) sorted digest until the gate can admit it.  An exact
@@ -3169,8 +3324,8 @@ class CorpusSnapshotManager:
 
         candidate_matches_previous_keys = (
             previous_source is not None
-            and len(train_keys) == len(previous_keys)
-            and not new_keys
+            and train_key_count == len(previous_keys)
+            and fresh_key_count == 0
         )
         if (previous_source is not None
                 and fresh_rate < self.min_fresh_fraction
@@ -3185,6 +3340,12 @@ class CorpusSnapshotManager:
         if candidate_matches_previous_keys and previous_keys_digest is not None:
             metrics["state_set_sha256"] = previous_keys_digest
         else:
+            if train_keys is None:
+                train_keys = _exclude_validation_state_keys(
+                    all_train_keys,
+                    validation_keys,
+                    self.external_validation_state_keys,
+                )
             metrics["state_set_sha256"] = _state_set_digest(train_keys)
 
         fingerprint_payload = {
@@ -3209,6 +3370,13 @@ class CorpusSnapshotManager:
                 f"fresh_unique_state_rate {fresh_rate:.6f} is below {self.min_fresh_fraction:.6f}",
                 current_path,
                 metrics,
+            )
+
+        if train_keys is None:
+            train_keys = _exclude_validation_state_keys(
+                all_train_keys,
+                validation_keys,
+                self.external_validation_state_keys,
             )
 
         self.snapshot_root.mkdir(parents=True, exist_ok=True)
