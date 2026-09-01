@@ -1,6 +1,8 @@
 """Replay buffer management for training data."""
 
+import json
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,94 @@ except ImportError:
 # (stdlib and orjson) subclasses ValueError; KeyError/TypeError cover entry
 # dicts with missing fields or malformed structures in ReplayEntry.from_dict.
 _PARSE_ERRORS = (ValueError, KeyError, TypeError)
+
+# [Pass 181] Durable per-shard physical line counts for count_entries().
+# Replay shards are write-once, so a shard whose (size, mtime_ns) identity is
+# unchanged has exactly the line count it had when it was last read.  The
+# sidecar lives next to the shards, like generation_cycle_cache.json, and its
+# name matches neither ``replay_*.jsonl`` nor ``*.jsonl`` so every corpus and
+# replay glob keeps ignoring it.  Keys are shard basenames (no inode) so a
+# corpus relocated across mounts or machines stays warm.
+_ENTRY_COUNT_SIDECAR_NAME = 'entry_count_cache.json'
+_ENTRY_COUNT_SIDECAR_SCHEMA = 1
+
+
+def _count_replay_lines(path: Path) -> int:
+    """Count the physical lines of one replay shard.
+
+    Text-mode iteration, so the count matches the line enumeration used by
+    ``sample_entries()``: an unterminated trailing line counts as a line.
+    """
+    with open(path, 'r') as fh:
+        return sum(1 for _ in fh)
+
+
+def _load_entry_count_sidecar(replay_dir: Path) -> Dict[str, tuple]:
+    """Load persisted (size, mtime_ns, count) triples per shard basename.
+
+    Best-effort by contract: any read or parse problem yields an empty
+    mapping and count_entries() re-derives the counts from the shards.
+    """
+    sidecar = replay_dir / _ENTRY_COUNT_SIDECAR_NAME
+    try:
+        raw = json.loads(sidecar.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict) or raw.get('schema') != _ENTRY_COUNT_SIDECAR_SCHEMA:
+        return {}
+    entries = raw.get('entries')
+    if not isinstance(entries, dict):
+        return {}
+    loaded: Dict[str, tuple] = {}
+    for name, record in entries.items():
+        if not isinstance(name, str) or not isinstance(record, list):
+            continue
+        if len(record) != 3:
+            continue
+        size, mtime_ns, count = record
+        if not all(isinstance(v, int) and not isinstance(v, bool)
+                   for v in (size, mtime_ns, count)):
+            continue
+        if size < 0 or count < 0:
+            continue
+        loaded[name] = (size, mtime_ns, count)
+    return loaded
+
+
+def _save_entry_count_sidecar(replay_dir: Path, entries: Dict[str, tuple]) -> bool:
+    """Persist per-shard line counts atomically; report whether written.
+
+    Always temp file + fsync + ``os.replace``: an in-place rewrite would go
+    through a shared inode when the replay directory is a hardlink copy of
+    another one (probes build such copies), and a torn write must never be
+    observable.
+    """
+    payload = {
+        'schema': _ENTRY_COUNT_SIDECAR_SCHEMA,
+        'entries': {
+            name: [size, mtime_ns, count]
+            for name, (size, mtime_ns, count) in sorted(entries.items())
+        },
+    }
+    sidecar = replay_dir / _ENTRY_COUNT_SIDECAR_NAME
+    temp_name = ''
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            dir=str(replay_dir), prefix='.entry_count_cache.', suffix='.tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, sidecar)
+        temp_name = ''
+        return True
+    except OSError:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        return False
 
 
 @dataclass
@@ -110,10 +200,22 @@ class ReplayBuffer:
     Stores replay data as JSONL files in the replay directory.
     """
 
-    def __init__(self, replay_dir: str = "data/replay", max_files: int = 100):
+    def __init__(
+        self,
+        replay_dir: str = "data/replay",
+        max_files: int = 100,
+        *,
+        cache_written_entries: bool = True,
+    ):
         self.replay_dir = Path(replay_dir)
         self.replay_dir.mkdir(parents=True, exist_ok=True)
         self.max_files = max_files
+        # Legacy training reads replay through load_all_entries(), where keeping
+        # newly written entries avoids an immediate JSON parse.  Snapshot-mode
+        # training reads the immutable shard through CorpusSnapshotManager and
+        # never consumes this cache, so retaining each cycle's complete Python
+        # object graph only spends session RAM.  See Journal Pass 183.
+        self._cache_written_entries = bool(cache_written_entries)
         self._current_file = None
         self._current_writer = None
         # Incremental file cache: {path: (mtime, [ReplayEntry, ...])}
@@ -126,6 +228,14 @@ class ReplayBuffer:
         # Raw dicts from add_entry_dicts() — defers ReplayEntry creation to close().
         # Merged into _session_entries on _close_current() to avoid per-call overhead.
         self._session_dicts: Dict[Path, List[dict]] = {}
+        # [Pass 181] Physical line count per shard basename, keyed by
+        # (size, mtime_ns, count) and persisted to _ENTRY_COUNT_SIDECAR_NAME so
+        # count_entries() never re-reads an unchanged write-once shard.  On
+        # drvfs the 60-file window cost ~14 s of reads per self-play cycle
+        # for a statistic.  The sidecar is loaded lazily on first use.
+        self._entry_count_cache: Dict[str, tuple] = {}
+        self._entry_count_sidecar_loaded = False
+        self._entry_count_dirty = False
 
     def start_new_file(self) -> Path:
         """Start a new replay file."""
@@ -200,20 +310,45 @@ class ReplayBuffer:
             finally:
                 self._current_writer = None
             # Promote in-memory entries to file cache so load_all_entries()
-            # skips re-parsing the file we just wrote.
+            # skips re-parsing the file we just wrote.  Snapshot-mode callers
+            # opt out: validate the same records, remember their exact physical
+            # line count, then release the object graph after the durable shard
+            # has closed.  CorpusSnapshotManager is that mode's reader.
             path = self._current_file
             if path is not None:
-                # Convert any deferred dicts to ReplayEntry now (bulk conversion)
                 deferred = self._session_dicts.pop(path, None)
-                if deferred:
-                    entries = [ReplayEntry.from_dict(d) for d in deferred]
-                    self._session_entries.setdefault(path, []).extend(entries)
-                if path in self._session_entries:
-                    try:
-                        mtime = path.stat().st_mtime
-                        self._file_cache[path] = (mtime, self._session_entries.pop(path))
-                    except OSError:
-                        self._session_entries.pop(path, None)
+                if self._cache_written_entries:
+                    # Convert any deferred dicts to ReplayEntry now (bulk conversion)
+                    if deferred:
+                        entries = [ReplayEntry.from_dict(d) for d in deferred]
+                        self._session_entries.setdefault(path, []).extend(entries)
+                    if path in self._session_entries:
+                        try:
+                            st = path.stat()
+                            entries = self._session_entries.pop(path)
+                            self._file_cache[path] = (st.st_mtime, entries)
+                            # Every add_* call wrote exactly one line per entry to
+                            # a file opened 'w', so the promoted length is this
+                            # shard's physical line count; make it durable.
+                            self._remember_entry_count(path.name, st, len(entries))
+                        except OSError:
+                            self._session_entries.pop(path, None)
+                else:
+                    # Preserve ReplayEntry.from_dict's bounds/type validation
+                    # without retaining the resulting wrappers.  Values remain
+                    # referenced by ``deferred`` until the validation completes.
+                    if deferred:
+                        for record in deferred:
+                            ReplayEntry.from_dict(record)
+                    entries = self._session_entries.pop(path, None)
+                    entry_count = len(deferred or ()) + len(entries or ())
+                    if entry_count:
+                        try:
+                            st = path.stat()
+                            self._remember_entry_count(
+                                path.name, st, entry_count)
+                        except OSError:
+                            pass
             self._current_file = None
 
     def close(self) -> None:
@@ -256,6 +391,7 @@ class ReplayBuffer:
         self._file_cache.pop(path, None)
         self._session_entries.pop(path, None)
         self._session_dicts.pop(path, None)
+        self._forget_entry_count(path.name)
         return path
 
     def get_replay_files(self) -> List[Path]:
@@ -292,6 +428,7 @@ class ReplayBuffer:
             self._file_cache.pop(f, None)
             self._session_entries.pop(f, None)
             self._session_dicts.pop(f, None)
+            self._forget_entry_count(f.name)
 
         return deleted
 
@@ -313,51 +450,128 @@ class ReplayBuffer:
         self._file_cache.clear()
         self._session_entries.clear()
         self._session_dicts.clear()
+        if self._entry_count_cache:
+            self._entry_count_cache.clear()
+            self._entry_count_dirty = True
         return deleted
+
+    # ------------------------------------------------------------------
+    # [Pass 181] Durable per-shard line counts
+    # ------------------------------------------------------------------
+
+    def _remember_entry_count(self, name: str, st: os.stat_result, count: int) -> None:
+        """Record a shard's physical line count under its (size, mtime_ns)."""
+        record = (int(st.st_size), int(st.st_mtime_ns), int(count))
+        if self._entry_count_cache.get(name) != record:
+            self._entry_count_cache[name] = record
+            self._entry_count_dirty = True
+
+    def _forget_entry_count(self, name: str) -> None:
+        """Drop a deleted shard's record so the sidecar is pruned on next save."""
+        if self._entry_count_cache.pop(name, None) is not None:
+            self._entry_count_dirty = True
+
+    def _ensure_entry_count_sidecar_loaded(self) -> None:
+        """Merge the persisted sidecar under any records this session made."""
+        if self._entry_count_sidecar_loaded:
+            return
+        self._entry_count_sidecar_loaded = True
+        loaded = _load_entry_count_sidecar(self.replay_dir)
+        if not loaded:
+            self._entry_count_dirty = self._entry_count_dirty or bool(self._entry_count_cache)
+            return
+        merged = dict(loaded)
+        merged.update(self._entry_count_cache)
+        if merged != loaded:
+            self._entry_count_dirty = True
+        self._entry_count_cache = merged
+
+    def _persist_entry_counts(self, live_names) -> None:
+        """Write the sidecar when it may differ from memory; prune dead shards."""
+        if not self._entry_count_dirty:
+            return
+        live = {
+            name: record for name, record in self._entry_count_cache.items()
+            if name in live_names
+        }
+        if _save_entry_count_sidecar(self.replay_dir, live):
+            self._entry_count_cache = live
+            self._entry_count_dirty = False
 
     def count_entries(self) -> int:
         """Count total entries across all files.
 
-        Uses cached entry counts where available (file cache + session cache)
-        and only reads uncached files from disk. ~500 bytes/entry estimate for
-        files not yet loaded.
+        Uses cached entry counts where available (session cache, file cache,
+        then the durable per-shard line-count cache) and reads only shards
+        whose (size, mtime_ns) identity has never been counted.  A shard is
+        therefore read at most once in its lifetime, instead of once per
+        self-play cycle for every file not written by this session.
         """
         files = self.get_replay_files()
         if not files:
             return 0
 
+        self._ensure_entry_count_sidecar_loaded()
+        open_file = self._current_file if self._current_writer is not None else None
+
         total = 0
-        uncached_files = []
+        live_names = set()
+        uncached_files = []  # (path, size, mtime_ns)
         for f in files:
-            # Check session entries first (not yet promoted to file cache)
+            live_names.add(f.name)
+            # Check session entries first (not yet promoted to file cache).
+            # The open writer's shard is counted here; its identity is still
+            # changing, so it is never persisted until _close_current().
             session_count = len(self._session_entries.get(f, ()))
             session_count += len(self._session_dicts.get(f, ()))
             if session_count > 0:
                 total += session_count
                 continue
+            try:
+                st = f.stat()
+            except OSError:
+                # Rotated away between the glob and the stat: not live.
+                live_names.discard(f.name)
+                continue
             # Check file cache (promoted after close)
             cached = self._file_cache.get(f)
-            if cached is not None:
-                try:
-                    if f.stat().st_mtime == cached[0]:
-                        total += len(cached[1])
-                        continue
-                except OSError:
-                    pass
-            uncached_files.append(f)
+            if cached is not None and st.st_mtime == cached[0]:
+                total += len(cached[1])
+                continue
+            if f == open_file:
+                continue
+            persisted = self._entry_count_cache.get(f.name)
+            if (persisted is not None
+                    and persisted[0] == st.st_size
+                    and persisted[1] == st.st_mtime_ns):
+                total += persisted[2]
+                continue
+            uncached_files.append((f, st.st_size, st.st_mtime_ns))
 
         if uncached_files:
-            def _count_file(path: Path) -> int:
-                with open(path, 'r') as fh:
-                    return sum(1 for _ in fh)
-
             with ThreadPoolExecutor(max_workers=min(8, len(uncached_files))) as executor:
-                futures = {executor.submit(_count_file, p): p for p in uncached_files}
+                futures = {
+                    executor.submit(_count_replay_lines, p): (p, size, mtime_ns)
+                    for p, size, mtime_ns in uncached_files
+                }
                 for future in as_completed(futures):
+                    path, size, mtime_ns = futures[future]
                     try:
-                        total += future.result()
+                        count = future.result()
                     except Exception as e:
-                        print(f"  Warning: failed to count replay file {futures[future]}: {e}")
+                        print(f"  Warning: failed to count replay file {path}: {e}")
+                        continue
+                    total += count
+                    # Persist only when the shard is provably the one that
+                    # was read: a changed identity means the count is stale.
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    if st.st_size == size and st.st_mtime_ns == mtime_ns:
+                        self._remember_entry_count(path.name, st, count)
+
+        self._persist_entry_counts(live_names)
         return total
 
     def iterate_entries(self, shuffle_files: bool = True) -> Iterator[ReplayEntry]:
