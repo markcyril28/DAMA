@@ -136,6 +136,32 @@ def test_selfplay_executor_shutdown_escalates_only_lingering_workers() -> None:
     assert stuck.kill_calls == 1
 
 
+def test_selfplay_batch_consumer_releases_future_delivery_list() -> None:
+    first = {"state": 1}
+    second = {"state": 2}
+    delivered = [first, second]
+    retained = []
+
+    def _consume(entries, game_count):
+        assert game_count == 2
+        retained.extend(entries)
+
+    trainer_module._consume_and_release_selfplay_batch(
+        delivered, 2, _consume)
+
+    assert delivered == []
+    assert retained == [first, second]
+
+    failed = [{"state": 3}]
+
+    def _fail(_entries, _game_count):
+        raise RuntimeError("synthetic consume failure")
+
+    with pytest.raises(RuntimeError, match="synthetic consume failure"):
+        trainer_module._consume_and_release_selfplay_batch(
+            failed, 1, _fail)
+    assert failed == []
+
 def test_training_stats_separate_current_dataset_and_historical_loss() -> None:
     stats = TrainingStats.from_dict({
         "best_loss": 0.0345,
@@ -1323,6 +1349,54 @@ def test_runtime_model_root_and_cleanup_removes_temporary_files(
     holder._cleanup_runtime_model_file(temp_path2)
     holder._cleanup_runtime_models_dir()
     assert not temp_path.parent.exists()
+
+
+def test_runtime_model_checkpoint_staging_skips_only_optional_disk_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fork staging streams exact loadable bytes without a model-sized copy."""
+    import torch
+
+    checkpoint = {
+        "model_state_dict": {"weight": torch.arange(6).reshape(2, 3)},
+        "arch_params": {"channels": 2},
+        "encoding_version": 2,
+        "step": 17,
+    }
+    path = tmp_path / "temp_selfplay_model.pt"
+    created_sinks = []
+    real_sink = trainer_module._RuntimeCheckpointHashSink
+
+    class TrackingSink(real_sink):
+        def __init__(self) -> None:
+            super().__init__()
+            created_sinks.append(self)
+
+    monkeypatch.setattr(
+        trainer_module, "_RuntimeCheckpointHashSink", TrackingSink)
+
+    memory_digest = trainer_module._stage_runtime_model_checkpoint(
+        checkpoint, path, persist_to_disk=False)
+
+    assert not path.exists()
+    assert len(memory_digest) == 64
+    assert memory_digest == memory_digest.upper()
+    assert len(created_sinks) == 1
+
+    disk_digest = trainer_module._stage_runtime_model_checkpoint(
+        checkpoint, path, persist_to_disk=True)
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert disk_digest == hashlib.sha256(path.read_bytes()).hexdigest().upper()
+    assert disk_digest == memory_digest
+    assert created_sinks[0].tell() == path.stat().st_size
+    assert loaded["step"] == checkpoint["step"]
+    assert loaded["arch_params"] == checkpoint["arch_params"]
+    assert torch.equal(
+        loaded["model_state_dict"]["weight"],
+        checkpoint["model_state_dict"]["weight"],
+    )
 
 
 def test_existing_frozen_suite_overlap_is_filtered_on_restart(
