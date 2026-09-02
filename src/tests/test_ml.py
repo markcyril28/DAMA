@@ -303,6 +303,33 @@ class TestModel:
         
         model = create_model()
         assert isinstance(model, MoveScorerNet)
+
+    def test_model_creation_can_skip_only_custom_weight_initialization(
+        self, monkeypatch
+    ):
+        """Inference copies preserve ordinary buffers without a second init."""
+        from dama.ai.ml import model as model_module
+
+        calls = []
+
+        def recording_init(model):
+            calls.append(model)
+
+        monkeypatch.setattr(
+            model_module.MoveScorerNet, "_init_weights", recording_init)
+        copied = model_module.create_model(
+            embedding_size=8,
+            num_blocks=1,
+            hidden_size=8,
+            channels=4,
+            initialize_weights=False,
+        )
+        assert calls == []
+        assert torch.equal(copied._mask_arange, torch.arange(64))
+
+        model_module.create_model(
+            embedding_size=8, num_blocks=1, hidden_size=8, channels=4)
+        assert len(calls) == 1
     
     def test_model_forward(self):
         """Test model forward pass."""
@@ -340,6 +367,59 @@ class TestModel:
         torch.save(checkpoint, legacy_path)
         with pytest.warns(RuntimeWarning, match='encoding version 1'):
             assert load_model(str(legacy_path), torch.device('cpu')) is not None
+
+    def test_cpu_checkpoint_mmap_preserves_legacy_archive_compatibility(
+        self, monkeypatch, tmp_path
+    ):
+        """CPU inference maps current archives and retries only legacy format."""
+        from dama.ai.ml import model as model_module
+
+        network = model_module.create_model()
+        current_path = tmp_path / 'current.pt'
+        model_module.save_model(network, str(current_path))
+        checkpoint = torch.load(current_path, weights_only=True)
+
+        legacy_path = tmp_path / 'legacy-format.pt'
+        torch.save(
+            checkpoint,
+            legacy_path,
+            _use_new_zipfile_serialization=False,
+        )
+
+        real_load = torch.load
+        calls = []
+
+        def recording_load(*args, **kwargs):
+            calls.append(kwargs.get('mmap'))
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(model_module.torch, 'load', recording_load)
+
+        assert model_module.load_model(
+            str(current_path), torch.device('cpu')) is not None
+        assert calls == [True]
+
+        calls.clear()
+        assert model_module.load_model(
+            str(legacy_path), torch.device('cpu')) is not None
+        assert calls == [True, None]
+
+    def test_cpu_checkpoint_mmap_does_not_mask_other_load_errors(
+        self, monkeypatch
+    ):
+        """A corrupt mmap load fails closed instead of retrying unverified data."""
+        from dama.ai.ml import model as model_module
+
+        calls = []
+
+        def broken_load(*args, **kwargs):
+            calls.append(kwargs.get('mmap'))
+            raise RuntimeError('checkpoint payload is corrupt')
+
+        monkeypatch.setattr(model_module.torch, 'load', broken_load)
+        with pytest.raises(RuntimeError, match='payload is corrupt'):
+            model_module.load_model('corrupt.pt', torch.device('cpu'))
+        assert calls == [True]
 
     def test_teacher_difficulties_are_assigned_to_both_sides(self):
         """Mixed teacher strengths must be generated in both orientations."""
