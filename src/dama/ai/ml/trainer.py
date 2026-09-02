@@ -158,10 +158,16 @@ def _stage_runtime_model_checkpoint(
 
     Linux fork workers inherit the already-folded CPU model, so writing the
     fallback checkpoint to drvfs only to read it back for SHA-256 is redundant.
-    Serializing into memory keeps the provenance digest tied to a real,
-    loadable checkpoint payload. Spawn workers and failed fork-model builds
-    persist those same bytes for ``get_model()``.
+    Streaming the discarded fork-only archive through a digest sink keeps the
+    provenance tied to the exact loadable ``torch.save`` bytes without owning
+    a second model-sized buffer. Spawn workers and failed fork-model builds
+    retain the buffered bytes needed by ``get_model()``.
     """
+
+    if not persist_to_disk:
+        sink = _RuntimeCheckpointHashSink()
+        torch.save(checkpoint, sink)
+        return sink.hexdigest()
 
     buffer = io.BytesIO()
     torch.save(checkpoint, buffer)
@@ -175,6 +181,31 @@ def _stage_runtime_model_checkpoint(
         serialized.release()
         buffer.close()
     return digest
+
+
+class _RuntimeCheckpointHashSink:
+    """Tellable write-only stream that hashes exact ``torch.save`` bytes."""
+
+    __slots__ = ("_digest", "_position")
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._position = 0
+
+    def write(self, payload) -> int:
+        self._digest.update(payload)
+        length = len(payload)
+        self._position += length
+        return length
+
+    def flush(self) -> None:
+        pass
+
+    def tell(self) -> int:
+        return self._position
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest().upper()
 
 
 def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
