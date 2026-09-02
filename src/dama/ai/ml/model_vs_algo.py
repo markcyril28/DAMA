@@ -17,6 +17,24 @@ from ...game_state import GameState
 from .acceptance import WILSON_95_METHOD, wdl_summary
 
 
+def _evaluation_worker_init() -> None:
+    """Keep each spawned evaluator to one PyTorch compute thread.
+
+    Evaluation already parallelizes across processes.  A spawn worker starts a
+    fresh Python runtime, so it does not inherit the trainer's one-thread
+    PyTorch setting and can otherwise create a full intra-op pool of its own.
+    """
+    import torch
+
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch permits setting inter-op width only before parallel work.
+        # Fresh spawn workers take the primary path; keep direct reuse safe.
+        pass
+
+
 class TestResult(Enum):
     """Result of a single test game."""
     ML_WIN = "ml_win"
@@ -748,6 +766,7 @@ class ModelVsAlgoTester:
         opening_seed: Optional[int] = 1234,
         opponent_type: str = "algorithm",
         ml_inference_depth: int = 1,
+        executor: Optional[ProcessPoolExecutor] = None,
     ):
         self.model_path = model_path
         self.algo_difficulty = algo_difficulty
@@ -765,6 +784,11 @@ class ModelVsAlgoTester:
         if isinstance(ml_inference_depth, bool) or ml_inference_depth not in (1, 2, 3):
             raise ValueError("ml_inference_depth must be one of 1, 2, or 3")
         self.ml_inference_depth = ml_inference_depth
+        # Acceptance evaluates random and easy sequentially against the same
+        # checkpoint.  An injected executor keeps the spawned workers and their
+        # folded CPU-model caches alive across both phases.  Standalone callers
+        # retain the established one-pool-per-run lifecycle.
+        self._executor = executor
 
         self._running = False
         self._games_completed = 0
@@ -867,23 +891,32 @@ class ModelVsAlgoTester:
                 self.ml_inference_depth,
             ))
 
-        # Use 'spawn' context so child processes don't inherit
-        # the parent's CUDA state (fork + CUDA = "Cannot re-initialize CUDA")
-        spawn_ctx = mp.get_context('spawn')
+        def _consume_parallel(executor: ProcessPoolExecutor) -> None:
+            futures = [executor.submit(_play_test_games_batch, batch)
+                       for batch in batches]
+
+            for future in as_completed(futures):
+                if not self._running:
+                    break
+
+                try:
+                    for record_data in future.result():
+                        _ingest_result(record_data)
+                except Exception as e:
+                    print(f"Test batch error: {e}")
+
         try:
-            with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=spawn_ctx) as executor:
-                futures = [executor.submit(_play_test_games_batch, batch)
-                           for batch in batches]
-
-                for future in as_completed(futures):
-                    if not self._running:
-                        break
-
-                    try:
-                        for record_data in future.result():
-                            _ingest_result(record_data)
-                    except Exception as e:
-                        print(f"Test batch error: {e}")
+            if self._executor is not None:
+                _consume_parallel(self._executor)
+            else:
+                # Use 'spawn' so children never inherit the parent's CUDA state.
+                spawn_ctx = mp.get_context('spawn')
+                with ProcessPoolExecutor(
+                    max_workers=self.num_workers,
+                    mp_context=spawn_ctx,
+                    initializer=_evaluation_worker_init,
+                ) as executor:
+                    _consume_parallel(executor)
 
         except Exception as e:
             print(f"Parallel testing failed ({e}), falling back to sequential")
