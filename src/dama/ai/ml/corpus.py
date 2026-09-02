@@ -117,6 +117,10 @@ _METADATA_STAT_PARALLEL_BY_PARENT: "OrderedDict[str, bool]" = OrderedDict()
 # Probe-only switch used by mirrored performance controls. Production keeps
 # the compiled batch enabled whenever it imported successfully.
 _FAST_METADATA_STAT_ENABLED = True
+# A final identity transaction already owns its exact path set. On a parent
+# proven slow by the adaptive probe above, stat those paths in one native batch
+# instead of rescanning the directory only to recover the same names.
+_FAST_METADATA_PATH_VERIFY_ENABLED = True
 
 # ``gzip.GzipFile`` text iteration pays substantial per-line overhead for the
 # fixed-width canonical-key files on drvfs.  Small key files can instead take
@@ -360,6 +364,50 @@ def _native_directory_entry_stats(
             return None
         else:
             results.append((entry, _FastStatResult(*map(int, fields)), None))
+    return results
+
+
+def _native_path_stats(
+    paths: Sequence[Path],
+) -> Optional[List[Tuple[Path, Optional[Any], Optional[OSError]]]]:
+    """Run one exact native path-stat batch, or decline to the fallback."""
+
+    paths = [Path(path) for path in paths]
+    if (
+        not _FAST_METADATA_STAT_ENABLED
+        or not _FAST_METADATA_PATH_VERIFY_ENABLED
+        or _fast_stat_paths is None
+        or len(paths) < _PARALLEL_METADATA_STAT_MIN_FILES
+    ):
+        return None
+    parents = {
+        os.path.abspath(os.path.dirname(os.fspath(path))) for path in paths
+    }
+    with _METADATA_STAT_STRATEGY_LOCK:
+        if any(
+            _METADATA_STAT_PARALLEL_BY_PARENT.get(parent) is not True
+            for parent in parents
+        ):
+            return None
+    try:
+        raw_results = _fast_stat_paths(
+            [os.fspath(path) for path in paths],
+            min(_NATIVE_METADATA_STAT_WORKERS, len(paths)),
+        )
+    except Exception:
+        return None
+    if len(raw_results) != len(paths):
+        return None
+    results = []
+    for path, (fields, error_number) in zip(paths, raw_results):
+        if error_number:
+            error = OSError(
+                int(error_number), os.strerror(int(error_number)), str(path))
+            results.append((path, None, error))
+        elif fields is None or len(fields) != 5:
+            return None
+        else:
+            results.append((path, _FastStatResult(*map(int, fields)), None))
     return results
 
 
@@ -1602,12 +1650,30 @@ class CorpusSnapshotManager:
     ) -> None:
         """Fail closed if any shard changed during an admission transaction.
 
-        Replay shards normally share one directory.  A separate ``Path.stat``
+        Replay shards normally share one directory. A separate ``Path.stat``
         for each file turns the mandatory final transaction check into dozens
-        of drvfs metadata round trips.  Scan each parent once and reuse the
-        ``DirEntry`` metadata, while retaining the exact path, device, inode,
-        size, and nanosecond-mtime comparison for every observed shard.
+        of drvfs metadata round trips. Once that parent is proven slow, the
+        optional native helper stats the already-known exact paths directly;
+        otherwise scan each parent once and reuse its ``DirEntry`` metadata.
+        Both paths retain the exact pathname, device, inode, size, and
+        nanosecond-mtime comparison for every observed shard.
         """
+
+        observed_paths = [Path(path) for path in identities]
+        native_stats = _native_path_stats(observed_paths)
+        if native_stats is not None:
+            for path, stat_result, error in native_stats:
+                if error is not None or stat_result is None:
+                    raise RuntimeError(
+                        "Replay file disappeared during corpus analysis: "
+                        f"{path}"
+                    ) from error
+                actual = _replay_file_identity_from_stat(path, stat_result)
+                if actual != identities[path]:
+                    raise RuntimeError(
+                        f"Replay file changed during corpus analysis: {path}"
+                    )
+            return
 
         by_parent: Dict[Path, Dict[str, Tuple[Path, _ReplayFileIdentity]]] = {}
         for observed_path, expected in identities.items():
