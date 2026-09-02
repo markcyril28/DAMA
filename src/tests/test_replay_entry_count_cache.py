@@ -13,11 +13,12 @@ import fnmatch
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
 from dama.ai.ml import replay as replay_mod
-from dama.ai.ml.replay import _ENTRY_COUNT_SIDECAR_NAME, ReplayBuffer
+from dama.ai.ml.replay import _ENTRY_COUNT_SIDECAR_NAME, ReplayBuffer, ReplayEntry
 
 
 def _entry(i):
@@ -222,7 +223,30 @@ def test_empty_directory_counts_zero_without_sidecar(tmp_path):
     replay_dir = tmp_path / "replay"
     buf = ReplayBuffer(str(replay_dir), max_files=0)
     assert buf.count_entries() == 0
+    assert buf.get_buffer_state() == (0, 0, 0)
     assert not (replay_dir / _ENTRY_COUNT_SIDECAR_NAME).exists()
+
+
+def test_buffer_state_reuses_one_shard_identity_snapshot(tmp_path, monkeypatch):
+    replay_dir = tmp_path / "replay"
+    buf, paths = _write_shards(replay_dir, [2, 4, 6])
+    assert buf.count_entries() == 12
+
+    fresh = ReplayBuffer(str(replay_dir), max_files=0)
+    file_stats = fresh._replay_file_stats()
+    expected_bytes = sum(stat.st_size for _, stat in file_stats)
+    monkeypatch.setattr(fresh, "_replay_file_stats", lambda: file_stats)
+
+    # A warm exact count must consume the captured stat results directly.  Any
+    # Path.stat() below would be the duplicate drvfs transaction this API exists
+    # to remove (uncached or changed shards still recheck after reading).
+    def _unexpected_stat(*_args, **_kwargs):
+        raise AssertionError("warm buffer state repeated a shard stat")
+
+    monkeypatch.setattr(Path, "stat", _unexpected_stat)
+    _forbid_reads(monkeypatch)
+    assert fresh.get_buffer_state() == (12, len(paths), expected_bytes)
+    assert fresh.count_entries() == 12
 
 
 def test_snapshot_writer_releases_closed_entries_but_preserves_exact_reload(tmp_path):
@@ -233,12 +257,16 @@ def test_snapshot_writer_releases_closed_entries_but_preserves_exact_reload(tmp_
     records = [_entry(i) for i in range(7)]
     buf.add_entry_dicts(records)
 
-    # An open shard remains exactly countable, but closing it must release the
-    # object graph instead of promoting it to the legacy parsed-entry cache.
+    # An open shard remains exactly countable without retaining the nested raw
+    # dictionaries, and closing it must not promote a parsed-entry cache.
     assert buf.count_entries() == 7
+    assert buf._session_dicts == {}
+    assert buf._session_entries == {}
+    assert buf._session_entry_counts == {shard: 7}
     buf.close()
     assert buf._session_dicts == {}
     assert buf._session_entries == {}
+    assert buf._session_entry_counts == {}
     assert buf._file_cache == {}
     assert buf.count_entries() == 7
     st = shard.stat()
@@ -252,15 +280,94 @@ def test_snapshot_writer_releases_closed_entries_but_preserves_exact_reload(tmp_
     assert len(buf._file_cache) == 1
 
 
-def test_snapshot_writer_still_validates_deferred_dicts_on_close(tmp_path):
+def test_snapshot_writer_buffers_batches_until_cycle_close(tmp_path):
+    """Snapshot cycles coalesce writes while legacy readers still see flushes."""
+
+    snapshot_dir = tmp_path / "snapshot_replay"
+    snapshot = ReplayBuffer(
+        str(snapshot_dir), max_files=0, cache_written_entries=False)
+    snapshot_shard = snapshot.start_new_file()
+    records = [_entry(0), _entry(1)]
+    snapshot.add_entry_dicts(records)
+
+    # The active snapshot path keeps small batches in its bounded userspace
+    # buffer. Integer-only session accounting keeps it exactly countable.
+    assert snapshot_shard.stat().st_size == 0
+    assert snapshot.count_entries() == len(records)
+    assert snapshot._session_dicts == {}
+    assert snapshot._session_entry_counts == {snapshot_shard: len(records)}
+    snapshot.close()
+    assert snapshot_shard.stat().st_size > 0
+    assert [entry.to_dict() for entry in snapshot.load_all_entries()] == records
+
+    legacy_dir = tmp_path / "legacy_replay"
+    legacy = ReplayBuffer(str(legacy_dir), max_files=0)
+    legacy_shard = legacy.start_new_file()
+    legacy.add_entry_dicts(records)
+
+    # Default callers retain the established per-batch visibility contract.
+    assert legacy_shard.stat().st_size > 0
+    legacy.close()
+
+
+def test_snapshot_writer_quarantines_deferred_close_failure(tmp_path):
+    """A buffered close error cannot publish an incomplete snapshot shard."""
+
+    replay_dir = tmp_path / "replay"
+    buf = ReplayBuffer(
+        str(replay_dir), max_files=0, cache_written_entries=False)
+    shard = buf.start_new_file()
+    buf.add_entry_dicts([_entry(0)])
+    real_writer = buf._current_writer
+
+    class FailingClose:
+        def close(self):
+            real_writer.close()
+            raise OSError("synthetic deferred flush failure")
+
+    buf._current_writer = FailingClose()
+    with pytest.raises(OSError, match="synthetic deferred flush failure"):
+        buf.close()
+
+    assert not shard.exists()
+    assert buf._current_file is None
+    assert buf._session_dicts == {}
+    assert buf._session_entries == {}
+    assert buf._session_entry_counts == {}
+
+
+def test_snapshot_writer_validates_dicts_before_buffering_them(tmp_path):
     replay_dir = tmp_path / "replay"
     buf = ReplayBuffer(
         str(replay_dir), max_files=0, cache_written_entries=False)
     invalid = _entry(0)
     invalid["chosen_index"] = len(invalid["legal_moves"])
-    buf.add_entry_dicts([invalid])
     with pytest.raises(ValueError, match="chosen_index"):
-        buf.close()
+        buf.add_entry_dicts([invalid])
+    assert buf._session_dicts == {}
+    assert buf._session_entry_counts == {}
+    buf.discard_current_file()
+
+
+def test_snapshot_writer_counts_typed_entries_without_retaining_them(tmp_path):
+    replay_dir = tmp_path / "replay"
+    buf = ReplayBuffer(
+        str(replay_dir), max_files=0, cache_written_entries=False)
+    shard = buf.start_new_file()
+    first = ReplayEntry.from_dict(_entry(0))
+    remaining = [ReplayEntry.from_dict(_entry(i)) for i in (1, 2)]
+    buf.add_entry(first)
+    buf.add_entries(remaining)
+
+    assert buf._session_entries == {}
+    assert buf._session_entry_counts == {shard: 3}
+    assert buf.count_entries() == 3
+    buf.close()
+    assert buf._session_entry_counts == {}
+    assert buf.count_entries() == 3
+    st = shard.stat()
+    assert _sidecar(replay_dir)["entries"][shard.name] == [
+        st.st_size, st.st_mtime_ns, 3]
 
 
 def test_default_writer_retains_closed_entries_for_legacy_loader(tmp_path):
