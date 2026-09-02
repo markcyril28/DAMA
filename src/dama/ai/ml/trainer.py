@@ -9141,6 +9141,22 @@ def main():
         config,
         resume_latest_requested=bool(args.resume_latest),
     )
+    # Refuse to start beside a live run of this namespace BEFORE construction:
+    # constructing the Trainer already loads the resume checkpoint, claims
+    # VRAM, and can run foreground corpus repair, and begin_run() would stomp
+    # the live run's marker. The process title is dynamic ("micro-trainer |
+    # step=N loss=L"), so casual pgrep -x checks false-negative; this check
+    # reads the marker's pid from procfs instead. Exits without writing any
+    # terminal record: the marker belongs to the live run, not to us.
+    try:
+        run_status.check_no_active_run(config.log_dir)
+    except run_status.ActiveRunError as exc:
+        print("=" * 72)
+        print(f"REFUSED: {exc}")
+        print("=" * 72)
+        sys.stdout.flush()
+        raise SystemExit(2)
+
     # Trainer.train() opens the run marker, so until here nothing records an
     # exit. A failure while constructing the Trainer -- loading the resume
     # checkpoint, opening the corpus, reaching the GPU -- therefore left no

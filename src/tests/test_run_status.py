@@ -429,3 +429,97 @@ def test_a_pool_dying_from_the_same_stop_signal_is_not_filed_as_a_crash(
     # Nothing is discarded: the raised error is still on the record.
     assert "BrokenProcessPool" in record["detail"] or "pool" in record["detail"]
     assert "Traceback" in record["traceback"]
+
+
+# ---------------------------------------------------------------------------
+# A running marker whose pid is a live trainer refuses a second writer.
+# Preserving it as "unterminated" would be a false verdict (the run did not
+# die), and proceeding would hand two trainers one namespace: same checkpoint
+# files, same replay shards, same corpus snapshots.
+# ---------------------------------------------------------------------------
+
+_HAS_PROCFS = Path("/proc").is_dir()
+
+
+@pytest.mark.skipif(not _HAS_PROCFS, reason="live-trainer evidence is procfs-based")
+def test_begin_run_refuses_to_stomp_a_live_trainer(tmp_path: Path) -> None:
+    import subprocess
+    import time
+
+    fake = subprocess.Popen(["bash", "-c", "exec -a micro-trainer sleep 60"])
+    try:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            cmdline = Path(f"/proc/{fake.pid}/cmdline").read_bytes()
+            if b"micro-trainer" in cmdline:
+                break
+            time.sleep(0.01)
+
+        run_status.begin_run(tmp_path, pid=fake.pid)
+        marker = tmp_path / run_status.RUN_STATUS_FILENAME
+        before = marker.read_bytes()
+
+        with pytest.raises(run_status.ActiveRunError) as excinfo:
+            run_status.check_no_active_run(tmp_path)
+        assert excinfo.value.pid == fake.pid
+        assert "micro-trainer" in (excinfo.value.cmdline or "")
+
+        with pytest.raises(run_status.ActiveRunError):
+            run_status.begin_run(tmp_path, pid=os.getpid())
+
+        # Zero writes on refusal: the live run's marker is untouched and no
+        # false "unterminated" record was preserved beside it.
+        assert marker.read_bytes() == before
+        assert not list(tmp_path.glob(run_status.UNTERMINATED_PREFIX + "*"))
+    finally:
+        fake.kill()
+        fake.wait()
+
+
+@pytest.mark.skipif(not _HAS_PROCFS, reason="live-trainer evidence is procfs-based")
+def test_begin_run_still_preserves_when_the_live_pid_is_not_a_trainer(
+    tmp_path: Path,
+) -> None:
+    """Pid reuse by an unrelated process must not block the next start."""
+    import subprocess
+
+    bystander = subprocess.Popen(["sleep", "60"])
+    try:
+        run_status.begin_run(tmp_path, pid=bystander.pid)
+        unterminated = run_status.begin_run(tmp_path, pid=os.getpid())
+        assert unterminated is not None
+        assert unterminated["status"] == "unterminated"
+        assert list(tmp_path.glob(run_status.UNTERMINATED_PREFIX + "*"))
+        assert _read(tmp_path)["pid"] == os.getpid()
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
+@pytest.mark.skipif(not _HAS_PROCFS, reason="live-trainer evidence is procfs-based")
+def test_begin_run_never_refuses_over_its_own_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relaunch that recycles the dead trainer's pid must not see itself.
+
+    The marker pid here IS this process, and the marker patterns are widened
+    to match this process's cmdline, so only the self-pid exclusion lets the
+    start proceed.
+    """
+    monkeypatch.setattr(
+        run_status, "ACTIVE_RUN_CMDLINE_MARKERS", ("python",))
+    run_status.begin_run(tmp_path, pid=os.getpid())
+    unterminated = run_status.begin_run(tmp_path, pid=os.getpid())
+    assert unterminated is not None
+    assert unterminated["status"] == "unterminated"
+
+
+def test_check_no_active_run_passes_missing_and_terminated_markers(
+    tmp_path: Path,
+) -> None:
+    assert run_status.check_no_active_run(tmp_path) is None
+    run_status.begin_run(tmp_path, pid=1)
+    run_status.record_terminal_reason(tmp_path, run_status.REASON_COMPLETED)
+    record = run_status.check_no_active_run(tmp_path)
+    assert record is not None
+    assert record["status"] == "terminated"

@@ -69,6 +69,89 @@ def _safe_stamp(value: Any) -> str:
     )[:64] or "unknown"
 
 
+# Command-line substrings that identify this project's trainer process: the
+# dynamic process title the launchers set ("micro-trainer | step=N loss=L" /
+# "micro_trainer ..."), and the module invocation used when setproctitle is
+# absent.  The title truncates comm to 15 bytes ("micro-trainer |"), so
+# name-exact matching (pgrep -x) cannot detect a live trainer; cmdline can.
+ACTIVE_RUN_CMDLINE_MARKERS = ("micro-trainer", "micro_trainer", "dama.ai.ml.trainer")
+
+
+class ActiveRunError(RuntimeError):
+    """A running marker's pid is a live trainer process: refuse a second writer.
+
+    Raised instead of preserving the marker as "unterminated", because that
+    verdict would be false (the run did not die) and proceeding would put two
+    trainers into one namespace: same checkpoint files, same replay shards,
+    same corpus snapshots, silent corruption.
+    """
+
+    def __init__(self, message: str, *, pid: Optional[int] = None,
+                 cmdline: Optional[str] = None,
+                 started_at: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.pid = pid
+        self.cmdline = cmdline
+        self.started_at = started_at
+
+
+def _live_trainer_cmdline(pid: Any) -> Optional[str]:
+    """Cmdline of ``pid`` if it is a live trainer process other than us.
+
+    Evidence is cmdline-only and procfs-based: on hosts without ``/proc``
+    (native Windows) this returns None and the caller keeps today's behavior.
+    The self-pid exclusion covers the recycled-pid case where the new trainer
+    inherits the dead one's pid and would otherwise refuse over its own
+    reflection.  A pid recycled into a trainer from a *different* namespace can
+    still false-positive; the remedy is deleting the stale marker, and the
+    ActiveRunError message says so.
+    """
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid_int <= 0 or pid_int == os.getpid():
+        return None
+    proc_dir = Path("/proc") / str(pid_int)
+    if not proc_dir.is_dir():
+        return None
+    try:
+        raw = (proc_dir / "cmdline").read_bytes()
+    except OSError:
+        return None
+    cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    if any(marker in cmdline for marker in ACTIVE_RUN_CMDLINE_MARKERS):
+        return cmdline
+    return None
+
+
+def check_no_active_run(log_dir: str | Path) -> Optional[dict]:
+    """Raise ActiveRunError if this namespace's marker belongs to a live trainer.
+
+    Returns the parsed marker (or None) otherwise, so ``begin_run`` can reuse
+    the read.  Call this before constructing a Trainer: construction already
+    loads the resume checkpoint, claims VRAM, and can run foreground corpus
+    repair, all of which are wrong beside a live run even before any marker
+    write.
+    """
+    previous = read_run_status(log_dir)
+    if previous is None or previous.get("status") != "running":
+        return previous
+    cmdline = _live_trainer_cmdline(previous.get("pid"))
+    if cmdline is None:
+        return previous
+    raise ActiveRunError(
+        f"run_status.json in {log_dir} records a run (pid {previous.get('pid')}, "
+        f"started {previous.get('started_at')}) that is still alive: "
+        f"cmdline is '{cmdline[:120]}'. Refusing to start a second writer into "
+        "this namespace. Stop it with 'bash stop_training.sh', or delete the "
+        "marker file only if you are certain it is stale (e.g. pid reuse).",
+        pid=previous.get("pid"),
+        cmdline=cmdline,
+        started_at=previous.get("started_at"),
+    )
+
+
 def begin_run(
     log_dir: str | Path,
     *,
@@ -83,7 +166,10 @@ def begin_run(
     """
     directory = Path(log_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    previous = read_run_status(directory)
+    # Raises ActiveRunError before anything is written when the marker's pid
+    # is a live trainer: the "unterminated" verdict below would be false and
+    # overwriting the marker would hand two writers one namespace.
+    previous = check_no_active_run(directory)
     unterminated = None
     if previous is not None and previous.get("status") == "running":
         unterminated = dict(previous)
