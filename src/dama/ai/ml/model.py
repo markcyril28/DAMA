@@ -9,6 +9,14 @@ import torch.nn.functional as F
 from .move_encoder import BOARD_PLANES, MOVE_FEATURE_SIZE, ENCODING_VERSION
 
 
+# Evaluation and spawn-based inference copy every checkpoint tensor into a new
+# CPU model immediately after loading it.  Mapping the zip archive avoids an
+# additional eager read/copy of the serialized storages before that required
+# model copy.  Tests may disable this flag to run matched loader controls.
+_CPU_CHECKPOINT_MMAP = True
+_LEGACY_MMAP_ERROR = "mmap can only be used with files saved with"
+
+
 class ResidualBlock(nn.Module):
     """Residual block with two convolutional layers."""
 
@@ -143,7 +151,8 @@ class MoveScorerNet(nn.Module):
     """
 
     def __init__(self, embedding_size: int = 128, num_blocks: int = 4, hidden_size: int = 64, channels: int = 64,
-                 value_head_enabled: bool = False, value_head_hidden: int = 128):
+                 value_head_enabled: bool = False, value_head_hidden: int = 128,
+                 initialize_weights: bool = True):
         super().__init__()
 
         # Store architecture params for checkpoint serialization
@@ -176,8 +185,12 @@ class MoveScorerNet(nn.Module):
         else:
             self.value_head = None
         
-        # Initialize weights for numerical stability
-        self._init_weights()
+        # Layer constructors already allocate initialized tensors. Training
+        # applies the project's custom initialization by default; inference
+        # copies that complete state from a checkpoint and can skip this second
+        # full parameter pass before immediately overwriting every value.
+        if initialize_weights:
+            self._init_weights()
     
     def _init_weights(self):
         """Initialize weights with proper scaling to prevent large values."""
@@ -405,6 +418,7 @@ def create_model(
     channels: int = 64,
     value_head_enabled: bool = False,
     value_head_hidden: int = 128,
+    initialize_weights: bool = True,
 ) -> MoveScorerNet:
     """Create a new model with given architecture parameters."""
     return MoveScorerNet(
@@ -414,6 +428,7 @@ def create_model(
         channels=channels,
         value_head_enabled=value_head_enabled,
         value_head_hidden=value_head_hidden,
+        initialize_weights=initialize_weights,
     )
 
 
@@ -455,8 +470,26 @@ def load_model(path: str, device: torch.device = None) -> MoveScorerNet:
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    device = torch.device(device)
+
     # weights_only=False needed for checkpoint dicts; safe since we control the saved files
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    load_kwargs = {
+        'map_location': device,
+        'weights_only': False,
+    }
+    if device.type == 'cpu' and _CPU_CHECKPOINT_MMAP:
+        try:
+            checkpoint = torch.load(path, mmap=True, **load_kwargs)
+        except RuntimeError as exc:
+            # Pre-1.6 checkpoints can use PyTorch's legacy non-zip format,
+            # which does not support mmap. Preserve their established loading
+            # path, but never turn corruption or another load failure into an
+            # unverified retry.
+            if _LEGACY_MMAP_ERROR not in str(exc):
+                raise
+            checkpoint = torch.load(path, **load_kwargs)
+    else:
+        checkpoint = torch.load(path, **load_kwargs)
 
     checkpoint_encoding = checkpoint.get('encoding_version', 1)
     if checkpoint_encoding != ENCODING_VERSION:
