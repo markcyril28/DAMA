@@ -783,9 +783,13 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                     counts[j] = _encode_moves_fast(sd, md, all_mf[j])
 
             with torch.inference_mode():
+                # CPU self-play batches need only the widest live legal-move
+                # set. The fixed 32-slot tensor remains useful for allocation
+                # reuse, but scoring its unused tail adds avoidable MLP work.
+                live_width = int(counts.max())
                 scores = model.forward_padded(
                     _boards_t[:batch_sz],
-                    _mf_t[:batch_sz],
+                    _mf_t[:batch_sz, :live_width],
                     _counts_t[:batch_sz],
                 )
 
