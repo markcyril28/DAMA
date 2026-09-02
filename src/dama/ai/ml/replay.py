@@ -41,6 +41,12 @@ _PARSE_ERRORS = (ValueError, KeyError, TypeError)
 _ENTRY_COUNT_SIDECAR_NAME = 'entry_count_cache.json'
 _ENTRY_COUNT_SIDECAR_SCHEMA = 1
 
+# Snapshot-mode self-play writes one complete cycle before the corpus manager
+# can inspect it.  Buffer that cycle in bounded chunks instead of forcing each
+# completed worker batch through drvfs immediately.  Legacy ReplayBuffer users
+# retain the historical per-batch flush behavior.
+_SNAPSHOT_WRITE_BUFFER_BYTES = 16 * 1024 * 1024
+
 
 def _count_replay_lines(path: Path) -> int:
     """Count the physical lines of one replay shard.
@@ -216,6 +222,11 @@ class ReplayBuffer:
         # never consumes this cache, so retaining each cycle's complete Python
         # object graph only spends session RAM.  See Journal Pass 183.
         self._cache_written_entries = bool(cache_written_entries)
+        # ``cache_written_entries=False`` is the snapshot-writer mode: the
+        # closed shard is consumed by CorpusSnapshotManager rather than by a
+        # concurrent ReplayBuffer reader.  Closing the cycle remains the flush
+        # boundary, while a bounded buffer coalesces the batch writes on drvfs.
+        self._buffer_snapshot_cycle = not self._cache_written_entries
         self._current_file = None
         self._current_writer = None
         # Incremental file cache: {path: (mtime, [ReplayEntry, ...])}
@@ -225,9 +236,13 @@ class ReplayBuffer:
         # Promoted to _file_cache on close() so the next load_all_entries() skips
         # re-parsing the file we just wrote.
         self._session_entries: Dict[Path, List[ReplayEntry]] = {}
-        # Raw dicts from add_entry_dicts() — defers ReplayEntry creation to close().
-        # Merged into _session_entries on _close_current() to avoid per-call overhead.
+        # Legacy raw dicts from add_entry_dicts() defer ReplayEntry creation to
+        # close(), then merge into _session_entries for the parsed-file cache.
         self._session_dicts: Dict[Path, List[dict]] = {}
+        # Snapshot writers validate each batch before writing and need only its
+        # exact line count after that point. Retaining the complete nested dict
+        # graph until cycle close spends scarce trainer RAM for no reader.
+        self._session_entry_counts: Dict[Path, int] = {}
         # [Pass 181] Physical line count per shard basename, keyed by
         # (size, mtime_ns, count) and persisted to _ENTRY_COUNT_SIDECAR_NAME so
         # count_entries() never re-reads an unchanged write-once shard.  On
@@ -253,7 +268,15 @@ class ReplayBuffer:
             filepath = self.replay_dir / f"replay_{timestamp}_{suffix:02d}.jsonl"
 
         self._current_file = filepath
-        self._current_writer = open(filepath, 'w')
+        if self._buffer_snapshot_cycle:
+            self._current_writer = open(
+                filepath,
+                'w',
+                encoding='utf-8',
+                buffering=_SNAPSHOT_WRITE_BUFFER_BYTES,
+            )
+        else:
+            self._current_writer = open(filepath, 'w')
 
         return filepath
 
@@ -264,10 +287,15 @@ class ReplayBuffer:
 
         line = _json_dumps(entry.to_dict())
         self._current_writer.write(line + '\n')
-        self._session_entries.setdefault(self._current_file, []).append(entry)
+        if self._buffer_snapshot_cycle:
+            self._session_entry_counts[self._current_file] = (
+                self._session_entry_counts.get(self._current_file, 0) + 1
+            )
+        else:
+            self._session_entries.setdefault(self._current_file, []).append(entry)
 
     def add_entries(self, entries: List[ReplayEntry]) -> None:
-        """Add multiple entries and flush once."""
+        """Add multiple entries, flushing immediately for legacy readers."""
         # Do not create an empty replay shard for a game batch that produced no
         # positions (for example a zero-move or immediately terminal batch).
         # Empty JSONL files are indistinguishable from interrupted writes to
@@ -279,43 +307,85 @@ class ReplayBuffer:
         # Build all lines then write once — reduces syscall overhead.
         lines = [_json_dumps(entry.to_dict()) for entry in entries]
         self._current_writer.write('\n'.join(lines) + '\n')
-        self._current_writer.flush()
-        # Keep in memory so close() can promote to file cache without re-parsing.
-        self._session_entries.setdefault(self._current_file, []).extend(entries)
+        if not self._buffer_snapshot_cycle:
+            self._current_writer.flush()
+            # Legacy readers promote these objects to the parsed file cache.
+            self._session_entries.setdefault(self._current_file, []).extend(entries)
+        else:
+            self._session_entry_counts[self._current_file] = (
+                self._session_entry_counts.get(self._current_file, 0)
+                + len(entries)
+            )
 
     def add_entry_dicts(self, dicts: List[dict]) -> None:
         """Add entries from raw dicts — avoids dict→ReplayEntry→dict round-trip.
 
         Self-play workers already return dicts (serialized for IPC). Writing
-        them directly to JSONL skips one to_dict() call per entry. ReplayEntry
-        conversion is deferred to _close_current() to avoid per-call overhead.
+        them directly to JSONL skips one to_dict() call per entry. Legacy mode
+        defers ReplayEntry conversion until close. Snapshot mode validates each
+        batch before writing, retains only its count, and defers the buffered
+        flush until the cycle closes.
         """
         if not dicts:
             return
+        if self._buffer_snapshot_cycle:
+            # Validate the exact objects about to be serialized, before any
+            # bytes from this batch can enter the durable shard. Constructed
+            # wrappers are released immediately instead of keeping the whole
+            # cycle's nested dictionary graph alive until close().
+            for record in dicts:
+                ReplayEntry.from_dict(record)
         if self._current_writer is None:
             self.start_new_file()
         lines = [_json_dumps(d) for d in dicts]
         self._current_writer.write('\n'.join(lines) + '\n')
-        self._current_writer.flush()
-        # Store raw dicts — ReplayEntry creation deferred to _close_current()
-        self._session_dicts.setdefault(self._current_file, []).extend(dicts)
+        if not self._buffer_snapshot_cycle:
+            self._current_writer.flush()
+            # Store raw dicts — ReplayEntry creation deferred to _close_current().
+            self._session_dicts.setdefault(self._current_file, []).extend(dicts)
+        else:
+            self._session_entry_counts[self._current_file] = (
+                self._session_entry_counts.get(self._current_file, 0)
+                + len(dicts)
+            )
 
     def _close_current(self) -> None:
         """Close the current file and promote session entries to file cache."""
         if self._current_writer is not None:
+            close_error = None
             try:
                 self._current_writer.close()
-            except OSError:
-                pass
+            except OSError as exc:
+                close_error = exc
             finally:
                 self._current_writer = None
+            if close_error is not None and self._buffer_snapshot_cycle:
+                # Deferred snapshot writes can surface an I/O failure only at
+                # the cycle boundary. Fail closed and quarantine that exact
+                # shard instead of publishing its expected entry count for a
+                # short or malformed file. Legacy callers retain their prior
+                # best-effort close behavior.
+                path = self._current_file
+                self._current_file = None
+                if path is not None:
+                    self._file_cache.pop(path, None)
+                    self._session_entries.pop(path, None)
+                    self._session_dicts.pop(path, None)
+                    self._session_entry_counts.pop(path, None)
+                    self._forget_entry_count(path.name)
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                raise close_error
             # Promote in-memory entries to file cache so load_all_entries()
             # skips re-parsing the file we just wrote.  Snapshot-mode callers
-            # opt out: validate the same records, remember their exact physical
-            # line count, then release the object graph after the durable shard
-            # has closed.  CorpusSnapshotManager is that mode's reader.
+            # opt out: their batches were already validated before writing, so
+            # remember only the exact physical line count after the durable
+            # shard closes. CorpusSnapshotManager is that mode's reader.
             path = self._current_file
             if path is not None:
+                tracked_count = self._session_entry_counts.pop(path, 0)
                 deferred = self._session_dicts.pop(path, None)
                 if self._cache_written_entries:
                     # Convert any deferred dicts to ReplayEntry now (bulk conversion)
@@ -341,7 +411,11 @@ class ReplayBuffer:
                         for record in deferred:
                             ReplayEntry.from_dict(record)
                     entries = self._session_entries.pop(path, None)
-                    entry_count = len(deferred or ()) + len(entries or ())
+                    entry_count = (
+                        tracked_count
+                        + len(deferred or ())
+                        + len(entries or ())
+                    )
                     if entry_count:
                         try:
                             st = path.stat()
@@ -391,6 +465,7 @@ class ReplayBuffer:
         self._file_cache.pop(path, None)
         self._session_entries.pop(path, None)
         self._session_dicts.pop(path, None)
+        self._session_entry_counts.pop(path, None)
         self._forget_entry_count(path.name)
         return path
 
@@ -428,6 +503,7 @@ class ReplayBuffer:
             self._file_cache.pop(f, None)
             self._session_entries.pop(f, None)
             self._session_dicts.pop(f, None)
+            self._session_entry_counts.pop(f, None)
             self._forget_entry_count(f.name)
 
         return deleted
@@ -450,6 +526,7 @@ class ReplayBuffer:
         self._file_cache.clear()
         self._session_entries.clear()
         self._session_dicts.clear()
+        self._session_entry_counts.clear()
         if self._entry_count_cache:
             self._entry_count_cache.clear()
             self._entry_count_dirty = True
@@ -498,8 +575,28 @@ class ReplayBuffer:
             self._entry_count_cache = live
             self._entry_count_dirty = False
 
-    def count_entries(self) -> int:
-        """Count total entries across all files.
+    def _replay_file_stats(self) -> List[tuple]:
+        """Capture each replay shard and its identity in one directory scan."""
+        records = []
+        try:
+            with os.scandir(self.replay_dir) as directory:
+                for entry in directory:
+                    name = entry.name
+                    if not (name.startswith('replay_') and name.endswith('.jsonl')):
+                        continue
+                    try:
+                        stat = entry.stat()
+                    except OSError:
+                        # A shard rotated between enumeration and stat is not
+                        # part of this point-in-time buffer view.
+                        continue
+                    records.append((Path(entry.path), stat))
+        except OSError:
+            return []
+        return records
+
+    def _count_entries_from_stats(self, file_stats: List[tuple]) -> int:
+        """Count entries using an already captured shard identity snapshot.
 
         Uses cached entry counts where available (session cache, file cache,
         then the durable per-shard line-count cache) and reads only shards
@@ -507,8 +604,7 @@ class ReplayBuffer:
         therefore read at most once in its lifetime, instead of once per
         self-play cycle for every file not written by this session.
         """
-        files = self.get_replay_files()
-        if not files:
+        if not file_stats:
             return 0
 
         self._ensure_entry_count_sidecar_loaded()
@@ -517,21 +613,16 @@ class ReplayBuffer:
         total = 0
         live_names = set()
         uncached_files = []  # (path, size, mtime_ns)
-        for f in files:
+        for f, st in file_stats:
             live_names.add(f.name)
             # Check session entries first (not yet promoted to file cache).
             # The open writer's shard is counted here; its identity is still
             # changing, so it is never persisted until _close_current().
             session_count = len(self._session_entries.get(f, ()))
             session_count += len(self._session_dicts.get(f, ()))
+            session_count += self._session_entry_counts.get(f, 0)
             if session_count > 0:
                 total += session_count
-                continue
-            try:
-                st = f.stat()
-            except OSError:
-                # Rotated away between the glob and the stat: not live.
-                live_names.discard(f.name)
                 continue
             # Check file cache (promoted after close)
             cached = self._file_cache.get(f)
@@ -573,6 +664,24 @@ class ReplayBuffer:
 
         self._persist_entry_counts(live_names)
         return total
+
+    def get_buffer_state(self) -> tuple[int, int, int]:
+        """Return exact ``(entries, files, bytes)`` from one metadata scan.
+
+        The self-play statistics path needs all three values after every
+        completed cycle.  Capturing shard identities once avoids sorting and
+        then restatting the same rolling window for each aggregate.
+        """
+        file_stats = self._replay_file_stats()
+        if not file_stats:
+            return 0, 0, 0
+        total_entries = self._count_entries_from_stats(file_stats)
+        total_bytes = sum(stat.st_size for _, stat in file_stats)
+        return total_entries, len(file_stats), total_bytes
+
+    def count_entries(self) -> int:
+        """Count total entries across all replay shards."""
+        return self.get_buffer_state()[0]
 
     def iterate_entries(self, shuffle_files: bool = True) -> Iterator[ReplayEntry]:
         """Iterate over all entries in all files."""
