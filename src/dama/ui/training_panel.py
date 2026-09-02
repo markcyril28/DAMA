@@ -315,6 +315,7 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
     """
     try:
         # Import here to avoid loading torch in main process
+        from ..ai.ml import run_status
         from ..ai.ml.trainer import (
             Trainer, TrainingConfig, config_from_yaml, load_config_from_yaml,
             validate_recovery_experiment_config,
@@ -355,6 +356,10 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
             )
 
         validate_recovery_experiment_config(config)
+        # Match the CLI's pre-construction guard. Trainer construction loads
+        # the resume checkpoint and can claim VRAM before train() opens the
+        # durable run marker, so begin_run() alone is too late for the GUI.
+        run_status.check_no_active_run(config.log_dir)
         trainer = Trainer(config)
 
         # train() services control_queue internally (PAUSE/RESUME/STOP/

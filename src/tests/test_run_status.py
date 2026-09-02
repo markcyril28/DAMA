@@ -523,3 +523,55 @@ def test_check_no_active_run_passes_missing_and_terminated_markers(
     record = run_status.check_no_active_run(tmp_path)
     assert record is not None
     assert record["status"] == "terminated"
+
+
+def test_gui_checks_for_a_live_run_before_constructing_trainer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GUI must refuse before checkpoint load or a VRAM claim."""
+    pytest.importorskip("PyQt6")
+    from dama.ui import training_panel
+
+    config = SimpleNamespace(
+        log_dir=str(tmp_path),
+        recovery_enforced=False,
+        resume=None,
+    )
+    monkeypatch.setattr(
+        trainer_module, "load_config_from_yaml", lambda _path: {})
+    monkeypatch.setattr(
+        trainer_module, "config_from_yaml", lambda _payload: config)
+    monkeypatch.setattr(
+        trainer_module, "validate_recovery_experiment_config",
+        lambda _config: None,
+    )
+
+    checked = []
+    constructed = []
+
+    def _refuse(log_dir):
+        checked.append(log_dir)
+        raise run_status.ActiveRunError("live trainer owns this namespace")
+
+    class _MustNotConstruct:
+        def __init__(self, _config):
+            constructed.append(True)
+            raise AssertionError("Trainer construction preceded the guard")
+
+    monkeypatch.setattr(run_status, "check_no_active_run", _refuse)
+    monkeypatch.setattr(trainer_module, "Trainer", _MustNotConstruct)
+
+    messages = []
+    status_queue = SimpleNamespace(put=messages.append)
+    training_panel._trainer_process(None, status_queue, {
+        "config_path": "unused.yaml",
+        "resume": None,
+    })
+
+    assert checked == [str(tmp_path)]
+    assert constructed == []
+    assert messages == [{
+        "type": training_panel.MSG_ERROR,
+        "message": "live trainer owns this namespace",
+    }]
