@@ -450,7 +450,7 @@ def _play_single_test_game(
     ml_moves = 0
     algo_moves = 0
 
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     while move_count < max_moves:
         legal_moves = state.legal_moves()
@@ -499,7 +499,7 @@ def _play_single_test_game(
         state = state.apply_move(chosen_move)
         move_count += 1
 
-    game_time_ms = (time.time() - start_time) * 1000
+    game_time_ms = (time.perf_counter() - start_time) * 1000
 
     # Determine result
     winner = state.winner()
@@ -616,7 +616,11 @@ def _play_test_games_batch(
             'move_count': 0,
             'ml_moves': 0,
             'algo_moves': 0,
-            'start_time': time.time(),
+            # Interleaved play shares one wall clock across the whole batch,
+            # so per-game time must be attributed, not read from a start
+            # timestamp: each round's elapsed time is split equally among the
+            # games active in that round, and the shares sum to the batch wall.
+            'active_ms': 0.0,
         })
 
     active = list(range(n))
@@ -629,6 +633,7 @@ def _play_test_games_batch(
     _counts_buf = np.zeros(n, dtype=np.int32)
 
     while active:
+        round_start = time.perf_counter()
         ml_requests = []      # (game_idx, legal_moves)
         algo_requests = []    # (game_idx, legal_moves)
         immediate = []        # (game_idx, legal_moves, chosen_idx)
@@ -716,10 +721,15 @@ def _play_test_games_batch(
             g['state'] = g['state'].apply_move(move)
             g['move_count'] += 1
 
+        round_ms = (time.perf_counter() - round_start) * 1000.0
+        share = round_ms / len(active)
+        for i in active:
+            games[i]['active_ms'] += share
+
     # Build results
     results = []
     for g in games:
-        game_time_ms = (time.time() - g['start_time']) * 1000
+        game_time_ms = g['active_ms']
         winner = g['state'].winner()
         if winner is None:
             result = TestResult.DRAW

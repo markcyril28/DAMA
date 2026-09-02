@@ -268,6 +268,41 @@ def test_random_opponent_uses_uniform_choice_path() -> None:
     assert all(abs(count - 4000) < 200 for count in counts.values())
 
 
+def test_batch_game_times_partition_the_batch_wall(monkeypatch) -> None:
+    """Interleaved batch play attributes the shared clock across games.
+
+    Before the attribution fix every game in a batch reported the whole
+    batch's elapsed wall as its own duration, so the per-game times summed
+    to roughly ``batch_size`` times the true wall.  Attributed shares are a
+    partition of the round walls, so their sum can never exceed the wall of
+    the whole call.
+    """
+    import time as _time
+
+    class _FirstMoveModel:
+        def forward_padded(self, boards, move_features, move_counts):
+            scores = torch.zeros(
+                (boards.shape[0], move_features.shape[1]), dtype=torch.float32)
+            scores[:, 0] = 1.0
+            return scores
+
+    monkeypatch.setattr(
+        inference, "get_model", lambda *_args, **_kwargs: _FirstMoveModel())
+
+    args = (
+        "unused.pt", "easy", "random", [1, 1, 2, 2], 60,
+        [(2, 11), (2, 12), (4, 13), (4, 14)], 1,
+    )
+    wall_start = _time.perf_counter()
+    records = model_vs_algo._play_test_games_batch(args)
+    wall_ms = (_time.perf_counter() - wall_start) * 1000.0
+
+    assert len(records) == 4
+    times = [record["game_time_ms"] for record in records]
+    assert all(value > 0.0 for value in times)
+    assert sum(times) <= wall_ms
+
+
 def test_algorithm_opponent_failure_never_falls_back_to_random(monkeypatch) -> None:
     from dama.ai.algorithmic import search
 
