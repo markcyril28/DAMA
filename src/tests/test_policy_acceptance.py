@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import Future
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from dama.ai.ml.acceptance import (
     wilson_score_interval_95,
 )
 from dama.ai.ml import inference
+from dama.ai.ml import model_vs_algo
 from dama.ai.ml.model_vs_algo import (
     TestStatistics as EvaluationStatistics,
     _build_balanced_game_specs,
@@ -127,6 +129,132 @@ def test_balanced_specs_pair_the_same_fixed_suite_across_sides() -> None:
         _build_balanced_game_specs(
             "checkpoint.pt", "easy", "random", 99, 200, (0, 2), 7719, 1
         )
+
+
+def test_injected_evaluation_executor_is_reused_without_internal_pool(
+    monkeypatch, tmp_path
+) -> None:
+    calls = []
+
+    def _fake_batch(batch):
+        (_model, _difficulty, opponent, ml_player_values,
+         _max_moves, openings, depth) = batch
+        return [
+            {
+                "result": "draw",
+                "ml_player": player,
+                "winner": None,
+                "num_moves": 12,
+                "ml_moves": 6,
+                "algo_moves": 6,
+                "game_time_ms": 1.0,
+                "opponent_type": opponent,
+                "opening_plies": opening[0],
+                "opening_seed": opening[1],
+                "ml_inference_depth": depth,
+            }
+            for player, opening in zip(ml_player_values, openings)
+        ]
+
+    class _Executor:
+        def submit(self, function, batch):
+            calls.append((function, batch))
+            future = Future()
+            future.set_result(_fake_batch(batch))
+            return future
+
+    class _UnexpectedPool:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("injected executor must bypass pool creation")
+
+    monkeypatch.setattr(model_vs_algo, "ProcessPoolExecutor", _UnexpectedPool)
+    executor = _Executor()
+    tester = model_vs_algo.ModelVsAlgoTester(
+        model_path="unused.pt",
+        algo_difficulty="easy",
+        num_workers=1,
+        stats_dir=str(tmp_path),
+        opening_plies=(2, 4),
+        opening_seed=7719,
+        opponent_type="random",
+        executor=executor,
+    )
+
+    stats = tester.run_tests(num_games=4)
+
+    assert stats.total_games == 4
+    assert stats.draws == 4
+    assert len(calls) == 1
+    assert calls[0][0] is model_vs_algo._play_test_games_batch
+
+
+def test_evaluation_worker_limits_pytorch_thread_pools(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(torch, "set_num_threads", lambda value: calls.append(("intra", value)))
+    monkeypatch.setattr(
+        torch, "set_num_interop_threads", lambda value: calls.append(("interop", value))
+    )
+
+    model_vs_algo._evaluation_worker_init()
+
+    assert calls == [("intra", 1), ("interop", 1)]
+
+
+def test_standalone_evaluation_pool_installs_thread_limiter(
+    monkeypatch, tmp_path
+) -> None:
+    instances = []
+
+    class _Executor:
+        def __init__(self, *, max_workers, mp_context, initializer):
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+            self.initializer = initializer
+            instances.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def submit(self, _function, batch):
+            (_model, _difficulty, opponent, ml_player_values,
+             _max_moves, openings, depth) = batch
+            future = Future()
+            future.set_result([
+                {
+                    "result": "draw",
+                    "ml_player": player,
+                    "winner": None,
+                    "num_moves": 12,
+                    "ml_moves": 6,
+                    "algo_moves": 6,
+                    "game_time_ms": 1.0,
+                    "opponent_type": opponent,
+                    "opening_plies": opening[0],
+                    "opening_seed": opening[1],
+                    "ml_inference_depth": depth,
+                }
+                for player, opening in zip(ml_player_values, openings)
+            ])
+            return future
+
+    monkeypatch.setattr(model_vs_algo, "ProcessPoolExecutor", _Executor)
+    stats = model_vs_algo.ModelVsAlgoTester(
+        model_path="unused.pt",
+        algo_difficulty="easy",
+        num_workers=2,
+        stats_dir=str(tmp_path),
+        opening_plies=(2, 4),
+        opening_seed=7719,
+        opponent_type="random",
+    ).run_tests(num_games=4)
+
+    assert stats.total_games == 4
+    assert len(instances) == 1
+    assert instances[0].max_workers == 2
+    assert instances[0].initializer is model_vs_algo._evaluation_worker_init
 
 
 def test_random_opponent_uses_uniform_choice_path() -> None:
