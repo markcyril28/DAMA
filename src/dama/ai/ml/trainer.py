@@ -11,6 +11,7 @@ import re
 import argparse
 import hashlib
 import hmac
+import io
 import gc
 import shutil
 import tempfile
@@ -147,6 +148,35 @@ def _training_opening_assignment(
     return int(opening_choices[choice_index]), opening_seed_base + game_index
 
 
+def _stage_runtime_model_checkpoint(
+    checkpoint: Mapping[str, Any],
+    path: Path,
+    *,
+    persist_to_disk: bool,
+) -> str:
+    """Serialize one behavior checkpoint and return its exact byte digest.
+
+    Linux fork workers inherit the already-folded CPU model, so writing the
+    fallback checkpoint to drvfs only to read it back for SHA-256 is redundant.
+    Serializing into memory keeps the provenance digest tied to a real,
+    loadable checkpoint payload. Spawn workers and failed fork-model builds
+    persist those same bytes for ``get_model()``.
+    """
+
+    buffer = io.BytesIO()
+    torch.save(checkpoint, buffer)
+    serialized = buffer.getbuffer()
+    try:
+        digest = hashlib.sha256(serialized).hexdigest().upper()
+        if persist_to_disk:
+            with path.open("wb") as handle:
+                handle.write(serialized)
+    finally:
+        serialized.release()
+        buffer.close()
+    return digest
+
+
 def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
     """Tear down a self-play pool without waiting indefinitely.
 
@@ -238,6 +268,24 @@ def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
                 manager_thread.join(timeout=remaining)
             except (RuntimeError, OSError, ValueError):
                 pass
+
+
+def _consume_and_release_selfplay_batch(
+    entries_data: list[dict], batch_game_count: int, consumer
+) -> None:
+    """Transfer a worker result to its durable owners, then empty the Future.
+
+    ``Future.result()`` returns the same list retained by the Future itself.
+    The unified pool keeps those Future objects through cycle teardown, so an
+    otherwise consumed batch remains live unless its list is cleared in place.
+    Replay, collection, and preprocessing owners take their references inside
+    ``consumer`` before this ownership boundary releases the delivery list.
+    """
+
+    try:
+        consumer(entries_data, batch_game_count)
+    finally:
+        entries_data.clear()
 
 
 def _make_compiled_fwd_loss(model, compile_mode):
@@ -4891,7 +4939,8 @@ class Trainer:
         # On Linux (fork start method), workers inherit this global via
         # copy-on-write — zero torch.save/load disk I/O per cycle.
         # Falls back to disk path on Windows (spawn mode) or if anything fails.
-        # Still save to disk as fallback for get_model() cache miss.
+        # The loadable payload is always serialized for provenance, but is
+        # persisted only when fork inheritance is unavailable.
         import dama.ai.ml.selfplay as _sp_mod
         if all_ml_tasks:
             temp_model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4927,24 +4976,25 @@ class Trainer:
                 _sp_mod._FORK_MODEL = _fork_model
             except Exception:
                 _sp_mod._FORK_MODEL = None
-            # Save to disk as fallback (Windows spawn, or cache miss)
-            torch.save({
+            runtime_checkpoint = {
                 'model_state_dict': _sd,
                 'arch_params': getattr(self.model, 'arch_params', {}),
                 'encoding_version': ENCODING_VERSION,
                 'step': behavior_step,
-            }, temp_model_path)
-            checkpoint_digest = hashlib.sha256()
-            try:
-                with temp_model_path.open('rb') as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
-                        checkpoint_digest.update(chunk)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Could not identify self-play behavior checkpoint: "
-                    f"{temp_model_path}: {exc}"
-                ) from exc
-            behavior_checkpoint_sha256 = checkpoint_digest.hexdigest().upper()
+            }
+            # The default ProcessPoolExecutor context is the same context
+            # queried here. Fork workers inherit _FORK_MODEL and need no file;
+            # spawn workers, or a failed folded-model build, retain the exact
+            # serialized fallback consumed by get_model().
+            persist_runtime_model = not (
+                _sp_mod._FORK_MODEL is not None
+                and mp.get_context().get_start_method() == 'fork'
+            )
+            behavior_checkpoint_sha256 = _stage_runtime_model_checkpoint(
+                runtime_checkpoint,
+                temp_model_path,
+                persist_to_disk=persist_runtime_model,
+            )
 
         # --- Batch tasks for the unified pool ---
         effective_workers = (
@@ -5113,7 +5163,8 @@ class Trainer:
                                 "self-play worker returned an incomplete batch"
                             )
                         unfinished.pop(future, None)
-                        _consume_batch(entries_data, batch_game_count)
+                        _consume_and_release_selfplay_batch(
+                            entries_data, batch_game_count, _consume_batch)
                     except BrokenProcessPool:
                         # A worker died abruptly (OOM, native crash, external
                         # kill).  The pool is now poisoned — every remaining
@@ -5139,7 +5190,8 @@ class Trainer:
                         break
                     try:
                         entries_data = _batch_fn[task_type](batch)
-                        _consume_batch(entries_data, batch_game_count)
+                        _consume_and_release_selfplay_batch(
+                            entries_data, batch_game_count, _consume_batch)
                     except Exception as e:
                         print(f"Self-play sequential re-run error ({task_type}): {e}")
         except Exception as e:
@@ -5162,7 +5214,8 @@ class Trainer:
                         raise RuntimeError(
                             "self-play sequential retry returned an incomplete batch"
                         )
-                    _consume_batch(entries_data, batch_game_count)
+                    _consume_and_release_selfplay_batch(
+                        entries_data, batch_game_count, _consume_batch)
                 except Exception as e:
                     print(f"Sequential fallback error ({task_type}): {e}")
         except BaseException:
@@ -5238,12 +5291,11 @@ class Trainer:
             # file counts would be stale and count_entries() does unnecessary I/O)
             if not skip_replay:
                 try:
-                    buf_entries = self.replay_buffer.count_entries()
-                    replay_dir = Path(self.config.replay_dir)
-                    # Single glob pass for both file count and total size
-                    _files = list(replay_dir.glob("*.jsonl")) if replay_dir.exists() else []
-                    num_files = len(_files)
-                    total_bytes = sum(f.stat().st_size for f in _files)
+                    # One immutable identity snapshot supplies all three
+                    # aggregates.  Re-enumerating and restatting the 60-shard
+                    # drvfs window made this recurring statistic measurable.
+                    buf_entries, num_files, total_bytes = (
+                        self.replay_buffer.get_buffer_state())
                     self.stats_collector.record_replay_buffer_state(
                         step=self.step,
                         total_entries=buf_entries,
