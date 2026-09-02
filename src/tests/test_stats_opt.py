@@ -60,3 +60,32 @@ def test_compute_score_stats_padded_matches_flat():
     for key in r_p:
         assert key in r_f, f"Missing key {key}"
         assert abs(r_p[key] - r_f[key]) < 1e-4, f"{key}: {r_p[key]} != {r_f[key]}"
+
+
+def test_resumed_session_counts_optimizer_steps_not_metric_rows(tmp_path):
+    collector = StatsCollector(output_dir=str(tmp_path), flush_every=1000)
+    collector.set_training_start_step(246_000)
+
+    collector.record_training_step(
+        step=246_200,
+        loss=1.5,
+        lr=2e-4,
+        batch_size=2048,
+        step_time=0.16,
+    )
+    collector.record_training_step(
+        step=246_400,
+        loss=1.4,
+        lr=2e-4,
+        batch_size=2048,
+        step_time=0.16,
+    )
+
+    assert collector.loss.count == 2
+    report = collector.generate_session_report()
+    assert report["summary"]["total_steps"] == 400
+    assert report["summary"]["training_start_step"] == 246_000
+    assert report["summary"]["training_end_step"] == 246_400
+
+    collector.set_training_end_step(246_450)
+    assert collector.generate_session_report()["summary"]["total_steps"] == 450
