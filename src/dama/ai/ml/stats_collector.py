@@ -272,6 +272,12 @@ class StatsCollector:
         self._last_flush_time = time.time()
         self._flush_max_seconds = 60.0
 
+        # Global checkpoint steps are sparse observations, not a count of
+        # optimizer steps.  Track the resumed session's step range explicitly
+        # so reports do not mistake one metric row every N steps for one step.
+        self._training_start_step: Optional[int] = None
+        self._training_latest_step: Optional[int] = None
+
         # --- Configuration snapshot (set by caller) ---
         self.config_snapshot: Dict[str, Any] = {}
 
@@ -300,6 +306,31 @@ class StatsCollector:
         """Store a snapshot of the training config for the session report."""
         with self._lock:
             self.config_snapshot = config
+
+    def set_training_start_step(self, step: int) -> None:
+        """Set the resumed global step used as this session's zero point."""
+
+        with self._lock:
+            value = int(step)
+            self._training_start_step = value
+            self._training_latest_step = value
+
+    def set_training_end_step(self, step: int) -> None:
+        """Update the latest completed global step before a final report."""
+
+        with self._lock:
+            self._training_latest_step = int(step)
+
+    def _completed_training_steps(self) -> int:
+        if (
+            self._training_start_step is not None
+            and self._training_latest_step is not None
+        ):
+            return max(
+                0, self._training_latest_step - self._training_start_step)
+        # Compatibility for standalone callers that do not declare a resumed
+        # step range.  Their historic behavior counted recorded metric rows.
+        return self.loss.count
 
     # ===================================================================
     # Training step recording
@@ -332,6 +363,7 @@ class StatsCollector:
             ts = datetime.now().isoformat()
 
             self.loss.append(loss, step, timestamp=ts)
+            self._training_latest_step = int(step)
             self.learning_rate.append(lr, step)
 
             if batch_size > 0:
@@ -1091,7 +1123,7 @@ class StatsCollector:
 
             # Training efficiency
             total_elapsed = (datetime.now() - self.session_start).total_seconds()
-            total_steps = self.loss.count
+            total_steps = self._completed_training_steps()
             if total_elapsed > 0 and total_steps > 0:
                 metrics['overall_steps_per_sec'] = total_steps / total_elapsed
                 metrics['overall_steps_per_hour'] = total_steps / total_elapsed * 3600
@@ -1296,7 +1328,9 @@ class StatsCollector:
                 },
                 'config': self.config_snapshot,
                 'summary': {
-                    'total_steps': self.loss.count,
+                    'total_steps': self._completed_training_steps(),
+                    'training_start_step': self._training_start_step,
+                    'training_end_step': self._training_latest_step,
                     'total_epochs': len(self.epoch_records),
                     'total_selfplay_epochs': len(self.selfplay_records),
                     'total_evaluations': len(self.eval_records),
@@ -1600,7 +1634,7 @@ class StatsCollector:
             print("=" * 60)
             print(f"  Session ID:     {self.session_id}")
             print(f"  Duration:       {timedelta(seconds=int(elapsed))}")
-            print(f"  Total Steps:    {self.loss.count:,}")
+            print(f"  Total Steps:    {self._completed_training_steps():,}")
             print(f"  Total Epochs:   {len(self.epoch_records)}")
 
             # Loss
