@@ -1399,6 +1399,131 @@ def test_runtime_model_checkpoint_staging_skips_only_optional_disk_copy(
     )
 
 
+def test_fork_behavior_model_loads_live_state_without_detached_cpu_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sole CPU model receives the live state mapping directly."""
+    source_state = {"weight": object()}
+
+    class LiveModel:
+        def state_dict(self):
+            return source_state
+
+    class ForkModel:
+        def __init__(self) -> None:
+            self.loaded_state = None
+            self.eval_called = False
+            self.cpu_called = False
+
+        def load_state_dict(self, state) -> None:
+            self.loaded_state = state
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+        def cpu(self):
+            self.cpu_called = True
+            return self
+
+    fork_model = ForkModel()
+    created_arch = []
+
+    def fake_create_model(**arch):
+        created_arch.append(arch)
+        return fork_model
+
+    monkeypatch.setattr(trainer_module, "create_model", fake_create_model)
+    result = trainer_module._build_fork_behavior_model(
+        LiveModel(), {"channels": 7})
+
+    assert result is fork_model
+    assert created_arch == [{"channels": 7, "initialize_weights": False}]
+    assert fork_model.loaded_state is source_state
+    assert fork_model.eval_called
+    assert fork_model.cpu_called
+
+
+def test_recorded_step_time_includes_forward_and_backward_work() -> None:
+    """Throughput timing covers compute, not only optimizer submission."""
+    import time
+
+    import torch
+
+    class SlowModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward_padded(self, boards, move_features, move_counts):
+            del boards, move_counts
+            time.sleep(0.04)
+            return self.scale * move_features.squeeze(-1)
+
+    class CapturingStats:
+        def __init__(self) -> None:
+            self.steps = []
+
+        def record_training_step(self, **record) -> None:
+            self.steps.append(record)
+
+        def record_epoch(self, **record) -> None:
+            pass
+
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        gradient_accumulation_steps=1,
+        stats_record_every=1,
+        stats_score_dist_every=100,
+        stats_system_every=100,
+        stats_model_health_every=100,
+        checkpoint_every=100,
+        train_steps=1,
+        grad_clip_norm=None,
+        amp=False,
+        value_head_enabled=False,
+        value_weight=0.15,
+        policy_stage="policy_only",
+        batch_size=2,
+        learning_rate=0.1,
+        thermal_enabled=False,
+    )
+    holder.device = torch.device("cpu")
+    holder.model = SlowModel()
+    holder.optimizer = torch.optim.SGD(holder.model.parameters(), lr=0.1)
+    holder.scheduler = None
+    holder.scaler = None
+    holder.amp_dtype = torch.bfloat16
+    holder.stats_collector = CapturingStats()
+    holder._use_padded = True
+    holder._compiled_fwd_loss = None
+    holder._control_queue = None
+    holder._stopped = False
+    holder._paused = False
+    holder.step = 0
+    holder.epoch = 0
+    holder._data_refreshed_pending = False
+    holder._record_step_stats = lambda *args, **kwargs: None
+    holder._update_process_title = lambda *args, **kwargs: None
+    holder._compute_loss_padded = (
+        lambda scores, move_counts, targets, reward_weights:
+        torch.nn.functional.cross_entropy(scores, targets)
+    )
+
+    batch = (
+        torch.zeros(2, 1),
+        torch.tensor([[[1.0], [0.0]], [[0.0], [1.0]]]),
+        torch.tensor([2, 2]),
+        torch.tensor([0, 1]),
+        torch.ones(2),
+        torch.zeros(2),
+    )
+    holder.train_epoch([batch])
+
+    assert len(holder.stats_collector.steps) == 1
+    assert holder.stats_collector.steps[0]["step_time"] >= 0.04
+
+
 def test_existing_frozen_suite_overlap_is_filtered_on_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
