@@ -208,6 +208,29 @@ class _RuntimeCheckpointHashSink:
         return self._digest.hexdigest().upper()
 
 
+def _build_fork_behavior_model(
+    live_model: nn.Module,
+    arch_params: Mapping[str, Any],
+) -> nn.Module:
+    """Copy live weights directly into the one fork-inherited CPU model.
+
+    ``load_state_dict`` copies each source tensor into the destination
+    parameter.  Passing the live state mapping directly avoids first owning a
+    detached CPU tensor copy that would otherwise survive into every worker
+    fork alongside this model.
+    """
+
+    # Conv2d and Linear constructors initialize their tensors, then the model's
+    # project-specific initializer normally writes them a second time. Both
+    # passes are dead work here because the complete live state is copied next.
+    fork_arch = dict(arch_params)
+    fork_arch["initialize_weights"] = False
+    fork_model = create_model(**fork_arch)
+    fork_model.load_state_dict(live_model.state_dict())
+    fork_model.eval()
+    return fork_model.cpu()
+
+
 def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
     """Tear down a self-play pool without waiting indefinitely.
 
@@ -1532,6 +1555,8 @@ class Trainer:
         # Resume if specified
         if config.resume:
             self._load_checkpoint(config.resume)
+        if self.stats_collector:
+            self.stats_collector.set_training_start_step(self.step)
 
         # Compile a fused forward+loss function for maximum performance.
         # Fusing forward and loss in one compiled graph lets the inductor fuse
@@ -4975,57 +5000,74 @@ class Trainer:
         import dama.ai.ml.selfplay as _sp_mod
         if all_ml_tasks:
             temp_model_path.parent.mkdir(parents=True, exist_ok=True)
-            if self.device.type == 'cuda':
-                _sd = {k: v.to('cpu', non_blocking=True)
-                       for k, v in self.model.state_dict().items()}
-                torch.cuda.current_stream().synchronize()
-            else:
-                _sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
-            # Build CPU model for fork inheritance (avoids N × torch.load).
-            # Fold BatchNorm into Conv2d for ~10-20% faster CPU inference:
-            # eliminates 17 BN forward calls per position (the BN affine
-            # transform is baked into the conv weights, replaced by Identity).
-            try:
-                from .model import fold_batchnorm
-                _fork_model = create_model(
-                    **getattr(self.model, 'arch_params', {
-                        'embedding_size': self.config.model_embedding,
-                        'num_blocks': self.config.model_blocks,
-                        'hidden_size': self.config.model_hidden,
-                        'channels': self.config.model_channels,
-                    }))
-                _fork_model.load_state_dict(_sd)
-                _fork_model.eval()
-                fold_batchnorm(_fork_model)
-                # [Pass 101] Guarantee the fork-inherited model is CPU-only.
-                # create_model + the CPU _sd already build a CPU model, but a
-                # stray CUDA param here would mean every forked self-play worker
-                # inherits a live GPU tensor whose GC-triggered destructor
-                # crashes the worker (see _selfplay_worker_init's gc.freeze()).
-                # .cpu() is idempotent insurance that documents the invariant.
-                _fork_model = _fork_model.cpu()
-                _sp_mod._FORK_MODEL = _fork_model
-            except Exception:
-                _sp_mod._FORK_MODEL = None
-            runtime_checkpoint = {
-                'model_state_dict': _sd,
-                'arch_params': getattr(self.model, 'arch_params', {}),
-                'encoding_version': ENCODING_VERSION,
-                'step': behavior_step,
-            }
-            # The default ProcessPoolExecutor context is the same context
-            # queried here. Fork workers inherit _FORK_MODEL and need no file;
-            # spawn workers, or a failed folded-model build, retain the exact
-            # serialized fallback consumed by get_model().
-            persist_runtime_model = not (
-                _sp_mod._FORK_MODEL is not None
-                and mp.get_context().get_start_method() == 'fork'
-            )
-            behavior_checkpoint_sha256 = _stage_runtime_model_checkpoint(
-                runtime_checkpoint,
-                temp_model_path,
-                persist_to_disk=persist_runtime_model,
-            )
+            runtime_arch = getattr(self.model, 'arch_params', {
+                'embedding_size': self.config.model_embedding,
+                'num_blocks': self.config.model_blocks,
+                'hidden_size': self.config.model_hidden,
+                'channels': self.config.model_channels,
+            })
+            _sp_mod._FORK_MODEL = None
+
+            # On fork hosts, copy live weights directly into the sole CPU model.
+            # Hash its still-unfolded state before folding mutates the conv
+            # tensors. The temporary dict contains references only and is gone
+            # before the worker pool forks.
+            if mp.get_context().get_start_method() == 'fork':
+                try:
+                    _fork_model = _build_fork_behavior_model(
+                        self.model, runtime_arch)
+                except Exception:
+                    _fork_model = None
+                if _fork_model is not None:
+                    fork_state_refs = dict(_fork_model.state_dict().items())
+                    runtime_checkpoint = {
+                        'model_state_dict': fork_state_refs,
+                        'arch_params': runtime_arch,
+                        'encoding_version': ENCODING_VERSION,
+                        'step': behavior_step,
+                    }
+                    behavior_checkpoint_sha256 = (
+                        _stage_runtime_model_checkpoint(
+                            runtime_checkpoint,
+                            temp_model_path,
+                            persist_to_disk=False,
+                        )
+                    )
+                    del runtime_checkpoint, fork_state_refs
+                    try:
+                        from .model import fold_batchnorm
+                        fold_batchnorm(_fork_model)
+                    except Exception:
+                        _fork_model = None
+                    else:
+                        _sp_mod._FORK_MODEL = _fork_model
+
+            # Spawn workers, or a failed folded-model build, retain the exact
+            # serialized fallback consumed by get_model(). The detached CPU
+            # state is released after persistence, before workers start.
+            if _sp_mod._FORK_MODEL is None:
+                if self.device.type == 'cuda':
+                    fallback_state = {
+                        k: v.to('cpu', non_blocking=True)
+                        for k, v in self.model.state_dict().items()
+                    }
+                    torch.cuda.current_stream().synchronize()
+                else:
+                    fallback_state = {
+                        k: v.cpu() for k, v in self.model.state_dict().items()
+                    }
+                runtime_checkpoint = {
+                    'model_state_dict': fallback_state,
+                    'arch_params': runtime_arch,
+                    'encoding_version': ENCODING_VERSION,
+                    'step': behavior_step,
+                }
+                behavior_checkpoint_sha256 = _stage_runtime_model_checkpoint(
+                    runtime_checkpoint,
+                    temp_model_path,
+                    persist_to_disk=True,
+                )
+                del runtime_checkpoint, fallback_state
 
         # --- Batch tasks for the unified pool ---
         effective_workers = (
@@ -5901,6 +5943,7 @@ class Trainer:
         first_batch = True
         epoch_start_time = time.time()
         _step_start = 0.0  # lazily set only when stats recording needs it
+        _will_record = False
         accum_steps = self.config.gradient_accumulation_steps
         # [Pass 81] Pre-compute loss scale factor: eliminates conditional check
         # in 3 separate code paths (compiled, AMP, no-AMP) on every step.
@@ -5984,6 +6027,19 @@ class Trainer:
                 (boards, move_features, move_counts, targets, reward_weights,
                  value_targets) = batch
                 teacher_probabilities = None
+
+            # Measure the complete sampled optimizer step, including every
+            # accumulation micro-batch, forward/backward, clipping and the
+            # optimizer update.  The matching stop is deliberately after the
+            # stats step's existing loss.item() synchronization, so CUDA work
+            # is complete without introducing another synchronization point.
+            if _micro_step == 0:
+                _will_record = bool(
+                    _stats_collector
+                    and (self.step + 1) % _stats_record_every == 0
+                )
+                if _will_record:
+                    _step_start = time.perf_counter()
             if first_batch:
                 print(f"  First batch loaded. Processing {total_batches} batches...")
                 sys.stdout.flush()
@@ -6251,13 +6307,6 @@ class Trainer:
             # Accumulated enough — clip, step, and reset
             _micro_step = 0
 
-            # Time the optimizer step (placed after accumulation continue so
-            # _step_start is always fresh for the step that actually records).
-            _will_record = (_stats_collector and
-                            (self.step + 1) % _stats_record_every == 0)
-            if _will_record:
-                _step_start = time.time()
-
             # Gradient clipping + stats.  clip_grad_norm_ returns the total
             # (unclipped) grad norm, so we capture it instead of iterating all
             # parameters a second time in compute_gradient_stats.  Per-layer
@@ -6295,7 +6344,7 @@ class Trainer:
             total_loss_acc.add_(loss.detach(), alpha=accum_steps)
             num_batches += 1
             self.step += 1
-            _step_elapsed = (time.time() - _step_start) if _will_record else 0.0
+            _step_elapsed = 0.0
 
             # Step the LR scheduler (per-step, not per-epoch)
             if _scheduler is not None:
@@ -6322,6 +6371,8 @@ class Trainer:
             if _need_loss_val and _clip_norm_tensor is not None:
                 _grad_norm = _clip_norm_tensor.item()  # coalesced with loss sync
                 _clip_norm_tensor = None
+            if _will_record:
+                _step_elapsed = time.perf_counter() - _step_start
 
             # Periodic NaN monitoring: piggyback on the stats sync to check
             # for NaN losses without an extra CUDA sync.  nan_to_num converts
@@ -7444,6 +7495,7 @@ class Trainer:
         # Export comprehensive statistics
         if self.stats_collector:
             try:
+                self.stats_collector.set_training_end_step(self.step)
                 self.stats_collector.print_session_summary()
                 exports = self.stats_collector.export_all()
                 print(f"\n  Statistics exported to: {self.config.stats_output_dir}/")
