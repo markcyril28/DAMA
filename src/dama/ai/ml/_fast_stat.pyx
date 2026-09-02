@@ -105,10 +105,10 @@ def stat_paths(paths, int workers=8):
         for worker in range(worker_count - 1):
             created[worker] = 0
 
-        # Use the calling thread for one partition and create at most seven
-        # helpers for the production width of eight.  A failed thread creation
-        # simply executes that partition synchronously.  Every successful
-        # helper is joined before Python can start the next self-play fork.
+        # Use the calling thread for one partition and create at most 31 helpers
+        # for the production width of 32. A failed thread creation simply runs
+        # that partition synchronously. Every successful helper is joined before
+        # Python can start the next self-play fork.
         with nogil:
             for worker in range(worker_count - 1):
                 if thrd_create(
