@@ -127,6 +127,17 @@ _FAST_METADATA_PATH_VERIFY_ENABLED = True
 # gzip's whole-member C path, while the cap keeps the much larger all-time
 # ledger and any unexpectedly large artifact on the streaming path.
 _STATE_KEYS_BULK_READ_MAX_BYTES = 64 * 1024 * 1024
+# Snapshot and hold-out key files contain the same uniformly distributed
+# SHA-256 hex as the trained ledger.  Fast gzip preserves the exact canonical
+# key stream while removing high-level compression work from every admission.
+_SNAPSHOT_STATE_KEYS_GZIP_COMPRESSLEVEL = 1
+# Canonical keys are already uniformly distributed SHA-256 hex, so gzip's
+# maximum level buys little space while making every admission rewrite much
+# slower.  Level 1 keeps the same standard gzip stream and bounded merge.
+_TRAINED_LEDGER_GZIP_COMPRESSLEVEL = 1
+# Each key occupies 65 ASCII bytes including its newline. Buffer about 1 MiB
+# before crossing TextIOWrapper and gzip, while retaining streaming memory use.
+_TRAINED_LEDGER_WRITE_BATCH_KEYS = 16 * 1024
 # A live snapshot manager repeatedly needs exactly two immutable key sets:
 # the active training snapshot and the append-only validation manifest.  Keep
 # only those two decompressed members process-local.  A larger bound spends
@@ -1295,7 +1306,13 @@ def _write_state_keys(path: Path, state_keys: Iterable[str]) -> None:
         # second handle: the reserved fd must be consumed here or it leaks
         # (one per growth/admission cycle until process exit).
         with os.fdopen(fd, "wb") as raw_handle:
-            with gzip.open(raw_handle, "wt", encoding="ascii", newline="\n") as handle:
+            with gzip.open(
+                raw_handle,
+                "wt",
+                encoding="ascii",
+                newline="\n",
+                compresslevel=_SNAPSHOT_STATE_KEYS_GZIP_COMPRESSLEVEL,
+            ) as handle:
                 for key in sorted(state_keys):
                     handle.write(key)
                     handle.write("\n")
@@ -1367,6 +1384,7 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     the whole-set memory cost this representation exists to avoid, so the two
     sorted streams are merged directly into a replacement file.
     """
+
     additions = sorted(set(new_keys))
     if not additions:
         return 0
@@ -1374,22 +1392,34 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     added = 0
     existing = _iter_state_keys(path) if path.is_file() else iter(())
     pending = next(existing, None)
-    with gzip.open(temporary, "wt", encoding="ascii", newline="\n") as handle:
+    with gzip.open(
+        temporary,
+        "wt",
+        encoding="ascii",
+        newline="\n",
+        compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
+    ) as handle:
         index = 0
+        write_batch: List[str] = []
         while pending is not None or index < len(additions):
             if pending is not None and (
                 index >= len(additions) or pending <= additions[index]
             ):
-                handle.write(pending)
-                handle.write("\n")
+                write_batch.append(pending)
                 if index < len(additions) and pending == additions[index]:
                     index += 1
                 pending = next(existing, None)
             else:
-                handle.write(additions[index])
-                handle.write("\n")
+                write_batch.append(additions[index])
                 added += 1
                 index += 1
+            if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+                handle.write("\n".join(write_batch))
+                handle.write("\n")
+                write_batch.clear()
+        if write_batch:
+            handle.write("\n".join(write_batch))
+            handle.write("\n")
     os.replace(temporary, path)
     return added
 
