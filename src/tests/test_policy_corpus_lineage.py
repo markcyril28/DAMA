@@ -749,6 +749,68 @@ def test_state_key_fingerprints_are_stable_and_streamed_merges_are_lossless(
     assert _state_key_fingerprint(key) == _state_key_fingerprint(key)
 
 
+def test_streamed_ledger_merge_uses_fast_gzip_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recurring ledger unions do not pay gzip's maximum compression cost."""
+    real_open = corpus.gzip.open
+    write_levels = []
+
+    def tracking_open(*args, **kwargs):
+        if len(args) > 1 and "w" in args[1]:
+            write_levels.append(kwargs.get("compresslevel"))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(corpus.gzip, "open", tracking_open)
+    path = tmp_path / "keys.txt.gz"
+    keys = {f"{index:064x}" for index in range(3)}
+
+    assert corpus._merge_state_keys_file(path, keys) == len(keys)
+    assert write_levels == [corpus._TRAINED_LEDGER_GZIP_COMPRESSLEVEL]
+    assert corpus._TRAINED_LEDGER_GZIP_COMPRESSLEVEL == 1
+    assert corpus._read_state_keys(path) == keys
+
+
+def test_streamed_ledger_merge_batches_text_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical-ledger rewrites cross the gzip stack in bounded batches."""
+    real_open = corpus.gzip.open
+    write_lengths = []
+
+    class TrackingWriter:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def write(self, value):
+            write_lengths.append(len(value))
+            return self.handle.write(value)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    def tracking_open(*args, **kwargs):
+        handle = real_open(*args, **kwargs)
+        if len(args) > 1 and "w" in args[1]:
+            return TrackingWriter(handle)
+        return handle
+
+    monkeypatch.setattr(corpus.gzip, "open", tracking_open)
+    path = tmp_path / "keys.txt.gz"
+    keys = {f"{index:064x}" for index in range(3)}
+
+    assert corpus._merge_state_keys_file(path, keys) == len(keys)
+    assert write_lengths == [len(keys) * 64 + len(keys) - 1, 1]
+    assert corpus._read_state_keys(path) == keys
+
+
 def test_rebuilt_hold_out_reaches_the_approved_share_of_a_sixty_file_corpus(
     tmp_path: Path,
 ) -> None:
