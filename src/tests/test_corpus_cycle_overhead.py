@@ -309,6 +309,140 @@ def test_native_metadata_helpers_are_joined_before_return(tmp_path):
     assert after == before
 
 
+@pytest.mark.skipif(
+    not corpus._HAS_FAST_STAT,
+    reason="compiled POSIX metadata accelerator is not built",
+)
+def test_native_identity_recheck_stats_exact_paths_without_rescan(
+    tmp_path, monkeypatch,
+):
+    """A proven-slow final transaction needs no second directory listing."""
+
+    paths = []
+    for index in range(12):
+        path = tmp_path / f"replay_{index:02d}.jsonl"
+        path.write_text(f"{index}\n", encoding="utf-8")
+        paths.append(path)
+    identities = {path: corpus._replay_file_identity(path) for path in paths}
+    parent = os.path.abspath(str(tmp_path))
+    monkeypatch.setitem(
+        corpus._METADATA_STAT_PARALLEL_BY_PARENT, parent, True)
+    real_fast_stat = corpus._fast_stat_paths
+    calls = []
+
+    def tracked_fast_stat(raw_paths, workers):
+        calls.append((list(raw_paths), workers))
+        return real_fast_stat(raw_paths, workers)
+
+    monkeypatch.setattr(corpus, "_fast_stat_paths", tracked_fast_stat)
+    monkeypatch.setattr(
+        corpus.os,
+        "scandir",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("native exact-path verification rescanned a directory")
+        ),
+    )
+
+    corpus.CorpusSnapshotManager._verify_replay_file_identities(identities)
+
+    assert calls == [([os.fspath(path) for path in paths], len(paths))]
+
+
+@pytest.mark.skipif(
+    not corpus._HAS_FAST_STAT,
+    reason="compiled POSIX metadata accelerator is not built",
+)
+def test_native_identity_recheck_fails_closed_on_missing_or_changed_path(
+    tmp_path, monkeypatch,
+):
+    """Direct native stats retain deletion and replacement rejection."""
+
+    paths = []
+    for index in range(12):
+        path = tmp_path / f"replay_{index:02d}.jsonl"
+        path.write_text(f"before-{index}\n", encoding="utf-8")
+        paths.append(path)
+    identities = {path: corpus._replay_file_identity(path) for path in paths}
+    monkeypatch.setitem(
+        corpus._METADATA_STAT_PARALLEL_BY_PARENT,
+        os.path.abspath(str(tmp_path)),
+        True,
+    )
+
+    paths[-1].unlink()
+    with pytest.raises(RuntimeError, match="disappeared during corpus analysis"):
+        corpus.CorpusSnapshotManager._verify_replay_file_identities(identities)
+
+    paths[-1].write_text("replacement-is-longer\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="changed during corpus analysis"):
+        corpus.CorpusSnapshotManager._verify_replay_file_identities(identities)
+
+
+@pytest.mark.skipif(
+    not corpus._HAS_FAST_STAT,
+    reason="compiled POSIX metadata accelerator is not built",
+)
+def test_native_identity_recheck_falls_back_when_accelerator_fails(
+    tmp_path, monkeypatch,
+):
+    """An optional native failure retains the exact directory verifier."""
+
+    paths = []
+    for index in range(12):
+        path = tmp_path / f"replay_{index:02d}.jsonl"
+        path.write_text(f"{index}\n", encoding="utf-8")
+        paths.append(path)
+    identities = {path: corpus._replay_file_identity(path) for path in paths}
+    monkeypatch.setitem(
+        corpus._METADATA_STAT_PARALLEL_BY_PARENT,
+        os.path.abspath(str(tmp_path)),
+        True,
+    )
+    monkeypatch.setattr(
+        corpus,
+        "_fast_stat_paths",
+        lambda _paths, _workers: (_ for _ in ()).throw(
+            RuntimeError("synthetic native failure")
+        ),
+    )
+
+    corpus.CorpusSnapshotManager._verify_replay_file_identities(identities)
+
+
+@pytest.mark.skipif(
+    not corpus._HAS_FAST_STAT,
+    reason="compiled POSIX metadata accelerator is not built",
+)
+def test_native_identity_recheck_stays_serial_on_fast_parent(
+    tmp_path, monkeypatch,
+):
+    """A low-latency server filesystem does not pay native thread setup."""
+
+    paths = []
+    for index in range(12):
+        path = tmp_path / f"replay_{index:02d}.jsonl"
+        path.write_text(f"{index}\n", encoding="utf-8")
+        paths.append(path)
+    identities = {path: corpus._replay_file_identity(path) for path in paths}
+    monkeypatch.setitem(
+        corpus._METADATA_STAT_PARALLEL_BY_PARENT,
+        os.path.abspath(str(tmp_path)),
+        False,
+    )
+    calls = []
+    real_fast_stat = corpus._fast_stat_paths
+
+    def tracked_fast_stat(raw_paths, workers):
+        calls.append((list(raw_paths), workers))
+        return real_fast_stat(raw_paths, workers)
+
+    monkeypatch.setattr(corpus, "_fast_stat_paths", tracked_fast_stat)
+
+    corpus.CorpusSnapshotManager._verify_replay_file_identities(identities)
+
+    assert calls == []
+
+
 def test_admission_identity_snapshot_recheck_fails_closed_on_replacement(tmp_path):
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir()
