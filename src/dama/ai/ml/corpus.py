@@ -164,6 +164,16 @@ def _read_relpath(value: str) -> str:
 POLICY_REPLAY_CONTRACT_VERSION = 1
 CANONICAL_RULES_ID = "filipino-dama-default-v1"
 
+# Behavior-model identity fields recorded in generation_settings.  They are
+# provenance, not contract: within a session training always proceeds past the
+# standing snapshot's admission step (and dead-epoch rollback can rewind
+# behind it), so no relation between the live step and the recorded step
+# distinguishes a healthy relaunch from a healthy running session.  Excluding
+# them from snapshot_matches_settings keeps a relaunch from discarding the
+# standing snapshot as a foreground contract repair; every manifest still
+# records both fields exactly (Journal Pass 238).
+_BEHAVIOR_PROVENANCE_KEYS = ("model_behavior_id", "model_behavior_step")
+
 
 # Corpus gating repeatedly inspects the same immutable replay files (contract
 # audit, byte hash, and exact diversity analysis).  Keep this cache strictly
@@ -2182,14 +2192,24 @@ class CorpusSnapshotManager:
         noise_settings: Mapping[str, Any],
         generation_settings: Mapping[str, Any],
     ) -> bool:
-        """Return whether a snapshot was built for the active data contract."""
+        """Return whether a snapshot is compatible with the active contract.
+
+        The behavior-model identity keys in ``generation_settings`` are
+        excluded from the comparison (see ``_BEHAVIOR_PROVENANCE_KEYS``); a
+        real contract change (teacher, noise, mix, openings, difficulties,
+        schema) still mismatches.
+        """
 
         manifest = self._load_manifest(Path(manifest_path))
+        recorded_generation = dict(manifest.get("generation_settings", {}))
+        active_generation = dict(generation_settings)
+        for key in _BEHAVIOR_PROVENANCE_KEYS:
+            recorded_generation.pop(key, None)
+            active_generation.pop(key, None)
         return (
             dict(manifest.get("teacher_settings", {})) == dict(teacher_settings)
             and dict(manifest.get("noise_settings", {})) == dict(noise_settings)
-            and dict(manifest.get("generation_settings", {}))
-            == dict(generation_settings)
+            and recorded_generation == active_generation
         )
 
     def _verify_manifest_state_keys(

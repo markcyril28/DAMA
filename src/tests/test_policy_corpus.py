@@ -974,6 +974,74 @@ def test_snapshot_settings_match_rejects_previous_stage_contract(
     )
 
 
+def test_snapshot_settings_match_treats_behavior_identity_as_provenance(
+    tmp_path: Path,
+) -> None:
+    """Behavior-step drift alone must not read as a contract change.
+
+    Training always proceeds past the standing snapshot's admission step
+    within a session, and dead-epoch rollback can rewind behind it, so
+    neither direction of behavior-identity drift distinguishes a healthy
+    relaunch from a healthy running session. Real contract drift (noise,
+    generation schema) must still mismatch.
+    """
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [_entry(index)])
+
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=17,
+        min_fresh_fraction=0.50,
+    )
+    teacher = {"stage": "policy_only", "target_type": "hard"}
+    noise = {"played_action_probability": 0.10}
+    admitted_generation = {
+        "current_model_inference_depth": 1,
+        "model_behavior_id": "trainer-step-312036",
+        "model_behavior_step": 312036,
+    }
+
+    first = manager.consider_snapshot(teacher, noise, admitted_generation)
+    assert first.admitted
+
+    resumed_generation = dict(
+        admitted_generation,
+        model_behavior_id="trainer-step-314000",
+        model_behavior_step=314000,
+    )
+    assert manager.snapshot_matches_settings(
+        first.manifest_path, teacher, noise, resumed_generation
+    )
+
+    rolled_back_generation = dict(
+        admitted_generation,
+        model_behavior_id="trainer-step-306000",
+        model_behavior_step=306000,
+    )
+    assert manager.snapshot_matches_settings(
+        first.manifest_path, teacher, noise, rolled_back_generation
+    )
+
+    assert not manager.snapshot_matches_settings(
+        first.manifest_path,
+        teacher,
+        {"played_action_probability": 0.0},
+        resumed_generation,
+    )
+
+    assert not manager.snapshot_matches_settings(
+        first.manifest_path,
+        teacher,
+        noise,
+        dict(resumed_generation, current_model_inference_depth=2),
+    )
+
+
 def test_snapshot_load_rejects_tampered_training_shard(tmp_path: Path) -> None:
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir()
