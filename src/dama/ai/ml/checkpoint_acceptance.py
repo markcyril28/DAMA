@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import multiprocessing as mp
 import os
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -14,7 +16,7 @@ from .acceptance import (
     ACCEPTANCE_GAMES_PER_OPPONENT,
     evaluate_acceptance_gates,
 )
-from .model_vs_algo import ModelVsAlgoTester
+from .model_vs_algo import ModelVsAlgoTester, _evaluation_worker_init
 
 
 PENDING_TASK_SCHEMA_VERSION = 1
@@ -365,19 +367,30 @@ def run_checkpoint_acceptance(
         "ml_inference_depth": int(inference_depth),
     }
 
-    random_stats = ModelVsAlgoTester(
-        algo_difficulty="easy",
-        opponent_type="random",
-        stats_dir=str(output_root / "random_details"),
-        **common,
-    ).run_tests(num_games=ACCEPTANCE_GAMES_PER_OPPONENT)
-    random_record = random_stats.to_dict()
-    easy_stats = ModelVsAlgoTester(
-        algo_difficulty="easy",
-        opponent_type="algorithm",
-        stats_dir=str(output_root / "easy_details"),
-        **common,
-    ).run_tests(num_games=ACCEPTANCE_GAMES_PER_OPPONENT)
+    # Both phases use the same checkpoint and run sequentially.  Reuse one
+    # spawn pool so each worker loads and folds the CPU model only once while
+    # preserving the CUDA-safe process boundary and the declared gate order.
+    spawn_ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=common["num_workers"],
+        mp_context=spawn_ctx,
+        initializer=_evaluation_worker_init,
+    ) as executor:
+        random_stats = ModelVsAlgoTester(
+            algo_difficulty="easy",
+            opponent_type="random",
+            stats_dir=str(output_root / "random_details"),
+            executor=executor,
+            **common,
+        ).run_tests(num_games=ACCEPTANCE_GAMES_PER_OPPONENT)
+        random_record = random_stats.to_dict()
+        easy_stats = ModelVsAlgoTester(
+            algo_difficulty="easy",
+            opponent_type="algorithm",
+            stats_dir=str(output_root / "easy_details"),
+            executor=executor,
+            **common,
+        ).run_tests(num_games=ACCEPTANCE_GAMES_PER_OPPONENT)
 
     easy_record = easy_stats.to_dict()
     if random_record.get("opening_suite_id") != easy_record.get("opening_suite_id"):
