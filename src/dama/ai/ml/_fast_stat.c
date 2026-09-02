@@ -3650,14 +3650,14 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_10_fast_stat_stat_paths(CYTHON_UNUSED Py
  *         for worker in range(worker_count - 1):
  *             created[worker] = 0             # <<<<<<<<<<<<<<
  * 
- *         # Use the calling thread for one partition and create at most seven
+ *         # Use the calling thread for one partition and create at most 31 helpers
 */
       (__pyx_v_created[__pyx_v_worker]) = 0;
     }
 
     /* "dama/ai/ml/_fast_stat.pyx":112
- *         # simply executes that partition synchronously.  Every successful
- *         # helper is joined before Python can start the next self-play fork.
+ *         # that partition synchronously. Every successful helper is joined before
+ *         # Python can start the next self-play fork.
  *         with nogil:             # <<<<<<<<<<<<<<
  *             for worker in range(worker_count - 1):
  *                 if thrd_create(
@@ -3669,7 +3669,7 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_10_fast_stat_stat_paths(CYTHON_UNUSED Py
         /*try:*/ {
 
           /* "dama/ai/ml/_fast_stat.pyx":113
- *         # helper is joined before Python can start the next self-play fork.
+ *         # Python can start the next self-play fork.
  *         with nogil:
  *             for worker in range(worker_count - 1):             # <<<<<<<<<<<<<<
  *                 if thrd_create(
@@ -3793,8 +3793,8 @@ static PyObject *__pyx_pf_4dama_2ai_2ml_10_fast_stat_stat_paths(CYTHON_UNUSED Py
         }
 
         /* "dama/ai/ml/_fast_stat.pyx":112
- *         # simply executes that partition synchronously.  Every successful
- *         # helper is joined before Python can start the next self-play fork.
+ *         # that partition synchronously. Every successful helper is joined before
+ *         # Python can start the next self-play fork.
  *         with nogil:             # <<<<<<<<<<<<<<
  *             for worker in range(worker_count - 1):
  *                 if thrd_create(
