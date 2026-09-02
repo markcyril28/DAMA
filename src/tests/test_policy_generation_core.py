@@ -152,9 +152,12 @@ def test_enhanced_model_trajectory_uses_configured_search_depth(monkeypatch):
 
 def test_interleaved_model_trajectory_keeps_hard_label(monkeypatch):
     torch = pytest.importorskip("torch")
+    observed_widths = []
 
     class FirstMoveModel:
         def forward_padded(self, boards, move_features, move_counts):
+            observed_widths.append(move_features.shape[1])
+            assert move_features.shape[1] == int(move_counts.max())
             scores = torch.zeros(
                 (boards.shape[0], move_features.shape[1]), dtype=torch.float32)
             scores[:, 0] = 1.0
@@ -176,6 +179,7 @@ def test_interleaved_model_trajectory_keeps_hard_label(monkeypatch):
     entries = selfplay.play_games_interleaved(tasks)
 
     assert len(entries) == 2
+    assert observed_widths == [7]
     for entry in entries:
         assert entry["chosen_index"] == len(entry["legal_moves"]) - 1
         assert entry["played_index"] == 0
