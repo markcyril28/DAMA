@@ -29,6 +29,29 @@ def test_write_state_keys_is_round_trip_stable(tmp_path: Path) -> None:
     assert raw == "k1\nk2\nk3\n"
 
 
+def test_write_state_keys_uses_fast_gzip_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recurring immutable key writes avoid maximum gzip compression."""
+    real_open = corpus.gzip.open
+    write_levels = []
+
+    def tracking_open(*args, **kwargs):
+        if len(args) > 1 and "w" in args[1]:
+            write_levels.append(kwargs.get("compresslevel"))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(corpus.gzip, "open", tracking_open)
+    path = tmp_path / "canonical_state_keys.txt.gz"
+
+    _write_state_keys(path, ["k3", "k1", "k2"])
+
+    assert write_levels == [corpus._SNAPSHOT_STATE_KEYS_GZIP_COMPRESSLEVEL]
+    assert corpus._SNAPSHOT_STATE_KEYS_GZIP_COMPRESSLEVEL == 1
+    assert _read_state_keys(path) == {"k1", "k2", "k3"}
+
+
 def test_read_state_keys_uses_bulk_gzip_for_bounded_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
