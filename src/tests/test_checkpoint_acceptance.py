@@ -53,8 +53,27 @@ class _Tester:
 def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
     monkeypatch, tmp_path: Path
 ) -> None:
+    class _Executor:
+        instances = []
+
+        def __init__(self, *, max_workers, mp_context, initializer) -> None:
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+            self.initializer = initializer
+            self.entered = False
+            self.exited = False
+            self.instances.append(self)
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            self.exited = True
+
     _Tester.calls = []
     monkeypatch.setattr(checkpoint_acceptance, "ModelVsAlgoTester", _Tester)
+    monkeypatch.setattr(checkpoint_acceptance, "ProcessPoolExecutor", _Executor)
     report = checkpoint_acceptance.run_checkpoint_acceptance(
         str(tmp_path / "model_step_136000.pt"),
         step=136000,
@@ -70,6 +89,12 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
 
     assert [call["opponent_type"] for call in _Tester.calls] == ["random", "algorithm"]
     assert all(call["opening_seed"] == 20260819 for call in _Tester.calls)
+    assert len(_Executor.instances) == 1
+    executor = _Executor.instances[0]
+    assert executor.max_workers == 2
+    assert executor.initializer is checkpoint_acceptance._evaluation_worker_init
+    assert executor.entered and executor.exited
+    assert all(call["executor"] is executor for call in _Tester.calls)
     assert report["passed"] is True
     assert report["opening_suite_id"] == "fixed-suite"
     saved = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
