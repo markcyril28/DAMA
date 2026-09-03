@@ -121,6 +121,62 @@ def test_fast_move_generation_matches_python_on_reachable_positions(
     assert saw_quiet
 
 
+def test_fused_teacher_decision_preserves_search_and_move_order():
+    """The compact fused boundary must be an exact hard-search replacement."""
+    if not getattr(search_mod, "_HAS_FAST_SEARCH", False):
+        pytest.skip("Cython _fast_search not built - pure-Python fallback in use")
+
+    from dama.ai.algorithmic._fast_search import (
+        apply_move_board,
+        board_bytes_to_compact,
+        fast_search,
+        gen_moves_from_board,
+        generate_teacher_decision_from_board,
+        init_board_bytes,
+    )
+    from dama.game_state import GameState
+
+    board_bytes = init_board_bytes()
+    player = 1
+    move_count = 0
+    saw_forced = False
+    saw_choice = False
+
+    for step in range(96):
+        expected_state = board_bytes_to_compact(
+            board_bytes, player, move_count)
+        expected_moves = gen_moves_from_board(board_bytes, player)
+        state, moves, teacher_index = generate_teacher_decision_from_board(
+            board_bytes, player, move_count)
+
+        assert state == expected_state, step
+        assert moves == expected_moves, step
+
+        result = fast_search(GameState.from_compact(state), "hard")
+        if not moves:
+            assert teacher_index is None, step
+            assert result["move"] is None, step
+            board_bytes = init_board_bytes()
+            player = 1
+            move_count = 0
+            continue
+
+        if len(moves) == 1:
+            saw_forced = True
+            assert teacher_index == 0, step
+        else:
+            saw_choice = True
+            assert teacher_index == moves.index(result["move"]), step
+
+        chosen = moves[(step * 7 + 3) % len(moves)]
+        board_bytes, player, _ = apply_move_board(
+            board_bytes, player, chosen)
+        move_count += 1
+
+    assert saw_forced
+    assert saw_choice
+
+
 def test_fast_capture_generation_matches_python_on_seeded_sparse_boards():
     """Exercise multi-jump and flying captures beyond one reachable walk."""
     if not getattr(search_mod, "_HAS_FAST_SEARCH", False):
