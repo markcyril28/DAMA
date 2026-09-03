@@ -471,6 +471,84 @@ def test_saved_checkpoint_carries_declared_dataset_provenance(
     assert saved["selection_basis"] == "held_out_teacher_agreement"
 
 
+@pytest.mark.parametrize("drop_point", ["numbered", "latest"])
+def test_checkpoint_writer_repairs_numbered_file_lost_during_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,
+    drop_point: str,
+) -> None:
+    """A transient DrvFS disappearance must not leave only the latest alias."""
+    import threading
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint_path = checkpoint_dir / "model_step_002000.pt"
+    latest_path = tmp_path / "latest.pt"
+
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        latest_path=str(latest_path),
+    )
+    holder.model = SimpleNamespace(
+        state_dict=lambda: {"weight": torch.tensor([1.0])},
+        arch_params={},
+    )
+    holder.optimizer = SimpleNamespace(
+        state_dict=lambda: {"state": {}, "param_groups": []})
+    holder.stats = TrainingStats()
+    holder.step = 2000
+    holder.epoch = 1
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats_collector = None
+    holder.log_file = str(tmp_path / "train.jsonl")
+    holder.device = torch.device("cpu")
+    holder._checkpoint_thread = None
+    holder._active_snapshot_manifest = {}
+    holder._evaluate_validation_loss = lambda: None
+    holder._evaluate_teacher_promotion = lambda _path: None
+    holder._live_optimizer_context = lambda: {}
+    holder._snapshot_stats = lambda: {}
+    holder._save_stats = lambda **_kwargs: None
+    holder._put_status = lambda _message: None
+
+    real_replace = trainer_module.os.replace
+    removed_once = False
+
+    def _replace_then_drop_numbered(source, destination):
+        nonlocal removed_once
+        real_replace(source, destination)
+        destination = Path(destination)
+        should_drop = (
+            (drop_point == "numbered" and destination == checkpoint_path)
+            or (drop_point == "latest" and destination == latest_path)
+        )
+        if should_drop and not removed_once:
+            checkpoint_path.unlink()
+            removed_once = True
+
+    monkeypatch.setattr(
+        trainer_module.os, "replace", _replace_then_drop_numbered)
+
+    returned = Trainer._save_checkpoint(holder, loss=0.5)
+    thread = holder._checkpoint_thread
+    assert isinstance(thread, threading.Thread)
+    thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    assert returned == str(checkpoint_path)
+    assert removed_once
+    assert checkpoint_path.is_file()
+    assert latest_path.is_file()
+    assert torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False,
+    )["step"] == 2000
+    assert "Numbered checkpoint disappeared" in capsys.readouterr().out
+
+
 def test_checkpoint_collision_still_measures_without_writing(
     tmp_path: Path,
 ) -> None:
@@ -1296,6 +1374,7 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
     holder._bg_snapshot_manifest = None
     holder._bg_validation_entries = None
     holder._bg_selfplay_lock = trainer_module.threading.Lock()
+    holder._bg_selfplay_stop_event = trainer_module.threading.Event()
     holder._stopped = False
     holder._paused = False
     holder._data_ready_event = SimpleNamespace(set=lambda: None)
@@ -1324,6 +1403,82 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
 
     assert observed_steps == [23]
     assert holder._bg_snapshot_manifest["fingerprint"] == "enhanced"
+
+
+def test_background_selfplay_stop_event_prevents_another_snapshot_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class _FakeThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+            self._running = False
+
+        def start(self):
+            self._running = True
+            try:
+                self._target()
+            finally:
+                self._running = False
+
+        def is_alive(self):
+            return self._running
+
+    class _SnapshotManager:
+        def consider_snapshot(self, **_kwargs):
+            raise AssertionError(
+                "shutdown must skip corpus work after the in-flight cycle"
+            )
+
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = _SnapshotManager()
+    holder.config = SimpleNamespace(replay_max_files=60)
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_stop_event = trainer_module.threading.Event()
+    holder._stopped = False
+    holder._paused = False
+
+    def _run_selfplay(_num_games, **_kwargs):
+        calls.append("cycle")
+        holder._bg_selfplay_stop_event.set()
+        return 1, 23
+
+    holder.run_selfplay = _run_selfplay
+    monkeypatch.setattr(trainer_module.threading, "Thread", _FakeThread)
+
+    Trainer._start_background_selfplay(holder, 72)
+
+    assert calls == ["cycle"]
+    assert holder._stopped is False
+
+
+def test_background_selfplay_shutdown_signals_before_join() -> None:
+    holder = object.__new__(Trainer)
+    holder._bg_selfplay_stop_event = trainer_module.threading.Event()
+    holder._data_ready_event = trainer_module.threading.Event()
+
+    class _FakeThread:
+        def __init__(self):
+            self.alive = True
+            self.joined = False
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self):
+            assert holder._bg_selfplay_stop_event.is_set()
+            self.joined = True
+            self.alive = False
+
+    thread = _FakeThread()
+    holder._bg_selfplay_thread = thread
+
+    Trainer._stop_background_selfplay(holder)
+
+    assert thread.joined
+    assert holder._data_ready_event.is_set()
 
 
 def test_runtime_model_root_and_cleanup_removes_temporary_files(
