@@ -50,6 +50,21 @@ MIN_FREE_DISK_GB=10              # Refuse to launch below this much free space o
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
+# A smoke launcher is intentionally copied outside the repository so its
+# session settings can be changed without touching the operator-owned script.
+# In that case, retain the caller's project root instead of treating the copy's
+# temporary directory as the repository. Normal launches still resolve from
+# the script location and therefore remain independent of the caller's cwd.
+if [ ! -f "${PROJECT_DIR}/src/dama/ai/ml/trainer.py" ]; then
+    _caller_dir="$(pwd -P)"
+    if [ -f "${_caller_dir}/src/dama/ai/ml/trainer.py" ] &&
+       [ -f "${_caller_dir}/local_train.sh" ]; then
+        PROJECT_DIR="$_caller_dir"
+    else
+        echo "ERROR: Could not resolve the Dama project root from $SCRIPT_DIR or $_caller_dir." >&2
+        exit 1
+    fi
+fi
 
 # Resolve the config before creating logs or invoking the trainer. The policy
 # recovery is resume-only and tied to one preserved checkpoint. Other configs
