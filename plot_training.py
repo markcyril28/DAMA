@@ -18,6 +18,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -567,6 +568,25 @@ def load_stats(stats_path: str = "models/training_stats.json"):
         return json.load(f)
 
 
+def _load_stats_after_atomic_replace(stats_path: str | Path) -> dict:
+    """Tolerate the brief missing-name window exposed by DrvFS replace.
+
+    Checkpoint and acceptance threads can both persist the same stats file.
+    They use ``os.replace`` correctly, but the Windows-mounted project volume
+    has occasionally returned ENOENT to a dashboard reader that enumerated the
+    old name immediately before another thread replaced it. Retrying only that
+    transient error keeps real JSON and permission failures visible.
+    """
+    for attempt in range(3):
+        try:
+            return load_stats(str(stats_path))
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+            time.sleep(0.01)
+    raise AssertionError("unreachable")
+
+
 def _stats_source_label(path: Path) -> str:
     """Human-readable label for a training stats file."""
     name = path.stem
@@ -690,17 +710,17 @@ def load_stats_bundle(stats_path: str | Path, include_related: bool = True) -> t
     if stats_path.exists() and stats_path not in paths:
         paths.append(stats_path)
     if not paths:
-        return load_stats(str(stats_path)), [stats_path]
+        return _load_stats_after_atomic_replace(stats_path), [stats_path]
 
     loaded = []
     for path in paths:
         try:
-            loaded.append((path, load_stats(str(path))))
+            loaded.append((path, _load_stats_after_atomic_replace(path)))
         except Exception as e:
             print(f"Warning: Could not read stats file {path}: {e}")
 
     if not loaded:
-        return load_stats(str(stats_path)), [stats_path]
+        return _load_stats_after_atomic_replace(stats_path), [stats_path]
     return _aggregate_stats(loaded), [path for path, _ in loaded]
 
 
