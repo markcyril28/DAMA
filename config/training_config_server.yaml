@@ -4,13 +4,7 @@
 # Hardware: server GPU (64GB VRAM) + 128 CPU threads + 1TB DDR4 RAM
 # Platform: ROCm 6.x
 #
-# Thread Allocation (128 total — auto-configured by trainer):
-#   - Self-play workers:   96 (75%)   ← game generation via ProcessPoolExecutor
-#                                        (separate processes, no GIL contention)
-#   - PyTorch intra-op:    64 (50%)   ← tensor ops, preprocessing (auto: cores//2, cap 64)
-#   - PyTorch inter-op:    16 (12.5%) ← parallel independent ops (auto: cores//8, cap 8)
-#   - DataLoader workers:   0         ← FastBatchIterator bypasses DataLoader
-#
+# Thread allocation: 32 self-play workers, 1 intra-op, 1 inter-op, and 0 DataLoader workers. See Journal Pass 248.
 # GPU VRAM: batch_size=65536 BF16 uses ~19.4 GB of 64 GB (model+activations+optimizer).
 # _compute_loss() is fully vectorized — 3 GPU kernels for the entire batch.
 # Masked MoveScorer only computes valid move slots (~84% less MLP compute vs
@@ -94,10 +88,7 @@ device:
     dtype: "bfloat16"                 # bfloat16, native on the server GPU, same exponent range as FP32
   compile:
     enabled: true                     # torch.compile for kernel fusion
-    mode: "max-autotune"              # "max-autotune" = maximum GPU optimization.
-                                      # Slower to compile (~5 min), but faster execution.
-                                      # Board is always 8x8, so autotuning pays off.
-                                      # option: reduce-overhead
+    mode: "reduce-overhead"           # Avoid measured per-shape ROCm autotune stalls. See Journal Pass 248.
   matmul_precision: "medium"          # TF32-equivalent for float32 matmuls (when not using AMP)
 
 # -----------------------------------------------------------------------------
@@ -128,16 +119,8 @@ model:
 #   Total cycle: ~212 min. 6h session ≈ 1.7 cycles ≈ 945 training steps.
 # -----------------------------------------------------------------------------
 selfplay:
-  cpu_workers: 32                     # 96 of 128 cores — maximize game generation.
-                                      # ProcessPoolExecutor creates separate processes (no GIL).
-                                      # Training uses only 1 CPU thread (torch.set_num_threads(1)
-                                      # when device=cuda), leaving 127 cores available.
-                                      # 96 uses 75% of cores; 32 remain for preprocessing + OS.
-  games_per_epoch: 512                # *** Reduced from 1024 ***
-                                      # 512 × ~41 moves = ~21K new positions per cycle.
-                                      # In simultaneous mode, self-play runs continuously in
-                                      # background — GPU trains on existing data while 96 CPU
-                                      # workers generate fresh data via Cython fast search.
+  cpu_workers: 32                     # Leave 96 of 128 server threads for compiler and system work. See Journal Pass 248.
+  games_per_epoch: 512                # Keep the v5 cycle volume with 32 background workers. See Journal Pass 248.
   difficulties:                       # Train against medium difficulty only.
     - "medium"                        #   Medium: 0.8s/move, depth 5 — optimal learning signal.
     # - "super_hard"                  #   5.0s/move, depth 12 — enable when model beats hard
@@ -159,6 +142,7 @@ selfplay:
                                       # "alternate"     = generate all data first, then train
                                       # Allow endgame patterns: king promotion, piece
                                       # advantage conversion, and closing out wins.
+  max_stale_epochs: 500               # Bound unchanged-data reuse instead of inheriting unlimited. See Journal Pass 248.
 
   # Algo-vs-algo: pure algorithmic games as additional training data.
   # Generates games between all difficulty matchup pairs (e.g., easy-vs-medium,
@@ -336,4 +320,3 @@ resume:
   enabled: true                       # Auto-resume from latest valid checkpoint
   checkpoint_path: null               # null = auto-detect latest
   skip_corrupted: true                # Skip checkpoints with NaN/Inf
-
