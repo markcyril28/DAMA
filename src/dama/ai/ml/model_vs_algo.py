@@ -715,9 +715,13 @@ def _play_test_games_batch(
                     counts[j] = _encode_moves_fast(sd, md, all_mf[j])
 
             with torch.inference_mode():
+                # Score only the widest live legal-move set in this round.
+                # Padding remains reusable at 32 slots, but evaluating its
+                # unused tail adds MLP work without affecting any valid logit.
+                live_width = int(counts.max())
                 scores = model.forward_padded(
                     torch.from_numpy(boards),
-                    torch.from_numpy(all_mf),
+                    torch.from_numpy(all_mf[:, :live_width]),
                     torch.from_numpy(counts),
                 )
 
