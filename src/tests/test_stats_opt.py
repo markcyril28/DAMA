@@ -1,7 +1,11 @@
 """Quick verification of batched stats_collector methods."""
+import json
+import os
+
 import torch
 from dama.ai.ml.stats_collector import StatsCollector
 from dama.ai.ml.model import MoveScorerNet
+from scripts import analyze_training_stats
 
 
 def _make_model_with_grads():
@@ -89,3 +93,133 @@ def test_resumed_session_counts_optimizer_steps_not_metric_rows(tmp_path):
 
     collector.set_training_end_step(246_450)
     assert collector.generate_session_report()["summary"]["total_steps"] == 450
+
+
+def test_incremental_flush_preserves_partial_run_diagnostics(tmp_path):
+    collector = StatsCollector(
+        output_dir=str(tmp_path), session_id="partial", flush_every=1000)
+    collector.set_training_start_step(100)
+    collector.record_training_step(
+        step=140,
+        loss=0.75,
+        lr=2e-4,
+        batch_size=2048,
+        step_time=0.25,
+        grad_norm=3.5,
+    )
+    collector.gpu_utilization_pct.append(91.0, 140)
+    collector.gpu_power_w.append(42.0, 140)
+    collector.process_rss_gb.append(7.25, 140)
+    collector.record_gpu_idle_wait(1.5, stale_epochs=4)
+    collector.record_selfplay_epoch(
+        step=140,
+        epoch=3,
+        num_games=240,
+        num_entries=14_000,
+        elapsed_sec=12.0,
+    )
+    collector.record_epoch(
+        epoch=3,
+        step=140,
+        avg_loss=0.8,
+        num_batches=20,
+        epoch_time_sec=4.0,
+    )
+    collector.record_replay_buffer_state(
+        step=140, total_entries=650_000, num_files=60)
+    collector.record_checkpoint(
+        step=140, loss=0.75, path="models/checkpoint.pt")
+
+    collector.flush_incremental()
+
+    output = tmp_path / "incremental_partial.jsonl"
+    row = json.loads(output.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["session_summary"]["training_start_step"] == 100
+    assert row["session_summary"]["training_end_step"] == 140
+    assert row["session_summary"]["completed_training_steps"] == 40
+    assert row["session_summary"]["gpu_idle_wait_seconds"] == 1.5
+    assert row["system_summary"]["gpu_utilization_pct"]["latest"] == {
+        "step": 140,
+        "value": 91.0,
+    }
+    assert row["system_summary"]["gpu_power_w"]["recent_mean"] == 42.0
+    assert row["system_summary"]["process_rss_gb"]["recent_max"] == 7.25
+    assert row["latest_records"]["selfplay"]["num_games"] == 240
+    assert row["latest_records"]["epoch"]["num_batches"] == 20
+    assert row["latest_records"]["replay_buffer"]["num_files"] == 60
+    assert row["latest_records"]["checkpoint"]["step"] == 140
+
+
+def test_zero_sample_report_is_missing_not_healthy():
+    empty_summary = {
+        "total_count": 0,
+        "running_mean": 0.0,
+        "running_min": 0.0,
+        "recent_mean": 0.0,
+        "recent_stdev": 0.0,
+        "recent_max": 0.0,
+    }
+    report = {
+        "meta": {},
+        "config": {"selfplay_noise_prob": 0.1},
+        "summary": {"total_steps": 0, "nan_inf_events": 0},
+        "loss": {"summary": dict(empty_summary)},
+        "gradient_norms": {"global_summary": dict(empty_summary)},
+        "throughput": {
+            "samples_per_sec": dict(empty_summary),
+            "step_time_sec": dict(empty_summary),
+        },
+        "score_distribution": {
+            "entropy_summary": dict(empty_summary),
+        },
+    }
+
+    loss = analyze_training_stats.analyze_loss(report)
+    throughput = analyze_training_stats.analyze_throughput(report)
+    gradients = analyze_training_stats.analyze_gradients(report)
+    model = analyze_training_stats.analyze_model_health(report)
+    evaluations = analyze_training_stats.analyze_evaluations(report)
+    selfplay = analyze_training_stats.analyze_selfplay(report)
+    system = analyze_training_stats.analyze_system(report)
+    recommendations = analyze_training_stats.generate_recommendations(
+        report,
+        loss,
+        throughput,
+        gradients,
+        model,
+        evaluations,
+        selfplay,
+        system,
+    )
+    markdown = analyze_training_stats.format_markdown_report(
+        report,
+        loss,
+        throughput,
+        gradients,
+        model,
+        evaluations,
+        selfplay,
+        system,
+        recommendations,
+    )
+
+    assert not loss["has_data"]
+    assert not throughput["has_data"]
+    assert not gradients["has_data"]
+    assert [item["category"] for item in recommendations] == ["Data Quality"]
+    assert "MISSING (0 recorded loss samples)" in markdown
+    assert "MISSING (0 recorded gradient samples)" in markdown
+    assert "No issues detected" not in markdown
+    assert "Score entropy is low" not in markdown
+
+
+def test_newer_incremental_stream_marks_terminal_report_stale(tmp_path):
+    report = tmp_path / "session_report_20260903_120000.json"
+    incremental = tmp_path / "incremental_20260903_120500.jsonl"
+    report.write_text("{}", encoding="utf-8")
+    incremental.write_text("{}\n", encoding="utf-8")
+    os.utime(report, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(incremental, ns=(2_000_000_000, 2_000_000_000))
+
+    assert analyze_training_stats.find_newer_incremental(
+        str(tmp_path), str(report)) == str(incremental)
