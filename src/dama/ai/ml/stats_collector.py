@@ -1279,13 +1279,88 @@ class StatsCollector:
         with self._lock:
             path = self.output_dir / f"incremental_{self.session_id}.jsonl"
             try:
+                elapsed = max(
+                    0.0, (datetime.now() - self.session_start).total_seconds())
+
+                def _metric_snapshot(buffer: MetricBuffer) -> Dict[str, Any]:
+                    latest = buffer.last_n(1)
+                    return {
+                        **buffer.summary(100),
+                        'latest': dict(latest[-1]) if latest else None,
+                    }
+
                 # Write just the latest metrics snapshot
                 snapshot = {
                     'timestamp': datetime.now().isoformat(),
+                    # A hard process/VM stop skips export_all(). Keep the
+                    # operational signals needed to diagnose that partial run
+                    # in this already-periodic crash-recovery stream.
+                    'session_summary': {
+                        'session_id': self.session_id,
+                        'start_time': self.session_start.isoformat(),
+                        'elapsed_seconds': elapsed,
+                        'training_start_step': self._training_start_step,
+                        'training_end_step': self._training_latest_step,
+                        'completed_training_steps': self._completed_training_steps(),
+                        'epochs_recorded': len(self.epoch_records),
+                        'selfplay_epochs_recorded': len(self.selfplay_records),
+                        'evaluations_recorded': len(self.eval_records),
+                        'checkpoints_recorded': len(self.checkpoint_records),
+                        'gpu_idle_wait_count': self.gpu_idle_wait_count,
+                        'gpu_idle_wait_seconds': self.gpu_idle_wait_seconds,
+                        'gpu_idle_wait_max_seconds': self.gpu_idle_wait_max_seconds,
+                        'gpu_idle_wait_pct': (
+                            min(100.0, 100.0 * self.gpu_idle_wait_seconds / elapsed)
+                            if elapsed > 0 else 0.0
+                        ),
+                    },
                     'loss_summary': self.loss.summary(100),
                     'grad_norm_summary': self.grad_norm_global.summary(100),
                     'throughput_summary': self.throughput_samples_sec.summary(100),
                     'step_time_summary': self.step_time_sec.summary(100),
+                    'system_summary': {
+                        'gpu_mem_allocated_mb': _metric_snapshot(
+                            self.gpu_mem_allocated_mb),
+                        'gpu_mem_reserved_mb': _metric_snapshot(
+                            self.gpu_mem_reserved_mb),
+                        'gpu_utilization_pct': _metric_snapshot(
+                            self.gpu_utilization_pct),
+                        'cpu_percent': _metric_snapshot(self.cpu_percent),
+                        'ram_used_gb': _metric_snapshot(self.ram_used_gb),
+                        'process_rss_gb': _metric_snapshot(self.process_rss_gb),
+                        'gpu_power_w': _metric_snapshot(self.gpu_power_w),
+                        'gpu_sm_clock_mhz': _metric_snapshot(
+                            self.gpu_sm_clock_mhz),
+                        'gpu_temp_c': _metric_snapshot(self.gpu_temp_c),
+                        'gpu_throttle_reasons': _metric_snapshot(
+                            self.gpu_throttle_reasons),
+                    },
+                    'latest_records': {
+                        'selfplay': (
+                            dict(self.selfplay_records[-1])
+                            if self.selfplay_records else None
+                        ),
+                        'epoch': (
+                            dict(self.epoch_records[-1])
+                            if self.epoch_records else None
+                        ),
+                        'replay_buffer': (
+                            dict(self.replay_records[-1])
+                            if self.replay_records else None
+                        ),
+                        'evaluation': (
+                            dict(self.eval_records[-1])
+                            if self.eval_records else None
+                        ),
+                        'checkpoint': (
+                            dict(self.checkpoint_records[-1])
+                            if self.checkpoint_records else None
+                        ),
+                        'non_finite_event': (
+                            dict(self.nan_inf_events[-1])
+                            if self.nan_inf_events else None
+                        ),
+                    },
                     'convergence': self.get_convergence_metrics(),
                 }
                 with open(path, 'a') as f:
