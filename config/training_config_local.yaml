@@ -29,6 +29,7 @@ device:
   compile:
     enabled: false                      # [Pass 20] Always fails on RTX 5050 ("device kernel image
                                         # is invalid"). Disabling avoids 5s warmup overhead.
+    mode: "reduce-overhead"             # Keep this standalone config self-contained. See Journal Pass 246.
   matmul_precision: "medium"            # TF32 enabled
 
 # -----------------------------------------------------------------------------
@@ -83,6 +84,7 @@ selfplay:
   noise_prob: 0.15                      # Sweet spot — 85% teacher moves, 15% exploration
   max_moves_per_game: 150               # Allow endgame play (avg game length is ~42 moves,
                                         # so this rarely constrains games)
+  max_stale_epochs: 0                   # Match the generic local profile explicitly. See Journal Pass 246.
   pipeline_mode: "simultaneous"         # Was "alternate" — GPU sat idle during entire self-play
                                         # cycle (~60s+). Simultaneous trains on GPU while CPU
                                         # generates data in background. With batch_size=8192 and
@@ -218,32 +220,60 @@ time_limit:
 # =============================================================================
 # Hardware-Specific Profiles (reference only — use top-level values directly)
 # =============================================================================
-# WARNING: Profiles do NOT override model architecture. The base config in
-# training_config.yaml uses 64/4/128/64 which is INCOMPATIBLE with local
-# checkpoints (128/8/256/128). Always use this file for local training.
+# Generic and standalone architectures now both use 128/8/256/128. See Journal Pass 246.
 # =============================================================================
 
 profiles:
+  # Server profile mirrors training_config.yaml. See Journal Pass 246.
   server:
     device:
       amp:
         dtype: "bfloat16"
       compile:
-        mode: "max-autotune"
+        enabled: true
+        mode: "reduce-overhead"         # Match the generic server reference profile. See Journal Pass 246.
     selfplay:
-      cpu_workers: 96                   # Synced with training_config_server.yaml
-      games_per_epoch: 512              # Synced with training_config_server.yaml
+      cpu_workers: 96                   # Match the generic server reference profile. See Journal Pass 246.
+      games_per_epoch: 900              # Match the generic server reference profile. See Journal Pass 246.
+      difficulties: ["easy", "medium", "hard", "super_hard"]
+      opponent_focus: "both"
+      noise_prob: 0.20
+      max_moves_per_game: 100
+      algo_vs_algo:
+        enabled: true
+        games_per_epoch: 200
+        difficulties: ["easy", "medium", "hard"]
     training:
-      batch_size: 32768
-      learning_rate: 2.0e-4
+      batch_size: 65536                 # Match the generic server reference profile. See Journal Pass 246.
+      learning_rate: 4.2e-4             # Match the generic server reference profile. See Journal Pass 246.
+      reward_mode: "cycle"
       lr_scheduler:
         enabled: false                  # LR scheduler disabled per v5 post-mortem
+        T_0: 500
+        eta_min: 1.0e-5
     dataloader:
+      prefetch_factor: 3
       replay_max_entries: 5000000       # Synced with training_config_server.yaml
+      clear_replay_after_load: false
       ram_cache:
         threshold_gb: 64.0
+    testing:
+      enabled: true                    # Match the monitored generic server reference. See Journal Pass 248.
+      every_n_steps: 5000
+      difficulty: "medium"
+    statistics:
+      record_every: 500
+      system_every: 2000
+      score_dist_every: 500
+      flush_every: 5000
+      output_dir: "logs/stats"
     thermal_protection:
       enabled: false
+    paths:
+      log_dir: "logs"
+      stats_file: "models/training_stats.json"
+    time_limit:
+      duration: "7h"
 
   local:
     device:
