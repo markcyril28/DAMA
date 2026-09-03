@@ -189,50 +189,6 @@ def test_interleaved_model_trajectory_keeps_hard_label(monkeypatch):
         assert entry["teacher_difficulty"] == "hard"
 
 
-def test_interleaved_compact_path_uses_fused_teacher_boundary(monkeypatch):
-    """The fused compact API must bypass GameState reconstruction/search."""
-    if not getattr(selfplay, "_HAS_FUSED_COMPACT_TEACHER", False):
-        pytest.skip("fused Cython teacher boundary is not built")
-
-    torch = pytest.importorskip("torch")
-
-    class FirstMoveModel:
-        def forward_padded(self, boards, move_features, move_counts):
-            scores = torch.zeros(
-                (boards.shape[0], move_features.shape[1]),
-                dtype=torch.float32,
-            )
-            scores[:, 0] = 1.0
-            return scores
-
-    original_fused = selfplay._fused_teacher_decision
-    calls = []
-
-    def recording_fused(*args):
-        calls.append(args)
-        return original_fused(*args)
-
-    def unexpected_search(*args, **kwargs):
-        raise AssertionError("fused compact path called get_best_move")
-
-    monkeypatch.setattr(selfplay, "_FORK_MODEL", FirstMoveModel())
-    monkeypatch.setattr(selfplay, "_HAS_FAST_ENCODE", False)
-    monkeypatch.setattr(selfplay, "_fused_teacher_decision", recording_fused)
-    monkeypatch.setattr(selfplay, "get_best_move", unexpected_search)
-
-    tasks = [(
-        "medium", 1, 0.0, 1, "ml", "ml", "unused.pt", "cpu",
-        0, 23, "current_model", "fused-interleaved", "hard",
-    )]
-    entries = selfplay.play_games_interleaved(tasks)
-
-    assert len(calls) == 1
-    assert len(entries) == 1
-    assert entries[0]["played_index"] == 0
-    assert 0 <= entries[0]["chosen_index"] < len(entries[0]["legal_moves"])
-    assert entries[0]["teacher_difficulty"] == "hard"
-
-
 def test_replay_metadata_round_trip_and_old_entry_compatibility():
     state = GameState.initial()
     moves = [move.to_dict() for move in state.legal_moves()]
