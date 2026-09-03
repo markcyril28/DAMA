@@ -50,7 +50,7 @@ selfplay:
   opening_seed: 20260819
   max_moves_per_game: 200
   pipeline_mode: "simultaneous"
-  max_stale_epochs: 100
+  max_stale_epochs: 4  # Cap same-snapshot fitting before held-out loss rebounds. See Journal Pass 246.
   persist_selfplay: true
 
   generation_mix:
