@@ -67,6 +67,43 @@ def test_launcher_script_is_valid_bash() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_relocated_launcher_uses_project_working_directory(
+    tmp_path: Path,
+) -> None:
+    """The isolated smoke launcher lives outside the repository.
+
+    Relative config paths and recovery inputs still belong to the project, so
+    a relocated launcher must use a valid caller cwd rather than its own
+    temporary directory as PROJECT_DIR.
+    """
+    text = _launcher_text()
+    block = _extract(
+        text,
+        "# Get the directory where this script is located\n",
+        "# Resolve the config before creating logs or invoking the trainer.",
+    )
+    project_dir = tmp_path / "project"
+    (project_dir / "src/dama/ai/ml").mkdir(parents=True)
+    (project_dir / "src/dama/ai/ml/trainer.py").touch()
+    (project_dir / "local_train.sh").touch()
+    relocated_dir = tmp_path / "relocated"
+    relocated_dir.mkdir()
+    harness = relocated_dir / "local_train_smoke.sh"
+    harness.write_text(
+        "set -euo pipefail\n"
+        + block
+        + "\nprintf '%s\\n' \"$PROJECT_DIR\"\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [BASH, str(harness)], cwd=project_dir,
+        capture_output=True, text=True, timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(project_dir.resolve())
+
+
 def test_recovery_enabled_accepts_every_yaml_boolean_spelling() -> None:
     """The trainer classifies this key via yaml.safe_load; so must the launcher.
 
