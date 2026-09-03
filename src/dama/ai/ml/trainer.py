@@ -1405,6 +1405,10 @@ class Trainer:
         self._bg_snapshot_manifest: Optional[dict] = None
         self._bg_validation_entries: Optional[list] = None
         self._bg_selfplay_lock = threading.Lock()
+        # Duration expiry must stop the continuous producer without setting
+        # _stopped, which is reserved for an operator stop and controls the
+        # terminal run-status reason.
+        self._bg_selfplay_stop_event = threading.Event()
         self._last_selfplay_dicts: Optional[list] = None
         self._last_selfplay_preprocessed: Optional[CachedTensorDataset] = None
         # A verified manifest-keyed tensor cache may satisfy the initial
@@ -4578,16 +4582,18 @@ class Trainer:
 
         # Offload disk I/O to background thread — GPU resumes training immediately.
         def _write_checkpoint():
-            try:
-                # Save to temp file then rename (atomic)
-                with tempfile.NamedTemporaryFile(delete=False, dir=self.config.checkpoint_dir) as tmp:
+            stage = 'checkpoint serialization'
+            numbered_rewrite_attempted = False
+
+            def _write_numbered_checkpoint() -> None:
+                with tempfile.NamedTemporaryFile(
+                    delete=False, dir=self.config.checkpoint_dir,
+                ) as tmp:
                     torch.save(checkpoint, tmp.name)
                     tmp_path = tmp.name
                 os.replace(tmp_path, checkpoint_path)
 
-                # latest.pt = hardlink to checkpoint (instant, avoids second
-                # torch.save serialization + disk write of ~55MB).  Falls back
-                # to shutil.copy2 if hardlink fails (cross-device, permissions).
+            def _publish_latest_alias() -> None:
                 latest_path.parent.mkdir(parents=True, exist_ok=True)
                 _lp = str(latest_path)
                 try:
@@ -4603,7 +4609,52 @@ class Trainer:
                     import shutil
                     shutil.copy2(str(checkpoint_path), _lp)
 
+            def _rewrite_missing_numbered_checkpoint() -> None:
+                nonlocal numbered_rewrite_attempted
+                if numbered_rewrite_attempted:
+                    raise FileNotFoundError(
+                        f"numbered checkpoint missing after one rewrite: "
+                        f"{checkpoint_path}"
+                    )
+                numbered_rewrite_attempted = True
+                print(
+                    f"  [warn] Numbered checkpoint disappeared after "
+                    f"publication; rewriting once: {checkpoint_path}"
+                )
+                _write_numbered_checkpoint()
+
+            try:
+                # Save to temp file then rename (atomic)
+                _write_numbered_checkpoint()
+
+                # latest.pt = hardlink to checkpoint (instant, avoids second
+                # torch.save serialization + disk write of ~55MB).  Falls back
+                # to shutil.copy2 if hardlink fails (cross-device, permissions).
+                stage = 'latest alias publication'
+                try:
+                    _publish_latest_alias()
+                except FileNotFoundError:
+                    if checkpoint_path.is_file():
+                        raise
+                    _rewrite_missing_numbered_checkpoint()
+                    _publish_latest_alias()
+
+                # One production write disappeared between its successful
+                # atomic replace and the promotion digest on the Windows
+                # mounted project volume (step 252000, 2026-09-02). Repair the
+                # numbered artifact from the in-memory snapshot before any
+                # registry/task side effect. This also prevents a non-promoted
+                # checkpoint from being reported as saved when only its latest
+                # alias survived.
+                stage = 'post-publication checkpoint verification'
+                if not checkpoint_path.is_file():
+                    _rewrite_missing_numbered_checkpoint()
+                    _publish_latest_alias()
+                if not checkpoint_path.is_file():
+                    _rewrite_missing_numbered_checkpoint()
+
                 if selection:
+                    stage = 'checkpoint promotion digest'
                     promotion_record = dict(selection.get('promotion', {}))
                     promotion_record['run_identity'] = dict(
                         getattr(self, '_run_identity', {}) or {})
@@ -4630,6 +4681,7 @@ class Trainer:
                     ]
                     selection['promotion'] = promotion_record
 
+                stage = 'training statistics write'
                 self._save_stats(_snapshot=_stats_snapshot)
 
                 # Write JSONL log entry (moved from training thread).
@@ -4638,6 +4690,7 @@ class Trainer:
                     with open(_log_file, 'a') as f:
                         f.write(json.dumps(_log_entry) + '\n')
 
+                stage = 'checkpoint retention'
                 pruned = self._prune_old_checkpoints(checkpoint_path)
                 if pruned:
                     print(
@@ -4653,8 +4706,10 @@ class Trainer:
                         file_size_mb=ckpt_size,
                     )
                 if selection and selection.get('promotion', {}).get('promoted'):
+                    stage = 'promoted checkpoint publication'
                     self._publish_checkpoint_alias(
                         checkpoint_path, Path(self.config.promoted_path))
+                    stage = 'acceptance task enqueue'
                     self._enqueue_checkpoint_acceptance(checkpoint_path, selection)
                 print(f"Checkpoint saved: {checkpoint_path}")
                 # Notify the GUI so the panel can log the checkpoint and
@@ -4665,7 +4720,11 @@ class Trainer:
                     'checkpoint_path': str(checkpoint_path),
                 })
             except Exception as e:
-                print(f"Checkpoint save error: {e}")
+                print(
+                    f"Checkpoint save error during {stage} at step {_step}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                traceback.print_exc()
 
         self._checkpoint_thread = threading.Thread(target=_write_checkpoint, daemon=True)
         self._checkpoint_thread.start()
@@ -5407,14 +5466,18 @@ class Trainer:
         """
         if self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
             return  # already running
+        self._bg_selfplay_stop_event.clear()
+
+        def _shutdown_requested() -> bool:
+            return self._stopped or self._bg_selfplay_stop_event.is_set()
 
         def _worker():
             if self._snapshot_manager is not None:
-                while not self._stopped:
+                while not _shutdown_requested():
                     try:
-                        while self._paused and not self._stopped:
-                            time.sleep(0.5)
-                        if self._stopped:
+                        while self._paused and not _shutdown_requested():
+                            self._bg_selfplay_stop_event.wait(timeout=0.5)
+                        if _shutdown_requested():
                             break
 
                         _, selfplay_behavior_step = self.run_selfplay(
@@ -5430,6 +5493,11 @@ class Trainer:
                                 f"  Replay: pruned {pruned} old file(s) "
                                 f"(keeping newest {self.config.replay_max_files})"
                             )
+                        # Preserve the completed replay shard, but do not start
+                        # corpus work that can outlive a duration-triggered
+                        # shutdown. The next launch will consider this shard.
+                        if self._bg_selfplay_stop_event.is_set():
+                            break
 
                         teacher, noise, generation = self._corpus_settings(
                             model_behavior_step=selfplay_behavior_step
@@ -5473,8 +5541,8 @@ class Trainer:
                         import traceback
                         print(f"Background snapshot self-play error: {exc}")
                         traceback.print_exc()
-                        if not self._stopped:
-                            time.sleep(2.0)
+                        if not _shutdown_requested():
+                            self._bg_selfplay_stop_event.wait(timeout=2.0)
                 return
 
             _existing = getattr(self, '_current_dataset', None)
@@ -5489,7 +5557,7 @@ class Trainer:
             # copy — the data lives on GPU.
             _first_cycle = True
 
-            while not self._stopped:
+            while not _shutdown_requested():
                 try:
                     # Respect Pause: do not start a new self-play cycle while
                     # paused (games already in flight still finish).
@@ -5499,9 +5567,9 @@ class Trainer:
                     # naturally while paused, the main loop has exited and won't
                     # clear _paused; shutdown is then bounded by the bg-thread
                     # join timeout (see end of train()). Harmless but noted.
-                    while self._paused and not self._stopped:
-                        time.sleep(0.5)
-                    if self._stopped:
+                    while self._paused and not _shutdown_requested():
+                        self._bg_selfplay_stop_event.wait(timeout=0.5)
+                    if _shutdown_requested():
                         break
 
                     _has_existing = _existing_count > 0
@@ -5533,6 +5601,8 @@ class Trainer:
                         if _pruned:
                             print(f"  Replay: pruned {_pruned} old file(s) "
                                   f"(keeping newest {self.config.replay_max_files})")
+                    if self._bg_selfplay_stop_event.is_set():
+                        break
 
                     # Check for inline-preprocessed data first (fast path).
                     incremental = getattr(self, '_last_selfplay_preprocessed', None)
@@ -5622,11 +5692,26 @@ class Trainer:
                     print(f"Background self-play error: {e}")
                     traceback.print_exc()
                     # Don't crash the loop — sleep briefly and retry
-                    if not self._stopped:
-                        time.sleep(2.0)
+                    if not _shutdown_requested():
+                        self._bg_selfplay_stop_event.wait(timeout=2.0)
 
         self._bg_selfplay_thread = threading.Thread(target=_worker, daemon=True)
         self._bg_selfplay_thread.start()
+
+    def _stop_background_selfplay(self) -> None:
+        """Stop the continuous producer and wait until its process pool is gone.
+
+        The terminal run marker is written after ``_run_training`` returns, so
+        this wait is deliberately not timed out. Otherwise a marker could say
+        ``terminated`` while self-play workers are still live, allowing a
+        colliding trainer launch in the same namespace.
+        """
+        self._bg_selfplay_stop_event.set()
+        self._data_ready_event.set()
+        thread = self._bg_selfplay_thread
+        if thread is not None and thread.is_alive():
+            print("Waiting for background self-play to finish...")
+            thread.join()
 
     def _collect_background_selfplay(self):
         """Check if background self-play produced new data. Non-blocking.
@@ -7454,10 +7539,10 @@ class Trainer:
             _async_test_thread.join(timeout=30)
         _collect_async_test()
 
-        # Wait for any background self-play to finish before exit
-        if _simultaneous and self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
-            print("Waiting for background self-play to finish...")
-            self._bg_selfplay_thread.join(timeout=60)
+        # Stop the continuous producer before the final checkpoint and before
+        # train() is allowed to publish a terminal run-status record.
+        if _simultaneous:
+            self._stop_background_selfplay()
 
         # Final checkpoint
         self._save_checkpoint(loss)
