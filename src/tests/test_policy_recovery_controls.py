@@ -152,6 +152,32 @@ def test_recovery_summary_labels_acceptance_opponents_and_ignores_stale_score():
     assert stale_metrics["confidence_interval"] == "N/A"
 
 
+def test_stats_bundle_retries_a_file_replaced_during_dashboard_read(
+    monkeypatch,
+    tmp_path,
+):
+    stats_path = tmp_path / "training_stats_recovery.json"
+    stats_path.write_text('{"total_steps": 123}', encoding="utf-8")
+    real_load_stats = plot_training.load_stats
+    attempts = 0
+
+    def _replace_race_once(path):
+        nonlocal attempts
+        if Path(path) == stats_path and attempts == 0:
+            attempts += 1
+            raise FileNotFoundError(path)
+        attempts += 1
+        return real_load_stats(path)
+
+    monkeypatch.setattr(plot_training, "load_stats", _replace_race_once)
+    stats, sources = plot_training.load_stats_bundle(
+        stats_path, include_related=False)
+
+    assert attempts == 2
+    assert stats["total_steps"] == 123
+    assert sources == [stats_path]
+
+
 def test_every_launcher_exposes_the_lineage_verified_continuation_opt_in():
     """Audit Suggestion 7: a relaunch must be able to continue, from any entry point.
 
