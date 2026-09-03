@@ -32,10 +32,10 @@ device:
 # Changing these starts a NEW model (incompatible with existing checkpoints).
 # -----------------------------------------------------------------------------
 model:
-  channels: 64                        # CNN channels in ResidualBlocks
-  num_blocks: 4                       # Number of residual blocks
-  embedding_size: 128                 # Board embedding vector size
-  hidden_size: 64                     # MoveScorer MLP hidden layer size
+  channels: 128                       # Match the shared generic checkpoint architecture. See Journal Pass 246.
+  num_blocks: 8                       # Match the shared generic checkpoint architecture. See Journal Pass 246.
+  embedding_size: 256                 # Match the shared generic checkpoint architecture. See Journal Pass 246.
+  hidden_size: 128                    # Match the shared generic checkpoint architecture. See Journal Pass 246.
 
 # -----------------------------------------------------------------------------
 # Value Head (optional auxiliary head for position evaluation)
@@ -88,9 +88,9 @@ training:
   train_steps: 100000000000           # Total training steps
   checkpoint_every: 2000              # Save checkpoint every N steps
 
-  # Learning rate schedule (enable for better convergence)
+  # Learning rate schedule
   lr_scheduler:
-    enabled: true                     # Enable LR scheduler
+    enabled: false                    # Avoid short restart cycles in the resumable generic run. See Journal Pass 248.
     type: "cosine_warm_restarts"      # Cosine annealing with warm restarts
     T_0: 500                          # Steps for first cosine cycle
     T_mult: 2                         # Cycle length multiplier after each restart
@@ -133,7 +133,7 @@ dataloader:
 # Model Testing Settings (ML vs Algorithm)
 # -----------------------------------------------------------------------------
 testing:
-  enabled: false                      # Enable periodic testing against algorithm
+  enabled: true                       # Keep game-strength monitoring active. See Journal Pass 248.
   every_n_steps: 5000                 # Test every N training steps
   num_games: 50                       # Number of test games per evaluation
   difficulty: "medium"                # Algorithm difficulty for testing
@@ -229,7 +229,7 @@ profiles:
         enabled: true
         threshold_gb: 64.0
 
-  # Local development (NVIDIA RTX 5050, 8GB VRAM, 12 CPU cores, 32GB RAM)
+  # Local profile mirrors training_config_local.yaml. See Journal Pass 246.
   local:
     model:
       channels: 128
@@ -243,9 +243,12 @@ profiles:
         dtype: "bfloat16"              # Blackwell CC 12.0: no GradScaler, fused AdamW. See Journal Pass 74.
       compile:
         enabled: false                  # Always fails on RTX 5050. See Journal Pass 20, 92.
+        mode: "reduce-overhead"
     selfplay:
-      cpu_workers: 12
+      cpu_workers: 8
       games_per_epoch: 200
+      opponent_focus: "algorithm"
+      noise_prob: 0.15
       max_moves_per_game: 150             # Override base 100; matches local configs. See Journal Pass 70.
       max_stale_epochs: 0                 # Explicit unlimited; thermal handles GPU temp. See Journal Pass 70.
       difficulties:
@@ -255,28 +258,55 @@ profiles:
       pipeline_mode: "simultaneous"
       algo_vs_algo:
         enabled: false                    # Disabled: 99.7% P1 bias. See Journal Pass 83 + Landmines.
-        games_per_epoch: 1000
+        games_per_epoch: 200
         difficulties:
           - "easy"
           - "medium"
-          - "hard"
     training:
       batch_size: 8192                    # Synced with local_retrain.yaml. See Journal Pass 83.
       learning_rate: 2.0e-4               # Synced with local_retrain.yaml. See Journal Pass 83.
       gradient_accumulation_steps: 1
+      reward_mode: "scoring"
       lr_scheduler:
         enabled: false                  # LR scheduler caused catastrophic regression.
+        type: "cosine_warm_restarts"
+        T_0: 5000
+        T_mult: 2
+        eta_min: 5.0e-5
+        warmup_steps: 200
     dataloader:
       num_workers: 0
+      prefetch_factor: 4
       replay_max_entries: 500000          # Synced with local_retrain.yaml. See Journal Pass 83.
+      clear_replay_after_load: true
       ram_cache:
         enabled: true
         threshold_gb: 16.0
+    testing:
+      enabled: true
+      every_n_steps: 1000
+      num_games: 50
+      difficulty: "easy"
+    statistics:
+      enabled: true
+      record_every: 1000
+      system_every: 5000
+      model_health_every: 5000
+      score_dist_every: 1000
+      buffer_size: 50000
+      flush_every: 500
+      output_dir: "logs/local/stats"
     thermal_protection:
       enabled: true
       temp_limit_c: 90
       rest_duration: "5m"
       check_every: 30
+    paths:
+      log_dir: "logs/local"
+      stats_file: "models/training_stats_local.json"
+    time_limit:
+      enabled: true
+      duration: "4h"
 
   # CPU-only training
   cpu:
