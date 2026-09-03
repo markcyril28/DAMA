@@ -49,6 +49,17 @@ try:
 except ImportError:
     _HAS_COMPACT_STATE = False
 
+# [Pass 242] Fuse compact-state construction, root move generation, and the
+# hard-teacher decision. Keep this import separate so an older extension can
+# still use the established compact path while this optional API is absent.
+try:
+    from ...ai.algorithmic._fast_search import (
+        generate_teacher_decision_from_board as _fused_teacher_decision,
+    )
+    _HAS_FUSED_COMPACT_TEACHER = True
+except ImportError:
+    _HAS_FUSED_COMPACT_TEACHER = False
+
 # [Pass 67] Fast encoding for interleaved self-play inference.
 # Cython versions are 6-7x faster than Python move_encoder.encode_board/moves.
 # Python _encode_*_fast are ~2x faster (avoid GameState/Move object traversal).
@@ -583,6 +594,7 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
     # instead of GameState objects. Eliminates Move.from_dict + Board.__init__
     # + GameState.__init__ per position (~100-200μs saved per move).
     _use_compact = _HAS_COMPACT_STATE
+    _use_fused_teacher = _use_compact and _HAS_FUSED_COMPACT_TEACHER
 
     # Initialize all games
     # [Pass 80] Use int keys {1: 0, 2: 0} for captures dict instead of
@@ -691,7 +703,10 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
 
             # [Pass 75] Compact path: movegen + to_compact from raw board bytes.
             # Avoids _load_board (Python dict iteration) and to_compact overhead.
-            if _use_compact:
+            if _use_fused_teacher:
+                sd, md, teacher_idx = _fused_teacher_decision(
+                    g['bb'], g['pl'], g['state_move_count'])
+            elif _use_compact:
                 md = _gen_moves_board(g['bb'], g['pl'])
             elif _use_fast_movegen:
                 md = _fast_gen_moves(g['state'])
@@ -704,10 +719,10 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
                 continue
             new_active.append(i)
 
-            if _use_compact:
+            if _use_compact and not _use_fused_teacher:
                 sd = _board_to_compact(
                     g['bb'], g['pl'], g['state_move_count'])
-            else:
+            elif not _use_compact:
                 sd = g['state'].to_compact()
 
             # Single legal move — no inference needed
@@ -720,11 +735,13 @@ def play_games_interleaved(batch_args: list) -> List[dict]:
             else:
                 policy = g['p1_policy'] if g['state'].current_player == Player.ONE else g['p2_policy']
 
-            teacher_state = (
-                GameState.from_compact(sd) if _use_compact else g['state'])
-            teacher_move = get_best_move(
-                teacher_state, HARD_TEACHER_DIFFICULTY, use_parallel=False)
-            teacher_idx = _move_index(teacher_move, md)
+            if not _use_fused_teacher:
+                teacher_state = (
+                    GameState.from_compact(sd) if _use_compact else g['state'])
+                teacher_move = get_best_move(
+                    teacher_state, HARD_TEACHER_DIFFICULTY,
+                    use_parallel=False)
+                teacher_idx = _move_index(teacher_move, md)
 
             # Exploration changes the played action but never the hard label.
             if g['rng'].random() < g['noise_prob']:
