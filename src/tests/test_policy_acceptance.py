@@ -200,10 +200,53 @@ def test_evaluation_worker_limits_pytorch_thread_pools(monkeypatch) -> None:
     assert calls == [("intra", 1), ("interop", 1)]
 
 
+def test_linux_evaluation_context_preloads_cpu_inference_stack(monkeypatch) -> None:
+    calls = []
+    sentinel = object()
+    monkeypatch.setattr(model_vs_algo.sys, "platform", "linux")
+    monkeypatch.setattr(
+        model_vs_algo.mp,
+        "get_all_start_methods",
+        lambda: ["spawn", "forkserver"],
+    )
+    monkeypatch.setattr(
+        model_vs_algo.mp, "set_forkserver_preload",
+        lambda modules: calls.append(("preload", tuple(modules))),
+    )
+    monkeypatch.setattr(
+        model_vs_algo.mp, "get_context",
+        lambda method: calls.append(("context", method)) or sentinel,
+    )
+
+    assert model_vs_algo._evaluation_worker_context() is sentinel
+    assert calls == [
+        ("preload", model_vs_algo._EVALUATION_FORKSERVER_PRELOAD),
+        ("context", "forkserver"),
+    ]
+
+
+def test_evaluation_context_falls_back_to_spawn(monkeypatch) -> None:
+    calls = []
+    sentinel = object()
+    monkeypatch.setattr(model_vs_algo.sys, "platform", "win32")
+    monkeypatch.setattr(
+        model_vs_algo.mp, "set_forkserver_preload",
+        lambda _modules: calls.append("unexpected preload"),
+    )
+    monkeypatch.setattr(
+        model_vs_algo.mp, "get_context",
+        lambda method: calls.append(method) or sentinel,
+    )
+
+    assert model_vs_algo._evaluation_worker_context() is sentinel
+    assert calls == ["spawn"]
+
+
 def test_standalone_evaluation_pool_installs_thread_limiter(
     monkeypatch, tmp_path
 ) -> None:
     instances = []
+    worker_context = object()
 
     class _Executor:
         def __init__(self, *, max_workers, mp_context, initializer):
@@ -241,6 +284,11 @@ def test_standalone_evaluation_pool_installs_thread_limiter(
             return future
 
     monkeypatch.setattr(model_vs_algo, "ProcessPoolExecutor", _Executor)
+    monkeypatch.setattr(
+        model_vs_algo,
+        "_evaluation_worker_context",
+        lambda: worker_context,
+    )
     stats = model_vs_algo.ModelVsAlgoTester(
         model_path="unused.pt",
         algo_difficulty="easy",
@@ -254,6 +302,7 @@ def test_standalone_evaluation_pool_installs_thread_limiter(
     assert stats.total_games == 4
     assert len(instances) == 1
     assert instances[0].max_workers == 2
+    assert instances[0].mp_context is worker_context
     assert instances[0].initializer is model_vs_algo._evaluation_worker_init
 
 

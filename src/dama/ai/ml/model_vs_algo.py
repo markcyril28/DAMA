@@ -3,6 +3,7 @@
 import json
 import hashlib
 import multiprocessing as mp
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -17,12 +18,35 @@ from ...game_state import GameState
 from .acceptance import WILSON_95_METHOD, wdl_summary
 
 
-def _evaluation_worker_init() -> None:
-    """Keep each spawned evaluator to one PyTorch compute thread.
+_EVALUATION_FORKSERVER_PRELOAD = (
+    "torch",
+    "numpy",
+    "dama.ai.ml.inference",
+    "dama.ai.ml.dataset",
+    "dama.ai.ml.model_vs_algo",
+)
 
-    Evaluation already parallelizes across processes.  A spawn worker starts a
-    fresh Python runtime, so it does not inherit the trainer's one-thread
-    PyTorch setting and can otherwise create a full intra-op pool of its own.
+
+def _evaluation_worker_context():
+    """Return a CUDA-safe evaluator context with shared imports on Linux.
+
+    A forkserver is itself spawned without the trainer's CUDA state. Loading
+    the CPU inference stack once there lets evaluator children inherit those
+    immutable module pages instead of importing PyTorch independently in every
+    worker. Other platforms retain the established spawn path.
+    """
+    if sys.platform.startswith("linux") and "forkserver" in mp.get_all_start_methods():
+        mp.set_forkserver_preload(list(_EVALUATION_FORKSERVER_PRELOAD))
+        return mp.get_context("forkserver")
+    return mp.get_context("spawn")
+
+
+def _evaluation_worker_init() -> None:
+    """Keep each isolated evaluator to one PyTorch compute thread.
+
+    Evaluation already parallelizes across processes. Spawn and forkserver
+    workers do not inherit the trainer's one-thread PyTorch setting and can
+    otherwise create a full intra-op pool of their own.
     """
     import torch
 
@@ -31,7 +55,7 @@ def _evaluation_worker_init() -> None:
         torch.set_num_interop_threads(1)
     except RuntimeError:
         # PyTorch permits setting inter-op width only before parallel work.
-        # Fresh spawn workers take the primary path; keep direct reuse safe.
+        # Fresh evaluator workers take the primary path; keep direct reuse safe.
         pass
 
 
@@ -919,11 +943,13 @@ class ModelVsAlgoTester:
             if self._executor is not None:
                 _consume_parallel(self._executor)
             else:
-                # Use 'spawn' so children never inherit the parent's CUDA state.
-                spawn_ctx = mp.get_context('spawn')
+                # The Linux forkserver is spawned outside the CUDA-owning
+                # trainer and shares preloaded CPU inference imports. Other
+                # platforms use spawn with the same isolation guarantee.
+                worker_ctx = _evaluation_worker_context()
                 with ProcessPoolExecutor(
                     max_workers=self.num_workers,
-                    mp_context=spawn_ctx,
+                    mp_context=worker_ctx,
                     initializer=_evaluation_worker_init,
                 ) as executor:
                     _consume_parallel(executor)

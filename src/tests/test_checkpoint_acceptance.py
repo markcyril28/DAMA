@@ -72,8 +72,13 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
             self.exited = True
 
     _Tester.calls = []
+    worker_context = object()
     monkeypatch.setattr(checkpoint_acceptance, "ModelVsAlgoTester", _Tester)
     monkeypatch.setattr(checkpoint_acceptance, "ProcessPoolExecutor", _Executor)
+    monkeypatch.setattr(
+        checkpoint_acceptance, "_evaluation_worker_context",
+        lambda: worker_context,
+    )
     report = checkpoint_acceptance.run_checkpoint_acceptance(
         str(tmp_path / "model_step_136000.pt"),
         step=136000,
@@ -92,6 +97,7 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
     assert len(_Executor.instances) == 1
     executor = _Executor.instances[0]
     assert executor.max_workers == 2
+    assert executor.mp_context is worker_context
     assert executor.initializer is checkpoint_acceptance._evaluation_worker_init
     assert executor.entered and executor.exited
     assert all(call["executor"] is executor for call in _Tester.calls)
