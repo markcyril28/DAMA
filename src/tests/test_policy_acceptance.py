@@ -352,6 +352,33 @@ def test_batch_game_times_partition_the_batch_wall(monkeypatch) -> None:
     assert sum(times) <= wall_ms
 
 
+def test_batch_scores_only_widest_live_move_set(monkeypatch) -> None:
+    observed_widths = []
+
+    class _FirstMoveModel:
+        def forward_padded(self, boards, move_features, move_counts):
+            live_width = int(move_counts.max().item())
+            observed_widths.append((move_features.shape[1], live_width))
+            scores = torch.zeros(
+                (boards.shape[0], move_features.shape[1]), dtype=torch.float32)
+            scores[:, 0] = 1.0
+            return scores
+
+    monkeypatch.setattr(
+        inference, "get_model", lambda *_args, **_kwargs: _FirstMoveModel())
+
+    args = (
+        "unused.pt", "easy", "random", [1, 1, 2, 2], 60,
+        [(2, 11), (2, 12), (4, 13), (4, 14)], 1,
+    )
+    records = model_vs_algo._play_test_games_batch(args)
+
+    assert len(records) == 4
+    assert observed_widths
+    assert all(width == live_width for width, live_width in observed_widths)
+    assert all(width < 32 for width, _live_width in observed_widths)
+
+
 def test_algorithm_opponent_failure_never_falls_back_to_random(monkeypatch) -> None:
     from dama.ai.algorithmic import search
 
