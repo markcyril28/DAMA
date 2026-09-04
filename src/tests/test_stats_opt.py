@@ -98,6 +98,7 @@ def test_resumed_session_counts_optimizer_steps_not_metric_rows(tmp_path):
 def test_incremental_flush_preserves_partial_run_diagnostics(tmp_path):
     collector = StatsCollector(
         output_dir=str(tmp_path), session_id="partial", flush_every=1000)
+    collector.set_config_snapshot({"learning_rate": 2e-4, "batch_size": 2048})
     collector.set_training_start_step(100)
     collector.record_training_step(
         step=140,
@@ -138,6 +139,8 @@ def test_incremental_flush_preserves_partial_run_diagnostics(tmp_path):
     assert row["session_summary"]["training_end_step"] == 140
     assert row["session_summary"]["completed_training_steps"] == 40
     assert row["session_summary"]["gpu_idle_wait_seconds"] == 1.5
+    assert row["config"] == {"learning_rate": 2e-4, "batch_size": 2048}
+    assert row["learning_rate_summary"]["recent_mean"] == 2e-4
     assert row["system_summary"]["gpu_utilization_pct"]["latest"] == {
         "step": 140,
         "value": 91.0,
@@ -223,3 +226,103 @@ def test_newer_incremental_stream_marks_terminal_report_stale(tmp_path):
 
     assert analyze_training_stats.find_newer_incremental(
         str(tmp_path), str(report)) == str(incremental)
+
+
+def test_incremental_stream_builds_partial_report(tmp_path):
+    incremental = tmp_path / "incremental_partial.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-09-03T12:00:00",
+            "loss_summary": {"total_count": 0},
+        },
+        {
+            "timestamp": "2026-09-03T12:05:00",
+            "session_summary": {
+                "session_id": "partial",
+                "start_time": "2026-09-03T12:00:00",
+                "elapsed_seconds": 300.0,
+                "training_start_step": 100,
+                "training_end_step": 140,
+                "completed_training_steps": 40,
+                "epochs_recorded": 2,
+                "selfplay_epochs_recorded": 3,
+                "evaluations_recorded": 1,
+                "checkpoints_recorded": 1,
+                "gpu_idle_wait_pct": 2.5,
+            },
+            "config": {"learning_rate": 2e-4},
+            "loss_summary": {"total_count": 4, "recent_mean": 0.7},
+            "learning_rate_summary": {
+                "total_count": 4, "recent_mean": 2e-4},
+            "grad_norm_summary": {"total_count": 4, "recent_mean": 3.5},
+            "throughput_summary": {
+                "total_count": 4, "recent_mean": 5000.0},
+            "step_time_summary": {"total_count": 4, "recent_mean": 0.4},
+            "system_summary": {
+                "gpu_utilization_pct": {
+                    "total_count": 1, "recent_mean": 91.0},
+            },
+            "latest_records": {
+                "selfplay": {"num_games": 240},
+                "epoch": {"epoch": 2},
+                "evaluation": {"ml_win_rate": 0.5},
+                "checkpoint": {"step": 140},
+            },
+            "convergence": {"nan_inf_event_count": 0},
+        },
+    ]
+    incremental.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    report, warning = analyze_training_stats.load_incremental_report(
+        str(incremental))
+
+    assert warning is None
+    assert report["meta"]["data_source"] == "incremental"
+    assert report["summary"]["total_steps"] == 40
+    assert report["summary"]["gpu_idle_wait_pct"] == 2.5
+    assert report["config"]["learning_rate"] == 2e-4
+    assert report["loss"]["summary"]["recent_mean"] == 0.7
+    assert report["learning_rate"]["summary"]["recent_mean"] == 2e-4
+    assert report["gradient_norms"]["global_summary"]["recent_mean"] == 3.5
+    assert report["system"]["gpu_utilization"]["recent_mean"] == 91.0
+    assert report["selfplay"] == [{"num_games": 240}]
+
+    analyses = {
+        "loss_analysis": analyze_training_stats.analyze_loss(report),
+        "throughput_analysis": analyze_training_stats.analyze_throughput(report),
+        "grad_analysis": analyze_training_stats.analyze_gradients(report),
+        "model_analysis": analyze_training_stats.analyze_model_health(report),
+        "eval_analysis": analyze_training_stats.analyze_evaluations(report),
+        "selfplay_analysis": analyze_training_stats.analyze_selfplay(report),
+        "system_analysis": analyze_training_stats.analyze_system(report),
+    }
+    markdown = analyze_training_stats.format_markdown_report(
+        report,
+        **analyses,
+        recommendations=[],
+        data_warning="partial session",
+    )
+    assert "Total Steps | 40" in markdown
+    assert "N/A (unknown)" in markdown
+    assert "terminal-only metrics remain unavailable" in markdown
+
+
+def test_incremental_stream_uses_last_complete_row_after_truncated_append(tmp_path):
+    incremental = tmp_path / "incremental_partial.jsonl"
+    incremental.write_text(
+        json.dumps({
+            "timestamp": "2026-09-03T12:00:00",
+            "loss_summary": {"total_count": 2, "recent_mean": 0.8},
+        }) + "\n{\"timestamp\":",
+        encoding="utf-8",
+    )
+
+    report, warning = analyze_training_stats.load_incremental_report(
+        str(incremental))
+
+    assert report["loss"]["summary"]["recent_mean"] == 0.8
+    assert warning is not None
+    assert "truncated final row" in warning
