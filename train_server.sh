@@ -39,6 +39,7 @@ CONFIG_PROFILE="server"
 # -----------------------------------------------------------------------------
 SET_PROCESS_TITLE=true           # Set to false to disable custom process title in htop
 PROCESS_TITLE="micro_trainer"            # Process name shown in htop or btop (requires 'setproctitle' package)
+CONDA_ENV="${CONDA_ENV:-dama}"   # Project environment resolved explicitly before any Python command
 RESUME=""                        # Path to checkpoint to resume from
 RESUME_LATEST=false             # Forbidden for the resume-only recovery experiment.
 RESUME_CONTINUATION=true        # Recovery only: a relaunch continues this namespace's newest
@@ -180,6 +181,51 @@ cd "$PROJECT_DIR"
 # Add src to PYTHONPATH
 export PYTHONPATH="${PROJECT_DIR}/src:${PYTHONPATH:-}"
 
+# Resolve the project interpreter explicitly. A direct `bash train_server.sh`
+# may start from conda base (Python 3.13), whose CPython ABI cannot load the
+# project's 3.11 Cython extensions. Import fallbacks can otherwise hide the
+# mismatch and launch a plausible but drastically slower training process.
+if [ -n "${DAMA_PYTHON:-}" ]; then
+    if [ ! -x "$DAMA_PYTHON" ]; then
+        echo "ERROR: DAMA_PYTHON is not executable: $DAMA_PYTHON" >&2
+        exit 1
+    fi
+elif [ "${CONDA_DEFAULT_ENV:-}" = "$CONDA_ENV" ] && command -v python >/dev/null 2>&1; then
+    DAMA_PYTHON="$(command -v python)"
+else
+    _conda_bin="${CONDA_EXE:-}"
+    [ -x "$_conda_bin" ] || _conda_bin="$(command -v conda 2>/dev/null || true)"
+    if [ ! -x "$_conda_bin" ]; then
+        for _candidate in "$HOME/miniconda3/bin/conda" "$HOME/anaconda3/bin/conda" \
+                          "$HOME/miniforge3/bin/conda" "$HOME/mambaforge/bin/conda" \
+                          "/opt/conda/bin/conda"; do
+            if [ -x "$_candidate" ]; then
+                _conda_bin="$_candidate"
+                break
+            fi
+        done
+    fi
+    if [ ! -x "$_conda_bin" ]; then
+        echo "ERROR: The '$CONDA_ENV' interpreter is required. Run bash setup_conda_server.sh." >&2
+        exit 1
+    fi
+    if ! DAMA_PYTHON="$("$_conda_bin" run -n "$CONDA_ENV" python -c \
+        'import sys; print(sys.executable)' 2>/dev/null)" || [ ! -x "$DAMA_PYTHON" ]; then
+        echo "ERROR: Could not resolve the '$CONDA_ENV' interpreter. Run bash setup_conda_server.sh." >&2
+        exit 1
+    fi
+fi
+
+if ! _dama_python_info="$("$DAMA_PYTHON" -c '
+import sys
+if sys.version_info[:2] != (3, 11):
+    raise SystemExit(f"expected CPython 3.11, got {sys.version.split()[0]}")
+print(sys.executable)
+' 2>&1)"; then
+    echo "ERROR: The dama interpreter preflight failed: $_dama_python_info" >&2
+    exit 1
+fi
+
 # =============================================================================
 # GPU Vendor Settings
 # =============================================================================
@@ -200,7 +246,7 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 export TORCHINDUCTOR_CUDAGRAPH_SKIP_DYNAMIC=1
 
 # Enable Parallel Compilation - scale to available cores
-CPU_COUNT=$(python3 -c "import os; print(os.cpu_count() or 4)" 2>/dev/null || echo 4)
+CPU_COUNT=$("$DAMA_PYTHON" -c "import os; print(os.cpu_count() or 4)" 2>/dev/null || echo 4)
 export MAX_JOBS=$(( CPU_COUNT > 8 ? CPU_COUNT / 2 : CPU_COUNT ))
 export TORCHINDUCTOR_MAX_AUTOTUNE_PROCESSES=$(( MAX_JOBS > 4 ? MAX_JOBS * 3 / 4 : MAX_JOBS ))
 
@@ -218,9 +264,9 @@ if [ "$SET_PROCESS_TITLE" = true ]; then
     export PROCESS_TITLE
     # Self-heal #1: ensure the Python 'setproctitle' package is installed, otherwise
     # the trainer's rename is a silent no-op and htop/btop show 'python3'.
-    if ! python3 -c "import setproctitle" >/dev/null 2>&1; then
+    if ! "$DAMA_PYTHON" -c "import setproctitle" >/dev/null 2>&1; then
         echo "Installing 'setproctitle' (required for PROCESS_TITLE='${PROCESS_TITLE}')..."
-        python3 -m pip install --quiet setproctitle || \
+        "$DAMA_PYTHON" -m pip install --quiet setproctitle || \
             echo "[warn] Failed to install 'setproctitle'; process will show as 'python3' in htop/btop."
     fi
     # Self-heal #2: ensure 'btop' itself is on PATH — without it there's nowhere to
@@ -291,18 +337,13 @@ fi
 # when the extension is missing. No-op when fresh; never blocks training on
 # a build failure.
 #
-# The artifact is resolved by the running interpreter's EXT_SUFFIX rather than
+# The artifact is resolved by the selected Dama interpreter's EXT_SUFFIX rather than
 # by `ls -t ... | head -1`: that glob matched every ABI tag and kept the newest
 # by mtime, so a stray extension built for another Python version could mask a
-# genuinely stale one. EXT_SUFFIX names exactly the file the *resolved*
-# interpreter will import -- so this guard is only ABI-precise when `python`
-# already IS the training env. When conda activation failed and `python` is
-# some other env (e.g. base), the suffix names that other env's ABI, the
-# existing .so reads as missing, and every launch force-rebuilds with the
-# wrong interpreter; the rebuild then fails or produces an unusable .so and
-# the CUDA/import check below is what actually catches it. The cron entry
-# point (scripts/script.sh) activates dama before exec'ing this script.
-_ext_suffix="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
+# genuinely stale one. The interpreter resolver above fails closed before this
+# scan, so both the suffix and any rebuild use the same CPython 3.11 ABI as the
+# final trainer process, even when the caller started from conda base.
+_ext_suffix="$("$DAMA_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
 _cython_stale=false
 while IFS= read -r _pyx; do
     if [ -n "$_ext_suffix" ]; then
@@ -317,13 +358,13 @@ while IFS= read -r _pyx; do
 done < <(find "${PROJECT_DIR}/src" -name '*.pyx' -not -path '*/build/*' 2>/dev/null)
 if [ "$_cython_stale" = true ]; then
     echo "Cython sources changed — rebuilding extensions..."
-    ( cd "${PROJECT_DIR}/src" && python setup_cython.py build_ext --inplace ) \
+    ( cd "${PROJECT_DIR}/src" && "$DAMA_PYTHON" setup_cython.py build_ext --inplace ) \
         || echo "[warn] Cython rebuild failed — using existing .so files."
     echo ""
 fi
 
 # Verify GPU is available
-python3 -c "import torch; assert torch.cuda.is_available(), 'GPU not available. Training requires GPU.'" || {
+"$DAMA_PYTHON" -c "import torch; assert torch.cuda.is_available(), 'GPU not available. Training requires GPU.'" || {
     echo ""
     echo "ERROR: GPU is not available."
     echo ""
@@ -342,7 +383,7 @@ echo ""
 if [ "$RESUME_LATEST" = true ] && [ -z "$RESUME" ]; then
     echo "Checking checkpoints for corruption..."
     
-    VALID_CHECKPOINT=$(CHECKPOINT_DIR="${PROJECT_DIR}/models/checkpoints" python3 -W ignore << 'PYEOF' 2>/dev/null | head -1
+    VALID_CHECKPOINT=$(CHECKPOINT_DIR="${PROJECT_DIR}/models/checkpoints" "$DAMA_PYTHON" -W ignore << 'PYEOF' 2>/dev/null | head -1
 import sys, os
 from pathlib import Path
 import torch
@@ -412,6 +453,7 @@ fi
 
 echo "Training Configuration:"
 echo ""
+echo "  Python:          ${_dama_python_info}"
 echo "  Config File:     ${CONFIG_FILE}"
 if [ -n "$CONFIG_PROFILE" ]; then
     echo "  Profile:         ${CONFIG_PROFILE}"
@@ -436,4 +478,4 @@ echo ""
 echo "  See ${CONFIG_FILE} for all training parameters."
 echo ""
 
-exec -a "python3" python3 -W ignore::FutureWarning -m dama.ai.ml.trainer "${ARGS[@]}"
+exec -a "python3" "$DAMA_PYTHON" -W ignore::FutureWarning -m dama.ai.ml.trainer "${ARGS[@]}"
