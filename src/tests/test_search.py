@@ -121,6 +121,30 @@ def test_fast_move_generation_matches_python_on_reachable_positions(
     assert saw_quiet
 
 
+def test_fast_replay_serialization_reuses_immutable_coordinates():
+    """Repeated compact outputs must reuse the bounded coordinate objects."""
+    if not getattr(search_mod, "_HAS_FAST_SEARCH", False):
+        pytest.skip("Cython _fast_search not built - pure-Python fallback in use")
+
+    from dama.ai.algorithmic._fast_search import (
+        board_bytes_to_compact,
+        gen_moves_from_board,
+        init_board_bytes,
+    )
+
+    board = init_board_bytes()
+    first_state = board_bytes_to_compact(board, 1, 0)
+    second_state = board_bytes_to_compact(board, 1, 0)
+    first_moves = gen_moves_from_board(board, 1)
+    second_moves = gen_moves_from_board(board, 1)
+
+    assert first_state == second_state
+    assert first_moves == second_moves
+    assert isinstance(first_state["p1_men"][0], tuple)
+    assert first_state["p1_men"][0] is second_state["p1_men"][0]
+    assert first_moves[0]["path"][0] is second_moves[0]["path"][0]
+
+
 def test_fast_capture_generation_matches_python_on_seeded_sparse_boards():
     """Exercise multi-jump and flying captures beyond one reachable walk."""
     if not getattr(search_mod, "_HAS_FAST_SEARCH", False):
