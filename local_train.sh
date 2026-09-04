@@ -354,11 +354,10 @@ fi
 # -----------------------------------------------------------------------------
 # Conda environment guard
 # -----------------------------------------------------------------------------
-# Everything below runs bare `python`, so the script must work when launched from
-# `base`, from another env, or from a non-interactive shell with no env at all
-# (cron / scripts/runner.sh, where .bashrc never runs and conda is not on PATH).
-# Activate $CONDA_ENV when it isn't already active. Failures only warn: a working
-# non-conda interpreter stays usable, and the CUDA check below is the real gate.
+# Resolve the project environment when launched from `base`, another env, or a
+# non-interactive shell (cron / scripts/runner.sh, where .bashrc is not loaded).
+# Activation failures warn here, then the explicit CPython 3.11 check below
+# fails closed before the Cython scan or CUDA initialization.
 if [ "${CONDA_DEFAULT_ENV:-}" = "$CONDA_ENV" ]; then
     echo "Conda env: ${CONDA_ENV} (already active)"
 else
@@ -391,13 +390,35 @@ else
             echo "Conda env: ${CONDA_ENV} (activated; was '${_prev_env}')"
         else
             echo "[warn] Could not activate conda env '${CONDA_ENV}' (was '${_prev_env}')."
-            echo "[warn] Create it with: bash setup_conda.sh; continuing with $(command -v python 2>/dev/null || echo python)"
+            echo "[warn] Create it with: bash setup_conda.sh; validating the selected interpreter next."
         fi
     else
-        echo "[warn] conda installation not found; continuing with $(command -v python 2>/dev/null || echo python)"
+        echo "[warn] conda installation not found; validating the selected interpreter next."
     fi
 fi
 echo ""
+
+if [ -n "${DAMA_PYTHON:-}" ]; then
+    if [ ! -x "$DAMA_PYTHON" ]; then
+        echo "ERROR: DAMA_PYTHON is not executable: $DAMA_PYTHON" >&2
+        exit 1
+    fi
+else
+    DAMA_PYTHON="$(command -v python 2>/dev/null || true)"
+fi
+if [ ! -x "$DAMA_PYTHON" ]; then
+    echo "ERROR: The '$CONDA_ENV' interpreter is required. Run bash setup_conda.sh." >&2
+    exit 1
+fi
+if ! _dama_python_info="$("$DAMA_PYTHON" -c '
+import sys
+if sys.version_info[:2] != (3, 11):
+    raise SystemExit(f"expected CPython 3.11, got {sys.version.split()[0]}")
+print(sys.executable)
+' 2>&1)"; then
+    echo "ERROR: The dama interpreter preflight failed: $_dama_python_info" >&2
+    exit 1
+fi
 
 # Cython staleness guard (fail-safe). The .so files are NOT tracked (commit
 # 2f85ac6 untracked them; .gitignore carries *.so), so a fresh clone has none
@@ -405,16 +426,12 @@ echo ""
 # one behind. Rebuild in-place when a .pyx is newer than its extension, or when
 # the extension is missing. No-op when fresh; never blocks training on failure.
 #
-# The artifact is resolved by the running interpreter's EXT_SUFFIX rather than
+# The artifact is resolved by the selected Dama interpreter's EXT_SUFFIX rather than
 # by `ls -t ... | head -1`: that glob matched every ABI tag and kept the newest
 # by mtime, so a stray extension built for another Python version could mask a
-# genuinely stale one. EXT_SUFFIX names exactly the file the *resolved*
-# interpreter will import -- so this guard is only ABI-precise when `python`
-# already IS the training env (the conda guard above normally guarantees it).
-# If activation failed and `python` is another env, its ABI suffix makes the
-# existing .so read as missing and every launch force-rebuilds with the wrong
-# interpreter; the CUDA/import check below is what actually catches that.
-_ext_suffix="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
+# genuinely stale one. The validated executable above is reused for the suffix,
+# any rebuild, the CUDA/import check, and the final trainer process.
+_ext_suffix="$("$DAMA_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
 _cython_stale=false
 while IFS= read -r _pyx; do
     if [ -n "$_ext_suffix" ]; then
@@ -429,7 +446,7 @@ while IFS= read -r _pyx; do
 done < <(find "${PROJECT_DIR}/src" -name '*.pyx' -not -path '*/build/*' 2>/dev/null)
 if [ "$_cython_stale" = true ]; then
     echo "Cython sources changed — rebuilding extensions..."
-    ( cd "${PROJECT_DIR}/src" && python setup_cython.py build_ext --inplace ) \
+    ( cd "${PROJECT_DIR}/src" && "$DAMA_PYTHON" setup_cython.py build_ext --inplace ) \
         || echo "[warn] Cython rebuild failed — using existing .so files."
     echo ""
 fi
@@ -439,7 +456,7 @@ fi
 # back to the ~100-200x slower pure-Python alpha-beta with no error, no warning
 # and no failing test, and the only symptom is low self-play throughput. Only
 # the CUDA result gates the launch -- a missing extension warns and continues.
-python -W ignore::FutureWarning - <<'PYCHECK' || {
+"$DAMA_PYTHON" -W ignore::FutureWarning - <<'PYCHECK' || {
 import importlib
 import sys
 
@@ -465,7 +482,7 @@ if missing:
     for item in missing:
         print(f"[warn]   {item}")
     print("[warn] Self-play will be far slower. Rebuild with:")
-    print("[warn]   cd src && python setup_cython.py build_ext --inplace")
+    print('[warn]   cd src && "$DAMA_PYTHON" setup_cython.py build_ext --inplace')
 PYCHECK
     echo ""
     echo "ERROR: CUDA is not available."
@@ -482,6 +499,7 @@ PYCHECK
 }
 
 echo "CUDA verified. Starting training..."
+echo "Python: ${_dama_python_info}"
 echo "Config: ${SELECTED_CONFIG_PATH}"
 
 # Build command arguments — only session-level overrides
@@ -511,4 +529,4 @@ fi
 echo "Trainer args: ${ARGS[*]}"
 echo ""
 
-exec python -W ignore::FutureWarning -m dama.ai.ml.trainer "${ARGS[@]}"
+exec "$DAMA_PYTHON" -W ignore::FutureWarning -m dama.ai.ml.trainer "${ARGS[@]}"
