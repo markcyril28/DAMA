@@ -307,7 +307,7 @@ profiles:
       weight_decay: 1.0e-4
       checkpoint_every: 2000
       lr_scheduler:
-        enabled: true
+        enabled: false  # Schedulerless recovery resumes need fixed LR; restored warmup mis-scales. See Journal Pass 268.
         type: "cosine_warm_restarts"
         T_0: 5000
         T_mult: 2
