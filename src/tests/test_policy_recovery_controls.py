@@ -54,6 +54,39 @@ def test_policy_recovery_launchers_read_the_pin_from_the_selected_config():
     assert "recorded promoted policy-only checkpoint" in shell
 
 
+def test_shell_launchers_use_one_resolved_dama_interpreter_everywhere():
+    """A direct shell launch must never drift into conda base Python.
+
+    The project extensions target CPython 3.11, while a common base environment
+    is 3.13 and silently falls back at several accelerator import sites.  Keep
+    the suffix lookup, rebuild, checks, checkpoint scan, pip repair, and final
+    trainer on the one executable selected by the launcher's Dama resolver.
+    """
+    local = (PROJECT_ROOT / "local_train.sh").read_text(encoding="utf-8")
+    server = (PROJECT_ROOT / "train_server.sh").read_text(encoding="utf-8")
+
+    assert 'CONDA_ENV="dama"' in local
+    assert 'CONDA_ENV="${CONDA_ENV:-dama}"' in server
+    assert 'DAMA_PYTHON="$("$_conda_bin" run -n "$CONDA_ENV" python' in server
+    for launcher in (local, server):
+        assert "expected CPython 3.11" in launcher
+        assert launcher.count('"$DAMA_PYTHON"') >= 7
+
+    assert 'exec "$DAMA_PYTHON"' in local
+    assert 'exec -a "python3" "$DAMA_PYTHON"' in server
+
+    forbidden_commands = (
+        'CPU_COUNT=$(python3 ',
+        ' python3 -W ignore',
+        '&& python setup_cython.py',
+        'exec -a "python3" python3 ',
+    )
+    for command in forbidden_commands:
+        assert command not in server
+
+    assert 'exec python -W ignore::FutureWarning' not in local
+
+
 def test_recovery_summary_prefers_explicit_metrics():
     stats = {
         "current_train_loss": 0.88,
