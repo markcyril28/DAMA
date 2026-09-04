@@ -1314,7 +1314,11 @@ class StatsCollector:
                             if elapsed > 0 else 0.0
                         ),
                     },
+                    # Keep crash-recovery diagnostics tied to the exact run
+                    # settings instead of borrowing a stale terminal report.
+                    'config': dict(self.config_snapshot),
                     'loss_summary': self.loss.summary(100),
+                    'learning_rate_summary': self.learning_rate.summary(100),
                     'grad_norm_summary': self.grad_norm_global.summary(100),
                     'throughput_summary': self.throughput_samples_sec.summary(100),
                     'step_time_summary': self.step_time_sec.summary(100),
