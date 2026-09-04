@@ -39,9 +39,46 @@ cdef extern from *:
         return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     }
     #endif
+
+    /* The transposition table is a 128 MiB, pseudo-randomly indexed anonymous
+       allocation. Linux transparent huge pages reduce its page-table and TLB
+       footprint without changing any table bytes or replacement semantics.
+       MADV_HUGEPAGE requires page-aligned bounds, so leave malloc's partial
+       edge pages untouched. Other platforms retain the ordinary allocation. */
+    #if !defined(_WIN32)
+    #include <stdint.h>
+    #include <sys/mman.h>
+    #include <unistd.h>
+    #endif
+    #if !defined(_WIN32) && defined(MADV_HUGEPAGE)
+    static int dama_advise_hugepages(void *ptr, size_t length) {
+        long page_size = sysconf(_SC_PAGESIZE);
+        uintptr_t start, aligned_start, aligned_end;
+        if (page_size <= 0) {
+            return -1;
+        }
+        start = (uintptr_t)ptr;
+        aligned_start = (start + (uintptr_t)page_size - 1)
+                        & ~((uintptr_t)page_size - 1);
+        aligned_end = (start + length) & ~((uintptr_t)page_size - 1);
+        if (aligned_end <= aligned_start) {
+            return -1;
+        }
+        return madvise((void *)aligned_start, aligned_end - aligned_start,
+                       MADV_HUGEPAGE);
+    }
+    #else
+    static int dama_advise_hugepages(void *ptr, size_t length) {
+        (void)ptr;
+        (void)length;
+        return 0;
+    }
+    #endif
     """
     double dama_wall_now() noexcept nogil
+    int dama_advise_hugepages(void *ptr, size_t length) noexcept nogil
 from libc.stdlib cimport malloc, free, calloc
+from libc.stddef cimport size_t
 
 # ── Board cell values ──
 DEF EMPTY = 0
@@ -299,6 +336,9 @@ cdef void _ensure_tt():
     global _tt_table
     if _tt_table == NULL:
         _tt_table = <TTEntry *>calloc(TT_SIZE, sizeof(TTEntry))
+        if _tt_table != NULL:
+            dama_advise_hugepages(
+                <void *>_tt_table, <size_t>TT_SIZE * sizeof(TTEntry))
 
 cdef inline unsigned long long compute_hash_and_counts(
     signed char *board, int player, unsigned int *piece_counts
@@ -986,6 +1026,12 @@ cdef struct SearchState:
     signed char killers_to[MAX_PLY][NUM_KILLERS]
     # History heuristic: history[from_sq][to_sq] — cutoff frequency
     short history[64][64]
+    # History is halved once before each root search. Track the last logical
+    # age materialized for each entry so untouched square pairs do not force a
+    # 4,096-element sweep after every played move. One byte covers 255 ages;
+    # _age_history rebases exactly before it would wrap.
+    unsigned char history_age[64][64]
+    unsigned int history_generation
     # Countermove heuristic: when opponent plays prev_from→prev_to, the
     # stored response move is a good candidate (caused cutoffs historically).
     signed char countermove_from[64][64]
@@ -998,6 +1044,8 @@ cdef inline void _init_search_tables(SearchState *ss) noexcept nogil:
     memset(ss.killers_to, 0xFF,
            MAX_PLY * NUM_KILLERS * sizeof(signed char))
     memset(ss.history, 0, 64 * 64 * sizeof(short))
+    memset(ss.history_age, 0, 64 * 64 * sizeof(unsigned char))
+    ss.history_generation = 0
     memset(ss.countermove_from, 0xFF, 64 * 64 * sizeof(signed char))  # -1
     memset(ss.countermove_to, 0xFF, 64 * 64 * sizeof(signed char))
 
@@ -1018,14 +1066,48 @@ cdef inline void _store_killer(SearchState *ss, int ply, CMove *m) noexcept nogi
     ss.killers_to[ply][0] = to_sq
 
 
+cdef inline int _history_score(
+    SearchState *ss, int from_sq, int to_sq
+) noexcept nogil:
+    """Materialize and return one entry at the current logical age."""
+    cdef int value = ss.history[from_sq][to_sq]
+    cdef unsigned int delta
+
+    # Zero is invariant under every number of history-aging halvings.  Most
+    # square pairs never receive a cutoff or malus, so avoid loading and then
+    # rewriting their separate age entry on every quiet-move ordering pass.
+    # Update paths stamp the current age after installing a nonzero value.
+    if value == 0:
+        return 0
+
+    delta = ss.history_generation - ss.history_age[from_sq][to_sq]
+
+    if delta == 0:
+        return value
+    # History is clamped to +/-10000, so after 15 halvings every positive
+    # value is zero and every negative value is -1, matching repeated signed
+    # right shifts without looping over a long-unused entry's full age.
+    if delta >= 15:
+        value = -1 if value < 0 else 0
+    else:
+        while delta > 0:
+            value >>= 1
+            delta -= 1
+    ss.history[from_sq][to_sq] = <short>value
+    ss.history_age[from_sq][to_sq] = ss.history_generation
+    return value
+
+
 cdef inline void _update_history(SearchState *ss, CMove *m, int depth) noexcept nogil:
     """Increment history table on cutoff (depth^2 weighting)."""
     cdef int from_sq = m.from_sq
     cdef int to_sq = m.to_sq
     cdef int bonus = depth * depth
-    ss.history[from_sq][to_sq] += bonus
-    if ss.history[from_sq][to_sq] > 10000:
-        ss.history[from_sq][to_sq] = 10000
+    cdef int value = _history_score(ss, from_sq, to_sq) + bonus
+    if value > 10000:
+        value = 10000
+    ss.history[from_sq][to_sq] = <short>value
+    ss.history_age[from_sq][to_sq] = ss.history_generation
 
 
 cdef inline void _update_history_malus(SearchState *ss, CMove *m, int depth) noexcept nogil:
@@ -1035,9 +1117,11 @@ cdef inline void _update_history_malus(SearchState *ss, CMove *m, int depth) noe
     cdef int from_sq = m.from_sq
     cdef int to_sq = m.to_sq
     cdef int malus = depth * depth
-    ss.history[from_sq][to_sq] -= malus
-    if ss.history[from_sq][to_sq] < -10000:
-        ss.history[from_sq][to_sq] = -10000
+    cdef int value = _history_score(ss, from_sq, to_sq) - malus
+    if value < -10000:
+        value = -10000
+    ss.history[from_sq][to_sq] = <short>value
+    ss.history_age[from_sq][to_sq] = ss.history_generation
 
 
 cdef inline void _store_countermove(
@@ -1052,13 +1136,24 @@ cdef inline void _store_countermove(
 
 
 cdef inline void _age_history(SearchState *ss) noexcept nogil:
-    """Halve all history table entries to prevent saturation over long games.
-    Called once per move. Without aging, all entries eventually reach the cap
-    (10000) and the history heuristic loses its discriminative power."""
-    cdef int i, j
-    for i in range(64):
-        for j in range(64):
-            ss.history[i][j] >>= 1  # Right-shift by 1 = halve
+    """Advance one logical halving generation for lazy history aging."""
+    cdef int from_sq, to_sq
+
+    if ss.history_generation < 255:
+        ss.history_generation += 1
+        return
+
+    # Materialize generation 255 before the byte-sized per-entry ages would
+    # wrap. Resetting all entry ages to zero and the current generation to one
+    # then represents the pending 256th halving exactly. This cold path is not
+    # reached by the configured 200-move games, but preserves the public API for
+    # callers that request longer games.
+    for from_sq in range(64):
+        for to_sq in range(64):
+            if ss.history[from_sq][to_sq] != 0:
+                _history_score(ss, from_sq, to_sq)
+    memset(ss.history_age, 0, 64 * 64 * sizeof(unsigned char))
+    ss.history_generation = 1
 
 
 cdef inline unsigned long long _hash_after_move(
@@ -1163,7 +1258,7 @@ cdef void _order_moves_full(
                 s = 12000
             # History heuristic for quiet moves
             if s == 0:
-                s = ss.history[from_sq][to_sq]
+                s = _history_score(ss, from_sq, to_sq)
 
         # Promotion bonus
         if _move_promotes(&moves.moves[i]):
@@ -1491,6 +1586,22 @@ cdef int search_root(
     return best_idx
 
 
+# Replay states and legal moves use immutable ``(row, column)`` tuples at the
+# Python boundary.  Only 64 coordinate values exist, so retain one tuple per
+# square instead of allocating the same tiny objects for every piece and move
+# in every generated position.  Shared immutable tuples are also memoized once
+# when a worker batch is pickled for the parent process.
+cdef tuple _build_square_coords():
+    cdef int sq
+    cdef list coords = []
+    for sq in range(64):
+        coords.append((sq >> 3, sq & 7))
+    return tuple(coords)
+
+
+cdef tuple SQUARE_COORD = _build_square_coords()
+
+
 cdef dict cmove_to_dict(CMove *m):
     """Convert CMove to Python dict matching Move.to_dict() format.
 
@@ -1504,10 +1615,10 @@ cdef dict cmove_to_dict(CMove *m):
     cdef int i, sq
     for i in range(m.path_len):
         sq = m.path_sq[i]
-        path.append((sq >> 3, sq & 7))
+        path.append(SQUARE_COORD[sq])
     for i in range(m.num_captures):
         sq = m.cap_sq[i]
-        captures.append((sq >> 3, sq & 7))
+        captures.append(SQUARE_COORD[sq])
     return {
         "path": path,
         "captures": captures,
@@ -1862,21 +1973,19 @@ cdef dict board_to_compact_dict(signed char *board, int player, int move_count):
     Tuples are also ~40% smaller and ~20ns faster to create per position.
     """
     cdef list p1_men = [], p1_kings = [], p2_men = [], p2_kings = []
-    cdef int i, r, c, piece
+    cdef int i, piece
     for i in range(NUM_DARK_SQ):
         piece = board[DARK_SQ[i]]
         if piece == EMPTY:
             continue
-        r = DARK_SQ_R[i]
-        c = DARK_SQ_C[i]
         if piece == P1_MAN:
-            p1_men.append((r, c))
+            p1_men.append(SQUARE_COORD[DARK_SQ[i]])
         elif piece == P1_KING:
-            p1_kings.append((r, c))
+            p1_kings.append(SQUARE_COORD[DARK_SQ[i]])
         elif piece == P2_MAN:
-            p2_men.append((r, c))
+            p2_men.append(SQUARE_COORD[DARK_SQ[i]])
         elif piece == P2_KING:
-            p2_kings.append((r, c))
+            p2_kings.append(SQUARE_COORD[DARK_SQ[i]])
     return {
         'p1_men': p1_men,
         'p1_kings': p1_kings,
