@@ -2,9 +2,9 @@
 # =============================================================================
 # eval_checkpoints.sh - Evaluate checkpoints against the algorithmic AI.
 #
-# Watches models/checkpoints_policy_distillation/ for new model_step_*.pt files,
-# evaluates each untested checkpoint, appends compact JSONL results, and
-# regenerates a PNG plot.
+# Resolves the config selected by local_train.sh, watches that run's checkpoint
+# directory, evaluates each untested checkpoint, appends namespaced JSONL
+# results, and regenerates a namespaced PNG plot.
 #
 # Usage:
 #   bash eval_checkpoints.sh              # watch mode (default)
@@ -13,7 +13,8 @@
 #   bash eval_checkpoints.sh --all        # re-evaluate all checkpoints
 #
 # Optional environment overrides:
-#   NUM_GAMES=50 ALGO_DIFFICULTY=hard NUM_WORKERS=2 bash eval_checkpoints.sh --once
+#   EVAL_CONFIG=config/training_config.yaml NUM_GAMES=50 bash eval_checkpoints.sh --once
+#   DAMA_PYTHON=/path/to/dama/bin/python CHECKPOINT_DIR=/path bash eval_checkpoints.sh --once
 # =============================================================================
 
 set -euo pipefail
@@ -22,21 +23,142 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ========================== CONFIGURATION ====================================
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$PROJECT_DIR/models/checkpoints_policy_distillation}"
-TEST_STATS_DIR="${TEST_STATS_DIR:-$PROJECT_DIR/models/test_stats}"
-NUM_GAMES="${NUM_GAMES:-100}"                 # Games per checkpoint evaluation
-ALGO_DIFFICULTY="${ALGO_DIFFICULTY:-easy}"    # Algorithmic opponent difficulty
+CONDA_ENV="${CONDA_ENV:-dama}"
+
+# Follow the launcher's active CONFIG SELECTION by default. EVAL_CONFIG remains
+# an explicit escape hatch for evaluating another run without editing a script.
+if [[ -n "${EVAL_CONFIG:-}" ]]; then
+    CONFIG_FILE="$EVAL_CONFIG"
+else
+    _selected_config="$({
+        awk -F'"' '/^TRAINING_CONFIG="/ { selected = $2 } END { print selected }' \
+            "$PROJECT_DIR/local_train.sh"
+    } 2>/dev/null)"
+    if [[ -z "$_selected_config" ]]; then
+        echo "ERROR: Could not resolve the active TRAINING_CONFIG from local_train.sh." >&2
+        exit 1
+    fi
+    CONFIG_FILE="$_selected_config"
+fi
+[[ "$CONFIG_FILE" = /* ]] || CONFIG_FILE="$PROJECT_DIR/$CONFIG_FILE"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: Evaluation config not found: $CONFIG_FILE" >&2
+    exit 1
+fi
+CONFIG_FILE="$(readlink -f "$CONFIG_FILE")"
+
+_yaml_scalar() {
+    # _yaml_scalar <file> <top-level-section> <key>
+    awk -v section="$2" -v key="$3" '
+        /^[^[:space:]#]/ { in_section = ($0 ~ "^"section":[[:space:]]*$"); next }
+        in_section && $0 ~ "^[[:space:]]+"key":[[:space:]]*" {
+            line = $0
+            sub("^[[:space:]]+"key":[[:space:]]*", "", line)
+            sub(/[[:space:]]*#.*$/, "", line)
+            gsub(/^"|"$|^'"'"'|'"'"'$/, "", line)
+            print line
+            exit
+        }
+    ' "$1"
+}
+_abs_project_path() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$PROJECT_DIR" "$1" ;;
+    esac
+}
+
+_checkpoint_rel="$(_yaml_scalar "$CONFIG_FILE" paths checkpoint_dir)"
+if [[ -z "$_checkpoint_rel" ]]; then
+    echo "ERROR: paths.checkpoint_dir is missing from $CONFIG_FILE" >&2
+    exit 1
+fi
+OUTPUT_NAMESPACE="$(_yaml_scalar "$CONFIG_FILE" paths policy_output_namespace)"
+if [[ -n "$OUTPUT_NAMESPACE" && "$OUTPUT_NAMESPACE" == *[!A-Za-z0-9._-]* ]]; then
+    echo "ERROR: Unsafe paths.policy_output_namespace in $CONFIG_FILE: $OUTPUT_NAMESPACE" >&2
+    exit 1
+fi
+
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$(_abs_project_path "$_checkpoint_rel")}"
+if [[ -n "$OUTPUT_NAMESPACE" ]]; then
+    TEST_STATS_DIR="${TEST_STATS_DIR:-$PROJECT_DIR/models/test_stats/$OUTPUT_NAMESPACE}"
+    RESULTS_FILE="${RESULTS_FILE:-$PROJECT_DIR/models/eval_results_$OUTPUT_NAMESPACE.jsonl}"
+    PLOT_OUTPUT="${PLOT_OUTPUT:-$PROJECT_DIR/models/eval_progress_$OUTPUT_NAMESPACE.png}"
+    LOCK_DIR="${LOCK_DIR:-$PROJECT_DIR/models/.eval_checkpoints_$OUTPUT_NAMESPACE.lock}"
+else
+    # Legacy configs do not declare a namespace, so retain their established
+    # generic output locations while still taking checkpoint_dir from YAML.
+    TEST_STATS_DIR="${TEST_STATS_DIR:-$PROJECT_DIR/models/test_stats}"
+    RESULTS_FILE="${RESULTS_FILE:-$PROJECT_DIR/models/eval_results.jsonl}"
+    PLOT_OUTPUT="${PLOT_OUTPUT:-$PROJECT_DIR/models/eval_progress.png}"
+    LOCK_DIR="${LOCK_DIR:-$PROJECT_DIR/models/.eval_checkpoints.lock}"
+fi
+_configured_test_games="$(_yaml_scalar "$CONFIG_FILE" testing num_games)"
+_configured_test_difficulty="$(_yaml_scalar "$CONFIG_FILE" testing difficulty)"
+_configured_max_moves="$(_yaml_scalar "$CONFIG_FILE" selfplay max_moves_per_game)"
+NUM_GAMES="${NUM_GAMES:-${_configured_test_games:-100}}"          # Games per checkpoint evaluation
+ALGO_DIFFICULTY="${ALGO_DIFFICULTY:-${_configured_test_difficulty:-easy}}"
 NUM_WORKERS="${NUM_WORKERS:-4}"               # Parallel test workers
-MAX_MOVES="${MAX_MOVES:-200}"                 # Max moves per game before draw
+MAX_MOVES="${MAX_MOVES:-${_configured_max_moves:-200}}"           # Max moves per game before draw
 POLL_INTERVAL="${POLL_INTERVAL:-60}"          # Seconds between scans in watch mode
 
 # ========================== END CONFIGURATION ================================
 
-RESULTS_FILE="${RESULTS_FILE:-$PROJECT_DIR/models/eval_results.jsonl}"
-PLOT_OUTPUT="${PLOT_OUTPUT:-$PROJECT_DIR/models/eval_progress.png}"
-LOCK_DIR="${LOCK_DIR:-$PROJECT_DIR/models/.eval_checkpoints.lock}"
+# Never let this diagnostic fall back to conda base. DAMA_PYTHON can pin a
+# nonstandard install; otherwise use the active dama env or `conda run`.
+PYTHON_CMD=()
+if [[ -n "${DAMA_PYTHON:-}" ]]; then
+    if [[ ! -x "$DAMA_PYTHON" ]]; then
+        echo "ERROR: DAMA_PYTHON is not executable: $DAMA_PYTHON" >&2
+        exit 1
+    fi
+    PYTHON_CMD=("$DAMA_PYTHON")
+elif [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]] && command -v python >/dev/null 2>&1; then
+    PYTHON_CMD=("$(command -v python)")
+else
+    _conda_bin="${CONDA_EXE:-}"
+    [[ -x "$_conda_bin" ]] || _conda_bin="$(command -v conda 2>/dev/null || true)"
+    if [[ ! -x "$_conda_bin" ]]; then
+        for _candidate in "$HOME/miniconda3/bin/conda" "$HOME/anaconda3/bin/conda" \
+                          "$HOME/miniforge3/bin/conda" "$HOME/mambaforge/bin/conda" \
+                          "/opt/conda/bin/conda"; do
+            if [[ -x "$_candidate" ]]; then
+                _conda_bin="$_candidate"
+                break
+            fi
+        done
+    fi
+    if [[ ! -x "$_conda_bin" ]]; then
+        echo "ERROR: The '$CONDA_ENV' interpreter is required. Run bash setup_conda.sh." >&2
+        exit 1
+    fi
+    if ! _dama_python="$("$_conda_bin" run -n "$CONDA_ENV" python -c \
+        'import sys; print(sys.executable)' 2>/dev/null)" || [[ ! -x "$_dama_python" ]]; then
+        echo "ERROR: Could not resolve the '$CONDA_ENV' interpreter. Run bash setup_conda.sh." >&2
+        exit 1
+    fi
+    PYTHON_CMD=("$_dama_python")
+fi
 
-mkdir -p "$CHECKPOINT_DIR" "$(dirname "$RESULTS_FILE")" "$(dirname "$PLOT_OUTPUT")"
+export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+if ! _python_info="$("${PYTHON_CMD[@]}" -c '
+import sys
+from dama.ai.algorithmic.search import _HAS_FAST_SEARCH
+if sys.version_info[:2] != (3, 11):
+    raise SystemExit(f"expected CPython 3.11, got {sys.version.split()[0]}")
+if not _HAS_FAST_SEARCH:
+    raise SystemExit("the compiled fast-search extension did not load")
+print(sys.executable)
+' 2>&1)"; then
+    echo "ERROR: The dama interpreter preflight failed: $_python_info" >&2
+    exit 1
+fi
+
+if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+    echo "ERROR: Configured checkpoint directory does not exist: $CHECKPOINT_DIR" >&2
+    exit 1
+fi
+mkdir -p "$TEST_STATS_DIR" "$(dirname "$RESULTS_FILE")" "$(dirname "$PLOT_OUTPUT")"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,7 +224,8 @@ already_tested() {
     local ckpt_name="$1"
     [[ -f "$RESULTS_FILE" ]] || return 1
 
-    CHECKPOINT_NAME="$ckpt_name" RESULTS_FILE="$RESULTS_FILE" EXPECTED_GAMES="$NUM_GAMES" python3 - <<'PY'
+    CHECKPOINT_NAME="$ckpt_name" RESULTS_FILE="$RESULTS_FILE" EXPECTED_GAMES="$NUM_GAMES" \
+        "${PYTHON_CMD[@]}" - <<'PY'
 import json
 import os
 import sys
@@ -154,8 +277,7 @@ evaluate_checkpoint() {
 
     if ! json_line="$(
         cd "$PROJECT_DIR"
-        PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m dama.ai.ml.eval_checkpoint_once \
+        "${PYTHON_CMD[@]}" -m dama.ai.ml.eval_checkpoint_once \
             --checkpoint "$ckpt_path" \
             --checkpoint-name "$ckpt_name" \
             --step "$step" \
@@ -169,14 +291,16 @@ evaluate_checkpoint() {
         return 1
     fi
 
-    if ! printf '%s\n' "$json_line" | python3 -c 'import json, sys; json.load(sys.stdin)' 2>/dev/null; then
+    if ! printf '%s\n' "$json_line" | \
+         "${PYTHON_CMD[@]}" -c 'import json, sys; json.load(sys.stdin)' 2>/dev/null; then
         log "ERROR: invalid JSON from evaluation of $ckpt_name"
         log "Output: $json_line"
         return 1
     fi
 
     printf '%s\n' "$json_line" >> "$RESULTS_FILE"
-    wr="$(printf '%s\n' "$json_line" | python3 -c 'import json, sys; d=json.load(sys.stdin); print("{:.1%}".format(d["ml_win_rate"]))')"
+    wr="$(printf '%s\n' "$json_line" | \
+        "${PYTHON_CMD[@]}" -c 'import json, sys; d=json.load(sys.stdin); print("{:.1%}".format(d["ml_win_rate"]))')"
     log "DONE: $ckpt_name - win rate: $wr"
 }
 
@@ -200,7 +324,8 @@ generate_plot() {
     log "PLOT: generating $PLOT_OUTPUT ($count evaluations)"
 
     cd "$PROJECT_DIR"
-    RESULTS_FILE="$RESULTS_FILE" PLOT_OUTPUT="$PLOT_OUTPUT" python3 - <<'PY'
+    RESULTS_FILE="$RESULTS_FILE" PLOT_OUTPUT="$PLOT_OUTPUT" \
+        "${PYTHON_CMD[@]}" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -376,6 +501,11 @@ run_pending() {
 }
 
 mode="${1:---watch}"
+if [[ "$mode" != "-h" && "$mode" != "--help" ]]; then
+    log "Config: ${CONFIG_FILE#"$PROJECT_DIR"/}"
+    log "Namespace: ${OUTPUT_NAMESPACE:-legacy}"
+    log "Python: $_python_info"
+fi
 case "$mode" in
     --once)
         acquire_lock
