@@ -97,13 +97,6 @@ if platform.system() == "Linux":
         if _ext.name.endswith("_fast_search"):
             _ext.extra_compile_args.append("-fno-plt")
 
-# Duplicate selected branch tails into larger straight-line regions for the
-# branch-heavy recursive search without changing its operations or results.
-if platform.system() != "Windows":
-    for _ext in ext_modules:
-        if _ext.name.endswith("_fast_search"):
-            _ext.extra_compile_args.append("-ftracer")
-
 # _fast_encode is the only one that uses the numpy C API.
 for _ext in ext_modules:
     if _ext.name.endswith("_fast_encode"):
