@@ -422,9 +422,9 @@ fi
 
 # Cython staleness guard (fail-safe). The .so files are NOT tracked (commit
 # 2f85ac6 untracked them; .gitignore carries *.so), so a fresh clone has none
-# at all and a local .pyx edit or a pull that changes a .pyx leaves the built
-# one behind. Rebuild in-place when a .pyx is newer than its extension, or when
-# the extension is missing. No-op when fresh; never blocks training on failure.
+# at all and a source or build-recipe edit leaves the built one behind. Rebuild
+# in-place when a .pyx or either setup script is newer than an extension, or
+# when the extension is missing. No-op when fresh; never blocks on failure.
 #
 # The artifact is resolved by the selected Dama interpreter's EXT_SUFFIX rather than
 # by `ls -t ... | head -1`: that glob matched every ABI tag and kept the newest
@@ -432,6 +432,8 @@ fi
 # genuinely stale one. The validated executable above is reused for the suffix,
 # any rebuild, the CUDA/import check, and the final trainer process.
 _ext_suffix="$("$DAMA_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
+_cython_entrypoint="${PROJECT_DIR}/src/setup_cython.py"
+_cython_recipe="${PROJECT_DIR}/src/scripts/setup_cython.py"
 _cython_stale=false
 while IFS= read -r _pyx; do
     if [ -n "$_ext_suffix" ]; then
@@ -442,11 +444,15 @@ while IFS= read -r _pyx; do
         # any-ABI glob rather than forcing a rebuild on every launch.
         _so="$(ls -t "${_pyx%.pyx}".*.so 2>/dev/null | head -1 || true)"
     fi
-    if [ -z "$_so" ] || [ "$_pyx" -nt "$_so" ]; then _cython_stale=true; fi
+    if [ -z "$_so" ] || [ "$_pyx" -nt "$_so" ] \
+       || [ "$_cython_entrypoint" -nt "$_so" ] \
+       || [ "$_cython_recipe" -nt "$_so" ]; then
+        _cython_stale=true
+    fi
 done < <(find "${PROJECT_DIR}/src" -name '*.pyx' -not -path '*/build/*' 2>/dev/null)
 if [ "$_cython_stale" = true ]; then
-    echo "Cython sources changed — rebuilding extensions..."
-    ( cd "${PROJECT_DIR}/src" && "$DAMA_PYTHON" setup_cython.py build_ext --inplace ) \
+    echo "Cython source or build recipe changed - rebuilding extensions..."
+    ( cd "${PROJECT_DIR}/src" && "$DAMA_PYTHON" setup_cython.py build_ext --inplace --force ) \
         || echo "[warn] Cython rebuild failed — using existing .so files."
     echo ""
 fi
