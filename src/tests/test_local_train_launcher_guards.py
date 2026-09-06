@@ -15,6 +15,7 @@ import subprocess
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = PROJECT_ROOT / "local_train.sh"
+SERVER_LAUNCHER = PROJECT_ROOT / "train_server.sh"
 # Resolved once: one test deliberately empties the child PATH, and exec must
 # still be able to locate the shell itself.
 BASH = shutil.which("bash") or "/bin/bash"
@@ -253,3 +254,74 @@ def test_disk_floor_zero_disables_and_missing_df_degrades_to_warning(
     assert completed.returncode == 0, completed.stderr
     assert "Could not measure free disk space" in completed.stdout
     assert "free_kb=unset" in completed.stdout
+
+
+def test_cython_guard_rebuilds_after_build_recipe_change(tmp_path: Path) -> None:
+    """Compiler-flag edits must not leave an older extension active."""
+    project = tmp_path / "project"
+    source_dir = project / "src/dama/ai/algorithmic"
+    recipe_dir = project / "src/scripts"
+    source_dir.mkdir(parents=True)
+    recipe_dir.mkdir(parents=True)
+
+    suffix = ".cpython-311-test.so"
+    pyx = source_dir / "_fast_search.pyx"
+    extension = source_dir / f"_fast_search{suffix}"
+    entrypoint = project / "src/setup_cython.py"
+    recipe = recipe_dir / "setup_cython.py"
+    for path in (pyx, extension, entrypoint, recipe):
+        path.touch()
+
+    build_log = tmp_path / "build.log"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = -c ]; then\n"
+        f"    printf '%s\\n' '{suffix}'\n"
+        "    exit 0\n"
+        "fi\n"
+        "printf '%s\\n' \"$*\" >> \"${CYTHON_BUILD_LOG:?}\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    old_ns = 1_700_000_000_000_000_000
+    extension_ns = old_ns + 2_000_000_000
+    changed_ns = extension_ns + 2_000_000_000
+
+    def set_mtimes(changed: Path | None = None) -> None:
+        for path in (pyx, entrypoint, recipe):
+            os.utime(path, ns=(old_ns, old_ns))
+        os.utime(extension, ns=(extension_ns, extension_ns))
+        if changed is not None:
+            os.utime(changed, ns=(changed_ns, changed_ns))
+
+    env = {
+        "DAMA_PYTHON": str(fake_python),
+        "CYTHON_BUILD_LOG": str(build_log),
+    }
+    for launcher, end_marker in (
+        (LAUNCHER, "# Verify CUDA is available"),
+        (SERVER_LAUNCHER, "# Verify GPU is available"),
+    ):
+        block = _extract(
+            launcher.read_text(encoding="utf-8"),
+            "# Cython staleness guard (fail-safe).",
+            end_marker,
+        )
+
+        set_mtimes()
+        build_log.unlink(missing_ok=True)
+        completed = _run_block(block, env, project_dir=str(project))
+        assert completed.returncode == 0, completed.stderr
+        assert not build_log.exists()
+
+        for changed in (entrypoint, recipe):
+            set_mtimes(changed)
+            build_log.unlink(missing_ok=True)
+            completed = _run_block(block, env, project_dir=str(project))
+            assert completed.returncode == 0, completed.stderr
+            assert "source or build recipe changed" in completed.stdout
+            assert build_log.read_text(encoding="utf-8").strip() == (
+                "setup_cython.py build_ext --inplace"
+            )
