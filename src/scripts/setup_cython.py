@@ -80,6 +80,30 @@ for _ext in ext_modules:
     _ext.extra_compile_args = list(_compile_args)
     _ext.extra_link_args = list(_link_args)
 
+# The recursive search keeps several board, move, hash, and heuristic values
+# live across calls. Let GCC rename result registers to remove false output and
+# anti-dependencies without forcing the loop unrolling that enlarged and slowed
+# this extension in earlier measurements.
+if platform.system() != "Windows":
+    for _ext in ext_modules:
+        if _ext.name.endswith("_fast_search"):
+            _ext.extra_compile_args.append("-frename-registers")
+
+# The search's capture emission and periodic deadline checks retain external
+# libc calls in the hot path. On ELF hosts, address them through the GOT
+# directly instead of paying an extra PLT trampoline on every call.
+if platform.system() == "Linux":
+    for _ext in ext_modules:
+        if _ext.name.endswith("_fast_search"):
+            _ext.extra_compile_args.append("-fno-plt")
+
+# Duplicate selected branch tails into larger straight-line regions for the
+# branch-heavy recursive search without changing its operations or results.
+if platform.system() != "Windows":
+    for _ext in ext_modules:
+        if _ext.name.endswith("_fast_search"):
+            _ext.extra_compile_args.append("-ftracer")
+
 # _fast_encode is the only one that uses the numpy C API.
 for _ext in ext_modules:
     if _ext.name.endswith("_fast_encode"):
