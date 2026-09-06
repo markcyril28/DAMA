@@ -323,5 +323,5 @@ def test_cython_guard_rebuilds_after_build_recipe_change(tmp_path: Path) -> None
             assert completed.returncode == 0, completed.stderr
             assert "source or build recipe changed" in completed.stdout
             assert build_log.read_text(encoding="utf-8").strip() == (
-                "setup_cython.py build_ext --inplace"
+                "setup_cython.py build_ext --inplace --force"
             )
