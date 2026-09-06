@@ -288,19 +288,17 @@ DEF TT_EXACT = 0
 DEF TT_LOWERBOUND = 1
 DEF TT_UPPERBOUND = 2
 
-# Depth needs only 6 bits (0-32), leaving its upper 2 bits for the bound flag.
-# Keeping the 6-bit generation in its own byte removes shift/mask work from
-# every TT probe without changing the established 64-search alias cadence.
-DEF TT_DEPTH_MASK = 63           # 0x3F, 6 bits for search depth
-DEF TT_FLAG_SHIFT = 6
-DEF TT_FLAG_MASK = 3             # 0x03, 2 bits for flag
-DEF TT_GEN_MASK = 63             # 0x3F, established generation cadence
+# Packed generation+flag byte: (generation << 2) | flag
+# 6-bit generation (0-63) wraps more often but fits best-move in 16 bytes.
+DEF TT_GEN_SHIFT = 2
+DEF TT_GEN_MASK = 63            # 0x3F — 6 bits for generation
+DEF TT_FLAG_MASK = 3            # 0x03 — 2 bits for flag
 
 cdef struct TTEntry:
     unsigned long long hash_key  # 8 bytes: full hash for collision verification
     float score                  # 4 bytes
-    unsigned char depth_flag     # 1 byte: 6-bit depth + 2-bit bound flag
-    unsigned char generation     # 1 byte: generation (0-63)
+    unsigned char depth          # 1 byte: search depth (max 32, was short)
+    unsigned char gen_flag       # 1 byte: (generation << 2) | flag
     unsigned char best_from      # 1 byte: best move from-square (0-63), 0xFF = none
     unsigned char best_to        # 1 byte: best move to-square (0-63), 0xFF = none
     # Total: 16 bytes — same as before, no padding increase
@@ -314,7 +312,7 @@ cdef unsigned long long ZOBRIST_SIDE
 cdef TTEntry *_tt_table = NULL
 # Generation counter: incremented on each fast_search() call. Entries with a
 # different generation are treated as stale (logically empty) without needing
-# a 128MB memset to physically clear the table. Wraps at 64; worst case, a
+# a 128MB memset to physically clear the table. Wraps at 64 — worst case, a
 # 64-search-old entry passes the generation check, which is harmless (just a
 # rare false TT hit that the hash verification catches).
 cdef unsigned char _tt_generation = 0
@@ -373,9 +371,8 @@ cdef inline void tt_store(
     # iterative deepening (newer results from deeper searches overwrite).
     entry.hash_key = hash_key
     entry.score = score
-    entry.depth_flag = ((<unsigned char>depth & TT_DEPTH_MASK)
-                        | ((<unsigned char>flag & TT_FLAG_MASK) << TT_FLAG_SHIFT))
-    entry.generation = _tt_generation
+    entry.depth = <unsigned char>depth
+    entry.gen_flag = (_tt_generation << TT_GEN_SHIFT) | (<unsigned char>flag & TT_FLAG_MASK)
     entry.best_from = <unsigned char>best_from
     entry.best_to = <unsigned char>best_to
 
@@ -392,12 +389,13 @@ cdef inline bint tt_probe(
     """
     cdef unsigned long long idx = hash_key & TT_MASK
     cdef TTEntry *entry = &_tt_table[idx]
-    cdef unsigned char flag
+    cdef unsigned char gen, flag
 
     tt_from[0] = -1
     tt_to[0] = -1
 
-    if entry.generation != _tt_generation:
+    gen = (entry.gen_flag >> TT_GEN_SHIFT) & TT_GEN_MASK
+    if gen != _tt_generation:
         return False
     if entry.hash_key != hash_key:
         return False
@@ -407,10 +405,10 @@ cdef inline bint tt_probe(
         tt_from[0] = <int>entry.best_from
         tt_to[0] = <int>entry.best_to
 
-    if (entry.depth_flag & TT_DEPTH_MASK) < depth:
+    if entry.depth < depth:
         return False
 
-    flag = entry.depth_flag >> TT_FLAG_SHIFT
+    flag = entry.gen_flag & TT_FLAG_MASK
     if flag == TT_EXACT:
         score[0] = entry.score
         return True
@@ -1092,9 +1090,7 @@ cdef inline int _history_score(
     if delta >= 15:
         value = -1 if value < 0 else 0
     else:
-        while delta > 0:
-            value >>= 1
-            delta -= 1
+        value >>= delta
     ss.history[from_sq][to_sq] = <short>value
     ss.history_age[from_sq][to_sq] = ss.history_generation
     return value
@@ -1737,7 +1733,7 @@ def fast_search(
         return {'move': cmove_to_dict(&moves.moves[0]), 'score': 0, 'depth': 0, 'nodes': 1}
 
     # Allocate TT on first use. Bump generation counter to logically invalidate
-    # all stale entries — avoids a 16MB memset (~1ms) per search call.
+    # all stale entries — avoids a 128MB memset per search call.
     _ensure_tt()
     global _tt_generation
     _tt_generation = (_tt_generation + 1) & TT_GEN_MASK
