@@ -18,8 +18,9 @@ Runs DAMA training natively on Windows with a CUDA-enabled Conda environment.
 
 .DESCRIPTION
 This launcher bypasses WSL and its GPU bridge. It performs read-only preflight
-checks before starting training and does not install packages, compile Cython
-extensions, edit configuration files, or modify Git state.
+checks before starting training and does not install packages, edit source or
+configuration files, or modify Git state. It rebuilds missing or stale local
+Cython extension binaries before importing the trainer.
 
 Training itself still writes the logs, replay data, and checkpoints configured
 by DAMA.
@@ -355,7 +356,8 @@ try {
         Write-Host "Recovery:  verified anchor $(Split-Path -Leaf $PolicyRecoveryBaselinePath) ($PolicyRecoveryBaselineSha256)"
     }
     Write-Host ''
-    Write-Host 'Source safeguard: no package installation, source build, config edit, or Git mutation is performed.'
+    Write-Host 'Source safeguard: no package installation, source edit, config edit, or Git mutation is performed.'
+    Write-Host 'Missing or stale local Cython binaries are rebuilt fail-closed before trainer import.'
     Write-Host 'Expected training outputs may still be written according to the selected config.'
     Write-Host ''
 
@@ -387,6 +389,24 @@ try {
 
     Push-Location -LiteralPath $ProjectDirectory
     $LocationPushed = $true
+
+    Write-Host 'Checking exact-ABI Cython extension readiness...'
+    $EnsureCythonScript = Join-Path $ProjectDirectory `
+        'src\scripts\ensure_cython_extensions.py'
+    if (-not (Test-Path -LiteralPath $EnsureCythonScript -PathType Leaf)) {
+        throw "Cython readiness helper not found: $EnsureCythonScript"
+    }
+    $CythonGuardArguments = @(
+        'run', '--no-capture-output', '-n', $CondaEnvironment,
+        'python', $EnsureCythonScript, '--source-root', $SourceDirectory
+    )
+    Invoke-CondaCommand -Arguments $CythonGuardArguments
+    if ($NativeExitCode -ne 0) {
+        throw (
+            "Cython extension readiness failed with code $NativeExitCode. " +
+            'Training was not started.'
+        )
+    }
 
     Write-Host 'Running Windows Python and CUDA preflight checks...'
     $PreflightCode = @'
