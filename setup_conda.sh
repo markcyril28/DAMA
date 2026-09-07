@@ -103,27 +103,8 @@ pip install nvidia-ml-py
 # Build Cython extensions (encoding: ~7x speedup, search: ~130x speedup)
 echo "Building Cython extensions..."
 if [[ -f "$PROJECT_DIR/src/setup_cython.py" ]]; then
-    (cd "$PROJECT_DIR/src" && python setup_cython.py build --build-base=build build_ext --inplace 2>/dev/null || true)
-    # Copy .so files to correct locations (setuptools targets wrong dir with src layout)
-    BUILD_LIB="$PROJECT_DIR/src/build/lib.linux-$(uname -m)-cpython-${PYTHON_VERSION//./}"
-    PYVER="${PYTHON_VERSION//./}"
-    ARCH="$(uname -m)"
-    SUFFIX="cpython-${PYVER}-${ARCH}-linux-gnu.so"
-    built_any=false
-    # Copy every built extension (_fast_encode, _fast_score, _fast_search, ...)
-    while IFS= read -r -d '' so_src; do
-        # Derive destination from relative path within build dir
-        rel="${so_src#$BUILD_LIB/}"
-        dest="$PROJECT_DIR/src/$rel"
-        mkdir -p "$(dirname "$dest")"
-        cp "$so_src" "$dest"
-        built_any=true
-    done < <(find "$BUILD_LIB" -name "*.${SUFFIX}" -print0 2>/dev/null)
-    if [[ "$built_any" = true ]]; then
-        echo "Cython extensions built and installed."
-    else
-        echo "Warning: Cython extension build failed (training will use Python fallback)."
-    fi
+    (cd "$PROJECT_DIR/src" && python setup_cython.py build_ext --inplace --force)
+    echo "Cython extensions built, installed, and recorded in the readiness manifest."
 fi
 
 # Install Qt GUI dependencies (required for PyQt6 on Linux/WSL)
