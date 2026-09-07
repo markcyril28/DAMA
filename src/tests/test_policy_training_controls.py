@@ -452,7 +452,7 @@ def test_saved_checkpoint_carries_declared_dataset_provenance(
     path = Trainer._save_checkpoint(holder, loss=0.9)
     thread = holder._checkpoint_thread
     assert isinstance(thread, threading.Thread)
-    thread.join(timeout=30)
+    Trainer._wait_for_checkpoint_writer(holder, timeout=30)
     assert not thread.is_alive()
 
     saved = torch.load(path, map_location="cpu", weights_only=False)
@@ -469,6 +469,144 @@ def test_saved_checkpoint_carries_declared_dataset_provenance(
     assert saved["generation_settings"] == manifest["generation_settings"]
     # Never call a checkpoint "best" from training loss alone.
     assert saved["selection_basis"] == "held_out_teacher_agreement"
+
+
+def test_latest_checkpoint_copy_fallback_is_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A hardlink failure must not expose a partial latest checkpoint."""
+    import shutil
+    import threading
+
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    latest_path = tmp_path / "latest.pt"
+    previous_latest = b"verified previous latest checkpoint"
+    latest_path.write_bytes(previous_latest)
+
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        latest_path=str(latest_path),
+    )
+    holder.model = SimpleNamespace(
+        state_dict=lambda: {"weight": torch.arange(4096)},
+        arch_params={},
+    )
+    holder.optimizer = SimpleNamespace(
+        state_dict=lambda: {"state": {}, "param_groups": []})
+    holder.stats = TrainingStats()
+    holder.step = 2000
+    holder.epoch = 1
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats_collector = None
+    holder.log_file = str(tmp_path / "train.jsonl")
+    holder.device = torch.device("cpu")
+    holder._checkpoint_thread = None
+    holder._active_snapshot_manifest = {}
+    holder._evaluate_validation_loss = lambda: None
+    holder._evaluate_teacher_promotion = lambda _path: None
+    holder._live_optimizer_context = lambda: {}
+    holder._snapshot_stats = lambda: {}
+    holder._save_stats = lambda **_kwargs: None
+    holder._put_status = lambda _message: None
+    holder._prune_old_checkpoints = lambda _path: []
+
+    copy_opened = threading.Event()
+    allow_copy_to_finish = threading.Event()
+    copy_destinations = []
+    real_copy2 = shutil.copy2
+
+    def _fail_hardlink(_source, _destination):
+        raise OSError("forced hardlink fallback")
+
+    def _paused_copy2(source, destination, *args, **kwargs):
+        destination = Path(destination)
+        copy_destinations.append(destination)
+        destination.write_bytes(b"partial checkpoint")
+        copy_opened.set()
+        assert allow_copy_to_finish.wait(timeout=5)
+        return real_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(trainer_module.os, "link", _fail_hardlink)
+    monkeypatch.setattr(shutil, "copy2", _paused_copy2)
+
+    Trainer._save_checkpoint(holder, loss=0.5)
+    assert copy_opened.wait(timeout=5)
+    try:
+        assert latest_path.read_bytes() == previous_latest
+        assert copy_destinations == [tmp_path / "latest.pt.tmp"]
+    finally:
+        allow_copy_to_finish.set()
+
+    thread = holder._checkpoint_thread
+    assert isinstance(thread, threading.Thread)
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert torch.load(
+        latest_path, map_location="cpu", weights_only=False,
+    )["step"] == 2000
+
+
+def test_checkpoint_writer_failure_propagates_after_join(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A daemon-writer error must fail the training thread after its join."""
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        latest_path=str(tmp_path / "latest.pt"),
+    )
+    holder.model = SimpleNamespace(
+        state_dict=lambda: {"weight": torch.tensor([1.0])},
+        arch_params={},
+    )
+    holder.optimizer = SimpleNamespace(
+        state_dict=lambda: {"state": {}, "param_groups": []})
+    holder.stats = TrainingStats()
+    holder.step = 2000
+    holder.epoch = 1
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats_collector = None
+    holder.log_file = str(tmp_path / "train.jsonl")
+    holder.device = torch.device("cpu")
+    holder._checkpoint_thread = None
+    holder._checkpoint_write_error = None
+    holder._active_snapshot_manifest = {}
+    holder._evaluate_validation_loss = lambda: None
+    holder._evaluate_teacher_promotion = lambda _path: None
+    holder._live_optimizer_context = lambda: {}
+    holder._snapshot_stats = lambda: {}
+    holder._save_stats = lambda **_kwargs: None
+    holder._put_status = lambda _message: None
+
+    def _fail_alias(_self: Trainer, _source: Path, _destination: Path) -> None:
+        raise OSError("forced final alias publication failure")
+
+    monkeypatch.setattr(Trainer, "_publish_checkpoint_alias", _fail_alias)
+
+    Trainer._save_checkpoint(holder, loss=0.5)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Checkpoint save error during latest alias publication at step 2000: "
+            "OSError: forced final alias publication failure"
+        ),
+    ):
+        Trainer._wait_for_checkpoint_writer(holder)
+
+    assert (checkpoint_dir / "model_step_002000.pt").is_file()
+    assert not Path(holder.config.latest_path).exists()
 
 
 @pytest.mark.parametrize("drop_point", ["numbered", "latest"])
@@ -699,6 +837,43 @@ def test_checkpoint_load_rewinds_newer_sidecar_histories(
         "acceptance_history",
     ):
         assert all(entry.get("step", 0) <= 12 for entry in getattr(holder.stats, name))
+
+
+def test_delayed_stats_snapshot_cannot_replace_newer_progress(
+    tmp_path: Path,
+) -> None:
+    """Background checkpoint I/O must not move the stats sidecar backward."""
+    import threading
+
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        stats_file=str(tmp_path / "training_stats.json"),
+        log_dir=str(tmp_path),
+        recovery_enforced=False,
+    )
+    holder.stats = TrainingStats()
+    holder._stats_write_lock = threading.RLock()
+    holder._stats_snapshot_generation = 0
+    holder._stats_persisted_generation = -1
+    holder._update_training_progress_report = lambda _path: None
+
+    holder.step = 100
+    holder.stats.loss_history.append({"step": 100, "loss": 1.0})
+    delayed_checkpoint_snapshot = Trainer._snapshot_stats(holder)
+
+    holder.step = 200
+    holder.stats.loss_history.append({"step": 200, "loss": 0.8})
+    current_progress_snapshot = Trainer._snapshot_stats(holder)
+
+    # Reproduce the physical completion order of a slow checkpoint writer:
+    # current progress lands first, then the older captured snapshot arrives.
+    Trainer._save_stats(holder, _snapshot=current_progress_snapshot)
+    Trainer._save_stats(holder, _snapshot=delayed_checkpoint_snapshot)
+
+    stored = json.loads(Path(holder.config.stats_file).read_text())
+    assert stored["total_steps"] == 200
+    assert [entry["step"] for entry in stored["loss_history"]] == [100, 200]
+    assert trainer_module._STATS_WRITE_GENERATION_KEY not in stored
 
 
 def test_checkpoint_collision_fails_closed_without_overwriting(
@@ -1377,7 +1552,9 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
     holder._bg_selfplay_stop_event = trainer_module.threading.Event()
     holder._stopped = False
     holder._paused = False
-    holder._data_ready_event = SimpleNamespace(set=lambda: None)
+    holder._data_ready_event = SimpleNamespace(
+        set=holder._bg_selfplay_stop_event.set
+    )
     holder.step = 23
     holder._corpus_settings = lambda model_behavior_step=None, **_: (
         {"difficulty": "hard", "target_type": "hard"},
@@ -1388,7 +1565,6 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
         num_games: int, **_kwargs: object
     ) -> tuple[int, int]:
         holder.step = 99
-        holder._stopped = True
         return 0, 23
     holder.run_selfplay = _run_selfplay
 
@@ -1451,6 +1627,128 @@ def test_background_selfplay_stop_event_prevents_another_snapshot_cycle(
     Trainer._start_background_selfplay(holder, 72)
 
     assert calls == ["cycle"]
+    assert holder._stopped is False
+
+
+def test_background_selfplay_stop_during_admission_skips_snapshot_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class _FakeThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+            self._running = False
+
+        def start(self):
+            self._running = True
+            try:
+                self._target()
+            finally:
+                self._running = False
+
+        def is_alive(self):
+            return self._running
+
+    class _SnapshotManager:
+        def consider_snapshot(self, **_kwargs):
+            calls.append("consider")
+            holder._bg_selfplay_stop_event.set()
+            return SimpleNamespace(
+                admitted=True,
+                manifest_path="snapshot/manifest.json",
+            )
+
+        def load_split(self, *_args, **_kwargs):
+            raise AssertionError(
+                "shutdown must leave the admitted snapshot for next launch"
+            )
+
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = _SnapshotManager()
+    holder.config = SimpleNamespace(
+        replay_max_files=60,
+        replay_max_entries=1_000_000,
+    )
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_stop_event = trainer_module.threading.Event()
+    holder._data_ready_event = trainer_module.threading.Event()
+    holder._stopped = False
+    holder._paused = False
+    holder.run_selfplay = lambda *_args, **_kwargs: (1, 23)
+    holder._corpus_settings = lambda **_kwargs: ({}, {}, {})
+
+    monkeypatch.setattr(trainer_module.threading, "Thread", _FakeThread)
+
+    Trainer._start_background_selfplay(holder, 72)
+
+    assert calls == ["consider"]
+    assert holder._stopped is False
+
+
+def test_background_selfplay_stop_during_snapshot_load_skips_tensorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class _FakeThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+            self._running = False
+
+        def start(self):
+            self._running = True
+            try:
+                self._target()
+            finally:
+                self._running = False
+
+        def is_alive(self):
+            return self._running
+
+    class _SnapshotManager:
+        def consider_snapshot(self, **_kwargs):
+            calls.append("consider")
+            return SimpleNamespace(
+                admitted=True,
+                manifest_path="snapshot/manifest.json",
+            )
+
+        def load_split(self, *_args, **_kwargs):
+            calls.append("load")
+            holder._bg_selfplay_stop_event.set()
+            return [object()], [], {"version": 1, "metrics": {}}
+
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = _SnapshotManager()
+    holder.config = SimpleNamespace(
+        replay_max_files=60,
+        replay_max_entries=1_000_000,
+        max_moves_per_sample=32,
+    )
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_stop_event = trainer_module.threading.Event()
+    holder._data_ready_event = trainer_module.threading.Event()
+    holder._stopped = False
+    holder._paused = False
+    holder.run_selfplay = lambda *_args, **_kwargs: (1, 23)
+    holder._corpus_settings = lambda **_kwargs: ({}, {}, {})
+
+    def _fail_tensorize(*_args, **_kwargs):
+        raise AssertionError("shutdown must skip snapshot tensorization")
+
+    monkeypatch.setattr(trainer_module.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(
+        trainer_module.CachedTensorDataset,
+        "from_entries",
+        staticmethod(_fail_tensorize),
+    )
+
+    Trainer._start_background_selfplay(holder, 72)
+
+    assert calls == ["consider", "load"]
     assert holder._stopped is False
 
 
@@ -1599,11 +1897,88 @@ def test_fork_behavior_model_loads_live_state_without_detached_cpu_copy(
     assert fork_model.cpu_called
 
 
+def test_behavior_capture_and_optimizer_update_cannot_mix_revisions() -> None:
+    """The behavior snapshot owns one complete model revision and step."""
+    import threading
+
+    import torch
+
+    state_lock = threading.Lock()
+    source = {
+        "first": torch.tensor([0.0]),
+        "second": torch.tensor([0.0]),
+    }
+    first_copied = threading.Event()
+    continue_copy = threading.Event()
+    update_finished = threading.Event()
+    captured = []
+    step = [7]
+
+    def capture_state():
+        result = {"first": source["first"].clone()}
+        first_copied.set()
+        assert continue_copy.wait(2.0)
+        result["second"] = source["second"].clone()
+        return result
+
+    def capture_revision():
+        captured.append(trainer_module._capture_model_revision(
+            state_lock, lambda: step[0], capture_state))
+
+    def optimizer_update():
+        def mutate():
+            source["first"].fill_(1.0)
+            source["second"].fill_(1.0)
+            step[0] += 1
+
+        trainer_module._call_under_model_state_lock(state_lock, mutate)
+        update_finished.set()
+
+    capture_thread = threading.Thread(target=capture_revision)
+    capture_thread.start()
+    assert first_copied.wait(2.0)
+    update_thread = threading.Thread(target=optimizer_update)
+    update_thread.start()
+    assert not update_finished.wait(0.05)
+    continue_copy.set()
+    capture_thread.join(2.0)
+    update_thread.join(2.0)
+
+    captured_step, captured_state = captured[0]
+    assert captured_step == 7
+    assert captured_state["first"].item() == 0.0
+    assert captured_state["second"].item() == 0.0
+    assert source["first"].item() == 1.0
+    assert source["second"].item() == 1.0
+    assert step[0] == 8
+
+
+def test_cpu_behavior_fallback_owns_tensor_storage() -> None:
+    """CPU fallback serialization must not alias later trainer updates."""
+    import torch
+
+    model = torch.nn.Linear(2, 1)
+    copied = trainer_module._copy_behavior_state_to_cpu(
+        model, torch.device("cpu"))
+    original = {key: value.clone() for key, value in copied.items()}
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(1.0)
+
+    for key, value in copied.items():
+        assert torch.equal(value, original[key])
+        assert value.data_ptr() != model.state_dict()[key].data_ptr()
+
+
 def test_recorded_step_time_includes_forward_and_backward_work() -> None:
     """Throughput timing covers compute, not only optimizer submission."""
+    import threading
     import time
 
     import torch
+
+    state_lock = threading.Lock()
 
     class SlowModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -1612,6 +1987,7 @@ def test_recorded_step_time_includes_forward_and_backward_work() -> None:
 
         def forward_padded(self, boards, move_features, move_counts):
             del boards, move_counts
+            assert state_lock.locked()
             time.sleep(0.04)
             return self.scale * move_features.squeeze(-1)
 
@@ -1646,6 +2022,13 @@ def test_recorded_step_time_includes_forward_and_backward_work() -> None:
     holder.device = torch.device("cpu")
     holder.model = SlowModel()
     holder.optimizer = torch.optim.SGD(holder.model.parameters(), lr=0.1)
+    original_step = holder.optimizer.step
+
+    def checked_step():
+        assert state_lock.locked()
+        return original_step()
+
+    holder.optimizer.step = checked_step
     holder.scheduler = None
     holder.scaler = None
     holder.amp_dtype = torch.bfloat16
@@ -1655,6 +2038,7 @@ def test_recorded_step_time_includes_forward_and_backward_work() -> None:
     holder._control_queue = None
     holder._stopped = False
     holder._paused = False
+    holder._model_state_lock = state_lock
     holder.step = 0
     holder.epoch = 0
     holder._data_refreshed_pending = False
@@ -2037,6 +2421,44 @@ def test_rollback_accepts_the_anchor_whose_embedded_lineage_predates_it(
         Trainer._verified_recovery_rollback_checkpoint(holder)
 
 
+def _acceptance_game_evidence(
+    config: TrainingConfig,
+    opponent_type: str,
+    *,
+    p1_wins: int,
+    p1_draws: int,
+    p1_losses: int,
+    p2_wins: int,
+    p2_draws: int,
+    p2_losses: int,
+) -> list[dict]:
+    """Build the exact paired opening evidence behind acceptance aggregates."""
+    games = []
+    side_counts = {
+        1: (p1_wins, p1_draws, p1_losses),
+        2: (p2_wins, p2_draws, p2_losses),
+    }
+    for player, (wins, draws, losses) in side_counts.items():
+        assert wins + draws + losses == 50
+        results = ["ml_win"] * wins + ["draw"] * draws + ["algo_win"] * losses
+        for index, result in enumerate(results):
+            games.append({
+                "result": result,
+                "ml_player": player,
+                "winner": (
+                    player if result == "ml_win"
+                    else None if result == "draw"
+                    else 3 - player
+                ),
+                "opponent_type": opponent_type,
+                "opening_plies": config.test_opening_plies[
+                    index % len(config.test_opening_plies)],
+                "opening_seed": config.test_opening_seed + index,
+                "ml_inference_depth": 1,
+            })
+    return games
+
+
 def _enhanced_stage_acceptance_fixture(tmp_path: Path) -> dict:
     """Build a complete, genuinely passing enhanced-stage unlock on disk.
 
@@ -2053,7 +2475,7 @@ def _enhanced_stage_acceptance_fixture(tmp_path: Path) -> dict:
     policy_checkpoint_dir.mkdir(parents=True)
     promoted = policy_checkpoint_dir / "model_step_140000.pt"
     promoted.write_bytes(b"promoted policy")
-    promoted_sha256 = hashlib.sha256(promoted.read_bytes()).hexdigest()
+    promoted_sha256 = hashlib.sha256(promoted.read_bytes()).hexdigest().upper()
     suite = tmp_path / "frozen.jsonl"
     suite.write_bytes(b"frozen suite")
     suite_sha256 = hashlib.sha256(suite.read_bytes()).hexdigest()
@@ -2101,20 +2523,33 @@ def _enhanced_stage_acceptance_fixture(tmp_path: Path) -> dict:
         "ml_inference_depth": 1,
     }
     random_result = {
+        "total_games": 100,
         "ml_wins": 90, "draws": 0, "algo_wins": 10,
         "ml_as_p1_wins": 45, "ml_as_p1_draws": 0, "ml_as_p1_losses": 5,
         "ml_as_p2_wins": 45, "ml_as_p2_draws": 0, "ml_as_p2_losses": 5,
+        "games": _acceptance_game_evidence(
+            config, "random",
+            p1_wins=45, p1_draws=0, p1_losses=5,
+            p2_wins=45, p2_draws=0, p2_losses=5,
+        ),
         "opponent_type": "random", **common,
     }
     easy_result = {
+        "total_games": 100,
         "ml_wins": 65, "draws": 10, "algo_wins": 25,
         "ml_as_p1_wins": 32, "ml_as_p1_draws": 5, "ml_as_p1_losses": 13,
         "ml_as_p2_wins": 33, "ml_as_p2_draws": 5, "ml_as_p2_losses": 12,
+        "games": _acceptance_game_evidence(
+            config, "algorithm",
+            p1_wins=32, p1_draws=5, p1_losses=13,
+            p2_wins=33, p2_draws=5, p2_losses=12,
+        ),
         "opponent_type": "algorithm", **common,
     }
     decision = checkpoint_acceptance.evaluate_acceptance_gates(
         0.55, random_result, easy_result)
     report = {
+        "schema_version": 1,
         "passed": True,
         "step": 140000,
         "training_stage": "policy_only",
@@ -2254,6 +2689,17 @@ def test_acceptance_gate_rejects_a_suite_id_only_one_record_carries(
         validate_recovery_experiment_config(fixture["config"])
 
 
+def test_enhanced_stage_rejects_incomplete_paired_game_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    fixture["report"]["random"].pop("games")
+    fixture["write_report"]()
+
+    with pytest.raises(ValueError, match="complete paired-game protocol"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
 def test_acceptance_gate_requires_exactly_the_frozen_suite_size(
     tmp_path: Path,
 ) -> None:
@@ -2320,7 +2766,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     policy_checkpoint_dir.mkdir(parents=True)
     promoted = policy_checkpoint_dir / "model_step_140000.pt"
     promoted.write_bytes(b"promoted policy")
-    promoted_sha256 = hashlib.sha256(promoted.read_bytes()).hexdigest()
+    promoted_sha256 = hashlib.sha256(promoted.read_bytes()).hexdigest().upper()
     suite = tmp_path / "frozen.jsonl"
     suite.write_bytes(b"frozen suite")
     suite_sha256 = hashlib.sha256(suite.read_bytes()).hexdigest()
@@ -2371,6 +2817,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     expected_suite_id = opening_suite_identity(
         config.test_opening_seed, config.test_opening_plies, 50)
     random_result = {
+        "total_games": 100,
         "ml_wins": 90,
         "draws": 0,
         "algo_wins": 10,
@@ -2380,6 +2827,11 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "ml_as_p2_wins": 45,
         "ml_as_p2_draws": 0,
         "ml_as_p2_losses": 5,
+        "games": _acceptance_game_evidence(
+            config, "random",
+            p1_wins=45, p1_draws=0, p1_losses=5,
+            p2_wins=45, p2_draws=0, p2_losses=5,
+        ),
         "model_path": str(promoted),
         "opponent_type": "random",
         "algo_difficulty": "easy",
@@ -2390,6 +2842,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "ml_inference_depth": 1,
     }
     easy_result = {
+        "total_games": 100,
         "ml_wins": 65,
         "draws": 10,
         "algo_wins": 25,
@@ -2399,6 +2852,11 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         "ml_as_p2_wins": 33,
         "ml_as_p2_draws": 5,
         "ml_as_p2_losses": 12,
+        "games": _acceptance_game_evidence(
+            config, "algorithm",
+            p1_wins=32, p1_draws=5, p1_losses=13,
+            p2_wins=33, p2_draws=5, p2_losses=12,
+        ),
         "model_path": str(promoted),
         "opponent_type": "algorithm",
         "algo_difficulty": "easy",
@@ -2414,6 +2872,7 @@ def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
         str(promoted), 140000)
     acceptance_report_path = acceptance_dir / "acceptance_step_140000.json"
     acceptance_report = {
+        "schema_version": 1,
         "passed": True,
         "step": 140000,
         "training_stage": "policy_only",
