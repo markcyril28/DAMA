@@ -470,10 +470,10 @@ cdef inline int opponent(int player) noexcept nogil:
 # Move generation
 # ═══════════════════════════════════════════════════════════════════════
 
-cdef void _get_move_dirs(int piece, int player, Rules *rules,
+cdef void _get_move_dirs(bint piece_is_king, int player, Rules *rules,
                          int **out_dr, int **out_dc, int *out_n) noexcept nogil:
     """Get movement directions for simple (non-capture) moves."""
-    if is_king(piece):
+    if piece_is_king:
         out_dr[0] = ALL_DR; out_dc[0] = ALL_DC; out_n[0] = 4
     elif player == PLAYER_ONE:
         out_dr[0] = FWD_P1_DR; out_dc[0] = FWD_P1_DC; out_n[0] = 2
@@ -481,10 +481,10 @@ cdef void _get_move_dirs(int piece, int player, Rules *rules,
         out_dr[0] = FWD_P2_DR; out_dc[0] = FWD_P2_DC; out_n[0] = 2
 
 
-cdef void _get_capture_dirs(int piece, int player, Rules *rules,
+cdef void _get_capture_dirs(bint piece_is_king, int player, Rules *rules,
                             int **out_dr, int **out_dc, int *out_n) noexcept nogil:
     """Get capture directions — all 4 for kings, or forward+backward if enabled."""
-    if is_king(piece) or rules.backward_capture:
+    if piece_is_king or rules.backward_capture:
         out_dr[0] = ALL_DR; out_dc[0] = ALL_DC; out_n[0] = 4
     elif player == PLAYER_ONE:
         out_dr[0] = FWD_P1_DR; out_dc[0] = FWD_P1_DC; out_n[0] = 2
@@ -503,7 +503,7 @@ cdef void generate_simple_moves(
     cdef int ndirs
     cdef bint is_k = is_king(piece)
 
-    _get_move_dirs(piece, player, rules, &dirs_r, &dirs_c, &ndirs)
+    _get_move_dirs(is_k, player, rules, &dirs_r, &dirs_c, &ndirs)
 
     for d in range(ndirs):
         if is_k and rules.king_flying_capture:
@@ -553,7 +553,7 @@ cdef inline void _add_simple_move(
 
 cdef int _generate_captures_recursive(
     signed char *board, int r, int c, int piece, int player,
-    int capture_value,
+    bint piece_is_king, int capture_value,
     int *path_sq, int path_len,
     int *cap_sq,
     Rules *rules, CMoveList *out
@@ -566,10 +566,14 @@ cdef int _generate_captures_recursive(
     cdef int *dirs_c
     cdef int ndirs
 
-    _get_capture_dirs(piece, player, rules, &dirs_r, &dirs_c, &ndirs)
+    # The moving piece cannot change during one capture sequence. Classify it
+    # once at the public generator boundary, then carry that value through the
+    # full recursion instead of decoding the same piece again in every frame.
+    _get_capture_dirs(
+        piece_is_king, player, rules, &dirs_r, &dirs_c, &ndirs)
 
     for d in range(ndirs):
-        if is_king(piece) and rules.king_flying_capture:
+        if piece_is_king and rules.king_flying_capture:
             found += _flying_king_capture(
                 board, r, c, piece, player,
                 dirs_r[d], dirs_c[d],
@@ -604,7 +608,7 @@ cdef int _generate_captures_recursive(
 
             further = _generate_captures_recursive(
                 board, lr, lc, piece, player,
-                next_capture_value,
+                piece_is_king, next_capture_value,
                 path_sq, path_len + 1,
                 cap_sq,
                 rules, out
@@ -621,7 +625,7 @@ cdef int _generate_captures_recursive(
                     _copy_capture_move(
                         out, path_sq, path_len + 1,
                         cap_sq,
-                        not is_king(piece) and lr == promotion_row(player),
+                        not piece_is_king and lr == promotion_row(player),
                         next_capture_value,
                     )
                     found += 1
@@ -682,7 +686,7 @@ cdef int _flying_king_capture(
 
                     further = _generate_captures_recursive(
                         board, lr, lc, piece, player,
-                        next_capture_value,
+                        1, next_capture_value,
                         path_sq, path_len + 1,
                         cap_sq,
                         rules, out
@@ -738,7 +742,7 @@ cdef void generate_captures(
 
     _generate_captures_recursive(
         board, r, c, piece, player,
-        0, path_sq, 1, cap_sq,
+        is_king(piece), 0, path_sq, 1, cap_sq,
         rules, out
     )
 
