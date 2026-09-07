@@ -1,14 +1,17 @@
 """Replay buffer management for training data."""
 
+import errno
 import json
 import os
+import random
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Iterator, Optional, Dict, Any
-from dataclasses import dataclass
-import random
 
 # Use orjson (Rust-backed, 3-5x faster) when available, fall back to stdlib json.
 try:
@@ -40,6 +43,9 @@ _PARSE_ERRORS = (ValueError, KeyError, TypeError)
 # corpus relocated across mounts or machines stays warm.
 _ENTRY_COUNT_SIDECAR_NAME = 'entry_count_cache.json'
 _ENTRY_COUNT_SIDECAR_SCHEMA = 1
+_ENTRY_COUNT_SIDECAR_LOCK_NAME = '.entry_count_cache.lock'
+_ENTRY_COUNT_SIDECAR_LOCK_TIMEOUT_SECONDS = 0.25
+_ENTRY_COUNT_SIDECAR_LOCK_POLL_SECONDS = 0.05
 
 # Snapshot-mode self-play writes one complete cycle before the corpus manager
 # can inspect it.  Buffer that cycle in bounded chunks instead of forcing each
@@ -124,6 +130,68 @@ def _save_entry_count_sidecar(replay_dir: Path, entries: Dict[str, tuple]) -> bo
             except OSError:
                 pass
         return False
+
+
+@contextmanager
+def _entry_count_sidecar_lock(replay_dir: Path):
+    """Serialize sidecar merges, abandoning this optional cache if stalled."""
+    lock_path = replay_dir / _ENTRY_COUNT_SIDECAR_LOCK_NAME
+    with lock_path.open('a+b') as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b'\0')
+            stream.flush()
+
+        deadline = (
+            time.monotonic() + _ENTRY_COUNT_SIDECAR_LOCK_TIMEOUT_SECONDS
+        )
+        if os.name == 'nt':
+            import msvcrt
+
+            def acquire():
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+
+            retry_errnos = (errno.EACCES, errno.EAGAIN, errno.EDEADLK)
+        else:
+            import fcntl
+
+            def acquire():
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            retry_errnos = (errno.EACCES, errno.EAGAIN)
+
+        while True:
+            try:
+                acquire()
+                break
+            except OSError as exc:
+                if exc.errno not in retry_errnos:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        errno.ETIMEDOUT,
+                        f"timed out locking optional replay cache {lock_path}",
+                    ) from exc
+                time.sleep(min(
+                    _ENTRY_COUNT_SIDECAR_LOCK_POLL_SECONDS,
+                    remaining,
+                ))
+
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == 'nt':
+                try:
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    # The cache remains fail-open even if a host invalidates
+                    # the byte-range lock while unwinding an I/O failure.
+                    pass
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass
@@ -228,6 +296,10 @@ class ReplayBuffer:
         # boundary, while a bounded buffer coalesces the batch writes on drvfs.
         self._buffer_snapshot_cycle = not self._cache_written_entries
         self._current_file = None
+        # Snapshot-mode cycles stay under an ignored dotfile until close().
+        # ``_current_file`` is the eventual immutable public name so every
+        # cache and caller keeps using the established replay basename.
+        self._current_staging_file = None
         self._current_writer = None
         # Incremental file cache: {path: (mtime, [ReplayEntry, ...])}
         # Avoids re-parsing unchanged JSONL files across epochs.
@@ -256,27 +328,50 @@ class ReplayBuffer:
         """Start a new replay file."""
         self._close_current()
 
-        # [Pass 109] The name has only second resolution, and the file is opened
-        # 'w'. Two cycles finishing in the same second used to silently truncate
-        # the first one's data. That was near-harmless while persistence only
-        # ran on the first cycle; now that every cycle persists, disambiguate.
+        # [Pass 109] The name has only second resolution. Every cycle persists,
+        # so claim the selected name with exclusive creation: an exists-then-
+        # open('w') sequence lets concurrent writers both choose and truncate
+        # the same shard. FileExistsError advances to the established suffix.
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = self.replay_dir / f"replay_{timestamp}.jsonl"
         suffix = 0
-        while filepath.exists():
-            suffix += 1
-            filepath = self.replay_dir / f"replay_{timestamp}_{suffix:02d}.jsonl"
+        while True:
+            stem = f"replay_{timestamp}"
+            if suffix:
+                stem += f"_{suffix:02d}"
+            filepath = self.replay_dir / f"{stem}.jsonl"
+            staging_path = filepath.with_name(f".{filepath.name}.pending")
+            try:
+                if self._buffer_snapshot_cycle:
+                    writer = open(
+                        staging_path,
+                        'x',
+                        encoding='utf-8',
+                        buffering=_SNAPSHOT_WRITE_BUFFER_BYTES,
+                    )
+                    # A complete shard with this name can coexist with an
+                    # orphaned staging claim after a host failure. Never
+                    # replace it: discard this claim and advance the suffix.
+                    if filepath.exists():
+                        writer.close()
+                        writer = None
+                        try:
+                            staging_path.unlink()
+                        except OSError:
+                            pass
+                        suffix += 1
+                        continue
+                else:
+                    writer = open(filepath, 'x')
+            except FileExistsError:
+                suffix += 1
+                continue
+            break
 
         self._current_file = filepath
-        if self._buffer_snapshot_cycle:
-            self._current_writer = open(
-                filepath,
-                'w',
-                encoding='utf-8',
-                buffering=_SNAPSHOT_WRITE_BUFFER_BYTES,
-            )
-        else:
-            self._current_writer = open(filepath, 'w')
+        self._current_staging_file = (
+            staging_path if self._buffer_snapshot_cycle else None
+        )
+        self._current_writer = writer
 
         return filepath
 
@@ -365,19 +460,36 @@ class ReplayBuffer:
                 # shard instead of publishing its expected entry count for a
                 # short or malformed file. Legacy callers retain their prior
                 # best-effort close behavior.
-                path = self._current_file
-                self._current_file = None
-                if path is not None:
-                    self._file_cache.pop(path, None)
-                    self._session_entries.pop(path, None)
-                    self._session_dicts.pop(path, None)
-                    self._session_entry_counts.pop(path, None)
-                    self._forget_entry_count(path.name)
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
+                # Reuse the incomplete-cycle removal path so an immediate
+                # unlink refusal moves the shard out of the active replay
+                # namespace instead of leaving it visible to corpus scans.
+                self.discard_current_file()
                 raise close_error
+            if self._buffer_snapshot_cycle:
+                # The closed staging file is complete, but it is still absent
+                # from every replay/corpus glob. Publish with link(2), whose
+                # destination creation is atomic and refuses to overwrite an
+                # unexpectedly colliding shard. Unlinking the hidden name then
+                # leaves one immutable public inode without a visibility gap.
+                staging_path = self._current_staging_file
+                final_path = self._current_file
+                if staging_path is None or final_path is None:
+                    raise RuntimeError(
+                        "snapshot replay writer lost its publication paths"
+                    )
+                try:
+                    os.link(staging_path, final_path)
+                except OSError:
+                    self.discard_current_file()
+                    raise
+                try:
+                    staging_path.unlink()
+                except OSError:
+                    # The public shard is already complete and immutable. A
+                    # hidden extra hardlink consumes no additional data blocks
+                    # and remains ignored by all replay readers.
+                    pass
+                self._current_staging_file = None
             # Promote in-memory entries to file cache so load_all_entries()
             # skips re-parsing the file we just wrote.  Snapshot-mode callers
             # opt out: their batches were already validated before writing, so
@@ -443,6 +555,7 @@ class ReplayBuffer:
         # raise — which would leave the partial file on disk, the exact outcome
         # this method exists to prevent.
         path = self._current_file
+        staging_path = self._current_staging_file
         if self._current_writer is not None:
             try:
                 self._current_writer.close()
@@ -451,17 +564,38 @@ class ReplayBuffer:
             finally:
                 self._current_writer = None
         self._current_file = None
+        self._current_staging_file = None
         if path is None:
             return None
+        removal_path = staging_path or path
         try:
-            path.unlink()
+            removal_path.unlink()
         except FileNotFoundError:
             pass
         except OSError:
-            # Keep the cache consistent even when the filesystem refuses the
-            # unlink.  The caller will reject the cycle, so it is safer to
-            # leave a diagnostic orphan than to admit it as active data.
-            return path
+            # Some hosts can refuse an unlink immediately after the buffered
+            # writer closes.  Preserve the bytes for diagnosis, but move them
+            # out of the replay_*.jsonl namespace so buffer statistics and
+            # corpus scans cannot treat an incomplete cycle as active data.
+            quarantine = path.with_name(f".{path.name}.incomplete")
+            suffix = 0
+            while quarantine.exists():
+                suffix += 1
+                quarantine = path.with_name(
+                    f".{path.name}.incomplete.{suffix}"
+                )
+            try:
+                removal_path.rename(quarantine)
+            except OSError:
+                if staging_path is None:
+                    # A legacy writer's file is still in the public namespace.
+                    # Retain its bookkeeping so count_entries() reports the
+                    # physical diagnostic shard rather than silently
+                    # disagreeing with the filesystem.
+                    return path
+                # A snapshot staging file remains hidden even when both
+                # cleanup operations fail. Drop its integer bookkeeping: no
+                # replay reader can observe or count that diagnostic dotfile.
         self._file_cache.pop(path, None)
         self._session_entries.pop(path, None)
         self._session_dicts.pop(path, None)
@@ -564,16 +698,47 @@ class ReplayBuffer:
         self._entry_count_cache = merged
 
     def _persist_entry_counts(self, live_names) -> None:
-        """Write the sidecar when it may differ from memory; prune dead shards."""
+        """Merge and write the sidecar; prune dead shards without lost updates."""
         if not self._entry_count_dirty:
             return
-        live = {
-            name: record for name, record in self._entry_count_cache.items()
-            if name in live_names
-        }
-        if _save_entry_count_sidecar(self.replay_dir, live):
-            self._entry_count_cache = live
-            self._entry_count_dirty = False
+        # Atomic replace prevents torn readers, but it is not a compare-and-swap:
+        # two ReplayBuffer instances can otherwise each replace the complete map
+        # with only their own newly closed shard. Merge while holding a narrow
+        # process lock so concurrent standalone generators retain both records.
+        try:
+            with _entry_count_sidecar_lock(self.replay_dir):
+                # The caller's point-in-time scan may predate a competing
+                # writer's new shard. Refresh names under the publication lock
+                # so merging its durable record does not immediately prune it.
+                try:
+                    with os.scandir(self.replay_dir) as directory:
+                        current_live_names = {
+                            entry.name
+                            for entry in directory
+                            if entry.name.startswith('replay_')
+                            and entry.name.endswith('.jsonl')
+                        }
+                except OSError:
+                    current_live_names = live_names
+                live = {
+                    name: record
+                    for name, record in _load_entry_count_sidecar(
+                        self.replay_dir).items()
+                    if name in current_live_names
+                }
+                live.update({
+                    name: record
+                    for name, record in self._entry_count_cache.items()
+                    if name in current_live_names
+                })
+                if _save_entry_count_sidecar(self.replay_dir, live):
+                    self._entry_count_cache = live
+                    self._entry_count_dirty = False
+        except OSError:
+            # The sidecar is a performance cache. Read-only directories and
+            # unavailable host locking must never turn an exact replay count
+            # into a training-session failure.
+            return
 
     def _replay_file_stats(self) -> List[tuple]:
         """Capture each replay shard and its identity in one directory scan."""
@@ -673,6 +838,19 @@ class ReplayBuffer:
         then restatting the same rolling window for each aggregate.
         """
         file_stats = self._replay_file_stats()
+        # Snapshot staging is deliberately invisible to get_replay_files(),
+        # corpus admission, and other processes. Preserve this instance's
+        # historical open-cycle statistics by representing its staging
+        # identity under the eventual public path for the local count pass.
+        if (self._current_writer is not None
+                and self._current_file is not None
+                and self._current_staging_file is not None):
+            try:
+                staging_stat = self._current_staging_file.stat()
+            except OSError:
+                pass
+            else:
+                file_stats.append((self._current_file, staging_stat))
         if not file_stats:
             return 0, 0, 0
         total_entries = self._count_entries_from_stats(file_stats)
