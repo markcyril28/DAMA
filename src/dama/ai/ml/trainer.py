@@ -3768,6 +3768,8 @@ class Trainer:
         task: Mapping[str, Any],
         report: Mapping[str, Any],
         durable_report: Path,
+        *,
+        publish_alias: bool = True,
     ) -> None:
         """Publish a passing alias and record one durable acceptance result."""
         report = dict(report)
@@ -3777,7 +3779,7 @@ class Trainer:
             and dict(record) == report
             for record in self.stats.acceptance_history
         )
-        if report['passed']:
+        if report['passed'] and publish_alias:
             # The durable history and accepted alias are independent outputs.
             # A prior finalization can persist the history while a later alias
             # deletion or failed pending cleanup leaves startup responsible for
@@ -3791,7 +3793,24 @@ class Trainer:
         if already_recorded:
             return
 
-        self.stats.acceptance_history.append(report)
+        # Normal evaluations arrive in increasing checkpoint order. Recovery
+        # can instead restore an older missing row after newer rows have
+        # survived a statistics rollback. Insert it before the first later
+        # checkpoint so callers that read the final row still see the newest
+        # acceptance result.
+        report_step = int(report.get('step', -1))
+        insert_at = len(self.stats.acceptance_history)
+        for index, existing in enumerate(self.stats.acceptance_history):
+            if not isinstance(existing, Mapping):
+                continue
+            try:
+                existing_step = int(existing.get('step', -1))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if existing_step > report_step:
+                insert_at = index
+                break
+        self.stats.acceptance_history.insert(insert_at, report)
         self._save_stats(_raise_on_error=True)
         state = 'PASSED' if report['passed'] else 'FAILED'
         print(
@@ -3905,6 +3924,7 @@ class Trainer:
         """Requeue pending work and reconcile durable acceptance results."""
         recovered = 0
         latest_passing_completion = None
+        passing_completions = []
         for task in checkpoint_acceptance_tasks.discover_pending_acceptance_tasks(
             self.config.acceptance_dir
         ):
@@ -3975,6 +3995,7 @@ class Trainer:
                     if report.get('passed') is True:
                         candidate = (
                             int(task['step']), task, report, durable_report)
+                        passing_completions.append(candidate)
                         if (
                             latest_passing_completion is None
                             or candidate[0] >= latest_passing_completion[0]
@@ -4007,6 +4028,38 @@ class Trainer:
                     "Could not reconcile promoted checkpoint acceptance task "
                     f"for step {promotion.get('step')}: {exc}"
                 )
+
+        # The accepted alias identifies only the newest passing checkpoint, but
+        # acceptance_history is the durable audit trail for every evaluated
+        # checkpoint. Restore older passing rows without repeatedly publishing
+        # and hashing the public alias. The newest completion is handled below
+        # so one finalization can repair its row and alias together.
+        for _, task, report, durable_report in passing_completions:
+            if (
+                latest_passing_completion is not None
+                and task['task_id'] == latest_passing_completion[1]['task_id']
+                and durable_report == latest_passing_completion[3]
+            ):
+                continue
+            expected_history = dict(report)
+            expected_history['report_path'] = str(durable_report)
+            history_matches = any(
+                isinstance(record, Mapping)
+                and dict(record) == expected_history
+                for record in self.stats.acceptance_history
+            )
+            if history_matches:
+                continue
+            try:
+                self._finalize_checkpoint_acceptance_report(
+                    task, report, durable_report, publish_alias=False)
+            except Exception as exc:
+                print(
+                    "Could not reconcile historical completed checkpoint "
+                    f"acceptance for step {task.get('step')}: {exc}"
+                )
+            else:
+                recovered += 1
 
         # The report and promotion registry are sufficient authority to
         # reconstruct a passing alias even after the pending marker has been
