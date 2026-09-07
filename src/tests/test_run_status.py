@@ -449,11 +449,18 @@ def test_begin_run_refuses_to_stomp_a_live_trainer(tmp_path: Path) -> None:
     fake = subprocess.Popen(["bash", "-c", "exec -a micro-trainer sleep 60"])
     try:
         deadline = time.time() + 5.0
+        trainer_argv_ready = False
         while time.time() < deadline:
             cmdline = Path(f"/proc/{fake.pid}/cmdline").read_bytes()
-            if b"micro-trainer" in cmdline:
+            # The pre-exec Bash argv contains the literal script text
+            # ``exec -a micro-trainer ...`` too. Wait for argv[0] itself to
+            # change, otherwise the next read can land in exec's transient
+            # empty-cmdline window and manufacture an active-guard failure.
+            if cmdline.split(b"\0", 1)[0] == b"micro-trainer":
+                trainer_argv_ready = True
                 break
             time.sleep(0.01)
+        assert trainer_argv_ready
 
         run_status.begin_run(tmp_path, pid=fake.pid)
         marker = tmp_path / run_status.RUN_STATUS_FILENAME

@@ -9,10 +9,13 @@ physical line counts, a shard is read at most once per (size, mtime_ns)
 identity, the sidecar is fail-open, pruned with the window, and always
 replaced atomically rather than rewritten through a possibly shared inode.
 """
+import builtins
 import fnmatch
 import json
 import os
+import threading
 import time
+from datetime import datetime as real_datetime
 from pathlib import Path
 
 import pytest
@@ -169,6 +172,247 @@ def test_discarded_cycle_shard_leaves_no_record(tmp_path):
     assert set(_sidecar(replay_dir)["entries"]) == {paths[0].name}
 
 
+def test_discarded_cycle_is_quarantined_when_unlink_is_refused(
+    tmp_path, monkeypatch,
+):
+    """An unlink failure must not leave an incomplete active replay shard."""
+    replay_dir = tmp_path / "replay"
+    buf = ReplayBuffer(
+        str(replay_dir), max_files=0, cache_written_entries=False)
+
+    complete = buf.start_new_file()
+    buf.add_entry_dicts([_entry(0), _entry(1)])
+    buf.close()
+    assert buf.count_entries() == 2
+
+    partial = buf.start_new_file()
+    buf.add_entry_dicts([_entry(2), _entry(3), _entry(4)])
+    staging = buf._current_staging_file
+    assert staging is not None
+    real_unlink = Path.unlink
+
+    def refuse_partial(path, *args, **kwargs):
+        if path == staging:
+            raise PermissionError("synthetic unlink refusal")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_partial)
+    assert buf.discard_current_file() == partial
+
+    quarantined = list(replay_dir.glob(".replay_*.jsonl.incomplete*"))
+    assert not partial.exists()
+    assert len(quarantined) == 1
+    assert len(quarantined[0].read_text(encoding="utf-8").splitlines()) == 3
+    assert buf.get_replay_files() == [complete]
+    assert buf.count_entries() == 2
+    assert buf._session_entry_counts == {}
+    assert set(_sidecar(replay_dir)["entries"]) == {complete.name}
+
+
+def test_concurrent_same_second_writers_claim_distinct_shards(
+    tmp_path, monkeypatch,
+):
+    """Filename selection and creation must be one atomic operation."""
+    replay_dir = tmp_path / "replay"
+    initial_name = ".replay_20260907_090000.jsonl.pending"
+    open_barrier = threading.Barrier(2)
+    real_open = builtins.open
+    first_open_by_thread = set()
+    first_open_lock = threading.Lock()
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return real_datetime(2026, 9, 7, 9, 0, 0)
+
+    def synchronized_open(path, *args, **kwargs):
+        path = Path(path)
+        thread_id = threading.get_ident()
+        if path.parent == replay_dir and path.name == initial_name:
+            with first_open_lock:
+                first_open = thread_id not in first_open_by_thread
+                first_open_by_thread.add(thread_id)
+            if first_open:
+                open_barrier.wait(timeout=5)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(replay_mod, "datetime", FixedDateTime)
+    monkeypatch.setattr(builtins, "open", synchronized_open)
+
+    paths = []
+    errors = []
+    result_lock = threading.Lock()
+
+    def write_one(marker):
+        try:
+            buf = ReplayBuffer(
+                str(replay_dir), max_files=0, cache_written_entries=False)
+            path = buf.start_new_file()
+            buf.add_entry_dicts([_entry(marker)])
+            buf.close()
+            with result_lock:
+                paths.append(path)
+        except BaseException as exc:
+            with result_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=write_one, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(set(paths)) == 2
+    shards = sorted(replay_dir.glob("replay_*.jsonl"))
+    assert shards == sorted(paths)
+    assert sorted(
+        len(path.read_text(encoding="utf-8").splitlines()) for path in shards
+    ) == [1, 1]
+
+
+def test_concurrent_sidecar_updates_merge_distinct_shard_counts(
+    tmp_path, monkeypatch,
+):
+    """Whole-map replacement must not discard another writer's cache record."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    shards = []
+    buffers = []
+    for index in range(2):
+        shard = replay_dir / f"replay_20260907_10000{index}.jsonl"
+        shard.write_text("{}\n", encoding="utf-8")
+        buffer = ReplayBuffer(str(replay_dir), max_files=0)
+        buffer._remember_entry_count(shard.name, shard.stat(), 1)
+        shards.append(shard)
+        buffers.append(buffer)
+
+    first_save_entered = threading.Event()
+    second_persist_started = threading.Event()
+    real_save = replay_mod._save_entry_count_sidecar
+    save_calls = 0
+    save_calls_lock = threading.Lock()
+
+    def delay_first_save(replay_root, entries):
+        nonlocal save_calls
+        with save_calls_lock:
+            save_calls += 1
+            first_save = save_calls == 1
+        if first_save:
+            first_save_entered.set()
+            assert second_persist_started.wait(timeout=5)
+            # Without the sidecar lock, the second writer replaces the map in
+            # this interval and the delayed first writer then loses its record.
+            time.sleep(0.05)
+        return real_save(replay_root, entries)
+
+    monkeypatch.setattr(
+        replay_mod, "_save_entry_count_sidecar", delay_first_save)
+    live_names = [{shard.name} for shard in shards]
+    errors = []
+
+    def persist(buffer, names, started_event=None):
+        if started_event is not None:
+            started_event.set()
+        try:
+            buffer._persist_entry_counts(names)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(
+        target=persist, args=(buffers[0], live_names[0]))
+    first.start()
+    assert first_save_entered.wait(timeout=5)
+    second = threading.Thread(
+        target=persist,
+        args=(buffers[1], live_names[1], second_persist_started),
+    )
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not errors
+    assert not first.is_alive() and not second.is_alive()
+    assert save_calls == 2
+    assert set(_sidecar(replay_dir)["entries"]) == {
+        shard.name for shard in shards
+    }
+
+    # A new process-equivalent buffer must use both durable records and avoid
+    # reopening either immutable replay shard merely to recount its lines.
+    _forbid_reads(monkeypatch)
+    assert ReplayBuffer(str(replay_dir), max_files=0).count_entries() == 2
+
+
+def test_sidecar_lock_failure_does_not_block_exact_count(
+    tmp_path, monkeypatch,
+):
+    """The durable sidecar remains a fail-open performance cache."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    shard = replay_dir / "replay_20260907_100000.jsonl"
+    shard.write_text("{}\n{}\n{}\n", encoding="utf-8")
+    real_open = Path.open
+
+    def refuse_lock(path, *args, **kwargs):
+        if path.name == replay_mod._ENTRY_COUNT_SIDECAR_LOCK_NAME:
+            raise PermissionError("synthetic lock refusal")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", refuse_lock)
+    assert ReplayBuffer(str(replay_dir), max_files=0).count_entries() == 3
+    assert not (replay_dir / _ENTRY_COUNT_SIDECAR_NAME).exists()
+
+
+def test_stalled_sidecar_lock_is_bounded_and_publication_retries(
+    tmp_path, monkeypatch,
+):
+    """A frozen cache writer must not stall an otherwise exact replay count."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    shard = replay_dir / "replay_20260907_110000.jsonl"
+    shard.write_text("{}\n{}\n{}\n", encoding="utf-8")
+    buffer = ReplayBuffer(str(replay_dir), max_files=0)
+
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+    count_finished = threading.Event()
+    outcome = {}
+
+    def hold_lock():
+        with replay_mod._entry_count_sidecar_lock(replay_dir):
+            holder_ready.set()
+            release_holder.wait(timeout=5)
+
+    def count_entries():
+        outcome["count"] = buffer.count_entries()
+        count_finished.set()
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert holder_ready.wait(timeout=2)
+    counter = threading.Thread(target=count_entries)
+    counter.start()
+    completed_while_stalled = count_finished.wait(timeout=0.6)
+    release_holder.set()
+    holder.join(timeout=2)
+    counter.join(timeout=2)
+
+    assert completed_while_stalled
+    assert not holder.is_alive() and not counter.is_alive()
+    assert outcome["count"] == 3
+    assert buffer._entry_count_dirty
+    assert not (replay_dir / _ENTRY_COUNT_SIDECAR_NAME).exists()
+
+    # Once the competing writer is gone, the still-dirty optional cache is
+    # retried and becomes durable without reopening the immutable shard.
+    _forbid_reads(monkeypatch)
+    assert buffer.count_entries() == 3
+    assert not buffer._entry_count_dirty
+    assert _sidecar(replay_dir)["entries"][shard.name][2] == 3
+
+
 def test_open_writer_shard_counted_but_not_persisted_until_close(tmp_path):
     replay_dir = tmp_path / "replay"
     buf, _paths = _write_shards(replay_dir, [3])
@@ -281,7 +525,7 @@ def test_snapshot_writer_releases_closed_entries_but_preserves_exact_reload(tmp_
 
 
 def test_snapshot_writer_buffers_batches_until_cycle_close(tmp_path):
-    """Snapshot cycles coalesce writes while legacy readers still see flushes."""
+    """Snapshot cycles remain hidden until close while counts stay exact."""
 
     snapshot_dir = tmp_path / "snapshot_replay"
     snapshot = ReplayBuffer(
@@ -291,13 +535,21 @@ def test_snapshot_writer_buffers_batches_until_cycle_close(tmp_path):
     snapshot.add_entry_dicts(records)
 
     # The active snapshot path keeps small batches in its bounded userspace
-    # buffer. Integer-only session accounting keeps it exactly countable.
-    assert snapshot_shard.stat().st_size == 0
+    # buffer under an ignored staging name. Integer-only session accounting
+    # keeps it exactly countable without exposing a partial corpus shard.
+    staging = snapshot._current_staging_file
+    assert staging is not None
+    assert not snapshot_shard.exists()
+    assert staging.stat().st_size == 0
+    assert snapshot.get_replay_files() == []
     assert snapshot.count_entries() == len(records)
+    assert snapshot.get_buffer_state()[1] == 1
     assert snapshot._session_dicts == {}
     assert snapshot._session_entry_counts == {snapshot_shard: len(records)}
     snapshot.close()
     assert snapshot_shard.stat().st_size > 0
+    assert not staging.exists()
+    assert snapshot.get_replay_files() == [snapshot_shard]
     assert [entry.to_dict() for entry in snapshot.load_all_entries()] == records
 
     legacy_dir = tmp_path / "legacy_replay"
@@ -308,6 +560,27 @@ def test_snapshot_writer_buffers_batches_until_cycle_close(tmp_path):
     # Default callers retain the established per-batch visibility contract.
     assert legacy_shard.stat().st_size > 0
     legacy.close()
+
+
+def test_snapshot_publication_refuses_to_replace_a_colliding_shard(tmp_path):
+    """Atomic close must preserve an unexpected pre-existing final name."""
+    replay_dir = tmp_path / "replay"
+    buf = ReplayBuffer(
+        str(replay_dir), max_files=0, cache_written_entries=False)
+    shard = buf.start_new_file()
+    buf.add_entry_dicts([_entry(0)])
+    staging = buf._current_staging_file
+    assert staging is not None
+
+    shard.write_text("external-writer\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        buf.close()
+
+    assert shard.read_text(encoding="utf-8") == "external-writer\n"
+    assert not staging.exists()
+    assert buf._current_file is None
+    assert buf._current_staging_file is None
+    assert buf._session_entry_counts == {}
 
 
 def test_snapshot_writer_quarantines_deferred_close_failure(tmp_path):
@@ -330,6 +603,47 @@ def test_snapshot_writer_quarantines_deferred_close_failure(tmp_path):
         buf.close()
 
     assert not shard.exists()
+    assert buf._current_file is None
+    assert buf._session_dicts == {}
+    assert buf._session_entries == {}
+    assert buf._session_entry_counts == {}
+
+
+def test_snapshot_close_failure_is_hidden_when_unlink_is_refused(
+    tmp_path, monkeypatch,
+):
+    """A failed deferred flush must never remain an active replay shard."""
+    replay_dir = tmp_path / "replay"
+    buf = ReplayBuffer(
+        str(replay_dir), max_files=0, cache_written_entries=False)
+    shard = buf.start_new_file()
+    buf.add_entry_dicts([_entry(0), _entry(1)])
+    staging = buf._current_staging_file
+    assert staging is not None
+    real_writer = buf._current_writer
+    real_unlink = Path.unlink
+
+    class FailingClose:
+        def close(self):
+            real_writer.close()
+            raise OSError("synthetic deferred flush failure")
+
+    def refuse_shard(path, *args, **kwargs):
+        if path == staging:
+            raise PermissionError("synthetic unlink refusal")
+        return real_unlink(path, *args, **kwargs)
+
+    buf._current_writer = FailingClose()
+    monkeypatch.setattr(Path, "unlink", refuse_shard)
+    with pytest.raises(OSError, match="synthetic deferred flush failure"):
+        buf.close()
+
+    quarantined = list(replay_dir.glob(".replay_*.jsonl.incomplete*"))
+    assert not shard.exists()
+    assert len(quarantined) == 1
+    assert len(quarantined[0].read_text(encoding="utf-8").splitlines()) == 2
+    assert buf.get_replay_files() == []
+    assert buf.count_entries() == 0
     assert buf._current_file is None
     assert buf._session_dicts == {}
     assert buf._session_entries == {}
