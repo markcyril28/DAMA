@@ -59,8 +59,8 @@ def test_shell_launchers_use_one_resolved_dama_interpreter_everywhere():
 
     The project extensions target CPython 3.11, while a common base environment
     is 3.13 and silently falls back at several accelerator import sites.  Keep
-    the suffix lookup, rebuild, checks, checkpoint scan, pip repair, and final
-    trainer on the one executable selected by the launcher's Dama resolver.
+    readiness guard, checks, checkpoint scan, pip repair, and final trainer on
+    the one executable selected by the launcher's Dama resolver.
     """
     local = (PROJECT_ROOT / "local_train.sh").read_text(encoding="utf-8")
     server = (PROJECT_ROOT / "train_server.sh").read_text(encoding="utf-8")
@@ -70,8 +70,12 @@ def test_shell_launchers_use_one_resolved_dama_interpreter_everywhere():
     assert 'DAMA_PYTHON="$("$_conda_bin" run -n "$CONDA_ENV" python' in server
     for launcher in (local, server):
         assert "expected CPython 3.11" in launcher
-        assert launcher.count('"$DAMA_PYTHON"') >= 7
+        assert 'if ! _dama_python_info="$("$DAMA_PYTHON" -c' in launcher
+        assert '"$DAMA_PYTHON" "$CYTHON_GUARD"' in launcher
 
+    assert '"$DAMA_PYTHON" -W ignore::FutureWarning - <<\'PYCHECK\'' in local
+    assert '"$DAMA_PYTHON" -c "import torch;' in server
+    assert 'CHECKPOINT_DIR="${PROJECT_DIR}/models/checkpoints" "$DAMA_PYTHON"' in server
     assert 'exec "$DAMA_PYTHON"' in local
     assert 'exec -a "python3" "$DAMA_PYTHON"' in server
 

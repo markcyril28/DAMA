@@ -280,3 +280,240 @@ def test_incomplete_cycle_quarantine_removes_partial_replay_file(tmp_path):
     assert collected == [] and chunks == []
     assert trainer._last_selfplay_dicts is None
     assert trainer._last_selfplay_preprocessed is None
+
+
+def test_broken_pool_retry_rejects_an_incomplete_game_batch(
+    monkeypatch,
+):
+    """A recovery retry must not commit games that produced no records."""
+    from concurrent.futures import Future
+    from concurrent.futures.process import BrokenProcessPool
+    import concurrent.futures
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from dama.ai.ml import trainer as trainer_module
+    from dama.ai.ml.trainer import Trainer
+
+    class BrokenPool:
+        def __init__(self, *args, **kwargs):
+            self._processes = {}
+            self._executor_manager_thread = None
+
+        def submit(self, _function, _batch):
+            future = Future()
+            future.set_exception(BrokenProcessPool("synthetic worker death"))
+            return future
+
+        def shutdown(self, wait=False, cancel_futures=False):
+            return None
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = SimpleNamespace(
+        selfplay_opening_plies=(0,),
+        selfplay_opening_seed=20260819,
+        selfplay_opponent_focus="algorithm",
+        selfplay_focus_side="both",
+        max_moves_per_sample=32,
+        algo_vs_algo_games=1,
+        algo_vs_algo_enabled=True,
+        selfplay_difficulties=("easy",),
+        selfplay_max_moves=1,
+        selfplay_noise_prob=0.10,
+        cpu_workers=1,
+        recovery_enforced=False,
+        algo_vs_algo_difficulties=("easy",),
+        teacher_difficulty="hard",
+        inference_depth=1,
+    )
+    trainer.step = 0
+    trainer.stats = SimpleNamespace(generation_cycles_completed=0)
+    trainer.stats_collector = None
+    trainer._stopped = False
+    trainer._allocate_generation_cycle_id = lambda: 0
+    trainer._runtime_model_path = lambda _name: Path("/tmp/unused-model.pt")
+    trainer._service_control_queue = lambda: None
+    trainer._annotate_selfplay_entries = lambda *args, **kwargs: None
+    trainer._balance_side_sample_weights = lambda entries: None
+    trainer._cleanup_runtime_model_file = lambda path: None
+    trainer._cleanup_runtime_models_dir = lambda: None
+    discarded = []
+    trainer._discard_incomplete_selfplay_cycle = (
+        lambda *args: discarded.append(True)
+    )
+
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", BrokenPool)
+    monkeypatch.setattr(
+        trainer_module, "_play_games_batch_worker_algo", lambda batch: [])
+
+    with pytest.raises(RuntimeError, match="cycle 0 incomplete"):
+        Trainer.run_selfplay(
+            trainer, 0, skip_replay=True, preprocess_inline=True)
+
+    assert trainer.stats.generation_cycles_completed == 0
+    assert discarded == [True]
+
+
+def test_selfplay_batch_rejects_wrong_game_ids_or_sources():
+    """Worker records must match unique requested game/source identities."""
+    from dama.ai.ml.trainer import _selfplay_batch_result_is_complete
+
+    expected_id = "cycle-000007-algorithm-000003"
+    batch = [
+        (
+            "easy", "easy", 200, 0.10, 1, 2, 20260819,
+            "algorithm", expected_id, "hard",
+        )
+    ]
+    expected_records = [
+        {"game_id": expected_id, "trajectory_source": "algorithm"},
+        {"game_id": expected_id, "trajectory_source": "algorithm"},
+    ]
+
+    assert _selfplay_batch_result_is_complete(expected_records, batch)
+    assert not _selfplay_batch_result_is_complete(
+        expected_records + [{
+            "game_id": "cycle-999999-algorithm-999999",
+            "trajectory_source": "algorithm",
+        }],
+        batch,
+    )
+    assert not _selfplay_batch_result_is_complete([{}], batch)
+    assert not _selfplay_batch_result_is_complete(
+        [{"game_id": 7, "trajectory_source": "algorithm"}], batch)
+    assert not _selfplay_batch_result_is_complete(
+        [{"game_id": expected_id, "trajectory_source": "current_model"}],
+        batch,
+    )
+    assert not _selfplay_batch_result_is_complete(expected_records, batch * 2)
+    assert not _selfplay_batch_result_is_complete([], batch)
+
+    model_id = "cycle-000007-model-000003"
+    model_batch = [(
+        "easy", 200, 0.10, 1, "ml", "algorithmic", "unused.pt", "cpu",
+        2, 20260819, "current_model", model_id, "hard", 1,
+    )]
+    assert _selfplay_batch_result_is_complete(
+        [{"game_id": model_id, "trajectory_source": "current_model"}],
+        model_batch,
+    )
+    assert not _selfplay_batch_result_is_complete(
+        [{"game_id": model_id, "trajectory_source": "algorithm"}],
+        model_batch,
+    )
+
+    zero_move_batch = [
+        (
+            "easy", "easy", 0, 0.10, 1, 2, 20260819,
+            "algorithm", expected_id, "hard",
+        )
+    ]
+    assert _selfplay_batch_result_is_complete([], zero_move_batch)
+    assert not _selfplay_batch_result_is_complete(
+        [{"game_id": expected_id, "trajectory_source": "algorithm"}],
+        zero_move_batch,
+    )
+
+
+def test_inflight_selfplay_polls_duration_shutdown_without_completed_future(
+    monkeypatch,
+):
+    """A stalled worker must not hide a duration-triggered shutdown."""
+    from concurrent.futures import Future
+    import concurrent.futures
+    from pathlib import Path
+    from queue import Empty
+    from types import SimpleNamespace
+
+    from dama.ai.ml import trainer as trainer_module
+    from dama.ai.ml.trainer import Trainer
+
+    class StalledPool:
+        def __init__(self, *args, **kwargs):
+            self._processes = {}
+            self._executor_manager_thread = None
+
+        def submit(self, _function, _batch):
+            return Future()
+
+        def shutdown(self, wait=False, cancel_futures=False):
+            return None
+
+    class PollingQueue:
+        get_calls = 0
+
+        def put(self, _future):
+            raise AssertionError("the stalled Future must not complete")
+
+        def get(self, timeout=None):
+            assert timeout == 0.1
+            type(self).get_calls += 1
+            raise Empty
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = SimpleNamespace(
+        selfplay_opening_plies=(0,),
+        selfplay_opening_seed=20260819,
+        selfplay_opponent_focus="algorithm",
+        selfplay_focus_side="both",
+        max_moves_per_sample=32,
+        algo_vs_algo_games=1,
+        algo_vs_algo_enabled=True,
+        selfplay_difficulties=("easy",),
+        selfplay_max_moves=1,
+        selfplay_noise_prob=0.10,
+        cpu_workers=1,
+        recovery_enforced=False,
+        algo_vs_algo_difficulties=("easy",),
+        teacher_difficulty="hard",
+        inference_depth=1,
+    )
+    trainer.step = 0
+    trainer.stats = SimpleNamespace(generation_cycles_completed=0)
+    trainer.stats_collector = None
+    trainer._stopped = False
+    trainer._bg_selfplay_stop_event = trainer_module.threading.Event()
+    trainer._allocate_generation_cycle_id = lambda: 0
+    trainer._runtime_model_path = lambda _name: Path("/tmp/unused-model.pt")
+    service_calls = []
+
+    def service_controls():
+        service_calls.append(True)
+        if len(service_calls) == 2:
+            trainer._bg_selfplay_stop_event.set()
+
+    trainer._service_control_queue = service_controls
+    trainer._annotate_selfplay_entries = lambda *args, **kwargs: None
+    trainer._balance_side_sample_weights = lambda entries: None
+    trainer._cleanup_runtime_model_file = lambda path: None
+    trainer._cleanup_runtime_models_dir = lambda: None
+    discarded = []
+    trainer._discard_incomplete_selfplay_cycle = (
+        lambda *args: discarded.append(True)
+    )
+
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", StalledPool)
+    monkeypatch.setattr(trainer_module, "Queue", PollingQueue)
+    shutdown_timeouts = []
+    original_shutdown = trainer_module._shutdown_selfplay_executor
+
+    def record_shutdown_timeout(executor, timeout=5.0):
+        shutdown_timeouts.append(timeout)
+        original_shutdown(executor, timeout=timeout)
+
+    monkeypatch.setattr(
+        trainer_module,
+        "_shutdown_selfplay_executor",
+        record_shutdown_timeout,
+    )
+
+    with pytest.raises(RuntimeError, match="cycle 0 incomplete"):
+        Trainer.run_selfplay(
+            trainer, 0, skip_replay=True, preprocess_inline=True)
+
+    assert PollingQueue.get_calls == 1
+    assert len(service_calls) == 2
+    assert shutdown_timeouts == [0.0]
+    assert trainer._stopped is False
+    assert trainer.stats.generation_cycles_completed == 0
+    assert discarded == [True]
