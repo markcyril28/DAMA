@@ -420,75 +420,28 @@ print(sys.executable)
     exit 1
 fi
 
-# Cython staleness guard (fail-safe). The .so files are NOT tracked (commit
-# 2f85ac6 untracked them; .gitignore carries *.so), so a fresh clone has none
-# at all and a source or build-recipe edit leaves the built one behind. Rebuild
-# in-place when a .pyx or either setup script is newer than an extension, or
-# when the extension is missing. No-op when fresh; never blocks on failure.
-#
-# The artifact is resolved by the selected Dama interpreter's EXT_SUFFIX rather than
-# by `ls -t ... | head -1`: that glob matched every ABI tag and kept the newest
-# by mtime, so a stray extension built for another Python version could mask a
-# genuinely stale one. The validated executable above is reused for the suffix,
-# any rebuild, the CUDA/import check, and the final trainer process.
-_ext_suffix="$("$DAMA_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)"
-_cython_entrypoint="${PROJECT_DIR}/src/setup_cython.py"
-_cython_recipe="${PROJECT_DIR}/src/scripts/setup_cython.py"
-_cython_stale=false
-while IFS= read -r _pyx; do
-    if [ -n "$_ext_suffix" ]; then
-        _so="${_pyx%.pyx}${_ext_suffix}"
-        [ -f "$_so" ] || _so=""
-    else
-        # EXT_SUFFIX unavailable (no working interpreter yet): fall back to the
-        # any-ABI glob rather than forcing a rebuild on every launch.
-        _so="$(ls -t "${_pyx%.pyx}".*.so 2>/dev/null | head -1 || true)"
-    fi
-    if [ -z "$_so" ] || [ "$_pyx" -nt "$_so" ] \
-       || [ "$_cython_entrypoint" -nt "$_so" ] \
-       || [ "$_cython_recipe" -nt "$_so" ]; then
-        _cython_stale=true
-    fi
-done < <(find "${PROJECT_DIR}/src" -name '*.pyx' -not -path '*/build/*' 2>/dev/null)
-if [ "$_cython_stale" = true ]; then
-    echo "Cython source or build recipe changed - rebuilding extensions..."
-    ( cd "${PROJECT_DIR}/src" && "$DAMA_PYTHON" setup_cython.py build_ext --inplace --force ) \
-        || echo "[warn] Cython rebuild failed — using existing .so files."
-    echo ""
+# One shared guard owns exact-ABI target discovery, staleness checks, mapped
+# binary refusal, forced builds, post-build publication checks, and imports.
+# A zero compiler exit without current importable outputs is still a failure.
+CYTHON_GUARD="${PROJECT_DIR}/src/scripts/ensure_cython_extensions.py"
+if [ ! -f "$CYTHON_GUARD" ]; then
+    echo "ERROR: Cython extension readiness helper is missing: $CYTHON_GUARD" >&2
+    exit 1
 fi
+if ! "$DAMA_PYTHON" "$CYTHON_GUARD" --source-root "${PROJECT_DIR}/src"; then
+    echo "ERROR: Cython extension readiness failed; refusing to start training." >&2
+    exit 1
+fi
+echo ""
 
-# Verify CUDA is available, and report whether the Cython accelerators loaded.
-# An unbuilt or broken extension is otherwise completely silent: search.py falls
-# back to the ~100-200x slower pure-Python alpha-beta with no error, no warning
-# and no failing test, and the only symptom is low self-play throughput. Only
-# the CUDA result gates the launch -- a missing extension warns and continues.
+# Verify CUDA after the fail-closed accelerator check above.
 "$DAMA_PYTHON" -W ignore::FutureWarning - <<'PYCHECK' || {
-import importlib
 import sys
 
 import torch
 
 if not torch.cuda.is_available():
     sys.exit(1)
-
-missing = []
-for name in (
-    "dama.ai.algorithmic._fast_search",
-    "dama.ai.ml._fast_encode",
-    "dama.ai.ml._fast_score",
-    "dama.ai.ml._fast_stat",
-):
-    try:
-        importlib.import_module(name)
-    except Exception as exc:  # noqa: BLE001 - a broken .so must not gate CUDA
-        missing.append(f"{name} ({type(exc).__name__}: {exc})")
-
-if missing:
-    print("[warn] Cython accelerator(s) unavailable — falling back to pure Python:")
-    for item in missing:
-        print(f"[warn]   {item}")
-    print("[warn] Self-play will be far slower. Rebuild with:")
-    print('[warn]   cd src && "$DAMA_PYTHON" setup_cython.py build_ext --inplace')
 PYCHECK
     echo ""
     echo "ERROR: CUDA is not available."
