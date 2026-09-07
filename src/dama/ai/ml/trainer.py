@@ -19,6 +19,7 @@ import traceback
 import warnings
 import numpy as np
 from collections import deque
+from contextlib import nullcontext
 import platform
 import threading
 import multiprocessing as mp
@@ -231,6 +232,37 @@ def _build_fork_behavior_model(
     return fork_model.cpu()
 
 
+def _call_under_model_state_lock(state_lock, operation, *args, **kwargs):
+    """Run one model read or mutation without crossing another revision."""
+    guard = state_lock if state_lock is not None else nullcontext()
+    with guard:
+        return operation(*args, **kwargs)
+
+
+def _capture_model_revision(state_lock, step_getter, capture):
+    """Capture one model snapshot and its step under the same state lock."""
+    guard = state_lock if state_lock is not None else nullcontext()
+    with guard:
+        step = int(step_getter())
+        return step, capture()
+
+
+def _copy_behavior_state_to_cpu(live_model, device) -> dict:
+    """Own a stable CPU copy of behavior weights before releasing its lock."""
+    if device.type == 'cuda':
+        state = {
+            key: value.to('cpu', non_blocking=True)
+            for key, value in live_model.state_dict().items()
+        }
+        torch.cuda.current_stream().synchronize()
+        return state
+    # ``Tensor.cpu()`` aliases storage when a tensor is already on CPU.
+    return {
+        key: value.detach().clone()
+        for key, value in live_model.state_dict().items()
+    }
+
+
 def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
     """Tear down a self-play pool without waiting indefinitely.
 
@@ -340,6 +372,50 @@ def _consume_and_release_selfplay_batch(
         consumer(entries_data, batch_game_count)
     finally:
         entries_data.clear()
+
+
+def _selfplay_batch_result_is_complete(entries_data, batch) -> bool:
+    """Return whether worker records match every requested game and source."""
+    expected: dict[str, str] = {}
+    for task in batch:
+        if len(task) >= 12:  # extended ML task
+            game_id = task[11]
+            max_moves = task[1]
+            trajectory_source = task[10]
+        elif len(task) >= 9:  # extended algorithm task
+            game_id = task[8]
+            max_moves = task[2]
+            trajectory_source = task[7]
+        else:
+            return False
+        try:
+            emits_positions = int(max_moves) > 0
+        except (TypeError, ValueError):
+            return False
+        if emits_positions:
+            if not isinstance(game_id, str) or not game_id:
+                return False
+            if not isinstance(trajectory_source, str) or not trajectory_source:
+                return False
+            # A duplicated task id cannot prove that both requested games ran:
+            # every position record would collapse onto the same identity.
+            if game_id in expected:
+                return False
+            expected[game_id] = trajectory_source
+
+    seen: set[str] = set()
+    for entry in entries_data:
+        # The consumer mutates provenance onto each record, so accepting a
+        # read-only Mapping here would only defer failure until annotation.
+        if not isinstance(entry, dict):
+            return False
+        game_id = entry.get('game_id')
+        if not isinstance(game_id, str) or not game_id:
+            return False
+        if entry.get('trajectory_source') != expected.get(game_id):
+            return False
+        seen.add(game_id)
+    return seen == expected.keys()
 
 
 def _make_compiled_fwd_loss(model, compile_mode):
@@ -523,6 +599,9 @@ def _eval_expr(value):
 
 
 _STATS_HISTORY_CAP = 10000  # Max entries per history list (trim oldest on overflow)
+# Private hand-off metadata used only between _snapshot_stats() and _save_stats().
+# It is removed before JSON publication, so the durable stats schema is unchanged.
+_STATS_WRITE_GENERATION_KEY = "__dama_stats_write_generation"
 
 
 @dataclass
@@ -1405,6 +1484,10 @@ class Trainer:
         self._bg_snapshot_manifest: Optional[dict] = None
         self._bg_validation_entries: Optional[list] = None
         self._bg_selfplay_lock = threading.Lock()
+        # Self-play copies live tensors while the training thread performs
+        # forwards and optimizer updates. Keep those short state boundaries
+        # exclusive so one behavior model cannot mix trainer revisions.
+        self._model_state_lock = threading.Lock()
         # Duration expiry must stop the continuous producer without setting
         # _stopped, which is reserved for an operator stop and controls the
         # terminal run-status reason.
@@ -1434,6 +1517,10 @@ class Trainer:
         # Background checkpoint write thread — tracked to avoid concurrent
         # disk I/O from overlapping checkpoints.
         self._checkpoint_thread: Optional[threading.Thread] = None
+        # Disk errors happen on the daemon writer rather than the training
+        # thread. Preserve the outcome so the next/final join can fail the run
+        # instead of reporting successful completion without a durable alias.
+        self._checkpoint_write_error: Optional[RuntimeError] = None
         self._acceptance_thread: Optional[threading.Thread] = None
         self._acceptance_queue: Queue = Queue()
         self._acceptance_task_lock = threading.Lock()
@@ -1445,7 +1532,13 @@ class Trainer:
         # Thermal protection state
         self._last_thermal_check: float = 0.0  # time.time() of last check
 
-        # Training statistics
+        # Training statistics. Checkpoint and acceptance workers can publish in
+        # parallel with the main progress writer. Atomic replace protects each
+        # individual file, while this generation gate also prevents a delayed
+        # older snapshot from replacing a newer one.
+        self._stats_write_lock = threading.RLock()
+        self._stats_snapshot_generation = 0
+        self._stats_persisted_generation = -1
         self.stats = TrainingStats()
         self._load_stats()
         self._prelaunch_free_ram_gb: Optional[float] = None
@@ -1861,18 +1954,23 @@ class Trainer:
         (mean=0, var=1), allowing the next forward pass to re-estimate
         clean statistics from the batch.
         """
-        repaired = False
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.BatchNorm2d) and module.track_running_stats:
-                rm = module.running_mean
-                rv = module.running_var
-                if (rm is not None and not torch.isfinite(rm).all()) or \
-                   (rv is not None and not torch.isfinite(rv).all()):
-                    module.running_mean.zero_()
-                    module.running_var.fill_(1.0)
-                    module.num_batches_tracked.zero_()
-                    repaired = True
-        return repaired
+        def _repair() -> bool:
+            repaired = False
+            for _name, module in self.model.named_modules():
+                if (isinstance(module, nn.BatchNorm2d)
+                        and module.track_running_stats):
+                    rm = module.running_mean
+                    rv = module.running_var
+                    if (rm is not None and not torch.isfinite(rm).all()) or \
+                       (rv is not None and not torch.isfinite(rv).all()):
+                        module.running_mean.zero_()
+                        module.running_var.fill_(1.0)
+                        module.num_batches_tracked.zero_()
+                        repaired = True
+            return repaired
+
+        return _call_under_model_state_lock(
+            getattr(self, '_model_state_lock', None), _repair)
 
     def _build_scheduler(self) -> None:
         """Create self.scheduler around the current self.optimizer.
@@ -2380,7 +2478,11 @@ class Trainer:
             try:
                 last_ckpt = str(self._verified_recovery_rollback_checkpoint())
                 print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
-                self._load_checkpoint(last_ckpt)
+                _call_under_model_state_lock(
+                    getattr(self, '_model_state_lock', None),
+                    self._load_checkpoint,
+                    last_ckpt,
+                )
                 if self.scaler is not None:
                     self.scaler = GradScaler(init_scale=2**10)
                     print(
@@ -2412,7 +2514,11 @@ class Trainer:
                 continue
             last_ckpt = str(candidate)
             print(f"  Rolling back to checkpoint: {last_ckpt}")
-            self._load_checkpoint(last_ckpt)
+            _call_under_model_state_lock(
+                getattr(self, '_model_state_lock', None),
+                self._load_checkpoint,
+                last_ckpt,
+            )
             # Reset GradScaler with conservative scale to prevent
             # re-triggering the same overflow.  Default init_scale=65536
             # is too aggressive for trained models — use 1024 (same as
@@ -2423,7 +2529,11 @@ class Trainer:
             return
         if not self.config.recovery_enforced:
             print("  No checkpoints found — resetting model from scratch")
-            self._reset_model_state("No checkpoint for recovery")
+            _call_under_model_state_lock(
+                getattr(self, '_model_state_lock', None),
+                self._reset_model_state,
+                "No checkpoint for recovery",
+            )
 
     def _seed_stats_file(self) -> None:
         """Copy ``paths.seed_stats_from`` into a not-yet-existing stats file.
@@ -2514,44 +2624,81 @@ class Trainer:
             self.stats.test_history.sort(key=lambda x: x.get('step', 0))
             print(f"Merged {merged_count} test entries from log files into stats")
 
-    def _save_stats(self, *, _snapshot: Optional[dict] = None) -> None:
+    def _save_stats(
+        self,
+        *,
+        _snapshot: Optional[dict] = None,
+        _raise_on_error: bool = False,
+    ) -> bool:
         """Save training stats to file.
 
         When called from a background thread, pass a pre-computed ``_snapshot``
         (from ``_snapshot_stats()``) to avoid reading ``self.stats`` while the
-        main thread mutates it.
+        main thread mutates it. Snapshot generations preserve their logical
+        capture order even when background disk I/O completes out of order.
+        Most telemetry callers remain fail-open. Durable task finalizers can
+        request an exception so they do not acknowledge work whose result was
+        not persisted.
         """
-        stats_path = Path(self.config.stats_file)
-        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        guard = getattr(self, '_stats_write_lock', None) or nullcontext()
+        with guard:
+            stats_path = Path(self.config.stats_file)
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if _snapshot is None:
-            # Main-thread path: safe to touch self.stats directly
-            self.stats.total_steps = self.step
-            self.stats.end_time = datetime.now().isoformat()
-            _snapshot = self.stats.to_dict()
-
-        # Atomic write: temp file + os.replace() prevents corruption from
-        # concurrent writes (checkpoint bg thread vs main thread) and from
-        # process crashes mid-write.
-        _tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                    mode='w', dir=stats_path.parent, suffix='.tmp',
-                    delete=False) as tmp:
-                _tmp_path = tmp.name
-                json.dump(_snapshot, tmp, indent=2)
-            os.replace(_tmp_path, stats_path)
-        except Exception as e:
-            print(f"Warning: Failed to save stats: {e}")
-            # Clean up temp file on failure
-            if _tmp_path is not None:
+            if _snapshot is None:
+                # Main-thread path: safe to touch self.stats directly.
+                self.stats.total_steps = self.step
+                self.stats.end_time = datetime.now().isoformat()
+                generation = int(getattr(
+                    self, '_stats_snapshot_generation', 0)) + 1
+                self._stats_snapshot_generation = generation
+                snapshot = self.stats.to_dict()
+            else:
+                # Never remove the private generation marker from a caller's
+                # retained snapshot. The checkpoint writer still augments that
+                # mapping with its promotion record before handing it off here.
+                snapshot = dict(_snapshot)
+                raw_generation = snapshot.pop(
+                    _STATS_WRITE_GENERATION_KEY, None)
                 try:
-                    os.unlink(_tmp_path)
-                except Exception:
-                    pass
-            return
+                    generation = int(raw_generation)
+                except (TypeError, ValueError):
+                    generation = int(getattr(
+                        self, '_stats_snapshot_generation', 0)) + 1
+                    self._stats_snapshot_generation = generation
 
-        self._update_training_progress_report(stats_path)
+            persisted_generation = int(getattr(
+                self, '_stats_persisted_generation', -1))
+            if generation < persisted_generation:
+                return True
+
+            # Atomic replace protects against torn files and the lock protects
+            # the complete write plus report-refresh transaction. The generation
+            # check above additionally rejects a delayed checkpoint snapshot
+            # after a newer main-thread progress snapshot has already landed.
+            _tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                        mode='w', dir=stats_path.parent, suffix='.tmp',
+                        delete=False) as tmp:
+                    _tmp_path = tmp.name
+                    json.dump(snapshot, tmp, indent=2)
+                os.replace(_tmp_path, stats_path)
+            except Exception as e:
+                print(f"Warning: Failed to save stats: {e}")
+                # Clean up temp file on failure
+                if _tmp_path is not None:
+                    try:
+                        os.unlink(_tmp_path)
+                    except Exception:
+                        pass
+                if _raise_on_error:
+                    raise
+                return False
+
+            self._stats_persisted_generation = generation
+            self._update_training_progress_report(stats_path)
+            return True
 
     def _update_training_progress_report(self, stats_path: Path) -> None:
         """Regenerate the HTML training report and PNG snapshot after each save."""
@@ -2589,9 +2736,16 @@ class Trainer:
         Must be called on the main thread (where self.stats is mutated).
         The returned dict is a deep copy safe for use in a background thread.
         """
-        self.stats.total_steps = self.step
-        self.stats.end_time = datetime.now().isoformat()
-        return self.stats.to_dict()
+        guard = getattr(self, '_stats_write_lock', None) or nullcontext()
+        with guard:
+            self.stats.total_steps = self.step
+            self.stats.end_time = datetime.now().isoformat()
+            generation = int(getattr(
+                self, '_stats_snapshot_generation', 0)) + 1
+            self._stats_snapshot_generation = generation
+            snapshot = self.stats.to_dict()
+            snapshot[_STATS_WRITE_GENERATION_KEY] = generation
+            return snapshot
 
     def _record_step_stats(self, loss: float, lr: float) -> None:
         """Record statistics for a training step."""
@@ -3557,8 +3711,6 @@ class Trainer:
         terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
             output_dir, task)
         if terminal is not None:
-            checkpoint_acceptance_tasks.remove_pending_acceptance_task(
-                output_dir, task)
             print(
                 f"Acceptance task {task_id} already has terminal report: {terminal}")
             return False
@@ -3611,6 +3763,46 @@ class Trainer:
         )
         self._acceptance_thread.start()
 
+    def _finalize_checkpoint_acceptance_report(
+        self,
+        task: Mapping[str, Any],
+        report: Mapping[str, Any],
+        durable_report: Path,
+    ) -> None:
+        """Publish a passing alias and record one durable acceptance result."""
+        report = dict(report)
+        report['report_path'] = str(durable_report)
+        already_recorded = any(
+            isinstance(record, Mapping)
+            and dict(record) == report
+            for record in self.stats.acceptance_history
+        )
+        if report['passed']:
+            # The durable history and accepted alias are independent outputs.
+            # A prior finalization can persist the history while a later alias
+            # deletion or failed pending cleanup leaves startup responsible for
+            # repairing the alias.  Publish it before the history idempotency
+            # return so pending recovery never clears its only repair marker.
+            self._publish_verified_checkpoint_alias(
+                Path(task['checkpoint_path']),
+                Path(self.config.accepted_path),
+                task.get('checkpoint_sha256'),
+            )
+        if already_recorded:
+            return
+
+        self.stats.acceptance_history.append(report)
+        self._save_stats(_raise_on_error=True)
+        state = 'PASSED' if report['passed'] else 'FAILED'
+        print(
+            f"Acceptance {state} for step {task['step']}: "
+            f"{durable_report}"
+        )
+        self._put_status({
+            'type': MSG_STATUS,
+            'acceptance': report,
+        })
+
     def _process_checkpoint_acceptance_task(
         self,
         queued: Mapping[str, Any],
@@ -3618,9 +3810,10 @@ class Trainer:
         """Run one durable task and retain it until a terminal report exists."""
         task = dict(queued)
         output_dir = self.config.acceptance_dir
+        task_completed = False
         try:
             checkpoint_acceptance_tasks.verify_pending_acceptance_checkpoint(task)
-            report = checkpoint_acceptance_tasks.run_checkpoint_acceptance(
+            checkpoint_acceptance_tasks.run_checkpoint_acceptance(
                 task['checkpoint_path'],
                 step=task['step'],
                 teacher_agreement=task['teacher_agreement'],
@@ -3637,30 +3830,32 @@ class Trainer:
                 teacher_correct_states=task.get('teacher_correct_states'),
                 teacher_total_states=task.get('teacher_total_states'),
             )
-            durable_report = (
-                checkpoint_acceptance_tasks.successful_acceptance_report_path(
+            completed = (
+                checkpoint_acceptance_tasks.load_completed_acceptance_report(
                     output_dir, task))
-            if durable_report is None:
+            if completed is None:
                 raise RuntimeError(
                     "Acceptance evaluator returned without a matching durable report")
+            durable_report, report = completed
 
-            self.stats.acceptance_history.append(report)
-            if report['passed']:
-                self._publish_checkpoint_alias(
-                    Path(task['checkpoint_path']),
-                    Path(self.config.accepted_path),
-                )
-            self._save_stats()
-            state = 'PASSED' if report['passed'] else 'FAILED'
-            print(
-                f"Acceptance {state} for step {task['step']}: "
-                f"{durable_report}"
-            )
-            self._put_status({
-                'type': MSG_STATUS,
-                'acceptance': report,
-            })
+            self._finalize_checkpoint_acceptance_report(
+                task, report, durable_report)
+            task_completed = True
         except Exception as exc:
+            # The evaluator publishes its report before the accepted alias and
+            # statistics are finalized. If that finalization fails, keep the
+            # pending task so startup can repair the alias without replaying
+            # the 200-game protocol or misclassifying the passed gate as an
+            # evaluation failure.
+            durable_success = (
+                checkpoint_acceptance_tasks.load_completed_acceptance_report(
+                    output_dir, task))
+            if durable_success is not None:
+                print(
+                    f"Acceptance finalization error for step {task['step']}: "
+                    f"{exc}. Pending task retained for startup recovery."
+                )
+                return
             try:
                 failure_path = (
                     checkpoint_acceptance_tasks.write_acceptance_failure_report(
@@ -3672,28 +3867,31 @@ class Trainer:
                 )
                 return
 
-            failure = {
-                'timestamp': datetime.now().isoformat(),
-                'step': task['step'],
-                'checkpoint_path': task['checkpoint_path'],
-                'task_id': task['task_id'],
-                'passed': False,
-                'error': str(exc),
-                'report_path': str(failure_path),
-            }
-            self.stats.acceptance_history.append(failure)
             try:
-                self._save_stats()
+                terminal = (
+                    checkpoint_acceptance_tasks.load_terminal_acceptance_report(
+                        output_dir, task))
+                if terminal is None or terminal[0] != failure_path:
+                    raise RuntimeError(
+                        "Acceptance failure writer returned without a matching "
+                        "durable report")
+                _, failure = terminal
+                self._finalize_checkpoint_acceptance_report(
+                    task, failure, failure_path)
             except Exception as stats_exc:
-                print(f"Acceptance failure stats could not be saved: {stats_exc}")
+                print(
+                    f"Acceptance failure finalization error for step "
+                    f"{task['step']}: {stats_exc}. Pending task retained for "
+                    f"startup recovery."
+                )
+                return
             print(
                 f"Acceptance evaluation error for step {task['step']}: {exc}. "
                 f"Failure report: {failure_path}"
             )
+            task_completed = True
         finally:
-            terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
-                output_dir, task)
-            if terminal is not None:
+            if task_completed:
                 try:
                     checkpoint_acceptance_tasks.remove_pending_acceptance_task(
                         output_dir, task)
@@ -3704,16 +3902,46 @@ class Trainer:
                     )
 
     def _recover_pending_checkpoint_acceptance(self) -> int:
-        """Requeue pending work and repair promotion-to-task crash windows."""
+        """Requeue pending work and reconcile durable acceptance results."""
         recovered = 0
+        latest_passing_completion = None
         for task in checkpoint_acceptance_tasks.discover_pending_acceptance_tasks(
             self.config.acceptance_dir
         ):
-            terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
+            completed = (
+                checkpoint_acceptance_tasks.load_completed_acceptance_report(
+                    self.config.acceptance_dir, task))
+            if completed is not None:
+                durable_success, report = completed
+                try:
+                    self._finalize_checkpoint_acceptance_report(
+                        task, report, durable_success)
+                    checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                        self.config.acceptance_dir, task)
+                except Exception as exc:
+                    print(
+                        f"Could not finalize durable acceptance report for "
+                        f"step {task.get('step')}: {exc}. Pending task retained."
+                    )
+                    continue
+                recovered += 1
+                continue
+            completed = checkpoint_acceptance_tasks.load_terminal_acceptance_report(
                 self.config.acceptance_dir, task)
-            if terminal is not None:
-                checkpoint_acceptance_tasks.remove_pending_acceptance_task(
-                    self.config.acceptance_dir, task)
+            if completed is not None:
+                terminal, report = completed
+                try:
+                    self._finalize_checkpoint_acceptance_report(
+                        task, report, terminal)
+                    checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                        self.config.acceptance_dir, task)
+                except Exception as exc:
+                    print(
+                        f"Could not finalize durable acceptance failure for "
+                        f"step {task.get('step')}: {exc}. Pending task retained."
+                    )
+                    continue
+                recovered += 1
                 continue
             if self._queue_checkpoint_acceptance_task(task, persist=False):
                 recovered += 1
@@ -3735,22 +3963,125 @@ class Trainer:
                 continue
             try:
                 task = self._acceptance_task_from_promotion(promotion)
-                if task is not None and self._queue_checkpoint_acceptance_task(
-                    task, persist=True
-                ):
+                if task is None:
+                    continue
+                completed = (
+                    checkpoint_acceptance_tasks
+                    .load_terminal_acceptance_report(
+                        self.config.acceptance_dir, task)
+                )
+                if completed is not None:
+                    durable_report, report = completed
+                    if report.get('passed') is True:
+                        candidate = (
+                            int(task['step']), task, report, durable_report)
+                        if (
+                            latest_passing_completion is None
+                            or candidate[0] >= latest_passing_completion[0]
+                        ):
+                            latest_passing_completion = candidate
+                    else:
+                        expected_history = dict(report)
+                        expected_history['report_path'] = str(durable_report)
+                        history_matches = any(
+                            isinstance(record, Mapping)
+                            and dict(record) == expected_history
+                            for record in self.stats.acceptance_history
+                        )
+                        if not history_matches:
+                            try:
+                                self._finalize_checkpoint_acceptance_report(
+                                    task, report, durable_report)
+                            except Exception as exc:
+                                print(
+                                    "Could not reconcile terminal checkpoint "
+                                    f"acceptance for step {task.get('step')}: {exc}"
+                                )
+                            else:
+                                recovered += 1
+                    continue
+                if self._queue_checkpoint_acceptance_task(task, persist=True):
                     recovered += 1
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 print(
                     "Could not reconcile promoted checkpoint acceptance task "
                     f"for step {promotion.get('step')}: {exc}"
                 )
+
+        # The report and promotion registry are sufficient authority to
+        # reconstruct a passing alias even after the pending marker has been
+        # cleaned up. This also repairs an older accepted alias or a statistics
+        # file restored from before finalization, without replaying 200 games.
+        if latest_passing_completion is not None:
+            _, task, report, durable_report = latest_passing_completion
+            accepted_path = Path(self.config.accepted_path)
+            alias_matches = False
+            if accepted_path.is_file():
+                try:
+                    alias_matches = os.path.samefile(
+                        accepted_path, Path(task['checkpoint_path']))
+                except OSError:
+                    alias_matches = False
+                if not alias_matches:
+                    try:
+                        checkpoint_acceptance_tasks.verify_pending_acceptance_checkpoint({
+                            'checkpoint_path': str(accepted_path),
+                            'checkpoint_sha256': task.get('checkpoint_sha256'),
+                        })
+                        alias_matches = True
+                    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+                        alias_matches = False
+
+            expected_history = dict(report)
+            expected_history['report_path'] = str(durable_report)
+            history_matches = any(
+                isinstance(record, Mapping)
+                and dict(record) == expected_history
+                for record in self.stats.acceptance_history
+            )
+            if not alias_matches or not history_matches:
+                try:
+                    self._finalize_checkpoint_acceptance_report(
+                        task, report, durable_report)
+                except Exception as exc:
+                    print(
+                        "Could not reconcile completed checkpoint acceptance "
+                        f"for step {task.get('step')}: {exc}"
+                    )
+                else:
+                    recovered += 1
         if recovered:
-            print(f"Recovered {recovered} pending checkpoint acceptance task(s)")
+            print(f"Recovered {recovered} checkpoint acceptance task(s)")
         return recovered
+
+    def _publish_verified_checkpoint_alias(
+        self,
+        source: Path,
+        destination: Path,
+        expected_sha256: Optional[str],
+    ) -> None:
+        """Atomically publish the exact checkpoint bytes pinned by acceptance."""
+        # Hashing ``source`` and then resolving that pathname again for the
+        # hardlink leaves a replacement window between the two operations.
+        # Stage the alias first, verify that stable inode, and only then replace
+        # the public destination. Numbered checkpoints are published by atomic
+        # rename and never modified in place, so a later pathname replacement
+        # cannot change the already-linked staging inode.
+        staged = destination.with_name(destination.name + '.verified.tmp')
+        staged.unlink(missing_ok=True)
+        try:
+            self._publish_checkpoint_alias(source, staged)
+            checkpoint_acceptance_tasks.verify_pending_acceptance_checkpoint({
+                'checkpoint_path': str(staged),
+                'checkpoint_sha256': expected_sha256,
+            })
+            os.replace(staged, destination)
+        finally:
+            staged.unlink(missing_ok=True)
 
     @staticmethod
     def _publish_checkpoint_alias(source: Path, destination: Path) -> None:
-        """Atomically publish a promoted or accepted checkpoint alias."""
+        """Atomically publish a latest, promoted, or accepted checkpoint alias."""
         import shutil
 
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -4386,6 +4717,24 @@ class Trainer:
             )
         return removed
 
+    def _wait_for_checkpoint_writer(
+        self, timeout: Optional[float] = None,
+    ) -> None:
+        """Wait for checkpoint I/O and propagate its background failure."""
+        thread = getattr(self, '_checkpoint_thread', None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                timeout_text = (
+                    f" within {timeout:g} seconds" if timeout is not None else ""
+                )
+                raise RuntimeError(
+                    f"Previous checkpoint write did not finish{timeout_text}")
+
+        error = getattr(self, '_checkpoint_write_error', None)
+        if error is not None:
+            raise error
+
     def _save_checkpoint(self, loss: float, log_entry: Optional[dict] = None) -> str:
         """Save a checkpoint atomically.
 
@@ -4402,10 +4751,7 @@ class Trainer:
         # Finish the prior write before selecting against the promotion registry.
         # This keeps the best-agreement comparison and checkpoint durability in
         # one strict order.
-        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
-            self._checkpoint_thread.join(timeout=30)
-            if self._checkpoint_thread.is_alive():
-                raise RuntimeError("Previous checkpoint write did not finish within 30 seconds")
+        self._wait_for_checkpoint_writer(timeout=30)
 
         checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
         if checkpoint_path.exists():
@@ -4593,22 +4939,6 @@ class Trainer:
                     tmp_path = tmp.name
                 os.replace(tmp_path, checkpoint_path)
 
-            def _publish_latest_alias() -> None:
-                latest_path.parent.mkdir(parents=True, exist_ok=True)
-                _lp = str(latest_path)
-                try:
-                    # Hardlink to a temp name, then atomically replace.
-                    # Avoids the unlink-then-link window where latest.pt
-                    # does not exist if the process is killed mid-update.
-                    _lp_tmp = _lp + '.tmp'
-                    if os.path.exists(_lp_tmp):
-                        os.unlink(_lp_tmp)
-                    os.link(str(checkpoint_path), _lp_tmp)
-                    os.replace(_lp_tmp, _lp)
-                except OSError:
-                    import shutil
-                    shutil.copy2(str(checkpoint_path), _lp)
-
             def _rewrite_missing_numbered_checkpoint() -> None:
                 nonlocal numbered_rewrite_attempted
                 if numbered_rewrite_attempted:
@@ -4628,16 +4958,19 @@ class Trainer:
                 _write_numbered_checkpoint()
 
                 # latest.pt = hardlink to checkpoint (instant, avoids second
-                # torch.save serialization + disk write of ~55MB).  Falls back
-                # to shutil.copy2 if hardlink fails (cross-device, permissions).
+                # torch.save serialization + disk write of ~55MB). The shared
+                # publisher keeps the copy fallback atomic too, so readers
+                # never observe a truncated latest checkpoint.
                 stage = 'latest alias publication'
                 try:
-                    _publish_latest_alias()
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, latest_path)
                 except FileNotFoundError:
                     if checkpoint_path.is_file():
                         raise
                     _rewrite_missing_numbered_checkpoint()
-                    _publish_latest_alias()
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, latest_path)
 
                 # One production write disappeared between its successful
                 # atomic replace and the promotion digest on the Windows
@@ -4649,7 +4982,8 @@ class Trainer:
                 stage = 'post-publication checkpoint verification'
                 if not checkpoint_path.is_file():
                     _rewrite_missing_numbered_checkpoint()
-                    _publish_latest_alias()
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, latest_path)
                 if not checkpoint_path.is_file():
                     _rewrite_missing_numbered_checkpoint()
 
@@ -4719,13 +5053,18 @@ class Trainer:
                     'step': _step,
                     'checkpoint_path': str(checkpoint_path),
                 })
-            except Exception as e:
-                print(
+            except BaseException as e:
+                message = (
                     f"Checkpoint save error during {stage} at step {_step}: "
                     f"{type(e).__name__}: {e}"
                 )
+                # Keep only a compact exception, not the worker exception's
+                # traceback, which can retain the full checkpoint tensor graph.
+                self._checkpoint_write_error = RuntimeError(message)
+                print(message)
                 traceback.print_exc()
 
+        self._checkpoint_write_error = None
         self._checkpoint_thread = threading.Thread(target=_write_checkpoint, daemon=True)
         self._checkpoint_thread.start()
 
@@ -4835,7 +5174,7 @@ class Trainer:
                 after the first cycle).
             preprocess_inline: If True, preprocess each completed batch into
                 tensors immediately using Cython (or Python fallback) in the
-                as_completed() loop.  Eliminates the separate from_dicts()
+                completion-delivery loop.  Eliminates the separate from_dicts()
                 preprocessing phase after self-play.  Result stored in
                 self._last_selfplay_preprocessed (a CachedTensorDataset).
 
@@ -4879,7 +5218,7 @@ class Trainer:
         self._last_selfplay_preprocessed = None  # Reset previous preprocessed data
 
         # Inline preprocessing: preprocess each completed batch immediately
-        # using Cython/Python encoding in the as_completed() loop.
+        # using Cython/Python encoding in the completion-delivery loop.
         # Eliminates the separate CachedTensorDataset.from_dicts() call that
         # spawns a ProcessPoolExecutor after all games finish.
         # Each batch has ~420-1050 entries; Cython processes them in <2ms.
@@ -4951,7 +5290,7 @@ class Trainer:
         #   - better CPU utilization (no idle gaps between phases)
         # ==================================================================
 
-        from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed
+        from concurrent.futures import ProcessPoolExecutor
         from concurrent.futures.process import BrokenProcessPool
 
         _max_moves = self.config.selfplay_max_moves
@@ -5073,8 +5412,13 @@ class Trainer:
             # before the worker pool forks.
             if mp.get_context().get_start_method() == 'fork':
                 try:
-                    _fork_model = _build_fork_behavior_model(
-                        self.model, runtime_arch)
+                    behavior_step, _fork_model = _capture_model_revision(
+                        getattr(self, '_model_state_lock', None),
+                        lambda: self.step,
+                        lambda: _build_fork_behavior_model(
+                            self.model, runtime_arch),
+                    )
+                    behavior_id = f"trainer-step-{behavior_step}"
                 except Exception:
                     _fork_model = None
                 if _fork_model is not None:
@@ -5105,16 +5449,13 @@ class Trainer:
             # serialized fallback consumed by get_model(). The detached CPU
             # state is released after persistence, before workers start.
             if _sp_mod._FORK_MODEL is None:
-                if self.device.type == 'cuda':
-                    fallback_state = {
-                        k: v.to('cpu', non_blocking=True)
-                        for k, v in self.model.state_dict().items()
-                    }
-                    torch.cuda.current_stream().synchronize()
-                else:
-                    fallback_state = {
-                        k: v.cpu() for k, v in self.model.state_dict().items()
-                    }
+                behavior_step, fallback_state = _capture_model_revision(
+                    getattr(self, '_model_state_lock', None),
+                    lambda: self.step,
+                    lambda: _copy_behavior_state_to_cpu(
+                        self.model, self.device),
+                )
+                behavior_id = f"trainer-step-{behavior_step}"
                 runtime_checkpoint = {
                     'model_state_dict': fallback_state,
                     'arch_params': runtime_arch,
@@ -5226,28 +5567,12 @@ class Trainer:
             if completed_total % 100 == 0 or completed_total == grand_total:
                 print(f"  Games: {completed_total}/{grand_total}")
 
-        def _batch_result_is_complete(entries_data, batch):
-            """Reject a worker result that silently dropped one of its games."""
-            # A max_moves=0 game legitimately emits no positions.  All normal
-            # games must emit at least one entry carrying their stable game_id.
-            expected = []
-            for task in batch:
-                if len(task) >= 12:  # extended ML task
-                    game_id = task[11]
-                    max_moves = task[1]
-                elif len(task) >= 9:  # extended algorithm task
-                    game_id = task[8]
-                    max_moves = task[2]
-                else:
-                    game_id = None
-                    max_moves = 1
-                if int(max_moves) > 0:
-                    expected.append(str(game_id) if game_id is not None else None)
-            if not expected:
-                return True
-            seen = {str(entry.get('game_id')) for entry in entries_data
-                    if entry.get('game_id') is not None}
-            return all(game_id in seen for game_id in expected)
+        def _selfplay_shutdown_requested():
+            """Keep operator and duration stops responsive between results."""
+            stop_event = getattr(self, '_bg_selfplay_stop_event', None)
+            return self._stopped or (
+                stop_event is not None and stop_event.is_set()
+            )
 
         # Worker fn per task type, for re-running a batch in-process. ML
         # batches reuse the fork-inherited _FORK_MODEL (set above), so they
@@ -5278,19 +5603,42 @@ class Trainer:
                     future_meta[f] = ('algo', len(batch), batch)
                 unfinished = dict(future_meta)
 
-                for future in _as_completed(future_meta):
+                # as_completed() blocks until some Future finishes, so the old
+                # future.result(timeout=600) could never make STOP responsive
+                # when every worker was stalled. Completion callbacks preserve the
+                # same delivery boundary while the bounded queue wait gives
+                # the trainer a chance to service controls and duration expiry.
+                completed_futures = Queue()
+                pending_results = set(future_meta)
+                for future in future_meta:
+                    future.add_done_callback(completed_futures.put)
+
+                while pending_results:
                     self._service_control_queue()
-                    if self._stopped:
+                    if _selfplay_shutdown_requested():
                         # Stop requested: drop queued game batches and return
                         # with whatever already finished.  The bounded pool
                         # teardown below terminates lingering workers without
                         # waiting indefinitely for a context-manager exit.
                         unfinished.clear()
                         break
+                    try:
+                        future = completed_futures.get(timeout=0.1)
+                    except Empty:
+                        continue
+                    self._service_control_queue()
+                    if _selfplay_shutdown_requested():
+                        unfinished.clear()
+                        break
+                    if future not in pending_results:
+                        continue
+                    pending_results.remove(future)
                     task_type, batch_game_count, batch = future_meta[future]
                     try:
-                        entries_data = future.result(timeout=600)
-                        if not _batch_result_is_complete(entries_data, batch):
+                        entries_data = future.result()
+                        if not _selfplay_batch_result_is_complete(
+                            entries_data, batch
+                        ):
                             raise RuntimeError(
                                 "self-play worker returned an incomplete batch"
                             )
@@ -5310,18 +5658,36 @@ class Trainer:
                     except Exception as e:
                         print(f"Self-play error ({task_type}): {e}")
             finally:
-                _shutdown_selfplay_executor(executor)
+                # Once an operator or duration stop is visible, no pending
+                # worker result remains useful: an incomplete cycle will be
+                # quarantined below, while an already complete one has all of
+                # its results. Skip the normal five-second grace period so
+                # terminal status is not held hostage by a stalled native
+                # search. Ordinary completion and broken-pool recovery retain
+                # the grace period.
+                shutdown_timeout = (
+                    0.0 if _selfplay_shutdown_requested() else 5.0
+                )
+                _shutdown_selfplay_executor(
+                    executor, timeout=shutdown_timeout)
 
             # Pool torn down. Re-run any batches the broken pool never
             # delivered, in-process (single process = less memory pressure
             # than the worker pool that just died).
-            if unfinished and not self._stopped:
+            if unfinished and not _selfplay_shutdown_requested():
                 for task_type, batch_game_count, batch in list(unfinished.values()):
                     self._service_control_queue()
-                    if self._stopped:
+                    if _selfplay_shutdown_requested():
                         break
                     try:
                         entries_data = _batch_fn[task_type](batch)
+                        if not _selfplay_batch_result_is_complete(
+                            entries_data, batch
+                        ):
+                            raise RuntimeError(
+                                "self-play sequential re-run returned an "
+                                "incomplete batch"
+                            )
                         _consume_and_release_selfplay_batch(
                             entries_data, batch_game_count, _consume_batch)
                     except Exception as e:
@@ -5338,11 +5704,13 @@ class Trainer:
                     unfinished[('algo', id(batch))] = ('algo', len(batch), batch)
             for task_type, batch_game_count, batch in list(unfinished.values()):
                 self._service_control_queue()
-                if self._stopped:
+                if _selfplay_shutdown_requested():
                     break
                 try:
                     entries_data = _batch_fn[task_type](batch)
-                    if not _batch_result_is_complete(entries_data, batch):
+                    if not _selfplay_batch_result_is_complete(
+                        entries_data, batch
+                    ):
                         raise RuntimeError(
                             "self-play sequential retry returned an incomplete batch"
                         )
@@ -5362,6 +5730,9 @@ class Trainer:
         # [Pass 70] Clean up fork-inherited model to free CPU memory.
         _sp_mod._FORK_MODEL = None
 
+        # A duration stop cuts off pending work, but if every batch was already
+        # consumed before the event was observed the complete immutable shard
+        # is still valid and should be preserved for the next launch.
         cycle_complete = completed_total == grand_total and not self._stopped
         if not cycle_complete:
             self._discard_incomplete_selfplay_cycle(
@@ -5390,7 +5761,7 @@ class Trainer:
             self._last_selfplay_dicts = _collected
 
         # Assemble inline-preprocessed chunks into a CachedTensorDataset.
-        # All chunks were preprocessed during the as_completed() loop, so
+        # All chunks were preprocessed during the completion-delivery loop, so
         # this is just numpy concatenation + torch.from_numpy (~1ms total).
         if _preprocess_chunks is not None and _preprocess_chunks:
             import numpy as _np
@@ -5496,7 +5867,7 @@ class Trainer:
                         # Preserve the completed replay shard, but do not start
                         # corpus work that can outlive a duration-triggered
                         # shutdown. The next launch will consider this shard.
-                        if self._bg_selfplay_stop_event.is_set():
+                        if _shutdown_requested():
                             break
 
                         teacher, noise, generation = self._corpus_settings(
@@ -5507,6 +5878,13 @@ class Trainer:
                             noise_settings=noise,
                             generation_settings=generation,
                         )
+                        # Admission is already durable. If STOP arrived while
+                        # the manager was auditing or publishing it, leave the
+                        # snapshot for the next launch instead of making the
+                        # terminal join wait for a full split load and tensor
+                        # rebuild that no consumer can activate.
+                        if _shutdown_requested():
+                            break
                         if not decision.admitted:
                             print(
                                 "  Corpus candidate not activated: "
@@ -5520,11 +5898,15 @@ class Trainer:
                                 max_train_entries=self.config.replay_max_entries,
                             )
                         )
+                        if _shutdown_requested():
+                            break
                         dataset = CachedTensorDataset.from_entries(
                             train_entries,
                             max_moves_per_sample=self.config.max_moves_per_sample,
                             show_progress=True,
                         )
+                        if _shutdown_requested():
+                            break
                         with self._bg_selfplay_lock:
                             self._bg_selfplay_entries = None
                             self._bg_selfplay_dataset = dataset
@@ -5587,7 +5969,7 @@ class Trainer:
                     _skip = _has_existing and not self.config.persist_selfplay
 
                     # Always use inline preprocessing: preprocess entries as each
-                    # game batch completes in the as_completed() loop.  Eliminates
+                    # game batch completes in the delivery loop. Eliminates
                     # the separate from_dicts() / from_entries() call that spawns
                     # a ProcessPoolExecutor after all games finish.  Saves 5-30s
                     # per cycle (entire preprocessing phase overlapped with games).
@@ -5601,7 +5983,7 @@ class Trainer:
                         if _pruned:
                             print(f"  Replay: pruned {_pruned} old file(s) "
                                   f"(keeping newest {self.config.replay_max_files})")
-                    if self._bg_selfplay_stop_event.is_set():
+                    if _shutdown_requested():
                         break
 
                     # Check for inline-preprocessed data first (fast path).
@@ -6066,6 +6448,21 @@ class Trainer:
         _use_padded = self._use_padded
         _sanity_interval = self._SANITY_CHECK_INTERVAL
         _thermal_enabled = _cfg.thermal_enabled
+        _model_state_lock = getattr(self, '_model_state_lock', None)
+
+        def _run_model_operation(operation, *args):
+            return _call_under_model_state_lock(
+                _model_state_lock, operation, *args)
+
+        def _apply_scaled_optimizer_step() -> None:
+            _scaler.step(_optimizer)
+            _scaler.update()
+            self.step += 1
+
+        def _apply_plain_optimizer_step() -> None:
+            _optimizer.step()
+            self.step += 1
+
         # GUI control servicing: None when training headless (CLI), so the
         # hot loop pays only a None check per batch.  The method itself is
         # time-throttled (_CONTROL_POLL_INTERVAL) when a queue is attached.
@@ -6200,20 +6597,24 @@ class Trainer:
                 if _value_head_enabled:
                     if _use_amp:
                         with autocast(device_type='cuda', dtype=_amp_dtype):
-                            loss, _current_scores = _compiled_fwd_loss(
+                            loss, _current_scores = _run_model_operation(
+                                _compiled_fwd_loss,
                                 boards, move_features, move_counts, targets,
                                 reward_weights, value_targets)
                     else:
-                        loss, _current_scores = _compiled_fwd_loss(
+                        loss, _current_scores = _run_model_operation(
+                            _compiled_fwd_loss,
                             boards, move_features, move_counts, targets,
                             reward_weights, value_targets)
                 else:
                     if _use_amp:
                         with autocast(device_type='cuda', dtype=_amp_dtype):
-                            loss, _current_scores = _compiled_fwd_loss(
+                            loss, _current_scores = _run_model_operation(
+                                _compiled_fwd_loss,
                                 boards, move_features, move_counts, targets, reward_weights)
                     else:
-                        loss, _current_scores = _compiled_fwd_loss(
+                        loss, _current_scores = _run_model_operation(
+                            _compiled_fwd_loss,
                             boards, move_features, move_counts, targets, reward_weights)
 
                 # Score-level NaN check at sanity interval only (expensive array-wide check)
@@ -6240,15 +6641,22 @@ class Trainer:
                     with autocast(device_type='cuda', dtype=_amp_dtype):
                         if _use_padded:
                             if _value_head_enabled:
-                                scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
+                                scores, value_preds = _run_model_operation(
+                                    _model.forward_padded_with_value,
+                                    boards, move_features, move_counts)
                             else:
-                                scores = _model.forward_padded(boards, move_features, move_counts)
+                                scores = _run_model_operation(
+                                    _model.forward_padded,
+                                    boards, move_features, move_counts)
                                 value_preds = None
                         else:
                             if _value_head_enabled:
-                                scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
+                                scores, value_preds = _run_model_operation(
+                                    _model.forward_with_value,
+                                    boards, move_features, move_counts)
                             else:
-                                scores = _model(boards, move_features, move_counts)
+                                scores = _run_model_operation(
+                                    _model, boards, move_features, move_counts)
                                 value_preds = None
                 except RuntimeError as _compile_err:
                     if "device kernel image is invalid" in str(_compile_err) and first_batch:
@@ -6265,15 +6673,23 @@ class Trainer:
                         with autocast(device_type='cuda', dtype=_amp_dtype):
                             if _use_padded:
                                 if _value_head_enabled:
-                                    scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
+                                    scores, value_preds = _run_model_operation(
+                                        _model.forward_padded_with_value,
+                                        boards, move_features, move_counts)
                                 else:
-                                    scores = _model.forward_padded(boards, move_features, move_counts)
+                                    scores = _run_model_operation(
+                                        _model.forward_padded,
+                                        boards, move_features, move_counts)
                                     value_preds = None
                             else:
                                 if _value_head_enabled:
-                                    scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
+                                    scores, value_preds = _run_model_operation(
+                                        _model.forward_with_value,
+                                        boards, move_features, move_counts)
                                 else:
-                                    scores = _model(boards, move_features, move_counts)
+                                    scores = _run_model_operation(
+                                        _model, boards, move_features,
+                                        move_counts)
                                     value_preds = None
                     else:
                         raise
@@ -6328,15 +6744,22 @@ class Trainer:
                 # ── No-AMP path ──
                 if _use_padded:
                     if _value_head_enabled:
-                        scores, value_preds = _model.forward_padded_with_value(boards, move_features, move_counts)
+                        scores, value_preds = _run_model_operation(
+                            _model.forward_padded_with_value,
+                            boards, move_features, move_counts)
                     else:
-                        scores = _model.forward_padded(boards, move_features, move_counts)
+                        scores = _run_model_operation(
+                            _model.forward_padded,
+                            boards, move_features, move_counts)
                         value_preds = None
                 else:
                     if _value_head_enabled:
-                        scores, value_preds = _model.forward_with_value(boards, move_features, move_counts)
+                        scores, value_preds = _run_model_operation(
+                            _model.forward_with_value,
+                            boards, move_features, move_counts)
                     else:
-                        scores = _model(boards, move_features, move_counts)
+                        scores = _run_model_operation(
+                            _model, boards, move_features, move_counts)
                         value_preds = None
                 if _do_sanity:
                     if _use_padded:
@@ -6412,8 +6835,7 @@ class Trainer:
                         foreach=True)
                     if _will_record:
                         _clip_norm_tensor = _clip_norm
-                _scaler.step(_optimizer)
-                _scaler.update()
+                _run_model_operation(_apply_scaled_optimizer_step)
             else:
                 if _grad_clip_norm is not None:
                     _clip_norm = torch.nn.utils.clip_grad_norm_(
@@ -6421,14 +6843,13 @@ class Trainer:
                         foreach=True)
                     if _will_record:
                         _clip_norm_tensor = _clip_norm
-                _optimizer.step()
+                _run_model_operation(_apply_plain_optimizer_step)
 
             # Accumulate on GPU — no sync. Only .item() when needed for logging.
             # Undo the /accum_steps scaling so total_loss_acc reflects true loss.
             # In-place add_ with alpha avoids a temporary tensor allocation.
             total_loss_acc.add_(loss.detach(), alpha=accum_steps)
             num_batches += 1
-            self.step += 1
             _step_elapsed = 0.0
 
             # Step the LR scheduler (per-step, not per-epoch)
@@ -7546,8 +7967,7 @@ class Trainer:
 
         # Final checkpoint
         self._save_checkpoint(loss)
-        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
-            self._checkpoint_thread.join()
+        self._wait_for_checkpoint_writer()
         if self._acceptance_thread is not None and not self._stopped:
             print("Waiting for queued promoted-checkpoint acceptance evaluations...")
             self._acceptance_queue.join()
@@ -7588,14 +8008,6 @@ class Trainer:
                     print(f"    {name}: {path}")
             except Exception as e:
                 print(f"  Warning: Failed to export statistics: {e}")
-
-        # Ensure the final checkpoint write (background daemon thread) is
-        # fully on disk before returning: the GUI wrapper reports completion
-        # as soon as train() returns and may then terminate this process,
-        # which would kill the daemon writer mid-write.
-        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
-            print("Waiting for final checkpoint write...")
-            self._checkpoint_thread.join(timeout=60)
 
     def pause(self) -> None:
         """Pause training."""
@@ -8584,6 +8996,27 @@ def validate_recovery_experiment_config(
                             expected_task = None
 
                         if expected_task is not None:
+                            # Enhanced-stage activation must accept exactly the
+                            # same terminal evidence as startup recovery.  The
+                            # field-by-field checks below retain their specific
+                            # diagnostics and frozen-suite requirements, while
+                            # the shared loader additionally reconstructs all
+                            # 200 paired game records and their aggregates.
+                            # Without this shared check, a hand-written report
+                            # containing only passing W/D/L totals could unlock
+                            # the value-head stage even though normal acceptance
+                            # recovery correctly rejected it as incomplete.
+                            validated_report = (
+                                checkpoint_acceptance_tasks
+                                .load_completed_acceptance_report(
+                                    acceptance_root, expected_task)
+                            )
+                            if validated_report is None:
+                                failures.append(
+                                    "enhanced stage acceptance report does not "
+                                    "prove the complete paired-game protocol"
+                                )
+
                             report_provenance = {
                                 'task_id': expected_task['task_id'],
                                 'step': expected_task['step'],
