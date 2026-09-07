@@ -19,12 +19,18 @@ from .model_vs_algo import (
     ModelVsAlgoTester,
     _evaluation_worker_context,
     _evaluation_worker_init,
+    opening_suite_identity,
 )
 
 
 PENDING_TASK_SCHEMA_VERSION = 1
 PENDING_TASK_PREFIX = "pending_acceptance_"
 FAILURE_REPORT_PREFIX = "acceptance_failure_"
+_ACCEPTANCE_SELECTION_SEQUENCE = [
+    "held_out_teacher_agreement",
+    "random_game_strength",
+    "easy_game_strength",
+]
 
 
 def acceptance_task_id(checkpoint_path: str, step: int) -> str:
@@ -108,8 +114,7 @@ def persist_pending_acceptance_task(
     path = pending_acceptance_task_path(output_root, normalized)
     if path.exists():
         existing = load_pending_acceptance_task(path)
-        comparable_keys = set(normalized) - {"created_at"}
-        if any(existing.get(key) != normalized.get(key) for key in comparable_keys):
+        if not _pending_acceptance_tasks_match(existing, normalized):
             raise RuntimeError(f"Pending acceptance task conflicts with {path}")
         return path
     _write_json_atomic(path, normalized)
@@ -150,22 +155,44 @@ def successful_acceptance_report_path(
     task: Mapping[str, Any],
 ) -> Optional[Path]:
     """Return the matching durable success report, if one already exists."""
-    path = Path(output_dir) / f"acceptance_step_{int(task['step']):06d}.json"
-    if not path.exists():
-        return None
+    completed = load_completed_acceptance_report(output_dir, task)
+    return completed[0] if completed is not None else None
+
+
+def load_completed_acceptance_report(
+    output_dir: str | Path,
+    task: Mapping[str, Any],
+) -> Optional[tuple[Path, dict[str, Any]]]:
+    """Load one validated, durable game-protocol report and its path."""
     try:
+        normalized = _validate_pending_acceptance_task(task)
+        path = (
+            Path(output_dir)
+            / f"acceptance_step_{normalized['step']:06d}.json"
+        )
+        if not path.exists():
+            return None
         with path.open("r", encoding="utf-8") as handle:
             report = json.load(handle)
+        metrics = report.get("metrics")
+        agreement_counts = report.get("teacher_agreement_counts")
+        if (
+            not isinstance(metrics, Mapping)
+            or not isinstance(agreement_counts, Mapping)
+        ):
+            return None
         report_checkpoint = os.path.normcase(str(
             Path(report["checkpoint_path"]).expanduser().resolve(strict=False)))
         task_checkpoint = os.path.normcase(str(
-            Path(task["checkpoint_path"]).expanduser().resolve(strict=False)))
-        if (int(report.get("step", -1)) != int(task["step"])
+            Path(normalized["checkpoint_path"]).expanduser().resolve(
+                strict=False)))
+        if (int(report.get("step", -1)) != normalized["step"]
                 or report_checkpoint != task_checkpoint):
             return None
         # A report is terminal only for the exact durable protocol input.
         # This prevents an old report for the same checkpoint path/step from
-        # clearing a task whose digest, suite, openings, or runtime changed.
+        # clearing a task whose teacher evidence, digest, suite, openings, or
+        # runtime changed.
         provenance_pairs = (
             ("checkpoint_sha256", "checkpoint_sha256"),
             ("suite_fingerprint", "frozen_suite_fingerprint"),
@@ -178,12 +205,181 @@ def successful_acceptance_report_path(
             ("task_id", "task_id"),
         )
         for task_key, report_key in provenance_pairs:
-            if task.get(task_key) is not None and report.get(report_key) != task[task_key]:
+            if report.get(report_key) != normalized.get(task_key):
                 return None
-        return path
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        if metrics.get("teacher_agreement") != normalized["teacher_agreement"]:
+            return None
+        count_pairs = (
+            ("teacher_correct_states", "correct_states"),
+            ("teacher_total_states", "total_states"),
+        )
+        for task_key, report_key in count_pairs:
+            if agreement_counts.get(report_key) != normalized.get(task_key):
+                return None
+        if not _completed_acceptance_report_matches_task(report, normalized):
+            return None
+        return path, report
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        OverflowError,
+        json.JSONDecodeError,
+    ):
         return None
     return None
+
+
+def _completed_acceptance_report_matches_task(
+    report: Mapping[str, Any],
+    task: Mapping[str, Any],
+) -> bool:
+    """Return whether a completed report proves its fixed game protocol.
+
+    Input provenance alone cannot make a report terminal. Startup recovery may
+    publish the accepted alias directly from this file, so the raw game counts,
+    protocol metadata, and recorded gate decision must still agree with one
+    another before the report is allowed to suppress a replacement evaluation.
+    """
+    if (
+        type(report.get("schema_version")) is not int
+        or report.get("schema_version") != 1
+        or report.get("selection_sequence") != _ACCEPTANCE_SELECTION_SEQUENCE
+    ):
+        return False
+
+    expected_suite_id = opening_suite_identity(
+        int(task["opening_seed"]),
+        task["opening_plies"],
+        ACCEPTANCE_GAMES_PER_OPPONENT // 2,
+    )
+    if report.get("opening_suite_id") != expected_suite_id:
+        return False
+
+    task_checkpoint = os.path.normcase(str(
+        Path(task["checkpoint_path"]).expanduser().resolve(strict=False)))
+    records = (
+        (report.get("random"), "random"),
+        (report.get("easy"), "algorithm"),
+    )
+    for record, opponent_type in records:
+        if not isinstance(record, Mapping):
+            return False
+        record_checkpoint = os.path.normcase(str(
+            Path(record.get("model_path", "")).expanduser().resolve(
+                strict=False)))
+        expected_metadata = {
+            "algo_difficulty": "easy",
+            "opponent_type": opponent_type,
+            "opening_seed": task["opening_seed"],
+            "opening_plies": task["opening_plies"],
+            "opening_suite_id": expected_suite_id,
+            "opening_suite_size": ACCEPTANCE_GAMES_PER_OPPONENT // 2,
+            "ml_inference_depth": task["inference_depth"],
+        }
+        if (
+            record_checkpoint != task_checkpoint
+            or any(record.get(key) != value
+                   for key, value in expected_metadata.items())
+            or not _completed_game_records_match_task(
+                record, task, opponent_type)
+        ):
+            return False
+
+    random_record, _ = records[0]
+    easy_record, _ = records[1]
+    decision = evaluate_acceptance_gates(
+        float(task["teacher_agreement"]), random_record, easy_record)
+    decision_payload = decision.to_dict()
+    if (
+        not decision.checks["random_exact_balanced_100_games"]
+        or not decision.checks["easy_exact_balanced_100_games"]
+        or report.get("passed") is not decision.passed
+    ):
+        return False
+    return all(
+        report.get(key) == decision_payload[key]
+        for key in ("checks", "metrics", "thresholds", "ci_method")
+    )
+
+
+def _completed_game_records_match_task(
+    record: Mapping[str, Any],
+    task: Mapping[str, Any],
+    opponent_type: str,
+) -> bool:
+    """Verify aggregate results against the complete paired-game evidence."""
+    games = record.get("games")
+    if not isinstance(games, list) or len(games) != ACCEPTANCE_GAMES_PER_OPPONENT:
+        return False
+
+    opening_plies = tuple(task["opening_plies"])
+    games_per_side = ACCEPTANCE_GAMES_PER_OPPONENT // 2
+    expected_specs = {
+        (
+            player,
+            int(task["opening_seed"]) + index,
+            opening_plies[index % len(opening_plies)],
+        )
+        for player in (1, 2)
+        for index in range(games_per_side)
+    }
+    seen_specs: set[tuple[int, int, int]] = set()
+    counts = {
+        "total_games": 0,
+        "ml_wins": 0,
+        "draws": 0,
+        "algo_wins": 0,
+        "ml_as_p1_wins": 0,
+        "ml_as_p1_draws": 0,
+        "ml_as_p1_losses": 0,
+        "ml_as_p2_wins": 0,
+        "ml_as_p2_draws": 0,
+        "ml_as_p2_losses": 0,
+    }
+
+    for game in games:
+        if not isinstance(game, Mapping):
+            return False
+        player = game.get("ml_player")
+        opening_seed = game.get("opening_seed")
+        opening_length = game.get("opening_plies")
+        if (
+            type(player) is not int
+            or player not in (1, 2)
+            or type(opening_seed) is not int
+            or type(opening_length) is not int
+            or game.get("opponent_type") != opponent_type
+            or game.get("ml_inference_depth") != task["inference_depth"]
+        ):
+            return False
+
+        spec = (player, opening_seed, opening_length)
+        if spec not in expected_specs or spec in seen_specs:
+            return False
+        seen_specs.add(spec)
+
+        result = game.get("result")
+        winner = game.get("winner")
+        side = "p1" if player == 1 else "p2"
+        if result == "ml_win" and winner == player:
+            counts["ml_wins"] += 1
+            counts[f"ml_as_{side}_wins"] += 1
+        elif result == "algo_win" and winner == 3 - player:
+            counts["algo_wins"] += 1
+            counts[f"ml_as_{side}_losses"] += 1
+        elif result == "draw" and winner is None:
+            counts["draws"] += 1
+            counts[f"ml_as_{side}_draws"] += 1
+        else:
+            return False
+        counts["total_games"] += 1
+
+    return seen_specs == expected_specs and all(
+        type(record.get(key)) is int and record[key] == value
+        for key, value in counts.items()
+    )
 
 
 def terminal_acceptance_report_path(
@@ -191,18 +387,52 @@ def terminal_acceptance_report_path(
     task: Mapping[str, Any],
 ) -> Optional[Path]:
     """Return a matching success or failure report for a durable task."""
-    success = successful_acceptance_report_path(output_dir, task)
-    if success is not None:
-        return success
+    terminal = load_terminal_acceptance_report(output_dir, task)
+    return terminal[0] if terminal is not None else None
+
+
+def load_terminal_acceptance_report(
+    output_dir: str | Path,
+    task: Mapping[str, Any],
+) -> Optional[tuple[Path, dict[str, Any]]]:
+    """Load one validated terminal report and its path."""
+    completed = load_completed_acceptance_report(output_dir, task)
+    if completed is not None:
+        return completed
     failure = failure_acceptance_report_path(output_dir, task)
     if not failure.exists():
         return None
     try:
         with failure.open("r", encoding="utf-8") as handle:
             report = json.load(handle)
-        if str(report.get("task_id")) == str(task["task_id"]):
-            return failure
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        report_task = report.get("task")
+        if not isinstance(report_task, Mapping):
+            return None
+        normalized = _validate_pending_acceptance_task(task)
+        if (
+            report.get("status") != "error"
+            or report.get("passed") is not False
+            or str(report.get("task_id")) != normalized["task_id"]
+            or int(report.get("step", -1)) != normalized["step"]
+            or not _pending_acceptance_tasks_match(report_task, normalized)
+        ):
+            return None
+        report_checkpoint = os.path.normcase(str(
+            Path(report.get("checkpoint_path", "")).expanduser().resolve(
+                strict=False)))
+        task_checkpoint = os.path.normcase(str(
+            Path(normalized["checkpoint_path"]).expanduser().resolve(
+                strict=False)))
+        if report_checkpoint == task_checkpoint:
+            return failure, report
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        OverflowError,
+        json.JSONDecodeError,
+    ):
         return None
     return None
 
@@ -340,6 +570,22 @@ def _validate_pending_acceptance_task(
     return normalized
 
 
+def _pending_acceptance_tasks_match(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+) -> bool:
+    """Return whether two tasks name the same durable protocol input."""
+    first_normalized = _validate_pending_acceptance_task(first)
+    second_normalized = _validate_pending_acceptance_task(second)
+    comparable_keys = (
+        set(first_normalized) | set(second_normalized)
+    ) - {"created_at"}
+    return all(
+        first_normalized.get(key) == second_normalized.get(key)
+        for key in comparable_keys
+    )
+
+
 def run_checkpoint_acceptance(
     checkpoint_path: str,
     *,
@@ -415,11 +661,7 @@ def run_checkpoint_acceptance(
             "correct_states": teacher_correct_states,
             "total_states": teacher_total_states,
         },
-        "selection_sequence": [
-            "held_out_teacher_agreement",
-            "random_game_strength",
-            "easy_game_strength",
-        ],
+        "selection_sequence": list(_ACCEPTANCE_SELECTION_SEQUENCE),
         "opening_seed": int(opening_seed),
         "opening_plies": [int(value) for value in opening_plies],
         "opening_suite_id": random_record.get("opening_suite_id"),
