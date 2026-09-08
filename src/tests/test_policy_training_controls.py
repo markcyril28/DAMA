@@ -2070,6 +2070,54 @@ def test_runtime_model_checkpoint_staging_skips_only_optional_disk_copy(
     )
 
 
+def test_runtime_model_checkpoint_staging_preserves_prior_file_on_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial spawn fallback must never replace a usable runtime model."""
+    import torch
+
+    checkpoint = {
+        "model_state_dict": {"weight": torch.arange(6).reshape(2, 3)},
+        "arch_params": {"channels": 2},
+        "encoding_version": 2,
+        "step": 17,
+    }
+    path = tmp_path / "temp_selfplay_model.pt"
+    prior = b"previous-valid-runtime-checkpoint"
+    path.write_bytes(prior)
+    temporary = path.with_name(path.name + ".tmp")
+    real_open = Path.open
+
+    class PartialWriter:
+        def __enter__(self):
+            self.handle = real_open(temporary, "wb")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.handle.close()
+            return False
+
+        def write(self, payload):
+            self.handle.write(memoryview(payload)[:37])
+            self.handle.flush()
+            raise OSError(28, "simulated runtime checkpoint disk full")
+
+    def failing_open(target, mode="r", *args, **kwargs):
+        if target == temporary and mode == "wb":
+            return PartialWriter()
+        return real_open(target, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    with pytest.raises(OSError, match="simulated runtime checkpoint disk full"):
+        trainer_module._stage_runtime_model_checkpoint(
+            checkpoint, path, persist_to_disk=True)
+
+    assert path.read_bytes() == prior
+    assert not temporary.exists()
+
+
 def test_fork_behavior_model_loads_live_state_without_detached_cpu_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
