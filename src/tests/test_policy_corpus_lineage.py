@@ -541,6 +541,104 @@ def test_ledger_records_each_admission_and_survives_snapshot_pruning(
     assert first_names <= reopened.trained_ledger_shard_names()
 
 
+def test_failed_ledger_shard_append_preserves_prior_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial append must not corrupt current or later shard provenance."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    manager._record_trained_ledger(
+        version=1,
+        file_records=[{"name": "prior.jsonl", "sha256": "a" * 64}],
+        state_keys={"1" * 64},
+    )
+    ledger_path = manager._ledger_shards_path
+    prior = ledger_path.read_bytes()
+    real_fdopen = corpus.os.fdopen
+
+    class PartialWriter:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self.handle.__exit__(exc_type, exc, traceback)
+
+        def write(self, payload):
+            self.handle.write(memoryview(payload)[:19])
+            self.handle.flush()
+            raise OSError(28, "simulated shard-ledger disk full")
+
+        def flush(self) -> None:
+            self.handle.flush()
+
+        def fileno(self) -> int:
+            return self.handle.fileno()
+
+    def failing_fdopen(fd, mode="r", *args, **kwargs):
+        handle = real_fdopen(fd, mode, *args, **kwargs)
+        if mode == "wb":
+            return PartialWriter(handle)
+        return handle
+
+    monkeypatch.setattr(corpus.os, "fdopen", failing_fdopen)
+
+    with pytest.raises(OSError, match="simulated shard-ledger disk full"):
+        manager._record_trained_ledger(
+            version=2,
+            file_records=[{"name": "partial.jsonl", "sha256": "b" * 64}],
+            state_keys={"2" * 64},
+        )
+
+    assert ledger_path.read_bytes() == prior
+    assert not list(ledger_path.parent.glob("trained_shards.jsonl.*.tmp"))
+    reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert reopened.trained_ledger_shard_names() == {"prior.jsonl"}
+
+    # The live manager retries after background admission errors. Its cache
+    # must not claim the failed row before that retry publishes it.
+    monkeypatch.setattr(corpus.os, "fdopen", real_fdopen)
+    manager._record_trained_ledger(
+        version=2,
+        file_records=[{"name": "partial.jsonl", "sha256": "b" * 64}],
+        state_keys={"2" * 64},
+    )
+    final = _manager(replay_dir, root, trained_ledger_enabled=True)
+    assert final.trained_ledger_shard_names() == {
+        "prior.jsonl", "partial.jsonl",
+    }
+
+
+@pytest.mark.parametrize(
+    "malformed_row",
+    ['{"name":', "[]\n", '{"name":""}\n'],
+)
+def test_malformed_trained_shard_ledger_fails_closed(
+    tmp_path: Path, malformed_row: str,
+) -> None:
+    """Corrupt shard history must not silently weaken hold-out exclusion."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    manager._record_trained_ledger(
+        version=1,
+        file_records=[{"name": "prior.jsonl", "sha256": "a" * 64}],
+        state_keys={"1" * 64},
+    )
+    with manager._ledger_shards_path.open("a", encoding="utf-8") as handle:
+        handle.write(malformed_row)
+
+    reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
+    with pytest.raises(RuntimeError, match="Trained-shard ledger contains"):
+        reopened.trained_ledger_shard_names()
+
+
 def test_failed_ledger_commit_does_not_activate_unrecorded_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
