@@ -130,6 +130,12 @@ _ACCEPTANCE_OPENING_SUITE_SIZE = ACCEPTANCE_GAMES_PER_OPPONENT // 2
 # while each difficulty/start-side slot sees all depths over four cycles.
 _ALGORITHM_OPENING_SCHEDULE = "cycle_rotated_v1"
 
+# Polling is deliberately infrequent while storage is constrained. The main
+# thread remains responsive through its normal two-second data wait, and STOP
+# wakes this wait immediately through ``_bg_selfplay_stop_event``.
+_SELFPLAY_DISK_HEADROOM_POLL_SECONDS = 30.0
+_GIB = 1024 ** 3
+
 
 def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
     """Assign every teacher difficulty to both player positions."""
@@ -931,6 +937,9 @@ class TrainingConfig:
     teacher_difficulty: str = 'hard'
     pipeline_mode: str = 'simultaneous'  # 'simultaneous' or 'alternate'
     max_stale_epochs: int = 0  # Max epochs on unchanged data before yielding (0 = unlimited)
+    # Pause persistent background generation below this free-space floor.
+    # Zero preserves the historical unchecked behavior for generic configs.
+    selfplay_min_free_disk_gb: float = 0.0
 
     # Algo-vs-algo data generation (pure algorithmic games as training data)
     algo_vs_algo_enabled: bool = False
@@ -1616,6 +1625,7 @@ class Trainer:
                 'selfplay_difficulties': config.selfplay_difficulties,
                 'selfplay_noise_prob': config.selfplay_noise_prob,
                 'selfplay_max_moves': config.selfplay_max_moves,
+                'selfplay_min_free_disk_gb': config.selfplay_min_free_disk_gb,
                 'pipeline_mode': config.pipeline_mode,
                 'algo_vs_algo_enabled': config.algo_vs_algo_enabled,
                 'algo_vs_algo_games': config.algo_vs_algo_games,
@@ -3673,7 +3683,11 @@ class Trainer:
         promotion: Mapping[str, Any],
     ) -> Optional[dict]:
         """Reconstruct the durable acceptance input for a promotion record."""
-        if not promotion.get('promoted'):
+        promoted = promotion.get('promoted')
+        if type(promoted) is not bool:
+            raise ValueError(
+                "Promotion record promoted decision must be a boolean")
+        if not promoted:
             return None
         checkpoint_path = promotion.get('checkpoint_path')
         checkpoint_sha256 = promotion.get('checkpoint_sha256')
@@ -3833,7 +3847,6 @@ class Trainer:
         output_dir = self.config.acceptance_dir
         task_completed = False
         try:
-            checkpoint_acceptance_tasks.verify_pending_acceptance_checkpoint(task)
             checkpoint_acceptance_tasks.run_checkpoint_acceptance(
                 task['checkpoint_path'],
                 step=task['step'],
@@ -3927,9 +3940,79 @@ class Trainer:
         recovered = 0
         latest_passing_completion = None
         passing_completions = []
+
+        # The promotion record becomes durable before its pending evaluation
+        # task. When the registry is available, derive the authoritative task
+        # inputs from that append-only record before trusting a recoverable
+        # JSON file. A modified pending file can otherwise win the task-id
+        # deduplication race and replace the frozen teacher evidence used by
+        # the fixed game-strength gate.
+        promotion_registry = getattr(self, '_promotion_registry', None)
+        if promotion_registry is None:
+            promotion_records = ()
+            promotion_tasks = None
+        else:
+            promotion_records = promotion_registry.records()
+            promotion_tasks = {}
+            conflicting_task_ids = set()
+            for promotion in promotion_records:
+                try:
+                    candidate = self._acceptance_task_from_promotion(promotion)
+                    if candidate is None:
+                        continue
+                    task_id = candidate['task_id']
+                    existing = promotion_tasks.get(task_id)
+                    if (
+                        existing is not None
+                        and not (
+                            checkpoint_acceptance_tasks
+                            ._pending_acceptance_tasks_match(
+                                existing, candidate)
+                        )
+                    ):
+                        conflicting_task_ids.add(task_id)
+                        promotion_tasks.pop(task_id, None)
+                    elif task_id not in conflicting_task_ids:
+                        promotion_tasks[task_id] = candidate
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    print(
+                        "Could not reconstruct promoted checkpoint acceptance "
+                        f"task for step {promotion.get('step')}: {exc}"
+                    )
+
         for task in checkpoint_acceptance_tasks.discover_pending_acceptance_tasks(
             self.config.acceptance_dir
         ):
+            if promotion_tasks is not None:
+                expected_task = promotion_tasks.get(task['task_id'])
+                task_matches = (
+                    expected_task is not None
+                    and (
+                        checkpoint_acceptance_tasks
+                        ._pending_acceptance_tasks_match(
+                            task, expected_task)
+                    )
+                )
+                if not task_matches:
+                    try:
+                        quarantine = (
+                            checkpoint_acceptance_tasks
+                            .quarantine_pending_acceptance_task(
+                                self.config.acceptance_dir, task))
+                    except OSError as exc:
+                        print(
+                            "Could not quarantine pending acceptance task "
+                            f"{task.get('task_id')}: {exc}"
+                        )
+                    else:
+                        print(
+                            "Quarantined pending acceptance task without an "
+                            "exact promoted-checkpoint record as "
+                            f"{quarantine}"
+                        )
+                    continue
+                task = expected_task
+
             completed = (
                 checkpoint_acceptance_tasks.load_completed_acceptance_report(
                     self.config.acceptance_dir, task))
@@ -3975,18 +4058,10 @@ class Trainer:
         # initializing the registry (for example, GUI/status recovery tests).
         # Pending-file recovery remains valid in that case; registry
         # reconciliation is simply unavailable.
-        promotion_registry = getattr(self, '_promotion_registry', None)
-        if promotion_registry is None:
-            promotion_records = ()
-        else:
-            promotion_records = promotion_registry.records()
-        for promotion in promotion_records:
-            if not promotion.get('promoted'):
-                continue
+        registry_tasks = (
+            () if promotion_tasks is None else promotion_tasks.values())
+        for task in registry_tasks:
             try:
-                task = self._acceptance_task_from_promotion(promotion)
-                if task is None:
-                    continue
                 completed = (
                     checkpoint_acceptance_tasks
                     .load_terminal_acceptance_report(
@@ -4028,7 +4103,7 @@ class Trainer:
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 print(
                     "Could not reconcile promoted checkpoint acceptance task "
-                    f"for step {promotion.get('step')}: {exc}"
+                    f"for step {task.get('step')}: {exc}"
                 )
 
         # The accepted alias identifies only the newest passing checkpoint, but
@@ -4143,10 +4218,19 @@ class Trainer:
         temporary = destination.with_name(destination.name + '.tmp')
         temporary.unlink(missing_ok=True)
         try:
-            os.link(str(source), str(temporary))
-        except OSError:
-            shutil.copy2(source, temporary)
-        os.replace(temporary, destination)
+            try:
+                os.link(str(source), str(temporary))
+            except OSError:
+                shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            # A failed copy or replace must not strand a partial checkpoint
+            # alias. Keep cleanup best-effort so the publication error remains
+            # the failure reported to the checkpoint writer.
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _generation_cycle_id_from_replay_entry(entry: Mapping[str, Any]) -> Optional[int]:
@@ -4686,26 +4770,41 @@ class Trainer:
                     continue
 
         best_agreement = float('-inf')
+        validated_records = []
         for record in records:
-            try:
-                agreement = float(record.get('teacher_agreement'))
-            except (TypeError, ValueError):
-                agreement = float('-inf')
+            # Retention is destructive, so semantically malformed registry
+            # evidence must fail closed just like unreadable JSON. In
+            # particular, bool is an int subclass: float(True) used to turn a
+            # corrupt row into a perfect 1.0 high-water mark and could leave
+            # the real best-agreement checkpoint eligible for deletion.
+            if not isinstance(record, Mapping):
+                return None
+            raw_agreement = record.get('teacher_agreement')
+            promoted = record.get('promoted')
+            checkpoint_path = record.get('checkpoint_path')
+            if (
+                type(raw_agreement) not in (int, float)
+                or not math.isfinite(float(raw_agreement))
+                or not 0.0 <= float(raw_agreement) <= 1.0
+                or type(promoted) is not bool
+                or type(checkpoint_path) is not str
+                or not checkpoint_path
+            ):
+                return None
+            agreement = float(raw_agreement)
+            validated_records.append((record, agreement))
             if agreement > best_agreement:
                 best_agreement = agreement
-            if record.get('promoted'):
-                _protect(record.get('checkpoint_path'))
+            if promoted:
+                _protect(checkpoint_path)
         # The registry high-water mark, promoted or not.  Nothing has cleared
         # the 0.50 gate on this arm, so protecting only promotions would leave
         # the whole agreement series prunable and discard the best result the
         # run has actually produced.
         if best_agreement > float('-inf'):
-            for record in records:
-                try:
-                    if float(record.get('teacher_agreement')) == best_agreement:
-                        _protect(record.get('checkpoint_path'))
-                except (TypeError, ValueError):
-                    continue
+            for record, agreement in validated_records:
+                if agreement == best_agreement:
+                    _protect(record['checkpoint_path'])
         return protected
 
     def _prune_old_checkpoints(self, keep_path: Path) -> list:
@@ -4987,12 +5086,23 @@ class Trainer:
             numbered_rewrite_attempted = False
 
             def _write_numbered_checkpoint() -> None:
-                with tempfile.NamedTemporaryFile(
-                    delete=False, dir=self.config.checkpoint_dir,
-                ) as tmp:
-                    torch.save(checkpoint, tmp.name)
-                    tmp_path = tmp.name
-                os.replace(tmp_path, checkpoint_path)
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        delete=False, dir=self.config.checkpoint_dir,
+                    ) as tmp:
+                        tmp_path = Path(tmp.name)
+                        torch.save(checkpoint, tmp.name)
+                    os.replace(tmp_path, checkpoint_path)
+                finally:
+                    # The random temporary name cannot be recovered reliably
+                    # by a later launch. Remove a partial serialization or a
+                    # source left behind by a failed atomic replacement.
+                    if tmp_path is not None:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
 
             def _rewrite_missing_numbered_checkpoint() -> None:
                 nonlocal numbered_rewrite_attempted
@@ -5874,6 +5984,59 @@ class Trainer:
     # Background self-play: overlap CPU game generation with GPU training
     # ------------------------------------------------------------------
 
+    def _wait_for_selfplay_disk_headroom(self) -> bool:
+        """Wait until persistent self-play and corpus writes have headroom.
+
+        Returns false when shutdown is requested while waiting. The check runs
+        both before generation and before snapshot admission: the former avoids
+        spending a complete CPU cycle on a replay shard that cannot close, and
+        the latter keeps a concurrent drop in free space away from the much
+        larger trained-ledger transaction.
+        """
+        minimum_gb = float(
+            getattr(self.config, 'selfplay_min_free_disk_gb', 0.0) or 0.0
+        )
+        if minimum_gb <= 0:
+            return not (
+                self._stopped or self._bg_selfplay_stop_event.is_set()
+            )
+
+        required_bytes = int(minimum_gb * _GIB)
+        replay_dir = Path(self.config.replay_dir)
+        waiting = False
+        while not (
+            self._stopped or self._bg_selfplay_stop_event.is_set()
+        ):
+            try:
+                free_bytes = int(shutil.disk_usage(replay_dir).free)
+                measurement_error = None
+            except OSError as exc:
+                free_bytes = None
+                measurement_error = exc
+
+            if free_bytes is not None and free_bytes >= required_bytes:
+                if waiting:
+                    print(
+                        "  Self-play storage headroom recovered: "
+                        f"{free_bytes / _GIB:.2f} GiB free, resuming"
+                    )
+                return True
+
+            if not waiting:
+                if measurement_error is None:
+                    detail = f"{free_bytes / _GIB:.2f} GiB free"
+                else:
+                    detail = f"free-space check failed: {measurement_error}"
+                print(
+                    "  Self-play paused for storage headroom: "
+                    f"{detail}, requires {minimum_gb:g} GiB"
+                )
+                waiting = True
+            self._bg_selfplay_stop_event.wait(
+                timeout=_SELFPLAY_DISK_HEADROOM_POLL_SECONDS
+            )
+        return False
+
     def _start_background_selfplay(self, num_games: int) -> None:
         """Launch continuous self-play + data preparation in a background thread.
 
@@ -5905,6 +6068,8 @@ class Trainer:
                             self._bg_selfplay_stop_event.wait(timeout=0.5)
                         if _shutdown_requested():
                             break
+                        if not self._wait_for_selfplay_disk_headroom():
+                            break
 
                         _, selfplay_behavior_step = self.run_selfplay(
                             num_games,
@@ -5923,6 +6088,8 @@ class Trainer:
                         # corpus work that can outlive a duration-triggered
                         # shutdown. The next launch will consider this shard.
                         if _shutdown_requested():
+                            break
+                        if not self._wait_for_selfplay_disk_headroom():
                             break
 
                         teacher, noise, generation = self._corpus_settings(
@@ -8383,6 +8550,17 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
     recovery_cfg = yaml_config.get('recovery_experiment', {})
     generation_mix_cfg = selfplay_cfg.get('generation_mix', {})
     augmentation_cfg = yaml_config.get('augmentation', {})
+
+    minimum_free_disk_gb = selfplay_cfg.get('minimum_free_disk_gb', 0.0)
+    if (
+        isinstance(minimum_free_disk_gb, bool)
+        or not isinstance(minimum_free_disk_gb, (int, float))
+        or not math.isfinite(float(minimum_free_disk_gb))
+        or float(minimum_free_disk_gb) < 0
+    ):
+        raise ValueError(
+            "selfplay.minimum_free_disk_gb must be a finite non-negative number"
+        )
     
     # Parse stop time if duration is set
     stop_time = None
@@ -8422,6 +8600,7 @@ def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
         teacher_difficulty=str(selfplay_cfg.get('teacher_difficulty', 'hard')),
         pipeline_mode=selfplay_cfg.get('pipeline_mode', 'simultaneous'),
         max_stale_epochs=selfplay_cfg.get('max_stale_epochs', 0),
+        selfplay_min_free_disk_gb=float(minimum_free_disk_gb),
         # Algo-vs-algo settings
         algo_vs_algo_enabled=algo_vs_algo_cfg.get('enabled', False),
         algo_vs_algo_games=algo_vs_algo_cfg.get('games_per_epoch', 100),
