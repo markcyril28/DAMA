@@ -130,7 +130,11 @@ def evaluate_acceptance_gates(
     ``to_dict()`` method, such as ``TestStatistics``. The helper also enforces
     the approved protocol size of 100 games per opponent and 50 games per side.
     """
-    if not math.isfinite(teacher_agreement) or not 0.0 <= teacher_agreement <= 1.0:
+    if (
+        type(teacher_agreement) not in (int, float)
+        or not math.isfinite(teacher_agreement)
+        or not 0.0 <= teacher_agreement <= 1.0
+    ):
         raise ValueError("teacher_agreement must be finite and within [0, 1]")
 
     random_data = _as_mapping(random_result)
@@ -204,12 +208,12 @@ def _as_mapping(value: Any) -> Mapping[str, Any]:
 
 def _extract_wdl(data: Mapping[str, Any], prefix: str = "") -> Tuple[int, int, int]:
     if prefix:
-        wins = int(data.get(f"{prefix}wins", 0))
-        draws = int(data.get(f"{prefix}draws", 0))
-        losses = int(data.get(f"{prefix}losses", 0))
+        wins = data.get(f"{prefix}wins", 0)
+        draws = data.get(f"{prefix}draws", 0)
+        losses = data.get(f"{prefix}losses", 0)
     else:
-        wins = int(data.get("ml_wins", data.get("wins", 0)))
-        draws = int(data.get("draws", 0))
-        losses = int(data.get("opponent_wins", data.get("algo_wins", 0)))
+        wins = data.get("ml_wins", data.get("wins", 0))
+        draws = data.get("draws", 0)
+        losses = data.get("opponent_wins", data.get("algo_wins", 0))
     _validate_wdl(wins, draws, losses)
     return wins, draws, losses
