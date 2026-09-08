@@ -181,9 +181,23 @@ def _stage_runtime_model_checkpoint(
     serialized = buffer.getbuffer()
     try:
         digest = hashlib.sha256(serialized).hexdigest().upper()
-        if persist_to_disk:
-            with path.open("wb") as handle:
-                handle.write(serialized)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.unlink(missing_ok=True)
+        try:
+            with temporary.open("wb") as handle:
+                written = handle.write(serialized)
+                if written != len(serialized):
+                    raise OSError(
+                        f"short runtime-checkpoint write: "
+                        f"{written}/{len(serialized)} bytes"
+                    )
+                handle.flush()
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     finally:
         serialized.release()
         buffer.close()
@@ -2564,14 +2578,22 @@ class Trainer:
             return
         if seed_path.resolve() == stats_path.resolve():
             return
+        temp_path = None
         try:
             stats_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = stats_path.with_name(stats_path.name + '.seed.tmp')
             shutil.copyfile(seed_path, temp_path)
             os.replace(temp_path, stats_path)
+            temp_path = None
         except OSError as exc:
             print(f"Could not seed training stats from {seed_path}: {exc}")
             return
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         print(
             "Recovery stats seeded without modifying the legacy stats file: "
             f"{stats_path}"
