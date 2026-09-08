@@ -2756,6 +2756,28 @@ def test_acceptance_gate_rejects_missing_teacher_counts(
         validate_recovery_experiment_config(fixture["config"])
 
 
+def test_enhanced_stage_rejects_coerced_promotion_agreement(
+    tmp_path: Path,
+) -> None:
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    fixture["registry_record"]["teacher_agreement"] = "0.55"
+    fixture["write_registry"]()
+
+    with pytest.raises(ValueError, match="recorded promoted policy-only"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
+def test_enhanced_stage_rejects_coerced_report_agreement(
+    tmp_path: Path,
+) -> None:
+    fixture = _enhanced_stage_acceptance_fixture(tmp_path)
+    fixture["report"]["metrics"]["teacher_agreement"] = "0.55"
+    fixture["write_report"]()
+
+    with pytest.raises(ValueError, match="agreement provenance"):
+        validate_recovery_experiment_config(fixture["config"])
+
+
 def test_enhanced_stage_resumes_only_from_recorded_policy_promotion(
     tmp_path: Path,
 ) -> None:
