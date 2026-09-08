@@ -34,6 +34,63 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _append_jsonl_atomic(path: Path, record: Mapping[str, Any]) -> None:
+    """Append one JSONL record without exposing an incomplete public row.
+
+    Promotion history is the durable authority used to reconstruct acceptance
+    work after a restart. A direct append can leave a partial final object on
+    an I/O failure, and a later append then joins onto that tail. Stream the
+    small existing registry into a same-directory replacement so readers see
+    either the previous complete history or the complete appended history.
+    """
+
+    payload = (
+        json.dumps(dict(record), sort_keys=True).encode("utf-8") + b"\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temp_name)
+    try:
+        raw_handle = os.fdopen(fd, "wb")
+        fd = -1
+        with raw_handle as handle:
+            last_byte = b""
+            try:
+                with path.open("rb") as source:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        last_byte = chunk[-1:]
+            except FileNotFoundError:
+                pass
+            if last_byte and last_byte != b"\n":
+                raise RuntimeError(
+                    f"Promotion registry has an incomplete final row: {path}"
+                )
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup is best-effort and must not mask the write or replace
+            # failure that kept the previous registry authoritative.
+            pass
+
+
 def _matching_move_index(legal_moves: Sequence[Move], chosen: Optional[Move]) -> int:
     if not legal_moves:
         raise ValueError("Cannot label a state without legal moves")
@@ -470,9 +527,4 @@ class PromotionRegistry:
     def persist(self, decision: PromotionDecision) -> None:
         """Append a decision after its referenced checkpoint is durable."""
         record = dict(decision.record)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(record, sort_keys=True))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        _append_jsonl_atomic(self.path, record)
