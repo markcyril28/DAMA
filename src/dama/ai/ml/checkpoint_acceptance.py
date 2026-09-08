@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import math
 import os
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from .model_vs_algo import (
 PENDING_TASK_SCHEMA_VERSION = 1
 PENDING_TASK_PREFIX = "pending_acceptance_"
 FAILURE_REPORT_PREFIX = "acceptance_failure_"
+FROZEN_TEACHER_SUITE_SIZE = 5000
 _ACCEPTANCE_SELECTION_SEQUENCE = [
     "held_out_teacher_agreement",
     "random_game_strength",
@@ -33,13 +35,81 @@ _ACCEPTANCE_SELECTION_SEQUENCE = [
 ]
 
 
+def _normalize_acceptance_step(step: int) -> int:
+    """Return an exact non-negative checkpoint step."""
+    if type(step) is not int or step < 0:
+        raise ValueError(
+            "Acceptance step must be a non-negative integer")
+    return step
+
+
 def acceptance_task_id(checkpoint_path: str, step: int) -> str:
     """Return a stable identifier for one promoted checkpoint evaluation."""
+    step = _normalize_acceptance_step(step)
     normalized_path = os.path.normcase(
         str(Path(checkpoint_path).expanduser().resolve(strict=False)))
-    identity = f"{int(step)}\n{normalized_path}".encode("utf-8")
+    identity = f"{step}\n{normalized_path}".encode("utf-8")
     digest = hashlib.sha256(identity).hexdigest()[:16]
-    return f"step-{int(step):06d}-{digest}"
+    return f"step-{step:06d}-{digest}"
+
+
+def _normalize_acceptance_opening_plies(
+    opening_plies: Sequence[int],
+) -> tuple[int, ...]:
+    """Return the exact positive-integer opening schedule for acceptance."""
+    try:
+        normalized = tuple(opening_plies)
+    except TypeError as exc:
+        raise ValueError(
+            "Acceptance opening plies must be non-empty and positive integers"
+        ) from exc
+    if (
+        not normalized
+        or any(type(value) is not int or value <= 0 for value in normalized)
+    ):
+        raise ValueError(
+            "Acceptance opening plies must be non-empty and positive integers")
+    return normalized
+
+
+def _normalize_acceptance_opening_seed(opening_seed: int) -> int:
+    """Return an exact integer seed for the paired opening schedule."""
+    if type(opening_seed) is not int:
+        raise ValueError("Acceptance opening_seed must be an integer")
+    return opening_seed
+
+
+def _normalize_acceptance_game_bounds(
+    inference_depth: int,
+    max_moves: int,
+) -> tuple[int, int]:
+    """Return the supported inference depth and a positive move limit."""
+    if type(inference_depth) is not int or inference_depth not in (1, 2, 3):
+        raise ValueError(
+            "Acceptance inference depth must be one of 1, 2, or 3")
+    if type(max_moves) is not int or max_moves <= 0:
+        raise ValueError("Acceptance max_moves must be a positive integer")
+    return inference_depth, max_moves
+
+
+def _normalize_acceptance_num_workers(num_workers: int) -> int:
+    """Return an exact positive worker count for acceptance evaluation."""
+    if type(num_workers) is not int or num_workers <= 0:
+        raise ValueError(
+            "Acceptance num_workers must be a positive integer")
+    return num_workers
+
+
+def _normalize_sha256(value: Any, *, field: str) -> str:
+    """Return one exact hexadecimal SHA-256 provenance value."""
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in value)
+    ):
+        raise ValueError(
+            f"Pending acceptance {field} must be 64 hexadecimal characters")
+    return value
 
 
 def make_pending_acceptance_task(
@@ -61,29 +131,36 @@ def make_pending_acceptance_task(
     """Build the complete durable input for one acceptance evaluation."""
     durable_checkpoint_path = str(
         Path(checkpoint_path).expanduser().resolve(strict=False))
+    step = _normalize_acceptance_step(step)
+    inference_depth, max_moves = _normalize_acceptance_game_bounds(
+        inference_depth, max_moves)
+    num_workers = _normalize_acceptance_num_workers(num_workers)
+    checkpoint_sha256 = _normalize_sha256(
+        checkpoint_sha256, field="checkpoint_sha256").upper()
+    suite_fingerprint = _normalize_sha256(
+        suite_fingerprint, field="suite_fingerprint")
     task = {
         "schema_version": PENDING_TASK_SCHEMA_VERSION,
         "status": "pending",
         "task_id": acceptance_task_id(durable_checkpoint_path, step),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint_path": durable_checkpoint_path,
-        "step": int(step),
-        "teacher_agreement": float(teacher_agreement),
-        "opening_plies": [int(value) for value in opening_plies],
-        "opening_seed": int(opening_seed),
-        "inference_depth": int(inference_depth),
-        "max_moves": int(max_moves),
-        "num_workers": max(1, int(num_workers)),
+        "step": step,
+        "teacher_agreement": teacher_agreement,
+        "opening_plies": list(
+            _normalize_acceptance_opening_plies(opening_plies)),
+        "opening_seed": _normalize_acceptance_opening_seed(opening_seed),
+        "inference_depth": inference_depth,
+        "max_moves": max_moves,
+        "num_workers": num_workers,
         "training_stage": str(training_stage),
+        "checkpoint_sha256": checkpoint_sha256,
+        "suite_fingerprint": suite_fingerprint,
     }
-    if checkpoint_sha256:
-        task["checkpoint_sha256"] = str(checkpoint_sha256).upper()
-    if suite_fingerprint:
-        task["suite_fingerprint"] = str(suite_fingerprint)
     if teacher_correct_states is not None:
-        task["teacher_correct_states"] = int(teacher_correct_states)
+        task["teacher_correct_states"] = teacher_correct_states
     if teacher_total_states is not None:
-        task["teacher_total_states"] = int(teacher_total_states)
+        task["teacher_total_states"] = teacher_total_states
     return _validate_pending_acceptance_task(task)
 
 
@@ -113,12 +190,38 @@ def persist_pending_acceptance_task(
     output_root.mkdir(parents=True, exist_ok=True)
     path = pending_acceptance_task_path(output_root, normalized)
     if path.exists():
-        existing = load_pending_acceptance_task(path)
-        if not _pending_acceptance_tasks_match(existing, normalized):
-            raise RuntimeError(f"Pending acceptance task conflicts with {path}")
-        return path
+        try:
+            existing = load_pending_acceptance_task(path)
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            # The append-only promotion registry can reconstruct this exact
+            # task after a crash, but an invalid file at the deterministic
+            # pathname would otherwise block every relaunch. Preserve its
+            # bytes for diagnosis outside the discovery glob, then let the
+            # normal atomic writer restore the validated task below. I/O
+            # failures still propagate rather than treating a transient read
+            # problem as corrupt content.
+            quarantine = _quarantine_unreadable_pending_task(path)
+            print(
+                f"Quarantined unreadable pending acceptance task {path} "
+                f"as {quarantine}: {exc}"
+            )
+        else:
+            if not _pending_acceptance_tasks_match(existing, normalized):
+                raise RuntimeError(f"Pending acceptance task conflicts with {path}")
+            return path
     _write_json_atomic(path, normalized)
     return path
+
+
+def _quarantine_unreadable_pending_task(path: Path) -> Path:
+    """Move one invalid pending task outside the active discovery pattern."""
+    quarantine = path.with_name(f".{path.name}.corrupt")
+    suffix = 0
+    while quarantine.exists():
+        suffix += 1
+        quarantine = path.with_name(f".{path.name}.corrupt.{suffix}")
+    path.rename(quarantine)
+    return quarantine
 
 
 def load_pending_acceptance_task(path: str | Path) -> dict[str, Any]:
@@ -144,7 +247,14 @@ def discover_pending_acceptance_tasks(
     for path in sorted(output_root.glob(f"{PENDING_TASK_PREFIX}*.json")):
         try:
             tasks.append(load_pending_acceptance_task(path))
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            OverflowError,
+            json.JSONDecodeError,
+        ) as exc:
             print(f"Ignoring unreadable pending acceptance task {path}: {exc}")
     tasks.sort(key=lambda task: (int(task["step"]), str(task["task_id"])))
     return tasks
@@ -186,7 +296,8 @@ def load_completed_acceptance_report(
         task_checkpoint = os.path.normcase(str(
             Path(normalized["checkpoint_path"]).expanduser().resolve(
                 strict=False)))
-        if (int(report.get("step", -1)) != normalized["step"]
+        if (type(report.get("step")) is not int
+                or report["step"] != normalized["step"]
                 or report_checkpoint != task_checkpoint):
             return None
         # A report is terminal only for the exact durable protocol input.
@@ -410,10 +521,13 @@ def load_terminal_acceptance_report(
             return None
         normalized = _validate_pending_acceptance_task(task)
         if (
-            report.get("status") != "error"
+            type(report.get("schema_version")) is not int
+            or report["schema_version"] != 1
+            or report.get("status") != "error"
             or report.get("passed") is not False
             or str(report.get("task_id")) != normalized["task_id"]
-            or int(report.get("step", -1)) != normalized["step"]
+            or type(report.get("step")) is not int
+            or report["step"] != normalized["step"]
             or not _pending_acceptance_tasks_match(report_task, normalized)
         ):
             return None
@@ -467,9 +581,8 @@ def verify_pending_acceptance_checkpoint(
     task: Mapping[str, Any],
 ) -> Optional[str]:
     """Verify a recorded checkpoint digest immediately before evaluation."""
-    expected = task.get("checkpoint_sha256")
-    if not expected:
-        return None
+    expected = _normalize_sha256(
+        task.get("checkpoint_sha256"), field="checkpoint_sha256").upper()
     checkpoint_path = Path(str(task["checkpoint_path"]))
     if not checkpoint_path.is_file():
         raise FileNotFoundError(
@@ -479,7 +592,6 @@ def verify_pending_acceptance_checkpoint(
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     actual = digest.hexdigest().upper()
-    expected = str(expected).upper()
     if not hmac.compare_digest(actual, expected):
         raise RuntimeError(
             f"Pending acceptance checkpoint SHA-256 mismatch for "
@@ -511,25 +623,39 @@ def _validate_pending_acceptance_task(
         "max_moves",
         "num_workers",
         "training_stage",
+        "checkpoint_sha256",
+        "suite_fingerprint",
     }
     missing = sorted(required - set(task))
     if missing:
         raise ValueError(f"Pending acceptance task is missing fields: {missing}")
-    if int(task["schema_version"]) != PENDING_TASK_SCHEMA_VERSION:
+    if (
+        type(task["schema_version"]) is not int
+        or task["schema_version"] != PENDING_TASK_SCHEMA_VERSION
+    ):
         raise ValueError("Unsupported pending acceptance task schema_version")
     if task["status"] != "pending":
         raise ValueError("Pending acceptance task status must be 'pending'")
     checkpoint_path = str(task["checkpoint_path"])
-    step = int(task["step"])
+    step = _normalize_acceptance_step(task["step"])
     expected_id = acceptance_task_id(checkpoint_path, step)
     if str(task["task_id"]) != expected_id:
         raise ValueError("Pending acceptance task_id does not match checkpoint and step")
-    if step < 0:
-        raise ValueError("Pending acceptance step must be non-negative")
-    opening_plies = [int(value) for value in task["opening_plies"]]
-    if not opening_plies or any(value <= 0 for value in opening_plies):
-        raise ValueError(
-            "Pending acceptance opening plies must be non-empty and positive")
+    opening_plies = list(
+        _normalize_acceptance_opening_plies(task["opening_plies"]))
+    opening_seed = _normalize_acceptance_opening_seed(task["opening_seed"])
+    inference_depth, max_moves = _normalize_acceptance_game_bounds(
+        task["inference_depth"], task["max_moves"])
+    num_workers = _normalize_acceptance_num_workers(task["num_workers"])
+    (
+        teacher_agreement,
+        teacher_correct_states,
+        teacher_total_states,
+    ) = _validate_teacher_evidence(
+        task["teacher_agreement"],
+        task.get("teacher_correct_states"),
+        task.get("teacher_total_states"),
+    )
     normalized = dict(task)
     normalized.update({
         "schema_version": PENDING_TASK_SCHEMA_VERSION,
@@ -538,35 +664,20 @@ def _validate_pending_acceptance_task(
         "created_at": str(task["created_at"]),
         "checkpoint_path": checkpoint_path,
         "step": step,
-        "teacher_agreement": float(task["teacher_agreement"]),
+        "teacher_agreement": teacher_agreement,
         "opening_plies": opening_plies,
-        "opening_seed": int(task["opening_seed"]),
-        "inference_depth": int(task["inference_depth"]),
-        "max_moves": int(task["max_moves"]),
-        "num_workers": max(1, int(task["num_workers"])),
+        "opening_seed": opening_seed,
+        "inference_depth": inference_depth,
+        "max_moves": max_moves,
+        "num_workers": num_workers,
         "training_stage": str(task["training_stage"]),
+        "teacher_correct_states": teacher_correct_states,
+        "teacher_total_states": teacher_total_states,
+        "checkpoint_sha256": _normalize_sha256(
+            task["checkpoint_sha256"], field="checkpoint_sha256").upper(),
+        "suite_fingerprint": _normalize_sha256(
+            task["suite_fingerprint"], field="suite_fingerprint"),
     })
-    if normalized.get("checkpoint_sha256"):
-        checkpoint_sha256 = str(normalized["checkpoint_sha256"]).upper()
-        if (len(checkpoint_sha256) != 64
-                or any(char not in "0123456789ABCDEF" for char in checkpoint_sha256)):
-            raise ValueError(
-                "Pending acceptance checkpoint_sha256 must be 64 hexadecimal characters")
-        normalized["checkpoint_sha256"] = checkpoint_sha256
-    if normalized.get("suite_fingerprint") is not None:
-        normalized["suite_fingerprint"] = str(normalized["suite_fingerprint"])
-    for key in ("teacher_correct_states", "teacher_total_states"):
-        if normalized.get(key) is not None:
-            normalized[key] = int(normalized[key])
-            if normalized[key] < 0:
-                raise ValueError(f"Pending acceptance {key} must be non-negative")
-    if (
-        normalized.get("teacher_correct_states") is not None
-        and normalized.get("teacher_total_states") is not None
-        and normalized["teacher_correct_states"] > normalized["teacher_total_states"]
-    ):
-        raise ValueError(
-            "Pending acceptance teacher_correct_states exceeds total states")
     return normalized
 
 
@@ -605,15 +716,41 @@ def run_checkpoint_acceptance(
     teacher_total_states: Optional[int] = None,
 ) -> dict[str, Any]:
     """Evaluate random first, then easy, and atomically persist one report."""
+    # Reject corrupt durable evidence before creating a worker pool and running
+    # the fixed 200-game protocol. The same helper guards task persistence and
+    # recovery, while this boundary also protects standalone evaluator calls.
+    (
+        teacher_agreement,
+        teacher_correct_states,
+        teacher_total_states,
+    ) = _validate_teacher_evidence(
+        teacher_agreement,
+        teacher_correct_states,
+        teacher_total_states,
+    )
+    step = _normalize_acceptance_step(step)
+    inference_depth, max_moves = _normalize_acceptance_game_bounds(
+        inference_depth, max_moves)
+    # Direct callers do not necessarily pass through durable task creation.
+    # Enforce the same randomized-opening contract before creating the report
+    # directory or worker pool so invalid protocols cannot spend 200 games or
+    # become terminal evidence.
+    opening_plies = _normalize_acceptance_opening_plies(opening_plies)
+    opening_seed = _normalize_acceptance_opening_seed(opening_seed)
+    num_workers = _normalize_acceptance_num_workers(num_workers)
+    checkpoint_sha256 = _normalize_sha256(
+        checkpoint_sha256, field="checkpoint_sha256").upper()
+    suite_fingerprint = _normalize_sha256(
+        suite_fingerprint, field="suite_fingerprint")
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     common = {
         "model_path": checkpoint_path,
-        "num_workers": max(1, int(num_workers)),
-        "max_moves": int(max_moves),
-        "opening_plies": tuple(int(value) for value in opening_plies),
-        "opening_seed": int(opening_seed),
-        "ml_inference_depth": int(inference_depth),
+        "num_workers": num_workers,
+        "max_moves": max_moves,
+        "opening_plies": opening_plies,
+        "opening_seed": opening_seed,
+        "ml_inference_depth": inference_depth,
     }
 
     # Both phases use the same checkpoint and run sequentially. Reuse one
@@ -651,31 +788,75 @@ def run_checkpoint_acceptance(
         "schema_version": 1,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "checkpoint_path": str(Path(checkpoint_path)),
-        "step": int(step),
+        "step": step,
         "training_stage": str(training_stage),
         "task_id": task_id,
-        "checkpoint_sha256": (
-            str(checkpoint_sha256).upper() if checkpoint_sha256 else None),
+        "checkpoint_sha256": checkpoint_sha256,
         "frozen_suite_fingerprint": suite_fingerprint,
         "teacher_agreement_counts": {
             "correct_states": teacher_correct_states,
             "total_states": teacher_total_states,
         },
         "selection_sequence": list(_ACCEPTANCE_SELECTION_SEQUENCE),
-        "opening_seed": int(opening_seed),
+        "opening_seed": opening_seed,
         "opening_plies": [int(value) for value in opening_plies],
         "opening_suite_id": random_record.get("opening_suite_id"),
-        "inference_depth": int(inference_depth),
-        "max_moves": int(max_moves),
-        "num_workers": max(1, int(num_workers)),
+        "inference_depth": inference_depth,
+        "max_moves": max_moves,
+        "num_workers": num_workers,
         "random": random_record,
         "easy": easy_record,
         **decision.to_dict(),
     }
-    report_path = output_root / f"acceptance_step_{int(step):06d}.json"
+    report_path = output_root / f"acceptance_step_{step:06d}.json"
     _write_json_atomic(report_path, report)
     report["report_path"] = str(report_path)
     return report
+
+
+def _validate_teacher_agreement(value: Any) -> float:
+    """Return finite teacher agreement within the protocol's probability range."""
+    if type(value) not in (int, float):
+        raise ValueError(
+            "Pending acceptance teacher_agreement must be a real number")
+    agreement = float(value)
+    if not math.isfinite(agreement) or not 0.0 <= agreement <= 1.0:
+        raise ValueError(
+            "Pending acceptance teacher_agreement must be finite and within [0, 1]")
+    return agreement
+
+
+def _validate_teacher_evidence(
+    agreement: Any,
+    correct_states: Any,
+    total_states: Any,
+) -> tuple[float, int, int]:
+    """Validate the complete frozen-suite measurement behind acceptance."""
+    normalized_agreement = _validate_teacher_agreement(agreement)
+    if correct_states is None or total_states is None:
+        raise ValueError(
+            "Pending acceptance has no held-out teacher-agreement counts")
+    if type(correct_states) is not int or type(total_states) is not int:
+        raise ValueError(
+            "Pending acceptance teacher-agreement counts must be integers")
+    normalized_correct = correct_states
+    normalized_total = total_states
+    if normalized_total != FROZEN_TEACHER_SUITE_SIZE:
+        raise ValueError(
+            "Pending acceptance teacher agreement was measured on "
+            f"{normalized_total} held-out state(s), not the required "
+            f"{FROZEN_TEACHER_SUITE_SIZE}")
+    if normalized_correct < 0:
+        raise ValueError(
+            "Pending acceptance teacher_correct_states must be non-negative")
+    if normalized_correct > normalized_total:
+        raise ValueError(
+            "Pending acceptance teacher_correct_states exceeds total states")
+    if normalized_correct / normalized_total != normalized_agreement:
+        raise ValueError(
+            "Pending acceptance teacher agreement is not the quotient of its "
+            "recorded counts")
+    return normalized_agreement, normalized_correct, normalized_total
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
