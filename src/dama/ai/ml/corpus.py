@@ -1402,35 +1402,47 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     added = 0
     existing = _iter_state_keys(path) if path.is_file() else iter(())
     pending = next(existing, None)
-    with gzip.open(
-        temporary,
-        "wt",
-        encoding="ascii",
-        newline="\n",
-        compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
-    ) as handle:
-        index = 0
-        write_batch: List[str] = []
-        while pending is not None or index < len(additions):
-            if pending is not None and (
-                index >= len(additions) or pending <= additions[index]
-            ):
-                write_batch.append(pending)
-                if index < len(additions) and pending == additions[index]:
+    try:
+        with gzip.open(
+            temporary,
+            "wt",
+            encoding="ascii",
+            newline="\n",
+            compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
+        ) as handle:
+            index = 0
+            write_batch: List[str] = []
+            while pending is not None or index < len(additions):
+                if pending is not None and (
+                    index >= len(additions) or pending <= additions[index]
+                ):
+                    write_batch.append(pending)
+                    if index < len(additions) and pending == additions[index]:
+                        index += 1
+                    pending = next(existing, None)
+                else:
+                    write_batch.append(additions[index])
+                    added += 1
                     index += 1
-                pending = next(existing, None)
-            else:
-                write_batch.append(additions[index])
-                added += 1
-                index += 1
-            if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+                if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+                    handle.write("\n".join(write_batch))
+                    handle.write("\n")
+                    write_batch.clear()
+            if write_batch:
                 handle.write("\n".join(write_batch))
                 handle.write("\n")
-                write_batch.clear()
-        if write_batch:
-            handle.write("\n".join(write_batch))
-            handle.write("\n")
-    os.replace(temporary, path)
+        os.replace(temporary, path)
+    except BaseException:
+        # The canonical ledger is still authoritative until os.replace().  A
+        # failed gzip write used to strand its partial sibling indefinitely;
+        # one production capacity-exhaustion incident left a partial file while
+        # the volume reported zero bytes free and later replay closes raised EIO.
+        # Cleanup is best-effort so it never masks the original write failure.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return added
 
 
@@ -3729,6 +3741,19 @@ class CorpusSnapshotManager:
                 manifest["lineage_base"] = lineage_base_record
             _write_json_atomic(staging / "manifest.json", manifest)
             os.replace(staging, final_dir)
+
+            # The active pointer authorizes the trainer to consume this
+            # snapshot.  Commit its states to the all-time ledger first so a
+            # failed ledger rewrite can never expose unrecorded training data
+            # through CURRENT/current.json.  The immutable snapshot directory
+            # may remain as crash evidence, but the previous active snapshot
+            # stays authoritative until the ledger transaction succeeds.
+            self._record_trained_ledger(
+                version=version,
+                file_records=stored_files,
+                state_keys=train_keys,
+            )
+
             _write_json_atomic(
                 self.snapshot_root / "current.json",
                 {"manifest": (Path(final_dir.name) / "manifest.json").as_posix(), "fingerprint": fingerprint},
@@ -3740,11 +3765,6 @@ class CorpusSnapshotManager:
             if staging.exists():
                 shutil.rmtree(staging)
             raise
-
-        # Only now that the snapshot is durable and current may the all-time
-        # ledger claim these shards and states as trained.
-        self._record_trained_ledger(
-            version=version, file_records=stored_files, state_keys=train_keys)
 
         # Reclaim disk only after the new snapshot is durable and current.
         pruned = self._prune_old_snapshots(final_dir)
