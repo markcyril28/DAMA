@@ -1301,6 +1301,68 @@ def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
     run_status._write_json_atomic(path, value)
 
 
+def _write_jsonl_atomic(
+    path: Path,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    append_existing: bool = False,
+) -> None:
+    """Atomically publish JSONL rows, optionally preserving existing rows.
+
+    The trained-shard ledger is logically append-only, but an in-place append
+    can strand a partial JSON record after a disk or filesystem error.  A later
+    append then joins its first row to that partial tail, hiding both records
+    from reload.  Stream the small existing shard ledger into a same-directory
+    replacement so the public path changes only after every new row is durable.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temp_name)
+    try:
+        raw_handle = os.fdopen(fd, "wb")
+        fd = -1
+        with raw_handle as handle:
+            last_byte = b""
+            if append_existing:
+                try:
+                    with path.open("rb") as source:
+                        while True:
+                            chunk = source.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            last_byte = chunk[-1:]
+                except FileNotFoundError:
+                    pass
+            if last_byte and last_byte != b"\n":
+                handle.write(b"\n")
+            for row in rows:
+                handle.write(json.dumps(
+                    row, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8"))
+                handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup is best-effort and must not mask the write or replace
+            # failure that kept the previous ledger authoritative.
+            pass
+
+
 def _write_state_keys(path: Path, state_keys: Iterable[str]) -> None:
     # Proofread 2026-08-25 C2: this file is part of the committed snapshot --
     # ``manifest.json`` names it and is treated as "the single commit point",
@@ -2803,11 +2865,13 @@ class CorpusSnapshotManager:
             })
 
         self.trained_ledger_dir.mkdir(parents=True, exist_ok=True)
-        with self._ledger_shards_path.open("w", encoding="utf-8", newline="\n") as handle:
-            for name in sorted(shard_records):
-                handle.write(json.dumps(
-                    {**shard_records[name], "recorded_by": "seed"},
-                    sort_keys=True, separators=(",", ":")) + "\n")
+        _write_jsonl_atomic(
+            self._ledger_shards_path,
+            (
+                {**shard_records[name], "recorded_by": "seed"}
+                for name in sorted(shard_records)
+            ),
+        )
         self._ledger_state_keys_path.unlink(missing_ok=True)
         _merge_state_keys_file(self._ledger_state_keys_path, state_keys)
         _write_json_atomic(self._ledger_seed_path, {
@@ -2853,17 +2917,29 @@ class CorpusSnapshotManager:
         names: Set[str] = set()
         if self._ledger_shards_path.is_file():
             with self._ledger_shards_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
+                for line_number, line in enumerate(handle, start=1):
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            "Trained-shard ledger contains malformed JSON at "
+                            f"{self._ledger_shards_path}:{line_number}"
+                        ) from exc
+                    if not isinstance(record, dict):
+                        raise RuntimeError(
+                            "Trained-shard ledger contains a non-object row at "
+                            f"{self._ledger_shards_path}:{line_number}"
+                        )
                     name = record.get("name")
-                    if isinstance(name, str):
-                        names.add(name)
+                    if not isinstance(name, str) or not name:
+                        raise RuntimeError(
+                            "Trained-shard ledger contains an invalid shard name at "
+                            f"{self._ledger_shards_path}:{line_number}"
+                        )
+                    names.add(name)
         fingerprints = self._load_ledger_fingerprint_sidecar()
         if fingerprints is None:
             fingerprints = set()
@@ -2921,9 +2997,9 @@ class CorpusSnapshotManager:
         """Append one admission to the append-only all-time trained ledger.
 
         Called only after the snapshot is durable, so the ledger never claims a
-        shard that no admission used.  Shard rows are appended; the state set is
-        rewritten as the union, which is the only representation that stays
-        answerable in one read after arbitrary pruning.
+        shard that no admission used. Shard rows are retained append-only through
+        atomic replacement; the state set is rewritten as the union, which is the
+        only representation that stays answerable in one read after pruning.
         """
         if not self.trained_ledger_enabled:
             return
@@ -2932,11 +3008,16 @@ class CorpusSnapshotManager:
         self.trained_ledger_dir.mkdir(parents=True, exist_ok=True)
         recorded_at = datetime.now(timezone.utc).isoformat()
         new_rows = []
+        new_names = set()
         for record in file_records:
             name = record.get("name")
-            if not isinstance(name, str) or name in known_names:
+            if (
+                not isinstance(name, str)
+                or name in known_names
+                or name in new_names
+            ):
                 continue
-            known_names.add(name)
+            new_names.add(name)
             new_rows.append({
                 "name": name,
                 "sha256": record.get("sha256"),
@@ -2945,14 +3026,12 @@ class CorpusSnapshotManager:
                 "recorded_by": "admission",
             })
         if new_rows:
-            with self._ledger_shards_path.open(
-                "a", encoding="utf-8", newline="\n"
-            ) as handle:
-                for row in new_rows:
-                    handle.write(json.dumps(
-                        row, sort_keys=True, separators=(",", ":")) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            _write_jsonl_atomic(
+                self._ledger_shards_path,
+                new_rows,
+                append_existing=True,
+            )
+            known_names.update(new_names)
         added_states = _merge_state_keys_file(
             self._ledger_state_keys_path, state_keys)
         known_fingerprints |= {
