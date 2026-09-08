@@ -35,6 +35,31 @@ _ACCEPTANCE_SELECTION_SEQUENCE = [
 ]
 
 
+def _values_match_exact(actual: Any, expected: Any) -> bool:
+    """Compare JSON evidence without bool/int or int/float coercion."""
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _values_match_exact(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _values_match_exact(actual_value, expected_value)
+            for actual_value, expected_value in zip(actual, expected)
+        )
+    return actual == expected
+
+
+def _normalize_acceptance_checkpoint_path(checkpoint_path: Any) -> str:
+    """Return one absolute checkpoint path without lossy type coercion."""
+    if type(checkpoint_path) is not str or not checkpoint_path:
+        raise ValueError(
+            "Acceptance checkpoint_path must be a non-empty string")
+    return str(Path(checkpoint_path).expanduser().resolve(strict=False))
+
+
 def _normalize_acceptance_step(step: int) -> int:
     """Return an exact non-negative checkpoint step."""
     if type(step) is not int or step < 0:
@@ -43,14 +68,38 @@ def _normalize_acceptance_step(step: int) -> int:
     return step
 
 
+def _acceptance_task_id_from_normalized_path(
+    checkpoint_path: str,
+    step: int,
+) -> str:
+    """Return an id after the public inputs have already been normalized."""
+    identity = f"{step}\n{os.path.normcase(checkpoint_path)}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    return f"step-{step:06d}-{digest}"
+
+
 def acceptance_task_id(checkpoint_path: str, step: int) -> str:
     """Return a stable identifier for one promoted checkpoint evaluation."""
     step = _normalize_acceptance_step(step)
-    normalized_path = os.path.normcase(
-        str(Path(checkpoint_path).expanduser().resolve(strict=False)))
-    identity = f"{step}\n{normalized_path}".encode("utf-8")
-    digest = hashlib.sha256(identity).hexdigest()[:16]
-    return f"step-{step:06d}-{digest}"
+    normalized_path = _normalize_acceptance_checkpoint_path(checkpoint_path)
+    return _acceptance_task_id_from_normalized_path(normalized_path, step)
+
+
+def _normalize_acceptance_task_id(
+    task_id: Any,
+    checkpoint_path: str,
+    step: int,
+    *,
+    allow_none: bool = False,
+) -> Optional[str]:
+    """Return the exact checkpoint identity expected by durable evaluation."""
+    if task_id is None and allow_none:
+        return None
+    expected = _acceptance_task_id_from_normalized_path(checkpoint_path, step)
+    if type(task_id) is not str or task_id != expected:
+        raise ValueError(
+            "Pending acceptance task_id does not match checkpoint and step")
+    return expected
 
 
 def _normalize_acceptance_opening_plies(
@@ -100,6 +149,17 @@ def _normalize_acceptance_num_workers(num_workers: int) -> int:
     return num_workers
 
 
+def _normalize_acceptance_training_stage(training_stage: str) -> str:
+    """Return one exact supported training stage for acceptance evidence."""
+    if type(training_stage) is not str or training_stage not in (
+        "policy_only",
+        "enhanced",
+    ):
+        raise ValueError(
+            "Acceptance training_stage must be 'policy_only' or 'enhanced'")
+    return training_stage
+
+
 def _normalize_sha256(value: Any, *, field: str) -> str:
     """Return one exact hexadecimal SHA-256 provenance value."""
     if (
@@ -129,8 +189,8 @@ def make_pending_acceptance_task(
     teacher_total_states: Optional[int] = None,
 ) -> dict[str, Any]:
     """Build the complete durable input for one acceptance evaluation."""
-    durable_checkpoint_path = str(
-        Path(checkpoint_path).expanduser().resolve(strict=False))
+    durable_checkpoint_path = _normalize_acceptance_checkpoint_path(
+        checkpoint_path)
     step = _normalize_acceptance_step(step)
     inference_depth, max_moves = _normalize_acceptance_game_bounds(
         inference_depth, max_moves)
@@ -142,7 +202,8 @@ def make_pending_acceptance_task(
     task = {
         "schema_version": PENDING_TASK_SCHEMA_VERSION,
         "status": "pending",
-        "task_id": acceptance_task_id(durable_checkpoint_path, step),
+        "task_id": _acceptance_task_id_from_normalized_path(
+            durable_checkpoint_path, step),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint_path": durable_checkpoint_path,
         "step": step,
@@ -153,7 +214,7 @@ def make_pending_acceptance_task(
         "inference_depth": inference_depth,
         "max_moves": max_moves,
         "num_workers": num_workers,
-        "training_stage": str(training_stage),
+        "training_stage": _normalize_acceptance_training_stage(training_stage),
         "checkpoint_sha256": checkpoint_sha256,
         "suite_fingerprint": suite_fingerprint,
     }
@@ -316,16 +377,23 @@ def load_completed_acceptance_report(
             ("task_id", "task_id"),
         )
         for task_key, report_key in provenance_pairs:
-            if report.get(report_key) != normalized.get(task_key):
+            if not _values_match_exact(
+                report.get(report_key), normalized.get(task_key)
+            ):
                 return None
-        if metrics.get("teacher_agreement") != normalized["teacher_agreement"]:
+        if not _values_match_exact(
+            metrics.get("teacher_agreement"),
+            normalized["teacher_agreement"],
+        ):
             return None
         count_pairs = (
             ("teacher_correct_states", "correct_states"),
             ("teacher_total_states", "total_states"),
         )
         for task_key, report_key in count_pairs:
-            if agreement_counts.get(report_key) != normalized.get(task_key):
+            if not _values_match_exact(
+                agreement_counts.get(report_key), normalized.get(task_key)
+            ):
                 return None
         if not _completed_acceptance_report_matches_task(report, normalized):
             return None
@@ -391,7 +459,7 @@ def _completed_acceptance_report_matches_task(
         }
         if (
             record_checkpoint != task_checkpoint
-            or any(record.get(key) != value
+            or any(not _values_match_exact(record.get(key), value)
                    for key, value in expected_metadata.items())
             or not _completed_game_records_match_task(
                 record, task, opponent_type)
@@ -410,7 +478,7 @@ def _completed_acceptance_report_matches_task(
     ):
         return False
     return all(
-        report.get(key) == decision_payload[key]
+        _values_match_exact(report.get(key), decision_payload[key])
         for key in ("checks", "metrics", "thresholds", "ci_method")
     )
 
@@ -462,7 +530,9 @@ def _completed_game_records_match_task(
             or type(opening_seed) is not int
             or type(opening_length) is not int
             or game.get("opponent_type") != opponent_type
-            or game.get("ml_inference_depth") != task["inference_depth"]
+            or not _values_match_exact(
+                game.get("ml_inference_depth"), task["inference_depth"]
+            )
         ):
             return False
 
@@ -474,10 +544,14 @@ def _completed_game_records_match_task(
         result = game.get("result")
         winner = game.get("winner")
         side = "p1" if player == 1 else "p2"
-        if result == "ml_win" and winner == player:
+        if result == "ml_win" and type(winner) is int and winner == player:
             counts["ml_wins"] += 1
             counts[f"ml_as_{side}_wins"] += 1
-        elif result == "algo_win" and winner == 3 - player:
+        elif (
+            result == "algo_win"
+            and type(winner) is int
+            and winner == 3 - player
+        ):
             counts["algo_wins"] += 1
             counts[f"ml_as_{side}_losses"] += 1
         elif result == "draw" and winner is None:
@@ -636,11 +710,11 @@ def _validate_pending_acceptance_task(
         raise ValueError("Unsupported pending acceptance task schema_version")
     if task["status"] != "pending":
         raise ValueError("Pending acceptance task status must be 'pending'")
-    checkpoint_path = str(task["checkpoint_path"])
+    checkpoint_path = _normalize_acceptance_checkpoint_path(
+        task["checkpoint_path"])
     step = _normalize_acceptance_step(task["step"])
-    expected_id = acceptance_task_id(checkpoint_path, step)
-    if str(task["task_id"]) != expected_id:
-        raise ValueError("Pending acceptance task_id does not match checkpoint and step")
+    expected_id = _normalize_acceptance_task_id(
+        task["task_id"], checkpoint_path, step)
     opening_plies = list(
         _normalize_acceptance_opening_plies(task["opening_plies"]))
     opening_seed = _normalize_acceptance_opening_seed(task["opening_seed"])
@@ -670,7 +744,8 @@ def _validate_pending_acceptance_task(
         "inference_depth": inference_depth,
         "max_moves": max_moves,
         "num_workers": num_workers,
-        "training_stage": str(task["training_stage"]),
+        "training_stage": _normalize_acceptance_training_stage(
+            task["training_stage"]),
         "teacher_correct_states": teacher_correct_states,
         "teacher_total_states": teacher_total_states,
         "checkpoint_sha256": _normalize_sha256(
@@ -742,6 +817,10 @@ def run_checkpoint_acceptance(
         checkpoint_sha256, field="checkpoint_sha256").upper()
     suite_fingerprint = _normalize_sha256(
         suite_fingerprint, field="suite_fingerprint")
+    training_stage = _normalize_acceptance_training_stage(training_stage)
+    checkpoint_path = _normalize_acceptance_checkpoint_path(checkpoint_path)
+    task_id = _normalize_acceptance_task_id(
+        task_id, checkpoint_path, step, allow_none=True)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     common = {
@@ -789,7 +868,7 @@ def run_checkpoint_acceptance(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "checkpoint_path": str(Path(checkpoint_path)),
         "step": step,
-        "training_stage": str(training_stage),
+        "training_stage": training_stage,
         "task_id": task_id,
         "checkpoint_sha256": checkpoint_sha256,
         "frozen_suite_fingerprint": suite_fingerprint,
