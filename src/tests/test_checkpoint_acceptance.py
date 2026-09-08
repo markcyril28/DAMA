@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -83,7 +84,10 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
         checkpoint_acceptance, "_evaluation_worker_context",
         lambda: worker_context,
     )
-    checkpoint_path = str(tmp_path / "model_step_136000.pt")
+    checkpoint = tmp_path / "model_step_136000.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    checkpoint_path = str(checkpoint)
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     task_id = checkpoint_acceptance.acceptance_task_id(
         checkpoint_path, 136000)
     report = checkpoint_acceptance.run_checkpoint_acceptance(
@@ -98,7 +102,7 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
         output_dir=str(tmp_path / "reports"),
         training_stage="policy_only",
         task_id=task_id,
-        checkpoint_sha256=_CHECKPOINT_SHA256,
+        checkpoint_sha256=checkpoint_sha256,
         suite_fingerprint=_SUITE_FINGERPRINT,
         teacher_correct_states=2750,
         teacher_total_states=5000,
@@ -119,6 +123,43 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
     saved = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
     assert saved["checks"]["random_exact_balanced_100_games"] is True
     assert saved["checks"]["easy_exact_balanced_100_games"] is True
+
+
+def test_direct_acceptance_rejects_checkpoint_hash_mismatch_before_evaluation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    def unexpected_worker_pool(**_kwargs):
+        raise AssertionError("checkpoint digest mismatch reached the worker pool")
+
+    monkeypatch.setattr(
+        checkpoint_acceptance, "ProcessPoolExecutor", unexpected_worker_pool)
+    checkpoint = tmp_path / "model_step_136000.pt"
+    checkpoint.write_bytes(b"actual checkpoint")
+    output_dir = tmp_path / "reports"
+
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        checkpoint_acceptance.run_checkpoint_acceptance(
+            str(checkpoint),
+            step=136000,
+            teacher_agreement=0.55,
+            opening_plies=(2, 4, 6, 8),
+            opening_seed=20260819,
+            inference_depth=1,
+            max_moves=200,
+            num_workers=2,
+            output_dir=str(output_dir),
+            training_stage="policy_only",
+            task_id=checkpoint_acceptance.acceptance_task_id(
+                str(checkpoint), 136000),
+            checkpoint_sha256=hashlib.sha256(
+                b"different checkpoint").hexdigest(),
+            suite_fingerprint=_SUITE_FINGERPRINT,
+            teacher_correct_states=2750,
+            teacher_total_states=5000,
+        )
+
+    assert not output_dir.exists()
 
 
 @pytest.mark.parametrize(
