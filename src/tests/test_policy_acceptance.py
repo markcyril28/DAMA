@@ -227,6 +227,41 @@ def test_injected_evaluation_executor_is_reused_without_internal_pool(
     assert calls[0][0] is model_vs_algo._play_test_games_batch
 
 
+def test_evaluation_stats_preserve_prior_latest_on_write_failure(
+    monkeypatch, tmp_path
+) -> None:
+    """A failed evaluation write must not truncate reusable prior evidence."""
+    tester = model_vs_algo.ModelVsAlgoTester(
+        model_path="unused.pt", num_workers=1, stats_dir=str(tmp_path))
+    stats = EvaluationStatistics(
+        model_path="unused.pt",
+        algo_difficulty="easy",
+        opponent_type="algorithm",
+    )
+    latest = tmp_path / "latest_test.json"
+    prior = b'{"prior":"valid"}\n'
+    latest.write_bytes(prior)
+    real_dump = model_vs_algo.json.dump
+    dump_calls = 0
+
+    def fail_after_partial_dump(payload, handle, *args, **kwargs):
+        nonlocal dump_calls
+        dump_calls += 1
+        if dump_calls == 2:
+            handle.write('{"partial":"broken"')
+            handle.flush()
+            raise OSError(28, "simulated evaluation stats disk full")
+        return real_dump(payload, handle, *args, **kwargs)
+
+    monkeypatch.setattr(model_vs_algo.json, "dump", fail_after_partial_dump)
+
+    with pytest.raises(OSError, match="simulated evaluation stats disk full"):
+        tester._save_stats(stats)
+
+    assert latest.read_bytes() == prior
+    assert not list(tmp_path.glob("latest_test.json.*.tmp"))
+
+
 def test_evaluation_worker_limits_pytorch_thread_pools(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(torch, "set_num_threads", lambda value: calls.append(("intra", value)))
