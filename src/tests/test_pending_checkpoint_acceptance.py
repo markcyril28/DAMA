@@ -162,6 +162,43 @@ def _write_success_report(
     return report_path
 
 
+def test_registry_task_replaces_modified_pending_teacher_evidence(
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    modified = dict(task)
+    modified["teacher_agreement"] = 1.0
+    modified["teacher_correct_states"] = 5000
+    output_dir = Path(_holder(tmp_path).config.acceptance_dir)
+    pending = checkpoint_acceptance.persist_pending_acceptance_task(
+        output_dir, modified)
+
+    holder = _holder(tmp_path)
+    holder._promotion_registry = SimpleNamespace(
+        records=lambda: ({"promoted": True},))
+    holder._acceptance_task_from_promotion = lambda _promotion: dict(task)
+    queued = {}
+
+    def _capture(candidate, *, persist):
+        task_id = candidate["task_id"]
+        if task_id in queued:
+            return False
+        if persist:
+            checkpoint_acceptance.persist_pending_acceptance_task(
+                output_dir, candidate)
+        queued[task_id] = dict(candidate)
+        return True
+
+    holder._queue_checkpoint_acceptance_task = _capture
+
+    assert holder._recover_pending_checkpoint_acceptance() == 1
+    assert list(queued.values()) == [task]
+    assert checkpoint_acceptance.load_pending_acceptance_task(pending) == task
+    quarantined = list(output_dir.glob(f".{pending.name}.corrupt*"))
+    assert len(quarantined) == 1
+    assert json.loads(quarantined[0].read_text(encoding="utf-8")) == modified
+
+
 def test_pending_task_is_atomic_and_discoverable(tmp_path: Path) -> None:
     task = _make_task(tmp_path)
     output_dir = tmp_path / "acceptance"
@@ -709,6 +746,40 @@ def test_registry_recovery_rejects_nonfinite_pending_teacher_evidence(
     assert len(quarantines) == 1
     quarantined = json.loads(quarantines[0].read_text(encoding="utf-8"))
     assert str(quarantined["teacher_agreement"]) == "nan"
+
+
+@pytest.mark.parametrize("promoted", (1, "false"))
+def test_registry_recovery_rejects_non_boolean_promotion_decision(
+    tmp_path: Path,
+    capsys,
+    promoted,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": promoted,
+        "step": task["step"],
+        "teacher_agreement": task["teacher_agreement"],
+        "training_stage": task["training_stage"],
+        "checkpoint_path": task["checkpoint_path"],
+        "checkpoint_sha256": task["checkpoint_sha256"],
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": task.get("teacher_correct_states"),
+        "teacher_total_states": task.get("teacher_total_states"),
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+
+    assert holder._recover_pending_checkpoint_acceptance() == 0
+
+    assert holder._acceptance_queue.empty()
+    assert not Path(holder.config.acceptance_dir).exists()
+    assert "promoted decision must be a boolean" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("step", (True, "140000", 140000.5, -1))
@@ -1540,21 +1611,22 @@ def test_checkpoint_hash_mismatch_writes_failure_without_running_evaluator(
     pending_path = checkpoint_acceptance.persist_pending_acceptance_task(
         holder.config.acceptance_dir, task)
     Path(task["checkpoint_path"]).write_bytes(b"tampered checkpoint")
-    evaluator_called = False
+    worker_pool_called = False
 
-    def unexpected_run(*args, **kwargs):
-        nonlocal evaluator_called
-        evaluator_called = True
-        raise AssertionError("evaluator must not run after a digest mismatch")
+    def unexpected_worker_pool(**_kwargs):
+        nonlocal worker_pool_called
+        worker_pool_called = True
+        raise AssertionError(
+            "worker pool must not run after a digest mismatch")
 
     monkeypatch.setattr(
-        checkpoint_acceptance, "run_checkpoint_acceptance", unexpected_run)
+        checkpoint_acceptance, "ProcessPoolExecutor", unexpected_worker_pool)
 
     holder._process_checkpoint_acceptance_task(task)
 
     failure_path = checkpoint_acceptance.failure_acceptance_report_path(
         holder.config.acceptance_dir, task)
-    assert evaluator_called is False
+    assert worker_pool_called is False
     assert failure_path.exists()
     assert not pending_path.exists()
     failure = json.loads(failure_path.read_text(encoding="utf-8"))
