@@ -83,8 +83,11 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
         checkpoint_acceptance, "_evaluation_worker_context",
         lambda: worker_context,
     )
+    checkpoint_path = str(tmp_path / "model_step_136000.pt")
+    task_id = checkpoint_acceptance.acceptance_task_id(
+        checkpoint_path, 136000)
     report = checkpoint_acceptance.run_checkpoint_acceptance(
-        str(tmp_path / "model_step_136000.pt"),
+        checkpoint_path,
         step=136000,
         teacher_agreement=0.55,
         opening_plies=(2, 4, 6, 8),
@@ -94,6 +97,7 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
         num_workers=2,
         output_dir=str(tmp_path / "reports"),
         training_stage="policy_only",
+        task_id=task_id,
         checkpoint_sha256=_CHECKPOINT_SHA256,
         suite_fingerprint=_SUITE_FINGERPRINT,
         teacher_correct_states=2750,
@@ -110,6 +114,7 @@ def test_promoted_checkpoint_runs_fixed_random_then_easy_protocol(
     assert executor.entered and executor.exited
     assert all(call["executor"] is executor for call in _Tester.calls)
     assert report["passed"] is True
+    assert report["task_id"] == task_id
     assert report["opening_suite_id"] == "fixed-suite"
     saved = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
     assert saved["checks"]["random_exact_balanced_100_games"] is True
@@ -133,6 +138,88 @@ def test_acceptance_task_rejects_invalid_opening_plies(opening_plies) -> None:
             max_moves=200, num_workers=1, training_stage="policy_only",
             checkpoint_sha256=_CHECKPOINT_SHA256,
             suite_fingerprint=_SUITE_FINGERPRINT)
+
+
+@pytest.mark.parametrize("checkpoint_path", (True, 1, ["checkpoint.pt"], ""))
+def test_acceptance_task_rejects_invalid_checkpoint_path(checkpoint_path) -> None:
+    with pytest.raises(ValueError, match="checkpoint_path must be"):
+        checkpoint_acceptance.make_pending_acceptance_task(
+            checkpoint_path, step=1, teacher_agreement=0.55,
+            opening_plies=(2, 4, 6, 8), opening_seed=1,
+            inference_depth=1, max_moves=200, num_workers=1,
+            training_stage="policy_only", teacher_correct_states=2750,
+            teacher_total_states=5000,
+            checkpoint_sha256=_CHECKPOINT_SHA256,
+            suite_fingerprint=_SUITE_FINGERPRINT)
+
+
+@pytest.mark.parametrize("checkpoint_path", (True, 1, ["checkpoint.pt"], ""))
+def test_direct_acceptance_rejects_invalid_checkpoint_before_evaluation(
+    monkeypatch,
+    tmp_path: Path,
+    checkpoint_path,
+) -> None:
+    def unexpected_worker_pool(**_kwargs):
+        raise AssertionError("invalid checkpoint path reached the worker pool")
+
+    monkeypatch.setattr(
+        checkpoint_acceptance, "ProcessPoolExecutor", unexpected_worker_pool)
+    output_dir = tmp_path / "reports"
+
+    with pytest.raises(ValueError, match="checkpoint_path must be"):
+        checkpoint_acceptance.run_checkpoint_acceptance(
+            checkpoint_path,
+            step=136000,
+            teacher_agreement=0.55,
+            opening_plies=(2, 4, 6, 8),
+            opening_seed=20260819,
+            inference_depth=1,
+            max_moves=200,
+            num_workers=2,
+            output_dir=str(output_dir),
+            training_stage="policy_only",
+            checkpoint_sha256=_CHECKPOINT_SHA256,
+            suite_fingerprint=_SUITE_FINGERPRINT,
+            teacher_correct_states=2750,
+            teacher_total_states=5000,
+        )
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("task_id", (True, 136000, "wrong-task-id"))
+def test_direct_acceptance_rejects_invalid_task_id_before_evaluation(
+    monkeypatch,
+    tmp_path: Path,
+    task_id,
+) -> None:
+    def unexpected_worker_pool(**_kwargs):
+        raise AssertionError("invalid task id reached the worker pool")
+
+    monkeypatch.setattr(
+        checkpoint_acceptance, "ProcessPoolExecutor", unexpected_worker_pool)
+    output_dir = tmp_path / "reports"
+
+    with pytest.raises(ValueError, match="task_id does not match"):
+        checkpoint_acceptance.run_checkpoint_acceptance(
+            str(tmp_path / "model_step_136000.pt"),
+            step=136000,
+            teacher_agreement=0.55,
+            opening_plies=(2, 4, 6, 8),
+            opening_seed=20260819,
+            inference_depth=1,
+            max_moves=200,
+            num_workers=2,
+            output_dir=str(output_dir),
+            training_stage="policy_only",
+            task_id=task_id,
+            checkpoint_sha256=_CHECKPOINT_SHA256,
+            suite_fingerprint=_SUITE_FINGERPRINT,
+            teacher_correct_states=2750,
+            teacher_total_states=5000,
+        )
+
+    assert not output_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -265,6 +352,55 @@ def test_direct_acceptance_rejects_invalid_num_workers_before_evaluation(
             num_workers=num_workers,
             output_dir=str(output_dir),
             training_stage="policy_only",
+            checkpoint_sha256=_CHECKPOINT_SHA256,
+            suite_fingerprint=_SUITE_FINGERPRINT,
+            teacher_correct_states=2750,
+            teacher_total_states=5000,
+        )
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "training_stage", (True, 1, ["policy_only"], "unknown", ""))
+def test_acceptance_task_rejects_invalid_training_stage(training_stage) -> None:
+    with pytest.raises(ValueError, match="training_stage must be"):
+        checkpoint_acceptance.make_pending_acceptance_task(
+            "checkpoint.pt", step=1, teacher_agreement=0.55,
+            opening_plies=(2, 4, 6, 8), opening_seed=20260819,
+            inference_depth=1, max_moves=200, num_workers=1,
+            training_stage=training_stage, teacher_correct_states=2750,
+            teacher_total_states=5000,
+            checkpoint_sha256=_CHECKPOINT_SHA256,
+            suite_fingerprint=_SUITE_FINGERPRINT)
+
+
+@pytest.mark.parametrize(
+    "training_stage", (True, 1, ["policy_only"], "unknown", ""))
+def test_direct_acceptance_rejects_invalid_training_stage_before_evaluation(
+    monkeypatch,
+    tmp_path: Path,
+    training_stage,
+) -> None:
+    def unexpected_worker_pool(**_kwargs):
+        raise AssertionError("invalid training stage reached the worker pool")
+
+    monkeypatch.setattr(
+        checkpoint_acceptance, "ProcessPoolExecutor", unexpected_worker_pool)
+    output_dir = tmp_path / "reports"
+
+    with pytest.raises(ValueError, match="training_stage must be"):
+        checkpoint_acceptance.run_checkpoint_acceptance(
+            str(tmp_path / "model_step_136000.pt"),
+            step=136000,
+            teacher_agreement=0.55,
+            opening_plies=(2, 4, 6, 8),
+            opening_seed=20260819,
+            inference_depth=1,
+            max_moves=200,
+            num_workers=2,
+            output_dir=str(output_dir),
+            training_stage=training_stage,
             checkpoint_sha256=_CHECKPOINT_SHA256,
             suite_fingerprint=_SUITE_FINGERPRINT,
             teacher_correct_states=2750,
