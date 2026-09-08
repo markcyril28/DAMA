@@ -3653,7 +3653,7 @@ class Trainer:
             selection.get('agreement', {}).get('top1_teacher_agreement', 0.0))
         task = checkpoint_acceptance_tasks.make_pending_acceptance_task(
             str(checkpoint_path),
-            step=int(promotion.get('step', self.step)),
+            step=promotion.get('step', self.step),
             teacher_agreement=agreement,
             opening_plies=self.config.test_opening_plies,
             opening_seed=self.config.test_opening_seed,
@@ -3677,13 +3677,15 @@ class Trainer:
             return None
         checkpoint_path = promotion.get('checkpoint_path')
         checkpoint_sha256 = promotion.get('checkpoint_sha256')
-        if not checkpoint_path or not checkpoint_sha256:
+        suite_fingerprint = promotion.get('suite_fingerprint')
+        if not checkpoint_path or not checkpoint_sha256 or not suite_fingerprint:
             raise ValueError(
-                "Promoted checkpoint record lacks path or SHA-256 provenance")
+                "Promoted checkpoint record lacks path, checkpoint SHA-256, "
+                "or frozen-suite provenance")
         return checkpoint_acceptance_tasks.make_pending_acceptance_task(
             str(checkpoint_path),
-            step=int(promotion['step']),
-            teacher_agreement=float(promotion['teacher_agreement']),
+            step=promotion['step'],
+            teacher_agreement=promotion['teacher_agreement'],
             opening_plies=self.config.test_opening_plies,
             opening_seed=self.config.test_opening_seed,
             inference_depth=self.config.inference_depth,
@@ -3692,7 +3694,7 @@ class Trainer:
             training_stage=str(
                 promotion.get('training_stage', self.config.policy_stage)),
             checkpoint_sha256=str(checkpoint_sha256),
-            suite_fingerprint=promotion.get('suite_fingerprint'),
+            suite_fingerprint=suite_fingerprint,
             teacher_correct_states=promotion.get('teacher_correct_states'),
             teacher_total_states=promotion.get('teacher_total_states'),
         )
@@ -8894,8 +8896,11 @@ def validate_recovery_experiment_config(
                                 else -1
                             )
                             try:
-                                record_agreement = float(
-                                    record.get('teacher_agreement'))
+                                raw_agreement = record.get('teacher_agreement')
+                                if type(raw_agreement) not in (int, float):
+                                    raise TypeError(
+                                        "teacher agreement must be numeric")
+                                record_agreement = float(raw_agreement)
                                 record_threshold = float(
                                     record.get('teacher_agreement_threshold'))
                             except (TypeError, ValueError, OverflowError):
@@ -9020,8 +9025,8 @@ def validate_recovery_experiment_config(
                                 .make_pending_acceptance_task(
                                     str(resume),
                                     step=gate_step,
-                                    teacher_agreement=float(
-                                        gate_record['teacher_agreement']),
+                                    teacher_agreement=gate_record[
+                                        'teacher_agreement'],
                                     opening_plies=config.test_opening_plies,
                                     opening_seed=config.test_opening_seed,
                                     # This report belongs to the policy-only
@@ -9191,8 +9196,12 @@ def validate_recovery_experiment_config(
 
                             metrics = acceptance_report.get('metrics')
                             try:
-                                report_agreement = float(
-                                    metrics['teacher_agreement'])
+                                raw_report_agreement = metrics[
+                                    'teacher_agreement']
+                                if type(raw_report_agreement) not in (int, float):
+                                    raise TypeError(
+                                        "teacher agreement must be numeric")
+                                report_agreement = float(raw_report_agreement)
                             except (KeyError, TypeError, ValueError, OverflowError):
                                 report_agreement = float('nan')
                             if (
