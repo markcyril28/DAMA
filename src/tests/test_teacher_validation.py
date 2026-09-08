@@ -114,6 +114,260 @@ def test_promotion_can_be_persisted_only_after_checkpoint_write(tmp_path: Path) 
     assert saved["promoted"] is True
 
 
+@pytest.mark.parametrize(
+    "teacher_agreement",
+    (True, "0.99", None, [], {}, float("nan"), float("inf"), -0.01, 1.01),
+)
+def test_malformed_current_agreement_cannot_create_promotion(
+    tmp_path: Path,
+    teacher_agreement,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    registry = PromotionRegistry(str(path), 0.50)
+
+    with pytest.raises(ValueError, match="Promotion teacher agreement"):
+        registry.consider(
+            "invalid.pt", 1, teacher_agreement, "suite", "data")
+
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_path", "step"),
+    (
+        (None, 2),
+        ("", 2),
+        (7, 2),
+        ("valid.pt", True),
+        ("valid.pt", "2"),
+        ("valid.pt", -1),
+    ),
+)
+def test_malformed_current_checkpoint_identity_cannot_create_promotion(
+    tmp_path: Path,
+    checkpoint_path,
+    step,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    registry = PromotionRegistry(str(path), 0.50)
+
+    with pytest.raises(ValueError, match="Promotion (checkpoint_path|step)"):
+        registry.consider(
+            checkpoint_path, step, 0.55, "suite", "data")
+
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "training_stage",
+    (None, True, 7, [], {}, "invalid"),
+)
+def test_malformed_current_training_stage_cannot_create_promotion(
+    tmp_path: Path,
+    training_stage,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    registry = PromotionRegistry(str(path), 0.50)
+
+    with pytest.raises(ValueError, match="Promotion training_stage"):
+        registry.consider(
+            "invalid.pt",
+            1,
+            0.55,
+            "suite",
+            "data",
+            training_stage=training_stage,
+        )
+
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "agreement_threshold",
+    (True, "0.50", None, [], {}, float("nan"), float("inf"), -0.01, 1.01),
+)
+def test_malformed_current_threshold_cannot_create_registry(
+    tmp_path: Path,
+    agreement_threshold,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+
+    with pytest.raises(ValueError, match="Promotion agreement threshold"):
+        PromotionRegistry(str(path), agreement_threshold)
+
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "threshold_update",
+    (
+        {"teacher_agreement_threshold": 0.40},
+        {"teacher_agreement_threshold": True},
+        {"teacher_agreement_threshold": "0.50"},
+        {"teacher_agreement_threshold": None},
+        {},
+    ),
+)
+def test_incomparable_registry_threshold_cannot_block_valid_promotion(
+    tmp_path: Path,
+    threshold_update,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    record = {
+        "checkpoint_path": "malformed.pt",
+        "step": 1,
+        "teacher_agreement": 0.99,
+        "suite_fingerprint": "suite",
+        "dataset_fingerprint": "data",
+        "training_stage": "policy_only",
+        "comparison_context": {},
+        "promoted": True,
+    }
+    record.update(threshold_update)
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    decision = PromotionRegistry(str(path), 0.50).consider(
+        "valid.pt", 2, 0.55, "suite", "data", persist=False)
+
+    assert decision.promoted is True
+
+
+@pytest.mark.parametrize(
+    "training_stage",
+    ("enhanced", None, True, 7, [], {}, "invalid"),
+)
+def test_incomparable_registry_training_stage_cannot_block_valid_promotion(
+    tmp_path: Path,
+    training_stage,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    path.write_text(json.dumps({
+        "checkpoint_path": "old.pt",
+        "step": 1,
+        "teacher_agreement": 0.99,
+        "teacher_agreement_threshold": 0.50,
+        "suite_fingerprint": "suite",
+        "dataset_fingerprint": "data",
+        "training_stage": training_stage,
+        "comparison_context": {},
+        "promoted": True,
+    }) + "\n", encoding="utf-8")
+
+    decision = PromotionRegistry(str(path), 0.50).consider(
+        "valid.pt",
+        2,
+        0.55,
+        "suite",
+        "data",
+        training_stage="policy_only",
+        persist=False,
+    )
+
+    assert decision.promoted is True
+
+
+@pytest.mark.parametrize("promoted", (1, "false"))
+def test_non_boolean_registry_decision_cannot_block_valid_promotion(
+    tmp_path: Path,
+    promoted,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    path.write_text(json.dumps({
+        "checkpoint_path": "malformed.pt",
+        "step": 1,
+        "teacher_agreement": 0.99,
+        "suite_fingerprint": "suite",
+        "dataset_fingerprint": "data",
+        "training_stage": "policy_only",
+        "comparison_context": {},
+        "promoted": promoted,
+    }) + "\n", encoding="utf-8")
+
+    decision = PromotionRegistry(str(path), 0.50).consider(
+        "valid.pt", 2, 0.55, "suite", "data", persist=False)
+
+    assert decision.promoted is True
+
+
+@pytest.mark.parametrize(
+    "teacher_agreement",
+    (True, "0.99", None, [], {}, float("nan"), float("inf"), -0.01, 1.01),
+)
+def test_malformed_registry_agreement_cannot_block_valid_promotion(
+    tmp_path: Path,
+    teacher_agreement,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    path.write_text(json.dumps({
+        "checkpoint_path": "malformed.pt",
+        "step": 1,
+        "teacher_agreement": teacher_agreement,
+        "suite_fingerprint": "suite",
+        "dataset_fingerprint": "data",
+        "training_stage": "policy_only",
+        "comparison_context": {},
+        "promoted": True,
+    }) + "\n", encoding="utf-8")
+
+    decision = PromotionRegistry(str(path), 0.50).consider(
+        "valid.pt", 2, 0.55, "suite", "data", persist=False)
+
+    assert decision.promoted is True
+
+
+@pytest.mark.parametrize(
+    "identity_update",
+    (
+        {"checkpoint_path": None},
+        {"checkpoint_path": ""},
+        {"checkpoint_path": 7},
+        {"step": True},
+        {"step": "1"},
+        {"step": -1},
+    ),
+)
+def test_malformed_registry_checkpoint_identity_cannot_block_valid_promotion(
+    tmp_path: Path,
+    identity_update,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    record = {
+        "checkpoint_path": "old.pt",
+        "step": 1,
+        "teacher_agreement": 0.99,
+        "teacher_agreement_threshold": 0.50,
+        "suite_fingerprint": "suite",
+        "dataset_fingerprint": "data",
+        "training_stage": "policy_only",
+        "comparison_context": {},
+        "promoted": True,
+    }
+    record.update(identity_update)
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    decision = PromotionRegistry(str(path), 0.50).consider(
+        "valid.pt", 2, 0.55, "suite", "data", persist=False)
+
+    assert decision.promoted is True
+
+
+@pytest.mark.parametrize(
+    "record",
+    ([], True, {"comparison_context": "invalid", "promoted": True}),
+)
+def test_malformed_registry_record_cannot_block_valid_promotion(
+    tmp_path: Path,
+    record,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    decision = PromotionRegistry(str(path), 0.50).consider(
+        "valid.pt", 2, 0.55, "suite", "data", persist=False)
+
+    assert decision.promoted is True
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ACTIVE_CONFIG = "config/training_config_policy_distillation_c174k.yaml"
 
