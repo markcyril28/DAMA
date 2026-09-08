@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -309,12 +310,57 @@ class PromotionDecision:
     record: Mapping[str, Any]
 
 
+def _validate_promotion_agreement(value: Any) -> float:
+    """Return exact finite agreement evidence within the probability range."""
+    if type(value) not in (int, float):
+        raise ValueError("Promotion teacher agreement must be a real number")
+    agreement = float(value)
+    if not math.isfinite(agreement) or not 0.0 <= agreement <= 1.0:
+        raise ValueError(
+            "Promotion teacher agreement must be finite and within [0, 1]")
+    return agreement
+
+
+def _validate_promotion_threshold(value: Any) -> float:
+    """Return an exact finite promotion threshold within the probability range."""
+    if type(value) not in (int, float):
+        raise ValueError("Promotion agreement threshold must be a real number")
+    threshold = float(value)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            "Promotion agreement threshold must be finite and within [0, 1]")
+    return threshold
+
+
+def _validate_promotion_training_stage(value: Any) -> str:
+    """Return one exact supported training stage for promotion evidence."""
+    if type(value) is not str or value not in ("policy_only", "enhanced"):
+        raise ValueError(
+            "Promotion training_stage must be 'policy_only' or 'enhanced'")
+    return value
+
+
+def _validate_promotion_checkpoint_identity(
+    checkpoint_path: Any,
+    step: Any,
+) -> tuple[str, int]:
+    """Return an exact checkpoint path and non-negative step for promotion."""
+    if type(checkpoint_path) is not str or not checkpoint_path:
+        raise ValueError(
+            "Promotion checkpoint_path must be a non-empty string")
+    if type(step) is not int or step < 0:
+        raise ValueError(
+            "Promotion step must be a non-negative integer")
+    return checkpoint_path, step
+
+
 class PromotionRegistry:
     """Append-only checkpoint selection driven only by held-out agreement."""
 
     def __init__(self, path: str, agreement_threshold: float = 0.50) -> None:
         self.path = Path(path)
-        self.agreement_threshold = float(agreement_threshold)
+        self.agreement_threshold = _validate_promotion_threshold(
+            agreement_threshold)
 
     def _records(self) -> List[dict]:
         if not self.path.exists():
@@ -341,19 +387,58 @@ class PromotionRegistry:
         comparison_context: Optional[Mapping[str, Any]] = None,
         persist: bool = True,
     ) -> PromotionDecision:
+        # Validate the current gate evidence before reading or writing the
+        # durable registry. Python bools otherwise act like 0/1, while NaN
+        # compares false in both gate branches and is promoted as a new best.
+        agreement = _validate_promotion_agreement(agreement)
+        checkpoint_path, step = _validate_promotion_checkpoint_identity(
+            checkpoint_path, step)
+        training_stage = _validate_promotion_training_stage(training_stage)
         records = self._records()
         context = dict(comparison_context or {})
-        comparable = [
-            record for record in records
-            if record.get("suite_fingerprint") == suite_fingerprint
-            and record.get("dataset_fingerprint") == dataset_fingerprint
-            and dict(record.get("comparison_context", {})) == context
-            and record.get("promoted")
-        ]
-        previous_best = max(
-            (float(record["teacher_agreement"]) for record in comparable),
-            default=float("-inf"),
-        )
+        comparable_agreements = []
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            record_context = record.get("comparison_context", {})
+            raw_agreement = record.get("teacher_agreement")
+            raw_threshold = record.get("teacher_agreement_threshold")
+            raw_checkpoint_path = record.get("checkpoint_path")
+            raw_step = record.get("step")
+            if (
+                record.get("suite_fingerprint") != suite_fingerprint
+                or record.get("dataset_fingerprint") != dataset_fingerprint
+                or record.get("training_stage") != training_stage
+                or not isinstance(record_context, Mapping)
+                or dict(record_context) != context
+                # Promotion is durable gate evidence, so JSON numbers and
+                # strings must not acquire boolean or numeric authority
+                # through Python truthiness or float coercion.
+                or record.get("promoted") is not True
+                or type(raw_agreement) not in (int, float)
+                or type(raw_threshold) not in (int, float)
+                # A row that cannot identify a real numbered checkpoint cannot
+                # reconstruct acceptance work and must not suppress one that
+                # can. Avoid str()/int() coercion for the same reason that
+                # booleans and numeric strings cannot carry gate authority.
+                or type(raw_checkpoint_path) is not str
+                or not raw_checkpoint_path
+                or type(raw_step) is not int
+                or raw_step < 0
+            ):
+                continue
+            record_agreement = float(raw_agreement)
+            record_threshold = float(raw_threshold)
+            if (
+                not math.isfinite(record_agreement)
+                or not 0.0 <= record_agreement <= 1.0
+                or not math.isfinite(record_threshold)
+                or not 0.0 <= record_threshold <= 1.0
+                or record_threshold != self.agreement_threshold
+            ):
+                continue
+            comparable_agreements.append(record_agreement)
+        previous_best = max(comparable_agreements, default=float("-inf"))
         if agreement < self.agreement_threshold:
             promoted = False
             reason = "below_teacher_agreement_gate"
@@ -366,8 +451,8 @@ class PromotionRegistry:
 
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "checkpoint_path": str(checkpoint_path),
-            "step": int(step),
+            "checkpoint_path": checkpoint_path,
+            "step": step,
             "teacher_agreement": float(agreement),
             "teacher_agreement_threshold": self.agreement_threshold,
             "suite_fingerprint": suite_fingerprint,
