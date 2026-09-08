@@ -52,6 +52,7 @@ selfplay:
   pipeline_mode: "simultaneous"
   max_stale_epochs: 4  # Cap same-snapshot fitting before held-out loss rebounds. See Journal Pass 246.
   persist_selfplay: true
+  minimum_free_disk_gb: 10.0  # Pause replay and corpus writes at the launcher's storage floor. See Journal Pass 390.
 
   generation_mix:
     total_games_per_cycle: 240
