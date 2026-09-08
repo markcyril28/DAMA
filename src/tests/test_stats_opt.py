@@ -1,8 +1,11 @@
 """Quick verification of batched stats_collector methods."""
 import json
 import os
+from pathlib import Path
 
+import pytest
 import torch
+import dama.ai.ml.stats_collector as stats_collector_module
 from dama.ai.ml.stats_collector import StatsCollector
 from dama.ai.ml.model import MoveScorerNet
 from scripts import analyze_training_stats
@@ -151,6 +154,102 @@ def test_incremental_flush_preserves_partial_run_diagnostics(tmp_path):
     assert row["latest_records"]["epoch"]["num_batches"] == 20
     assert row["latest_records"]["replay_buffer"]["num_files"] == 60
     assert row["latest_records"]["checkpoint"]["step"] == 140
+
+
+def test_incremental_flush_failure_preserves_history_and_later_retry(
+    tmp_path,
+    monkeypatch,
+):
+    collector = StatsCollector(
+        output_dir=str(tmp_path), session_id="fault", flush_every=1000)
+    target = tmp_path / "incremental_fault.jsonl"
+    prior = b'{"prior": true}\n'
+    target.write_bytes(prior)
+    real_dump = stats_collector_module.json.dump
+
+    def fail_dump(payload, handle, *args, **kwargs):
+        handle.write('{"partial":')
+        handle.flush()
+        raise OSError(28, "simulated incremental stats disk full")
+
+    monkeypatch.setattr(stats_collector_module.json, "dump", fail_dump)
+    collector.flush_incremental()
+
+    assert target.read_bytes() == prior
+    assert list(Path(tmp_path).glob("incremental_fault.jsonl.*.tmp")) == []
+
+    monkeypatch.setattr(stats_collector_module.json, "dump", real_dump)
+    collector.set_training_start_step(100)
+    collector.record_training_step(
+        step=101,
+        loss=0.5,
+        lr=2e-4,
+        batch_size=2048,
+        step_time=0.25,
+    )
+    collector.flush_incremental()
+
+    rows = [
+        json.loads(line)
+        for line in target.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[0] == {"prior": True}
+    assert rows[1]["session_summary"]["training_end_step"] == 101
+    assert list(Path(tmp_path).glob("incremental_fault.jsonl.*.tmp")) == []
+
+
+def test_terminal_report_preserves_prior_file_on_write_failure(
+    tmp_path,
+    monkeypatch,
+):
+    collector = StatsCollector(
+        output_dir=str(tmp_path), session_id="fault", flush_every=1000)
+    target = tmp_path / "session_report_fault.json"
+    prior = b'{"prior": true}\n'
+    target.write_bytes(prior)
+
+    def fail_dump(payload, handle, *args, **kwargs):
+        handle.write('{"partial":')
+        handle.flush()
+        raise OSError(28, "simulated terminal stats disk full")
+
+    monkeypatch.setattr(stats_collector_module.json, "dump", fail_dump)
+
+    with pytest.raises(OSError, match="simulated terminal stats disk full"):
+        collector.export_session_report()
+
+    assert target.read_bytes() == prior
+    assert list(Path(tmp_path).glob("session_report_fault.json.*.tmp")) == []
+
+
+def test_terminal_csv_preserves_prior_file_on_write_failure(
+    tmp_path,
+    monkeypatch,
+):
+    collector = StatsCollector(
+        output_dir=str(tmp_path), session_id="fault", flush_every=1000)
+    collector.loss.append(0.5, step=1)
+    target = tmp_path / "loss_history_fault.csv"
+    prior = b"prior,report\n"
+    target.write_bytes(prior)
+
+    class FailingDictWriter:
+        def __init__(self, handle, **kwargs):
+            self.handle = handle
+
+        def writeheader(self):
+            self.handle.write("partial,")
+            self.handle.flush()
+            raise OSError(28, "simulated terminal stats disk full")
+
+    monkeypatch.setattr(
+        stats_collector_module.csv, "DictWriter", FailingDictWriter)
+
+    with pytest.raises(OSError, match="simulated terminal stats disk full"):
+        collector.export_loss_csv()
+
+    assert target.read_bytes() == prior
+    assert list(Path(tmp_path).glob("loss_history_fault.csv.*.tmp")) == []
 
 
 def test_zero_sample_report_is_missing_not_healthy():
