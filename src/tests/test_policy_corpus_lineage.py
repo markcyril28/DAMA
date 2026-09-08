@@ -541,6 +541,59 @@ def test_ledger_records_each_admission_and_survives_snapshot_pruning(
     assert first_names <= reopened.trained_ledger_shard_names()
 
 
+def test_failed_ledger_commit_does_not_activate_unrecorded_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CURRENT must never expose training states absent from the ledger."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+
+    def fail_ledger_commit(**_kwargs) -> None:
+        raise OSError(28, "simulated ledger disk full")
+
+    monkeypatch.setattr(manager, "_record_trained_ledger", fail_ledger_commit)
+    with pytest.raises(OSError, match="simulated ledger disk full"):
+        manager.consider_snapshot(TEACHER, NOISE, GENERATION)
+
+    assert not manager.current_pointer.exists()
+    assert not (root / "current.json").exists()
+    assert (root / "snapshot_v000001" / "manifest.json").is_file()
+
+
+def test_failed_ledger_commit_preserves_previous_active_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed replacement admission must leave both pointers unchanged."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    first = manager.consider_snapshot(TEACHER, NOISE, GENERATION)
+    assert first.admitted
+    pointer_before = manager.current_pointer.read_bytes()
+    json_pointer_before = (root / "current.json").read_bytes()
+
+    for index in range(8):
+        _write_replay(replay_dir / f"replay_new_{index}.jsonl", [100 + index])
+
+    def fail_ledger_commit(**_kwargs) -> None:
+        raise OSError(28, "simulated ledger disk full")
+
+    monkeypatch.setattr(manager, "_record_trained_ledger", fail_ledger_commit)
+    with pytest.raises(OSError, match="simulated ledger disk full"):
+        manager.consider_snapshot(TEACHER, NOISE, GENERATION)
+
+    assert manager.current_pointer.read_bytes() == pointer_before
+    assert (root / "current.json").read_bytes() == json_pointer_before
+    assert (root / "snapshot_v000002" / "manifest.json").is_file()
+
+
 def test_ledger_fingerprint_sidecar_skips_text_parse_only_after_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -769,6 +822,49 @@ def test_streamed_ledger_merge_uses_fast_gzip_level(
     assert write_levels == [corpus._TRAINED_LEDGER_GZIP_COMPRESSLEVEL]
     assert corpus._TRAINED_LEDGER_GZIP_COMPRESSLEVEL == 1
     assert corpus._read_state_keys(path) == keys
+
+
+def test_streamed_ledger_merge_cleans_partial_file_after_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed atomic rewrite preserves the ledger without pinning disk."""
+    path = tmp_path / "keys.txt.gz"
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    original = {"0" * 64}
+    corpus._merge_state_keys_file(path, original)
+    before = path.read_bytes()
+    real_open = corpus.gzip.open
+
+    class FailingWriter:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def write(self, value: str) -> int:
+            self._handle.write(value[:1])
+            self._handle.flush()
+            raise OSError(28, "simulated disk full")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self._handle.__exit__(exc_type, exc, traceback)
+
+    def fail_temporary_write(target, *args, **kwargs):
+        handle = real_open(target, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "rb")
+        if Path(target) == temporary and "w" in mode:
+            return FailingWriter(handle)
+        return handle
+
+    monkeypatch.setattr(corpus.gzip, "open", fail_temporary_write)
+    with pytest.raises(OSError, match="simulated disk full"):
+        corpus._merge_state_keys_file(path, {"f" * 64})
+
+    assert path.read_bytes() == before
+    assert corpus._read_state_keys(path) == original
+    assert not temporary.exists()
 
 
 def test_streamed_ledger_merge_batches_text_writes(
