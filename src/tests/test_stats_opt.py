@@ -216,6 +216,30 @@ def test_zero_sample_report_is_missing_not_healthy():
     assert "Score entropy is low" not in markdown
 
 
+def test_unknown_gpu_capacity_does_not_block_partial_system_analysis():
+    report = {
+        "meta": {"gpu_name": "N/A", "gpu_vram_gb": None},
+        "gpu_memory": {
+            "allocated_mb": {
+                "total_count": 2,
+                "recent_mean": 4096.0,
+                "recent_max": 5120.0,
+            },
+        },
+        "system": {
+            "gpu_utilization": {"total_count": 1, "recent_mean": 91.0},
+        },
+    }
+
+    analysis = analyze_training_stats.analyze_system(report)
+
+    assert analysis["gpu_vram_gb"] is None
+    assert analysis["gpu_mem_mean_mb"] == 4096.0
+    assert analysis["gpu_mem_max_mb"] == 5120.0
+    assert "gpu_mem_utilization" not in analysis
+    assert analysis["gpu_compute_utilization"] == 91.0
+
+
 def test_newer_incremental_stream_marks_terminal_report_stale(tmp_path):
     report = tmp_path / "session_report_20260903_120000.json"
     incremental = tmp_path / "incremental_20260903_120500.jsonl"
