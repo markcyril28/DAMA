@@ -16,6 +16,7 @@ import random
 from ...types import Move, Player
 from ...game_state import GameState
 from .acceptance import WILSON_95_METHOD, wdl_summary
+from .run_status import _write_json_atomic
 
 
 _EVALUATION_FORKSERVER_PRELOAD = (
@@ -1004,21 +1005,20 @@ class ModelVsAlgoTester:
         return stats
     
     def _save_stats(self, stats: TestStatistics) -> str:
-        """Save test statistics to file."""
+        """Atomically save timestamped and latest test statistics."""
         self.stats_dir.mkdir(parents=True, exist_ok=True)
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"test_{timestamp}.json"
         filepath = self.stats_dir / filename
-        
-        with open(filepath, 'w') as f:
-            json.dump(stats.to_dict(), f, indent=2)
-        
+
+        payload = stats.to_dict()
+        _write_json_atomic(filepath, payload)
+
         # Also save as latest
         latest_path = self.stats_dir / "latest_test.json"
-        with open(latest_path, 'w') as f:
-            json.dump(stats.to_dict(), f, indent=2)
-        
+        _write_json_atomic(latest_path, payload)
+
         print(f"Test stats saved: {filepath}")
         return str(filepath)
     
