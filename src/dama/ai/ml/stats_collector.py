@@ -25,14 +25,16 @@ import os
 import csv
 import json
 import math
+import tempfile
 import time
 import platform
 import statistics
 import threading
 from collections import deque, defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple, Deque
+from typing import Optional, Dict, Any, List, Tuple, Deque, Iterator, TextIO
 
 try:
     import psutil
@@ -46,6 +48,69 @@ import torch
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+@contextmanager
+def _atomic_text_writer(
+    path: Path,
+    *,
+    newline: Optional[str] = None,
+) -> Iterator[TextIO]:
+    """Publish one text artifact only after its complete durable write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8",
+            newline=newline,
+        ) as handle:
+            fd = -1
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup is best-effort and must not hide the originating write
+            # or replace failure.
+            pass
+
+
+def _append_jsonl_atomic(path: Path, row: Dict[str, Any]) -> None:
+    """Append one JSONL row without exposing an incomplete public stream."""
+    with _atomic_text_writer(path, newline="\n") as destination:
+        last_character = ""
+        try:
+            with path.open("r", encoding="utf-8", newline="") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    destination.write(chunk)
+                    last_character = chunk[-1]
+        except FileNotFoundError:
+            pass
+
+        if last_character and last_character != "\n":
+            raise RuntimeError(
+                f"Incremental statistics stream has an incomplete final row: {path}"
+            )
+        json.dump(row, destination)
+        destination.write("\n")
+
 
 def _safe_mean(values: list) -> float:
     """Mean that handles empty lists and non-finite values."""
@@ -1367,8 +1432,7 @@ class StatsCollector:
                     },
                     'convergence': self.get_convergence_metrics(),
                 }
-                with open(path, 'a') as f:
-                    f.write(json.dumps(snapshot) + '\n')
+                _append_jsonl_atomic(path, snapshot)
             except Exception:
                 pass  # Non-critical — don't disrupt training
 
@@ -1512,7 +1576,7 @@ class StatsCollector:
         with self._lock:
             report = self.generate_session_report()
             path = self.output_dir / f"session_report_{self.session_id}.json"
-            with open(path, 'w') as f:
+            with _atomic_text_writer(path) as f:
                 json.dump(report, f, indent=2, default=str)
             return str(path)
 
@@ -1524,7 +1588,7 @@ class StatsCollector:
             if not entries:
                 return str(path)
 
-            with open(path, 'w', newline='') as f:
+            with _atomic_text_writer(path, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=['step', 'value', 'timestamp'])
                 writer.writeheader()
                 for entry in entries:
@@ -1543,7 +1607,7 @@ class StatsCollector:
             if not entries:
                 return str(path)
 
-            with open(path, 'w', newline='') as f:
+            with _atomic_text_writer(path, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=['step', 'value'])
                 writer.writeheader()
                 for entry in entries:
@@ -1561,7 +1625,7 @@ class StatsCollector:
             if not entries:
                 return str(path)
 
-            with open(path, 'w', newline='') as f:
+            with _atomic_text_writer(path, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=['step', 'value'])
                 writer.writeheader()
                 for entry in entries:
@@ -1585,7 +1649,7 @@ class StatsCollector:
                 'avg_game_length', 'estimated_elo_diff',
                 'win_rate_trend', 'win_rate_rolling_mean',
             ]
-            with open(path, 'w', newline='') as f:
+            with _atomic_text_writer(path, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 for record in self.eval_records:
@@ -1603,7 +1667,7 @@ class StatsCollector:
                 'epoch', 'step', 'timestamp', 'avg_loss', 'num_batches',
                 'epoch_time_sec', 'batches_per_sec', 'data_refresh',
             ]
-            with open(path, 'w', newline='') as f:
+            with _atomic_text_writer(path, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 for record in self.epoch_records:
@@ -1621,7 +1685,7 @@ class StatsCollector:
                 'step', 'epoch', 'timestamp', 'num_games', 'num_entries',
                 'elapsed_sec', 'games_per_sec', 'entries_per_sec',
             ]
-            with open(path, 'w', newline='') as f:
+            with _atomic_text_writer(path, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 for record in self.selfplay_records:
@@ -1657,7 +1721,7 @@ class StatsCollector:
             if not all_steps:
                 return str(path)
 
-            with open(path, 'w', newline='') as f:
+            with _atomic_text_writer(path, newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     'step', 'gpu_mem_allocated_mb', 'gpu_mem_reserved_mb',
