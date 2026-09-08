@@ -3683,7 +3683,7 @@ class Trainer:
                 "Promoted checkpoint record lacks path, checkpoint SHA-256, "
                 "or frozen-suite provenance")
         return checkpoint_acceptance_tasks.make_pending_acceptance_task(
-            str(checkpoint_path),
+            checkpoint_path,
             step=promotion['step'],
             teacher_agreement=promotion['teacher_agreement'],
             opening_plies=self.config.test_opening_plies,
@@ -3691,9 +3691,9 @@ class Trainer:
             inference_depth=self.config.inference_depth,
             max_moves=self.config.selfplay_max_moves,
             num_workers=min(self.config.cpu_workers, 4),
-            training_stage=str(
-                promotion.get('training_stage', self.config.policy_stage)),
-            checkpoint_sha256=str(checkpoint_sha256),
+            training_stage=promotion.get(
+                'training_stage', self.config.policy_stage),
+            checkpoint_sha256=checkpoint_sha256,
             suite_fingerprint=suite_fingerprint,
             teacher_correct_states=promotion.get('teacher_correct_states'),
             teacher_total_states=promotion.get('teacher_total_states'),
