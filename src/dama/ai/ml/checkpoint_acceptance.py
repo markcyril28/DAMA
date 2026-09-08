@@ -680,6 +680,19 @@ def remove_pending_acceptance_task(
     pending_acceptance_task_path(output_dir, task).unlink(missing_ok=True)
 
 
+def quarantine_pending_acceptance_task(
+    output_dir: str | Path,
+    task: Mapping[str, Any],
+) -> Path:
+    """Move one valid but unauthoritative task outside the recovery glob."""
+    normalized = _validate_pending_acceptance_task(task)
+    path = pending_acceptance_task_path(output_dir, normalized)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Pending acceptance task is missing: {path}")
+    return _quarantine_unreadable_pending_task(path)
+
+
 def _validate_pending_acceptance_task(
     task: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -821,6 +834,14 @@ def run_checkpoint_acceptance(
     checkpoint_path = _normalize_acceptance_checkpoint_path(checkpoint_path)
     task_id = _normalize_acceptance_task_id(
         task_id, checkpoint_path, step, allow_none=True)
+    # A direct caller can provide an internally consistent task id and digest
+    # without passing through the trainer's durable-task worker. Verify the
+    # actual checkpoint bytes here as well, before a pool runs 200 games or a
+    # step-numbered report can replace reusable terminal evidence.
+    verify_pending_acceptance_checkpoint({
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_sha256": checkpoint_sha256,
+    })
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     common = {
