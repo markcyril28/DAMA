@@ -1,10 +1,12 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 import torch
 
+import dama.ai.ml.teacher_validation as teacher_validation_module
 from dama.ai.ml.replay import ReplayEntry
 from dama.ai.ml.teacher_validation import (
     PromotionRegistry,
@@ -112,6 +114,67 @@ def test_promotion_can_be_persisted_only_after_checkpoint_write(tmp_path: Path) 
     saved = json.loads(path.read_text(encoding="utf-8").strip())
     assert saved["checkpoint_path"] == "step_2.pt"
     assert saved["promoted"] is True
+
+
+def test_promotion_registry_write_failure_preserves_history_and_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    registry = PromotionRegistry(str(path), 0.50)
+    registry.consider("step_1.pt", 1, 0.51, "suite", "data")
+    prior = path.read_bytes()
+    failed = registry.consider(
+        "step_2.pt", 2, 0.52, "suite", "data", persist=False)
+    retry = registry.consider(
+        "step_3.pt", 3, 0.53, "suite", "data", persist=False)
+
+    original_fdopen = teacher_validation_module.os.fdopen
+
+    class _FailingWriter:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+            self._writes = 0
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self._handle.__exit__(exc_type, exc, traceback)
+
+        def write(self, payload):
+            self._writes += 1
+            if self._writes == 2:
+                self._handle.write(payload[:19])
+                self._handle.flush()
+                os.fsync(self._handle.fileno())
+                raise OSError(28, "simulated promotion registry disk full")
+            return self._handle.write(payload)
+
+        def flush(self):
+            return self._handle.flush()
+
+        def fileno(self):
+            return self._handle.fileno()
+
+    monkeypatch.setattr(
+        teacher_validation_module.os,
+        "fdopen",
+        lambda fd, *args, **kwargs: _FailingWriter(
+            original_fdopen(fd, *args, **kwargs)),
+    )
+    with pytest.raises(OSError, match="simulated promotion registry disk full"):
+        registry.persist(failed)
+
+    assert path.read_bytes() == prior
+    assert list(tmp_path.glob("promotions.jsonl.*.tmp")) == []
+
+    monkeypatch.setattr(teacher_validation_module.os, "fdopen", original_fdopen)
+    registry.persist(retry)
+
+    records = registry.records()
+    assert [record["step"] for record in records] == [1, 3]
 
 
 @pytest.mark.parametrize(
