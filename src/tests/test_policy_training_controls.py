@@ -552,6 +552,36 @@ def test_latest_checkpoint_copy_fallback_is_atomic(
     )["step"] == 2000
 
 
+def test_latest_checkpoint_copy_failure_removes_partial_temporary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed alias copy must preserve the old alias and release its temp."""
+    import shutil
+
+    source = tmp_path / "source.pt"
+    latest_path = tmp_path / "latest.pt"
+    temporary = tmp_path / "latest.pt.tmp"
+    source.write_bytes(b"complete checkpoint")
+    latest_path.write_bytes(b"verified previous latest checkpoint")
+
+    def _fail_hardlink(_source, _destination):
+        raise OSError("forced hardlink fallback")
+
+    def _fail_partial_copy(_source, destination, *_args, **_kwargs):
+        Path(destination).write_bytes(b"partial checkpoint")
+        raise OSError(28, "simulated alias disk full")
+
+    monkeypatch.setattr(trainer_module.os, "link", _fail_hardlink)
+    monkeypatch.setattr(shutil, "copy2", _fail_partial_copy)
+
+    with pytest.raises(OSError, match="simulated alias disk full"):
+        Trainer._publish_checkpoint_alias(source, latest_path)
+
+    assert latest_path.read_bytes() == b"verified previous latest checkpoint"
+    assert not temporary.exists()
+
+
 def test_checkpoint_writer_failure_propagates_after_join(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -606,6 +636,60 @@ def test_checkpoint_writer_failure_propagates_after_join(
         Trainer._wait_for_checkpoint_writer(holder)
 
     assert (checkpoint_dir / "model_step_002000.pt").is_file()
+    assert not Path(holder.config.latest_path).exists()
+
+
+def test_checkpoint_serialization_failure_removes_partial_temporary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed numbered serialization must not consume disk indefinitely."""
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        latest_path=str(tmp_path / "latest.pt"),
+    )
+    holder.model = SimpleNamespace(
+        state_dict=lambda: {"weight": torch.tensor([1.0])},
+        arch_params={},
+    )
+    holder.optimizer = SimpleNamespace(
+        state_dict=lambda: {"state": {}, "param_groups": []})
+    holder.stats = TrainingStats()
+    holder.step = 2000
+    holder.epoch = 1
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats_collector = None
+    holder.log_file = str(tmp_path / "train.jsonl")
+    holder.device = torch.device("cpu")
+    holder._checkpoint_thread = None
+    holder._checkpoint_write_error = None
+    holder._active_snapshot_manifest = {}
+    holder._evaluate_validation_loss = lambda: None
+    holder._evaluate_teacher_promotion = lambda _path: None
+    holder._live_optimizer_context = lambda: {}
+    holder._snapshot_stats = lambda: {}
+    holder._save_stats = lambda **_kwargs: None
+    holder._put_status = lambda _message: None
+
+    def _fail_partial_save(_payload, destination):
+        Path(destination).write_bytes(b"partial checkpoint")
+        raise OSError(28, "simulated checkpoint disk full")
+
+    monkeypatch.setattr(trainer_module.torch, "save", _fail_partial_save)
+
+    Trainer._save_checkpoint(holder, loss=0.5)
+    with pytest.raises(
+        RuntimeError, match="simulated checkpoint disk full",
+    ):
+        Trainer._wait_for_checkpoint_writer(holder)
+
+    assert list(checkpoint_dir.iterdir()) == []
     assert not Path(holder.config.latest_path).exists()
 
 
@@ -1627,6 +1711,140 @@ def test_background_selfplay_stop_event_prevents_another_snapshot_cycle(
     Trainer._start_background_selfplay(holder, 72)
 
     assert calls == ["cycle"]
+    assert holder._stopped is False
+
+
+def test_background_selfplay_waits_for_storage_before_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class _FakeThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+            self._running = False
+
+        def start(self):
+            self._running = True
+            try:
+                self._target()
+            finally:
+                self._running = False
+
+        def is_alive(self):
+            return self._running
+
+    class _StopOnWaitEvent:
+        def __init__(self):
+            self._set = False
+
+        def is_set(self):
+            return self._set
+
+        def clear(self):
+            self._set = False
+
+        def wait(self, timeout=None):
+            calls.append(("wait", timeout))
+            self._set = True
+            return True
+
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = object()
+    holder.config = SimpleNamespace(
+        replay_dir="/replay",
+        replay_max_files=60,
+        selfplay_min_free_disk_gb=10.0,
+    )
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_stop_event = _StopOnWaitEvent()
+    holder._data_ready_event = trainer_module.threading.Event()
+    holder._stopped = False
+    holder._paused = False
+    holder.run_selfplay = lambda *_args, **_kwargs: calls.append("generate")
+
+    monkeypatch.setattr(trainer_module.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(
+        trainer_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(free=9 * 1024 ** 3),
+    )
+
+    Trainer._start_background_selfplay(holder, 72)
+
+    assert calls == [("wait", 30.0)]
+    assert holder._stopped is False
+
+
+def test_background_selfplay_rechecks_storage_before_snapshot_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class _FakeThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+            self._running = False
+
+        def start(self):
+            self._running = True
+            try:
+                self._target()
+            finally:
+                self._running = False
+
+        def is_alive(self):
+            return self._running
+
+    class _StopOnWaitEvent:
+        def __init__(self):
+            self._set = False
+
+        def is_set(self):
+            return self._set
+
+        def clear(self):
+            self._set = False
+
+        def wait(self, timeout=None):
+            calls.append(("wait", timeout))
+            self._set = True
+            return True
+
+    class _SnapshotManager:
+        def consider_snapshot(self, **_kwargs):
+            calls.append("consider")
+            raise AssertionError("low storage must block snapshot admission")
+
+    free_values = iter((11 * 1024 ** 3, 9 * 1024 ** 3))
+    holder = object.__new__(Trainer)
+    holder._snapshot_manager = _SnapshotManager()
+    holder.config = SimpleNamespace(
+        replay_dir="/replay",
+        replay_max_files=60,
+        selfplay_min_free_disk_gb=10.0,
+    )
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_stop_event = _StopOnWaitEvent()
+    holder._data_ready_event = trainer_module.threading.Event()
+    holder._stopped = False
+    holder._paused = False
+    holder.run_selfplay = lambda *_args, **_kwargs: (
+        calls.append("generate") or (1, 23)
+    )
+
+    monkeypatch.setattr(trainer_module.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(
+        trainer_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(free=next(free_values)),
+    )
+
+    Trainer._start_background_selfplay(holder, 72)
+
+    assert calls == ["generate", ("wait", 30.0)]
     assert holder._stopped is False
 
 
@@ -3083,6 +3301,13 @@ def test_active_policy_yaml_scopes_cache_compression_to_local(
     assert config.ram_cache_compress is expected_compression
     assert config.validation_tensor_cache_file.endswith(expected_validation_cache)
     assert config.validation_tensor_cache_compress is expected_validation_compression
+    assert config.selfplay_min_free_disk_gb == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize("value", [True, -1, float("nan"), "ten"])
+def test_selfplay_storage_floor_rejects_invalid_yaml_values(value) -> None:
+    with pytest.raises(ValueError, match="minimum_free_disk_gb"):
+        config_from_yaml({"selfplay": {"minimum_free_disk_gb": value}})
 
 
 def _rng_state_holder():
@@ -3664,6 +3889,52 @@ def test_checkpoint_retention_fails_closed_on_an_unreadable_registry(
 
     assert removed == []
     assert len(list(directory.glob("model_step_*.pt"))) == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("teacher_agreement", True),
+        ("teacher_agreement", "0.99"),
+        ("teacher_agreement", float("nan")),
+        ("promoted", 1),
+        ("checkpoint_path", ["checkpoints/model_step_004000.pt"]),
+    ),
+)
+def test_checkpoint_retention_fails_closed_on_malformed_registry_evidence(
+    tmp_path: Path,
+    field: str,
+    value,
+) -> None:
+    """Corrupt JSON values cannot redirect a destructive high-water mark."""
+    records = [
+        {
+            "checkpoint_path": "checkpoints/model_step_002000.pt",
+            "step": 2000,
+            "teacher_agreement": 0.55,
+            "promoted": False,
+        },
+        {
+            "checkpoint_path": "checkpoints/model_step_004000.pt",
+            "step": 4000,
+            "teacher_agreement": 0.40,
+            "promoted": False,
+        },
+    ]
+    records[1][field] = value
+    holder = _retention_holder(tmp_path, keep=1, records=records)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000])
+
+    removed = Trainer._prune_old_checkpoints(
+        holder, directory / "model_step_006000.pt")
+
+    assert removed == []
+    assert sorted(path.name for path in directory.glob("model_step_*.pt")) == [
+        "model_step_002000.pt",
+        "model_step_004000.pt",
+        "model_step_006000.pt",
+    ]
 
 
 # ---------------------------------------------------------------------------
