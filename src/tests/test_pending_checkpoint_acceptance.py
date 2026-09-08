@@ -17,7 +17,7 @@ from dama.ai.ml.trainer import Trainer, TrainingStats
 
 def _make_task(tmp_path: Path, step: int = 140000) -> dict:
     checkpoint = tmp_path / f"model_step_{step:06d}.pt"
-    checkpoint.write_bytes(b"checkpoint")
+    checkpoint.write_bytes(f"checkpoint-{step}".encode("ascii"))
     checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     return checkpoint_acceptance.make_pending_acceptance_task(
         str(checkpoint),
@@ -30,6 +30,7 @@ def _make_task(tmp_path: Path, step: int = 140000) -> dict:
         num_workers=2,
         training_stage="policy_only",
         checkpoint_sha256=checkpoint_sha256,
+        suite_fingerprint="b" * 64,
         teacher_correct_states=2750,
         teacher_total_states=5000,
     )
@@ -175,11 +176,103 @@ def test_pending_task_is_atomic_and_discoverable(tmp_path: Path) -> None:
         output_dir, task) == path
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("inference_depth", 0, "inference depth must be one of"),
+        ("max_moves", 0, "max_moves must be a positive integer"),
+    ),
+)
+def test_persisted_task_rejects_invalid_game_bounds(
+    tmp_path: Path,
+    field: str,
+    value: int,
+    message: str,
+) -> None:
+    task = _make_task(tmp_path)
+    task[field] = value
+    path = checkpoint_acceptance.pending_acceptance_task_path(
+        tmp_path / "acceptance", task)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(task), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        checkpoint_acceptance.load_pending_acceptance_task(path)
+
+
+@pytest.mark.parametrize("opening_plies", (
+    [True, 4, 6, 8],
+    [2.5, 4, 6, 8],
+    ["2", 4, 6, 8],
+))
+def test_persisted_task_rejects_coerced_opening_plies(
+    tmp_path: Path,
+    opening_plies: list,
+) -> None:
+    task = _make_task(tmp_path)
+    task["opening_plies"] = opening_plies
+    path = checkpoint_acceptance.pending_acceptance_task_path(
+        tmp_path / "acceptance", task)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(task), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="positive integers"):
+        checkpoint_acceptance.load_pending_acceptance_task(path)
+
+
+@pytest.mark.parametrize("opening_seed", (True, 20260819.5, "20260819"))
+def test_persisted_task_rejects_coerced_opening_seed(
+    tmp_path: Path,
+    opening_seed,
+) -> None:
+    task = _make_task(tmp_path)
+    task["opening_seed"] = opening_seed
+    path = checkpoint_acceptance.pending_acceptance_task_path(
+        tmp_path / "acceptance", task)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(task), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="opening_seed must be an integer"):
+        checkpoint_acceptance.load_pending_acceptance_task(path)
+
+
+@pytest.mark.parametrize("num_workers", (True, False, "2", 2.5, 0, -1))
+def test_persisted_task_rejects_invalid_num_workers(
+    tmp_path: Path,
+    num_workers,
+) -> None:
+    task = _make_task(tmp_path)
+    task["num_workers"] = num_workers
+    path = checkpoint_acceptance.pending_acceptance_task_path(
+        tmp_path / "acceptance", task)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(task), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="num_workers must be a positive integer"):
+        checkpoint_acceptance.load_pending_acceptance_task(path)
+
+
+@pytest.mark.parametrize("step", (True, "140000", 140000.5, -1))
+def test_persisted_task_rejects_invalid_step(
+    tmp_path: Path,
+    step,
+) -> None:
+    task = _make_task(tmp_path)
+    task["step"] = step
+    path = checkpoint_acceptance.pending_acceptance_task_path(
+        tmp_path / "acceptance", task)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(task), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="step must be a non-negative integer"):
+        checkpoint_acceptance.load_pending_acceptance_task(path)
+
+
 def test_existing_pending_task_rejects_removed_protocol_provenance(
     tmp_path: Path,
 ) -> None:
     task = _make_task(tmp_path)
-    task_with_suite = {**task, "suite_fingerprint": "suite-v1"}
+    task_with_suite = {**task, "suite_fingerprint": "c" * 64}
     output_dir = tmp_path / "acceptance"
     checkpoint_acceptance.persist_pending_acceptance_task(
         output_dir, task_with_suite)
@@ -212,21 +305,78 @@ def test_stale_success_report_cannot_clear_changed_protocol(tmp_path: Path) -> N
         output_dir, task) is None
 
 
-@pytest.mark.parametrize(("field", "replacement_value"), (
-    ("teacher_agreement", 0.49),
-    ("teacher_correct_states", 2450),
-    ("teacher_total_states", 5100),
+@pytest.mark.parametrize("step", (True, "140000", 140000.5))
+def test_success_report_rejects_coerced_step(
+    tmp_path: Path,
+    step,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+    output_dir.mkdir()
+    report_path = _write_success_report(output_dir, task, passed=True)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["step"] = step
+    checkpoint_acceptance._write_json_atomic(report_path, report)
+
+    assert checkpoint_acceptance.load_completed_acceptance_report(
+        output_dir, task) is None
+
+
+@pytest.mark.parametrize("step", (True, "140000", 140000.5))
+def test_failure_report_rejects_coerced_step(
+    tmp_path: Path,
+    step,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+    report_path = checkpoint_acceptance.write_acceptance_failure_report(
+        output_dir, task, RuntimeError("evaluation failed"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["step"] = step
+    checkpoint_acceptance._write_json_atomic(report_path, report)
+
+    assert checkpoint_acceptance.load_terminal_acceptance_report(
+        output_dir, task) is None
+
+
+@pytest.mark.parametrize("schema_version", (True, 1.0, "1", None))
+def test_failure_report_rejects_invalid_schema_version(
+    tmp_path: Path,
+    schema_version,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+    report_path = checkpoint_acceptance.write_acceptance_failure_report(
+        output_dir, task, RuntimeError("evaluation failed"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if schema_version is None:
+        report.pop("schema_version")
+    else:
+        report["schema_version"] = schema_version
+    checkpoint_acceptance._write_json_atomic(report_path, report)
+
+    assert checkpoint_acceptance.load_terminal_acceptance_report(
+        output_dir, task) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement_value", "paired_field", "paired_value"), (
+        ("teacher_agreement", 0.49, "teacher_correct_states", 2450),
+        ("teacher_correct_states", 2450, "teacher_agreement", 0.49),
 ))
 def test_stale_success_report_cannot_clear_changed_teacher_evidence(
     tmp_path: Path,
     field: str,
     replacement_value,
+    paired_field: str,
+    paired_value,
 ) -> None:
     old_task = _make_task(tmp_path)
     replacement = {
         **old_task,
         "created_at": "2026-09-07T12:00:00+00:00",
         field: replacement_value,
+        paired_field: paired_value,
     }
     output_dir = tmp_path / "acceptance"
     pending_path = checkpoint_acceptance.persist_pending_acceptance_task(
@@ -392,6 +542,232 @@ def test_startup_requeues_pending_once_without_duplicates(tmp_path: Path) -> Non
     assert holder._recover_pending_checkpoint_acceptance() == 0
     assert holder._acceptance_queue.qsize() == 1
     assert holder._acceptance_task_ids == {task["task_id"]}
+
+
+def test_registry_recovery_quarantines_and_rebuilds_corrupt_pending_task(
+    tmp_path: Path,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": True,
+        "step": task["step"],
+        "teacher_agreement": task["teacher_agreement"],
+        "training_stage": task["training_stage"],
+        "checkpoint_path": task["checkpoint_path"],
+        "checkpoint_sha256": task["checkpoint_sha256"],
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": task.get("teacher_correct_states"),
+        "teacher_total_states": task.get("teacher_total_states"),
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+    pending_path = checkpoint_acceptance.pending_acceptance_task_path(
+        holder.config.acceptance_dir, task)
+    pending_path.parent.mkdir(parents=True)
+    corrupt_bytes = b'{"schema_version":'
+    pending_path.write_bytes(corrupt_bytes)
+
+    assert holder._recover_pending_checkpoint_acceptance() == 1
+
+    recovered_task = checkpoint_acceptance.load_pending_acceptance_task(
+        pending_path)
+    assert checkpoint_acceptance._pending_acceptance_tasks_match(
+        recovered_task, task)
+    assert holder._acceptance_queue.qsize() == 1
+    assert checkpoint_acceptance._pending_acceptance_tasks_match(
+        holder._acceptance_queue.get_nowait(), task)
+    quarantines = list(
+        pending_path.parent.glob(f".{pending_path.name}.corrupt*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == corrupt_bytes
+
+    assert holder._recover_pending_checkpoint_acceptance() == 0
+    assert len(list(
+        pending_path.parent.glob(f".{pending_path.name}.corrupt*"))) == 1
+
+
+def test_registry_recovery_rejects_nonfinite_pending_teacher_evidence(
+    tmp_path: Path,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": True,
+        "step": task["step"],
+        "teacher_agreement": task["teacher_agreement"],
+        "training_stage": task["training_stage"],
+        "checkpoint_path": task["checkpoint_path"],
+        "checkpoint_sha256": task["checkpoint_sha256"],
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": task.get("teacher_correct_states"),
+        "teacher_total_states": task.get("teacher_total_states"),
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+    pending_path = checkpoint_acceptance.pending_acceptance_task_path(
+        holder.config.acceptance_dir, task)
+    pending_path.parent.mkdir(parents=True)
+    malformed = {**task, "teacher_agreement": float("nan")}
+    pending_path.write_text(json.dumps(malformed), encoding="utf-8")
+
+    assert holder._recover_pending_checkpoint_acceptance() == 1
+
+    recovered_task = checkpoint_acceptance.load_pending_acceptance_task(
+        pending_path)
+    assert checkpoint_acceptance._pending_acceptance_tasks_match(
+        recovered_task, task)
+    assert holder._acceptance_queue.qsize() == 1
+    assert checkpoint_acceptance._pending_acceptance_tasks_match(
+        holder._acceptance_queue.get_nowait(), task)
+    quarantines = list(
+        pending_path.parent.glob(f".{pending_path.name}.corrupt*"))
+    assert len(quarantines) == 1
+    quarantined = json.loads(quarantines[0].read_text(encoding="utf-8"))
+    assert str(quarantined["teacher_agreement"]) == "nan"
+
+
+@pytest.mark.parametrize("step", (True, "140000", 140000.5, -1))
+def test_registry_recovery_rejects_invalid_promotion_step(
+    tmp_path: Path,
+    capsys,
+    step,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": True,
+        "step": step,
+        "teacher_agreement": task["teacher_agreement"],
+        "training_stage": task["training_stage"],
+        "checkpoint_path": task["checkpoint_path"],
+        "checkpoint_sha256": task["checkpoint_sha256"],
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": task.get("teacher_correct_states"),
+        "teacher_total_states": task.get("teacher_total_states"),
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+
+    assert holder._recover_pending_checkpoint_acceptance() == 0
+
+    assert holder._acceptance_queue.empty()
+    assert not Path(holder.config.acceptance_dir).exists()
+    assert "Acceptance step must be a non-negative integer" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("teacher_agreement", (
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+    -0.01,
+    1.01,
+))
+def test_pending_task_rejects_invalid_teacher_agreement(
+    tmp_path: Path,
+    teacher_agreement: float,
+) -> None:
+    task = _make_task(tmp_path)
+    task["teacher_agreement"] = teacher_agreement
+
+    with pytest.raises(
+        ValueError,
+        match="teacher_agreement must be finite and within",
+    ):
+        checkpoint_acceptance.persist_pending_acceptance_task(tmp_path, task)
+
+
+@pytest.mark.parametrize(("teacher_agreement", "correct_states"), (
+    ("0.55", 2750),
+    (True, 5000),
+    (False, 0),
+))
+def test_pending_task_rejects_coerced_teacher_agreement(
+    tmp_path: Path,
+    teacher_agreement,
+    correct_states: int,
+) -> None:
+    task = _make_task(tmp_path)
+    task["teacher_agreement"] = teacher_agreement
+    task["teacher_correct_states"] = correct_states
+
+    with pytest.raises(ValueError, match="must be a real number"):
+        checkpoint_acceptance.persist_pending_acceptance_task(tmp_path, task)
+
+
+@pytest.mark.parametrize(("teacher_agreement", "correct_states"), (
+    ("0.55", 2750),
+    (True, 5000),
+    (False, 0),
+))
+def test_registry_recovery_rejects_coerced_promotion_agreement(
+    tmp_path: Path,
+    capsys,
+    teacher_agreement,
+    correct_states: int,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": True,
+        "step": task["step"],
+        "teacher_agreement": teacher_agreement,
+        "training_stage": task["training_stage"],
+        "checkpoint_path": task["checkpoint_path"],
+        "checkpoint_sha256": task["checkpoint_sha256"],
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": correct_states,
+        "teacher_total_states": 5000,
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+
+    assert holder._recover_pending_checkpoint_acceptance() == 0
+
+    assert holder._acceptance_queue.empty()
+    assert not Path(holder.config.acceptance_dir).exists()
+    assert "teacher_agreement must be a real number" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("correct_states", "total_states", "message"), (
+    (None, 5000, "no held-out teacher-agreement counts"),
+    (True, 5000, "counts must be integers"),
+    (2750.5, 5000, "counts must be integers"),
+    (55, 100, "not the required 5000"),
+    (2751, 5000, "quotient of its recorded counts"),
+))
+def test_pending_task_rejects_invalid_teacher_agreement_counts(
+    tmp_path: Path,
+    correct_states,
+    total_states,
+    message: str,
+) -> None:
+    task = _make_task(tmp_path)
+    task["teacher_correct_states"] = correct_states
+    task["teacher_total_states"] = total_states
+
+    with pytest.raises(ValueError, match=message):
+        checkpoint_acceptance.persist_pending_acceptance_task(tmp_path, task)
 
 
 def test_startup_finalizes_completed_pending_without_requeue(tmp_path: Path) -> None:
