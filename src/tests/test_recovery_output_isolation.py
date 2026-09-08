@@ -249,6 +249,29 @@ def test_trainer_stats_seed_never_overwrites_an_existing_stats_file(
     assert target.read_text(encoding="utf-8") == '{"total_steps": 180000}'
 
 
+def test_trainer_stats_seed_removes_partial_temporary_after_copy_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"total_steps": 174000}', encoding="utf-8")
+    target = tmp_path / "new" / "live.json"
+
+    def fail_after_partial_copy(_source: Path, temporary: Path) -> None:
+        Path(temporary).write_text("partial", encoding="utf-8")
+        raise OSError(28, "simulated stats seed disk full")
+
+    monkeypatch.setattr(
+        "dama.ai.ml.trainer.shutil.copyfile", fail_after_partial_copy)
+    config = TrainingConfig(
+        stats_file=str(target), stats_seed_file=str(legacy))
+
+    Trainer._seed_stats_file(SimpleNamespace(config=config))
+
+    assert not target.exists()
+    assert legacy.read_text(encoding="utf-8") == '{"total_steps": 174000}'
+    assert not list(target.parent.glob("*.seed.tmp"))
+
+
 @pytest.mark.parametrize(
     ("stage", "seed_exists"),
     [("enhanced", True), ("policy_only", False)],
