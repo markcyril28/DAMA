@@ -96,6 +96,45 @@ def test_acceptance_gates_pass_only_with_exact_protocol_and_thresholds() -> None
     assert not failed.checks["easy_exact_balanced_100_games"]
 
 
+@pytest.mark.parametrize("teacher_agreement", (True, False, "0.50"))
+def test_acceptance_gates_reject_non_numeric_teacher_agreement(
+    teacher_agreement,
+) -> None:
+    random_result = _result(45, 0, 5, 45, 0, 5)
+    easy_result = _result(32, 5, 13, 33, 5, 12)
+
+    with pytest.raises(ValueError, match="teacher_agreement must be finite"):
+        evaluate_acceptance_gates(
+            teacher_agreement, random_result, easy_result)
+
+
+@pytest.mark.parametrize(
+    ("arm", "key", "value"),
+    (
+        ("random", "ml_wins", "90"),
+        ("random", "draws", 10.9),
+        ("random", "algo_wins", False),
+        ("random", "ml_as_p1_wins", 45.8),
+        ("random", "ml_as_p2_draws", "5"),
+        ("easy", "algo_wins", "30"),
+        ("easy", "ml_as_p1_losses", 15.9),
+        ("easy", "ml_as_p2_draws", False),
+    ),
+)
+def test_acceptance_gates_reject_lossy_wdl_count_types(
+    arm: str,
+    key: str,
+    value,
+) -> None:
+    random_result = _result(45, 5, 0, 45, 5, 0)
+    easy_result = _result(35, 0, 15, 35, 0, 15)
+    target = random_result if arm == "random" else easy_result
+    target[key] = value
+
+    with pytest.raises(TypeError, match="wins, draws, and losses must be integers"):
+        evaluate_acceptance_gates(0.55, random_result, easy_result)
+
+
 def test_balanced_specs_pair_the_same_fixed_suite_across_sides() -> None:
     first, seed, suite_id = _build_balanced_game_specs(
         model_path="checkpoint.pt",
