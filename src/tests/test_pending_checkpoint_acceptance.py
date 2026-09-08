@@ -200,6 +200,24 @@ def test_persisted_task_rejects_invalid_game_bounds(
         checkpoint_acceptance.load_pending_acceptance_task(path)
 
 
+@pytest.mark.parametrize("checkpoint_path", (True, 1, ["checkpoint.pt"]))
+def test_persisted_task_rejects_coerced_checkpoint_path(
+    tmp_path: Path,
+    checkpoint_path,
+) -> None:
+    task = _make_task(tmp_path)
+    task["checkpoint_path"] = checkpoint_path
+    task["task_id"] = checkpoint_acceptance.acceptance_task_id(
+        str(checkpoint_path), task["step"])
+    path = checkpoint_acceptance.pending_acceptance_task_path(
+        tmp_path / "acceptance", task)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(task), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkpoint_path must be"):
+        checkpoint_acceptance.load_pending_acceptance_task(path)
+
+
 @pytest.mark.parametrize("opening_plies", (
     [True, 4, 6, 8],
     [2.5, 4, 6, 8],
@@ -249,6 +267,23 @@ def test_persisted_task_rejects_invalid_num_workers(
     path.write_text(json.dumps(task), encoding="utf-8")
 
     with pytest.raises(ValueError, match="num_workers must be a positive integer"):
+        checkpoint_acceptance.load_pending_acceptance_task(path)
+
+
+@pytest.mark.parametrize(
+    "training_stage", (True, 1, ["policy_only"], "unknown", ""))
+def test_persisted_task_rejects_invalid_training_stage(
+    tmp_path: Path,
+    training_stage,
+) -> None:
+    task = _make_task(tmp_path)
+    task["training_stage"] = training_stage
+    path = checkpoint_acceptance.pending_acceptance_task_path(
+        tmp_path / "acceptance", task)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(task), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="training_stage must be"):
         checkpoint_acceptance.load_pending_acceptance_task(path)
 
 
@@ -447,6 +482,45 @@ def test_success_report_requires_exact_paired_game_evidence(
     checkpoint_acceptance._write_json_atomic(report_path, report)
 
     assert checkpoint_acceptance.successful_acceptance_report_path(
+        output_dir, task) is None
+
+
+@pytest.mark.parametrize("corruption", (
+    "boolean_inference_depth",
+    "floating_opening_schedule",
+    "boolean_game_inference_depth",
+    "numeric_gate_check",
+    "floating_teacher_count",
+    "boolean_winner",
+))
+def test_success_report_rejects_lossy_json_numeric_types(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+    report_path = _write_success_report(output_dir, task, passed=True)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    if corruption == "boolean_inference_depth":
+        report["inference_depth"] = True
+    elif corruption == "floating_opening_schedule":
+        report["random"]["opening_plies"] = [2.0, 4.0, 6.0, 8.0]
+    elif corruption == "boolean_game_inference_depth":
+        report["random"]["games"][0]["ml_inference_depth"] = True
+    elif corruption == "numeric_gate_check":
+        report["checks"]["random_exact_balanced_100_games"] = 1
+    elif corruption == "floating_teacher_count":
+        report["teacher_agreement_counts"]["correct_states"] = 2750.0
+    else:
+        game = next(
+            game for game in report["random"]["games"]
+            if game["ml_player"] == 1 and game["result"] == "ml_win"
+        )
+        game["winner"] = True
+    checkpoint_acceptance._write_json_atomic(report_path, report)
+
+    assert checkpoint_acceptance.load_completed_acceptance_report(
         output_dir, task) is None
 
 
@@ -669,6 +743,106 @@ def test_registry_recovery_rejects_invalid_promotion_step(
     assert holder._acceptance_queue.empty()
     assert not Path(holder.config.acceptance_dir).exists()
     assert "Acceptance step must be a non-negative integer" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("training_stage", (True, 1, ["policy_only"], "unknown"))
+def test_registry_recovery_rejects_invalid_promotion_training_stage(
+    tmp_path: Path,
+    capsys,
+    training_stage,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": True,
+        "step": task["step"],
+        "teacher_agreement": task["teacher_agreement"],
+        "training_stage": training_stage,
+        "checkpoint_path": task["checkpoint_path"],
+        "checkpoint_sha256": task["checkpoint_sha256"],
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": task.get("teacher_correct_states"),
+        "teacher_total_states": task.get("teacher_total_states"),
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+
+    assert holder._recover_pending_checkpoint_acceptance() == 0
+
+    assert holder._acceptance_queue.empty()
+    assert not Path(holder.config.acceptance_dir).exists()
+    assert "training_stage must be" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("checkpoint_path", (True, 1, ["checkpoint.pt"]))
+def test_registry_recovery_rejects_coerced_checkpoint_path(
+    tmp_path: Path,
+    capsys,
+    checkpoint_path,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": True,
+        "step": task["step"],
+        "teacher_agreement": task["teacher_agreement"],
+        "training_stage": task["training_stage"],
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_sha256": task["checkpoint_sha256"],
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": task.get("teacher_correct_states"),
+        "teacher_total_states": task.get("teacher_total_states"),
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+
+    assert holder._recover_pending_checkpoint_acceptance() == 0
+
+    assert holder._acceptance_queue.empty()
+    assert not Path(holder.config.acceptance_dir).exists()
+    assert "checkpoint_path must be" in capsys.readouterr().out
+
+
+def test_registry_recovery_rejects_coerced_checkpoint_digest(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    holder = _holder(tmp_path)
+    task = _make_task(tmp_path)
+    holder.config.test_opening_plies = task["opening_plies"]
+    holder.config.test_opening_seed = task["opening_seed"]
+    holder.config.inference_depth = task["inference_depth"]
+    holder.config.selfplay_max_moves = task["max_moves"]
+    holder.config.cpu_workers = task["num_workers"]
+    holder.config.policy_stage = task["training_stage"]
+    holder._promotion_registry = SimpleNamespace(records=lambda: ({
+        "promoted": True,
+        "step": task["step"],
+        "teacher_agreement": task["teacher_agreement"],
+        "training_stage": task["training_stage"],
+        "checkpoint_path": task["checkpoint_path"],
+        "checkpoint_sha256": int("1" * 64),
+        "suite_fingerprint": task.get("suite_fingerprint"),
+        "teacher_correct_states": task.get("teacher_correct_states"),
+        "teacher_total_states": task.get("teacher_total_states"),
+    },))
+    holder._ensure_checkpoint_acceptance_worker = lambda: None
+
+    assert holder._recover_pending_checkpoint_acceptance() == 0
+
+    assert holder._acceptance_queue.empty()
+    assert not Path(holder.config.acceptance_dir).exists()
+    assert "checkpoint_sha256 must be 64 hexadecimal" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("teacher_agreement", (
