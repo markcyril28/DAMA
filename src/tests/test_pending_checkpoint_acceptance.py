@@ -10,7 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import dama.ai.ml.trainer as trainer_module
 from dama.ai.ml import checkpoint_acceptance
+from dama.ai.ml import run_status
 from dama.ai.ml.model_vs_algo import opening_suite_identity
 from dama.ai.ml.trainer import Trainer, TrainingStats
 
@@ -211,6 +213,113 @@ def test_pending_task_is_atomic_and_discoverable(tmp_path: Path) -> None:
     assert not list(output_dir.glob("*.tmp"))
     assert checkpoint_acceptance.persist_pending_acceptance_task(
         output_dir, task) == path
+
+
+def test_pending_task_removal_commits_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+    pending = checkpoint_acceptance.persist_pending_acceptance_task(
+        output_dir, task)
+    synced = []
+    real_sync = run_status._fsync_directory
+
+    def tracking_sync(path: Path) -> None:
+        synced.append(Path(path))
+        real_sync(path)
+
+    monkeypatch.setattr(run_status, "_fsync_directory", tracking_sync)
+
+    checkpoint_acceptance.remove_pending_acceptance_task(output_dir, task)
+
+    assert not pending.exists()
+    assert synced == [output_dir]
+
+
+def test_missing_pending_task_removal_skips_directory_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+
+    def unexpected_sync(_path: Path) -> None:
+        raise AssertionError("missing pending task must not trigger a sync")
+
+    monkeypatch.setattr(run_status, "_fsync_directory", unexpected_sync)
+
+    checkpoint_acceptance.remove_pending_acceptance_task(output_dir, task)
+
+
+def test_pending_task_removal_reports_directory_sync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+    pending = checkpoint_acceptance.persist_pending_acceptance_task(
+        output_dir, task)
+
+    def fail_sync(path: Path) -> None:
+        assert Path(path) == output_dir
+        raise OSError("simulated pending cleanup directory sync failure")
+
+    monkeypatch.setattr(run_status, "_fsync_directory", fail_sync)
+
+    with pytest.raises(OSError, match="pending cleanup directory sync failure"):
+        checkpoint_acceptance.remove_pending_acceptance_task(output_dir, task)
+
+    assert not pending.exists()
+
+
+def test_pending_task_commits_acceptance_namespace_before_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+    synced = []
+    real_sync = run_status._fsync_directory
+
+    def tracking_sync(path: Path) -> None:
+        synced.append(Path(path))
+        real_sync(path)
+
+    monkeypatch.setattr(run_status, "_fsync_directory", tracking_sync)
+
+    pending = checkpoint_acceptance.persist_pending_acceptance_task(
+        output_dir, task)
+
+    assert pending.is_file()
+    assert synced == [output_dir.parent, output_dir]
+
+
+def test_acceptance_namespace_sync_failure_prevents_pending_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    output_dir = tmp_path / "acceptance"
+
+    def fail_parent_sync(path: Path) -> None:
+        assert Path(path) == output_dir.parent
+        raise OSError("simulated acceptance namespace sync failure")
+
+    def unexpected_write(_path: Path, _payload: dict) -> None:
+        raise AssertionError("pending task published before namespace commit")
+
+    monkeypatch.setattr(run_status, "_fsync_directory", fail_parent_sync)
+    monkeypatch.setattr(
+        checkpoint_acceptance, "_write_json_atomic", unexpected_write)
+
+    with pytest.raises(OSError, match="namespace sync failure"):
+        checkpoint_acceptance.persist_pending_acceptance_task(
+            output_dir, task)
+
+    assert output_dir.is_dir()
+    assert not list(output_dir.iterdir())
 
 
 @pytest.mark.parametrize(
@@ -1483,6 +1592,34 @@ def test_checkpoint_replaced_after_final_hash_publishes_verified_inode(
     assert Path(holder.config.accepted_path).read_bytes() == original_bytes
     assert not pending_path.exists()
     assert holder.stats.acceptance_history[-1]["task_id"] == task["task_id"]
+
+
+def test_verified_accepted_alias_commits_final_public_name(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The verified staging rename and final accepted rename are both committed."""
+    holder = _holder(tmp_path)
+    holder._publish_checkpoint_alias = Trainer._publish_checkpoint_alias
+    task = _make_task(tmp_path)
+    destination = Path(holder.config.accepted_path)
+    events = []
+    real_sync = trainer_module._fsync_directory
+
+    def tracking_sync(path: Path) -> None:
+        events.append(Path(path))
+        real_sync(Path(path))
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", tracking_sync)
+
+    holder._publish_verified_checkpoint_alias(
+        Path(task["checkpoint_path"]),
+        destination,
+        task["checkpoint_sha256"],
+    )
+
+    assert events == [destination.parent, destination.parent]
+    assert destination.read_bytes() == Path(task["checkpoint_path"]).read_bytes()
 
 
 def test_unreported_failure_keeps_pending_for_next_startup(
