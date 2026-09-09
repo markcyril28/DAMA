@@ -34,6 +34,7 @@ from typing import (
     AbstractSet,
     Any,
     Dict,
+    FrozenSet,
     Iterable,
     Iterator,
     List,
@@ -309,6 +310,11 @@ class _SnapshotSplitContext:
     validation_keys: Set[str]
     historically_trained: Set[int]
     max_train_entries: int
+    # The verified key set of the immutable validation manifest alone, without
+    # the external frozen-suite exclusions folded into ``validation_keys``.
+    # This is the exact key universe ``load_validation_entries`` filters, so a
+    # parse-free reuse decision must derive from it and never from the union.
+    stored_validation_keys: FrozenSet[str] = frozenset()
 
 
 def _replay_file_identity_from_stat(
@@ -853,17 +859,33 @@ def audit_policy_replay_file(
 
 
 def _iter_entry_dicts(path: Path) -> Iterator[dict]:
+    # Large text reads avoid TextIOWrapper's small iterator refills on slow
+    # mounts. Keep its UTF-8 decoding and universal-newline translation, and
+    # split only LF so Unicode separators inside JSON strings stay intact.
+    chunk_chars = 1024 * 1024
+    pending = ""
+    line_number = 0
     with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                value = _replay_json_loads(line)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"Invalid replay JSON at {path}:{line_number}") from exc
-            if not isinstance(value, dict):
-                raise ValueError(f"Replay entry is not an object at {path}:{line_number}")
-            yield value
+        while True:
+            chunk = handle.read(chunk_chars)
+            if chunk:
+                lines = (pending + chunk).split("\n")
+                pending = lines.pop()
+            else:
+                lines = [pending] if pending else []
+            for line in lines:
+                line_number += 1
+                if not line.strip():
+                    continue
+                try:
+                    value = _replay_json_loads(line)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(f"Invalid replay JSON at {path}:{line_number}") from exc
+                if not isinstance(value, dict):
+                    raise ValueError(f"Replay entry is not an object at {path}:{line_number}")
+                yield value
+            if not chunk:
+                break
 
 
 def _iter_entry_dicts_with_digest(
@@ -4303,6 +4325,30 @@ class CorpusSnapshotManager:
             validation_keys=validation_keys,
             historically_trained=historically_trained,
             max_train_entries=max(0, int(max_train_entries)),
+            stored_validation_keys=frozenset(stored_validation_keys),
+        )
+
+    def validation_leak_fingerprints(
+        self, context: _SnapshotSplitContext,
+    ) -> FrozenSet[int]:
+        """Exact ledger-fingerprint subset that filters the held-out entries.
+
+        ``load_validation_entries`` drops an entry iff the fingerprint of its
+        canonical state key is present in the all-time trained ledger.  With
+        the validation manifest already integrity-verified, the retained entry
+        list is a pure function of (manifest-pinned file bytes, this subset):
+        a caller that proves both unchanged since its last materialization may
+        reuse the previously built held-out tensors without re-parsing any
+        shard.  A fingerprint collision behaves identically in both
+        computations because the same fingerprint function decides both.
+        """
+
+        historically_trained = context.historically_trained
+        return frozenset(
+            fingerprint
+            for fingerprint in map(
+                _state_key_fingerprint, context.stored_validation_keys)
+            if fingerprint in historically_trained
         )
 
     def load_validation_entries(
@@ -4342,6 +4388,46 @@ class CorpusSnapshotManager:
             )
         return validation_entries
 
+    def load_train_file_entries(
+        self, context: _SnapshotSplitContext, record: Mapping[str, Any],
+    ) -> List[ReplayEntry]:
+        """Materialize one manifest train shard's filtered entries in file order.
+
+        The returned list is a pure function of the manifest-pinned shard
+        bytes and ``context.validation_keys``: there is no cross-shard state,
+        and the entry cap samples over the assembled window afterwards.  A
+        caller that concatenates these lists in manifest order and applies
+        :meth:`train_cap_sample_indices` reproduces :meth:`load_train_entries`
+        exactly, which is what lets the trainer reuse per-shard tensors for
+        shards whose identity and filter inputs are unchanged.
+        """
+
+        file_path = context.manifest_path.parent / _read_relpath(
+            record["path"])
+        validation_keys = context.validation_keys
+        entries: List[ReplayEntry] = []
+        append = entries.append
+        for entry_dict in _iter_entry_dicts(file_path):
+            if canonical_state_key(entry_dict["state"]) in validation_keys:
+                continue
+            append(ReplayEntry.from_dict(entry_dict))
+        return entries
+
+    def train_cap_sample_indices(
+        self, total_entries: int, max_train_entries: int,
+    ) -> Optional[List[int]]:
+        """Exact retained-index subset the train entry cap keeps, or None.
+
+        Single source of the cap's seeded sampling so an assembled-tensor
+        caller cannot drift from the entry-list path.
+        """
+
+        cap = int(max_train_entries)
+        if cap <= 0 or total_entries <= cap:
+            return None
+        rng = random.Random(self.split_seed)
+        return sorted(rng.sample(range(total_entries), cap))
+
     def load_train_entries(
         self, context: _SnapshotSplitContext,
     ) -> List[ReplayEntry]:
@@ -4349,20 +4435,12 @@ class CorpusSnapshotManager:
 
         train_entries: List[ReplayEntry] = []
         for record in context.manifest["files"]:
-            file_path = context.manifest_path.parent / _read_relpath(
-                record["path"])
-            for entry_dict in _iter_entry_dicts(file_path):
-                if canonical_state_key(entry_dict["state"]) in context.validation_keys:
-                    continue
-                train_entries.append(ReplayEntry.from_dict(entry_dict))
+            train_entries.extend(
+                self.load_train_file_entries(context, record))
 
-        if (
-            context.max_train_entries > 0
-            and len(train_entries) > context.max_train_entries
-        ):
-            rng = random.Random(self.split_seed)
-            indices = sorted(rng.sample(
-                range(len(train_entries)), context.max_train_entries))
+        indices = self.train_cap_sample_indices(
+            len(train_entries), context.max_train_entries)
+        if indices is not None:
             train_entries = [train_entries[index] for index in indices]
         return train_entries
 
