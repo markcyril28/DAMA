@@ -35,6 +35,21 @@ _ACCEPTANCE_SELECTION_SEQUENCE = [
 ]
 
 
+def _prepare_acceptance_output_directory(output_dir: str | Path) -> Path:
+    """Create and commit the acceptance namespace before publishing evidence."""
+
+    from .run_status import _fsync_directory
+
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    # The JSON writer commits names inside this directory, but that fsync is
+    # not recursive. Commit the acceptance namespace in its parent before a
+    # pending task or terminal report can be acknowledged. Repeat on every
+    # writer entry point so an earlier failed parent sync is retried.
+    _fsync_directory(output_root.parent)
+    return output_root
+
+
 def _values_match_exact(actual: Any, expected: Any) -> bool:
     """Compare JSON evidence without bool/int or int/float coercion."""
     if type(actual) is not type(expected):
@@ -247,8 +262,7 @@ def persist_pending_acceptance_task(
 ) -> Path:
     """Atomically persist a pending task before it enters the memory queue."""
     normalized = _validate_pending_acceptance_task(task)
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = _prepare_acceptance_output_directory(output_dir)
     path = pending_acceptance_task_path(output_root, normalized)
     if path.exists():
         try:
@@ -632,8 +646,7 @@ def write_acceptance_failure_report(
 ) -> Path:
     """Atomically record a terminal evaluation error for a pending task."""
     normalized = _validate_pending_acceptance_task(task)
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = _prepare_acceptance_output_directory(output_dir)
     report = {
         "schema_version": 1,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -677,7 +690,18 @@ def remove_pending_acceptance_task(
     output_dir: str | Path,
     task: Mapping[str, Any],
 ) -> None:
-    pending_acceptance_task_path(output_dir, task).unlink(missing_ok=True)
+    """Remove a finalized task and commit that namespace transition."""
+    from .run_status import _fsync_directory
+
+    path = pending_acceptance_task_path(output_dir, task)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    # The terminal report and statistics are durable before this cleanup.
+    # Commit the successful unlink too, otherwise a sudden host or storage
+    # loss can resurrect already-finalized work and force redundant recovery.
+    _fsync_directory(path.parent)
 
 
 def quarantine_pending_acceptance_task(
@@ -842,8 +866,7 @@ def run_checkpoint_acceptance(
         "checkpoint_path": checkpoint_path,
         "checkpoint_sha256": checkpoint_sha256,
     })
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = _prepare_acceptance_output_directory(output_dir)
     common = {
         "model_path": checkpoint_path,
         "num_workers": num_workers,
