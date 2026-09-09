@@ -1,11 +1,13 @@
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 
 import pytest
 
+import dama.ai.ml.corpus as corpus
 from dama.ai.ml.corpus import (
     CorpusSnapshotManager,
     analyze_replay_files,
@@ -222,6 +224,100 @@ def test_snapshot_retention_prunes_oldest_and_keeps_current(tmp_path: Path) -> N
     assert (snapshot_root / "validation" / "manifest.json").is_file()
 
 
+def test_snapshot_retention_commits_deletion_batch_before_reporting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful retention call commits removed snapshot names once."""
+    snapshot_root = tmp_path / "snapshots"
+    for version in range(1, 4):
+        (snapshot_root / f"snapshot_v{version:06d}").mkdir(parents=True)
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"),
+        str(snapshot_root),
+        max_retained_snapshots=2,
+    )
+    events = []
+    real_rmtree = corpus.shutil.rmtree
+    real_fsync_directory = corpus.run_status._fsync_directory
+
+    def tracking_rmtree(path: Path) -> None:
+        events.append(f"removed:{Path(path).name}")
+        real_rmtree(path)
+
+    def tracking_fsync_directory(path: Path) -> None:
+        if Path(path) == snapshot_root:
+            events.append("snapshot_root_committed")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(corpus.shutil, "rmtree", tracking_rmtree)
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", tracking_fsync_directory
+    )
+
+    removed = manager._prune_old_snapshots(
+        snapshot_root / "snapshot_v000003"
+    )
+
+    assert removed == ["snapshot_v000001"]
+    assert events == ["removed:snapshot_v000001", "snapshot_root_committed"]
+
+
+def test_snapshot_retention_commit_failure_is_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retention cannot report reclaimed storage before its directory commit."""
+    snapshot_root = tmp_path / "snapshots"
+    for version in range(1, 3):
+        (snapshot_root / f"snapshot_v{version:06d}").mkdir(parents=True)
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"),
+        str(snapshot_root),
+        max_retained_snapshots=1,
+    )
+
+    def fail_snapshot_root_commit(path: Path) -> None:
+        if Path(path) == snapshot_root:
+            raise OSError(5, "simulated snapshot retention directory sync failure")
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", fail_snapshot_root_commit
+    )
+
+    with pytest.raises(OSError, match="snapshot retention directory sync failure"):
+        manager._prune_old_snapshots(snapshot_root / "snapshot_v000002")
+
+    assert not (snapshot_root / "snapshot_v000001").exists()
+    assert (snapshot_root / "snapshot_v000002").is_dir()
+
+
+def test_snapshot_retention_without_deletion_does_not_sync_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An at-cap snapshot root pays no retention directory-sync cost."""
+    snapshot_root = tmp_path / "snapshots"
+    for version in range(1, 3):
+        (snapshot_root / f"snapshot_v{version:06d}").mkdir(parents=True)
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"),
+        str(snapshot_root),
+        max_retained_snapshots=2,
+    )
+
+    def unexpected_sync(path: Path) -> None:
+        raise AssertionError(f"unexpected directory sync: {path}")
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", unexpected_sync
+    )
+
+    assert manager._prune_old_snapshots(
+        snapshot_root / "snapshot_v000002"
+    ) == []
+
+
 def test_snapshot_retention_disabled_by_default_keeps_every_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -348,6 +444,154 @@ def test_empty_leftover_version_directory_also_fails_closed(
 def _validation_manifest(snapshot_root: Path) -> dict:
     return json.loads(
         (snapshot_root / "validation" / "manifest.json").read_text(encoding="utf-8")
+    )
+
+
+def test_initial_validation_commits_shard_names_before_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation manifest cannot authorize uncommitted shard names."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(
+            replay_dir / f"replay_{index:02d}.jsonl", [_entry(index)]
+        )
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    events = []
+    real_fsync_directory = corpus.run_status._fsync_directory
+    real_write_json_atomic = corpus._write_json_atomic
+
+    def tracking_fsync_directory(path: Path) -> None:
+        if Path(path).name == "files":
+            events.append("validation_files_committed")
+        real_fsync_directory(path)
+
+    def tracking_write_json_atomic(path: Path, payload: dict) -> None:
+        if Path(path).name == "manifest.json":
+            events.append("validation_manifest_started")
+        real_write_json_atomic(path, payload)
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", tracking_fsync_directory
+    )
+    monkeypatch.setattr(corpus, "_write_json_atomic", tracking_write_json_atomic)
+
+    manager._ensure_validation(sorted(replay_dir.glob("replay_*.jsonl")))
+
+    assert events.index("validation_files_committed") < events.index(
+        "validation_manifest_started"
+    )
+
+
+def test_initial_validation_shard_commit_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed shard-name commit cannot publish or strand a validation set."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(
+            replay_dir / f"replay_{index:02d}.jsonl", [_entry(index)]
+        )
+    snapshot_root = tmp_path / "snapshots"
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(snapshot_root),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    real_fsync_directory = corpus.run_status._fsync_directory
+    failed = False
+
+    def fail_first_validation_files_commit(path: Path) -> None:
+        nonlocal failed
+        if Path(path).name == "files" and not failed:
+            failed = True
+            raise OSError(5, "simulated validation shard directory sync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(
+        corpus.run_status,
+        "_fsync_directory",
+        fail_first_validation_files_commit,
+    )
+
+    with pytest.raises(OSError, match="validation shard directory sync failure"):
+        manager._ensure_validation(files)
+
+    assert failed
+    assert not manager.validation_manifest_path.exists()
+    assert not manager.validation_manifest_path.parent.exists()
+    assert not list(snapshot_root.glob(".validation*"))
+
+    manifest, state_keys = manager._ensure_validation(files)
+    assert manifest["files"]
+    assert state_keys
+
+
+def test_validation_growth_commits_new_shard_names_before_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Append-only growth commits copied names before changing authority."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(8):
+        _write_replay(
+            replay_dir / f"replay_a{index}.jsonl", [_entry(index)]
+        )
+    manager = CorpusSnapshotManager(
+        str(replay_dir),
+        str(tmp_path / "snapshots"),
+        validation_fraction=0.25,
+        split_seed=5,
+    )
+    files = sorted(replay_dir.glob("replay_*.jsonl"))
+    initial, _keys = manager._ensure_validation(files)
+    held = {str(record["name"]) for record in initial["files"]}
+    for name in held:
+        (replay_dir / name).unlink()
+    for index in range(len(held)):
+        _write_replay(
+            replay_dir / f"replay_b{index}.jsonl", [_entry(100 + index)]
+        )
+
+    events = []
+    validation_files = manager.validation_manifest_path.parent / "files"
+    real_fsync_directory = corpus.run_status._fsync_directory
+    real_write_json_atomic = corpus._write_json_atomic
+
+    def tracking_fsync_directory(path: Path) -> None:
+        if Path(path) == validation_files:
+            events.append("validation_files_committed")
+        real_fsync_directory(path)
+
+    def tracking_write_json_atomic(path: Path, payload: dict) -> None:
+        if Path(path) == manager.validation_manifest_path:
+            events.append("validation_manifest_started")
+        real_write_json_atomic(path, payload)
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", tracking_fsync_directory
+    )
+    monkeypatch.setattr(corpus, "_write_json_atomic", tracking_write_json_atomic)
+
+    grown, _keys = manager._ensure_validation(
+        sorted(replay_dir.glob("replay_*.jsonl"))
+    )
+
+    assert grown.get("growth_history")
+    assert events.index("validation_files_committed") < events.index(
+        "validation_manifest_started"
     )
 
 
@@ -606,6 +850,131 @@ def test_load_current_manifest_rejects_non_regular_target(tmp_path: Path) -> Non
         str(tmp_path / "replay"), str(snapshot_root))
 
     assert manager._load_current_manifest() == (None, None)
+
+
+def test_current_json_recovers_a_missing_current_pointer(tmp_path: Path) -> None:
+    """The redundant committed pointer must recover a lost CURRENT name."""
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index:02d}.jsonl", [_entry(index)])
+    manager = CorpusSnapshotManager(
+        str(replay_dir), str(snapshot_root),
+        validation_fraction=0.25, split_seed=5,
+    )
+    decision = manager.consider_snapshot(
+        {"difficulty": "hard"}, {"noise": 0.1}, {"mix": "fixed"})
+    assert decision.admitted
+
+    manager.current_pointer.unlink()
+
+    assert manager.current_manifest_path() == decision.manifest_path
+    path, manifest = manager._load_current_manifest()
+    assert path == decision.manifest_path
+    assert manifest is not None
+    assert manifest["fingerprint"] == json.loads(
+        (snapshot_root / "current.json").read_text(encoding="utf-8")
+    )["fingerprint"]
+
+
+def test_current_json_fallback_rejects_a_fingerprint_mismatch(
+    tmp_path: Path,
+) -> None:
+    """A recovery pointer is authoritative only for its exact manifest."""
+
+    snapshot_root = tmp_path / "snapshots"
+    manifest = snapshot_root / "snapshot_v000001" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps({"fingerprint": "a" * 64}), encoding="utf-8")
+    (snapshot_root / "current.json").write_text(json.dumps({
+        "manifest": "snapshot_v000001/manifest.json",
+        "fingerprint": "b" * 64,
+    }), encoding="utf-8")
+    manager = CorpusSnapshotManager(
+        str(tmp_path / "replay"), str(snapshot_root))
+
+    with pytest.raises(RuntimeError, match="fingerprint does not match"):
+        manager.current_manifest_path()
+    with pytest.raises(RuntimeError, match="fingerprint does not match"):
+        manager._load_current_manifest()
+
+
+def test_atomic_current_pointer_syncs_file_and_directory_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        events.append("file_fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    def tracking_directory_fsync(path):
+        events.append("directory_fsync")
+        assert path == tmp_path
+
+    monkeypatch.setattr(corpus.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(corpus.os, "replace", tracking_replace)
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", tracking_directory_fsync)
+    target = tmp_path / "CURRENT"
+
+    corpus._write_text_atomic(target, "snapshot_v000001/manifest.json\n")
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert target.read_text(encoding="utf-8") == (
+        "snapshot_v000001/manifest.json\n")
+
+
+def test_atomic_current_pointer_failure_preserves_old_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "CURRENT"
+    target.write_text("snapshot_v000001/manifest.json\n", encoding="utf-8")
+
+    def fail_fsync(_fd):
+        raise OSError(5, "simulated pointer fsync failure")
+
+    monkeypatch.setattr(corpus.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="simulated pointer fsync failure"):
+        corpus._write_text_atomic(
+            target, "snapshot_v000002/manifest.json\n")
+
+    assert target.read_text(encoding="utf-8") == (
+        "snapshot_v000001/manifest.json\n")
+    assert not list(tmp_path.glob("CURRENT.*.tmp"))
+
+
+def test_atomic_current_pointer_reports_post_replace_directory_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A visible complete pointer is not reported durable if its name is not."""
+
+    target = tmp_path / "CURRENT"
+    target.write_text("snapshot_v000001/manifest.json\n", encoding="utf-8")
+
+    def fail_directory_fsync(_path):
+        raise OSError(5, "simulated pointer directory fsync failure")
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", fail_directory_fsync)
+    with pytest.raises(
+        OSError, match="simulated pointer directory fsync failure"
+    ):
+        corpus._write_text_atomic(
+            target, "snapshot_v000002/manifest.json\n")
+
+    assert target.read_text(encoding="utf-8") == (
+        "snapshot_v000002/manifest.json\n")
+    assert not list(tmp_path.glob("CURRENT.*.tmp"))
 
 
 def test_lost_current_pointer_fails_closed_instead_of_skipping_freshness_gate(
@@ -1085,7 +1454,7 @@ def test_snapshot_load_rejects_tampered_state_key_digest(tmp_path: Path) -> None
         manager.load_split(decision.manifest_path)
 
 
-def test_snapshot_shards_are_independent_copies_and_report_cross_cycle_repeats(
+def test_snapshot_shards_link_immutable_sources_and_report_cross_cycle_repeats(
     tmp_path: Path,
 ) -> None:
     replay_dir = tmp_path / "replay"
@@ -1115,8 +1484,12 @@ def test_snapshot_shards_are_independent_copies_and_report_cross_cycle_repeats(
     decision = manager.consider_snapshot({}, {}, {})
     manifest = json.loads(decision.manifest_path.read_text(encoding="utf-8"))
     shard = decision.manifest_path.parent / manifest["files"][0]["path"]
-    assert manifest["files"][0]["storage"] == "copy"
-    assert shard.stat().st_ino != first.stat().st_ino
+    source = replay_dir / manifest["files"][0]["name"]
+    assert manifest["files"][0]["storage"] == "source_hardlink"
+    assert shard.stat().st_ino == source.stat().st_ino
+
+    source.unlink()
+    assert shard.is_file()
 
 
 def test_existing_validation_manifest_must_match_split_contract(
@@ -1974,13 +2347,13 @@ _NOISE = {"played_action_probability": 0.10, "label_is_teacher": True}
 _GENERATION = {"algorithm_fraction": 0.70, "model_fraction": 0.30}
 
 
-def test_snapshot_reuses_unchanged_shards_via_hardlink(tmp_path: Path) -> None:
-    """Unchanged shards hardlink from the previous snapshot; new ones copy.
+def test_snapshot_reuses_immutable_shards_via_hardlink(tmp_path: Path) -> None:
+    """Survivors link from the predecessor and rotated shards from replay.
 
     The steady-state corpus rotates one shard per cycle, so per-admission
-    growth falls from the whole corpus to only that shard.  Reused entries are
-    byte-identical by construction (same inode), which is what makes this a
-    pure storage optimization rather than a semantic change.
+    copying falls to zero. Reused entries are byte-identical by construction
+    (same inode), which makes this a pure storage optimization rather than a
+    semantic change.
     """
     manager = _shard_reuse_manager(tmp_path)
     replay_dir = tmp_path / "replay"
@@ -1991,9 +2364,15 @@ def test_snapshot_reuses_unchanged_shards_via_hardlink(tmp_path: Path) -> None:
     assert first.admitted
     first_manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     assert all(
-        record["storage"] == "copy" for record in first_manifest["files"]
+        record["storage"] == "source_hardlink"
+        for record in first_manifest["files"]
     )
     assert first_manifest["admission"]["reused_shard_count"] == 0
+    assert (
+        first_manifest["admission"]["source_linked_shard_count"]
+        == len(first_manifest["files"])
+    )
+    assert first_manifest["admission"]["copied_shard_count"] == 0
 
     # Cycle 2 keeps three shards byte-identical and adds one new file.
     for offset in range(4):
@@ -2023,11 +2402,13 @@ def test_snapshot_reuses_unchanged_shards_via_hardlink(tmp_path: Path) -> None:
     rotated = {n for n in second_names if n.startswith("replay_01")}
     assert rotated
     for name in rotated:
-        assert storage_by_name[name] == "copy"
+        assert storage_by_name[name] == "source_hardlink"
     admission = second_manifest["admission"]
     assert admission["reused_shard_count"] == len(survivors)
-    assert admission["copied_shard_count"] == len(second_names) - len(survivors)
+    assert admission["source_linked_shard_count"] == len(rotated)
+    assert admission["copied_shard_count"] == 0
     assert admission["reused_shard_bytes"] > 0
+    assert admission["source_linked_shard_bytes"] > 0
 
     # Inode identity: reuse shares data instead of duplicating it.
     prev_dir = first.manifest_path.parent / "files"
@@ -2037,10 +2418,110 @@ def test_snapshot_reuses_unchanged_shards_via_hardlink(tmp_path: Path) -> None:
             prev_dir.joinpath(name).stat().st_ino
             == curr_dir.joinpath(name).stat().st_ino
         ), f"{name} was copied, not hardlinked"
+    for name in rotated:
+        assert (
+            replay_dir.joinpath(name).stat().st_ino
+            == curr_dir.joinpath(name).stat().st_ino
+        ), f"{name} was copied instead of linked from replay"
+
+    # Replay-window rotation unlinks only one name. The snapshot's immutable
+    # inode remains complete and loadable through its own link.
+    replay_dir.joinpath(next(iter(rotated))).unlink()
 
     # The reused snapshot still loads through full integrity verification.
     train_entries, _validation, _manifest = manager.load_split()
     assert train_entries
+
+
+def test_snapshot_commits_shard_directory_before_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The nested files/ transaction must precede snapshot publication."""
+    manager = _shard_reuse_manager(tmp_path)
+    replay_dir = tmp_path / "replay"
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(
+            replay_dir / f"replay_00_{index}.jsonl", [_entry(index)]
+        )
+
+    shard_directory_committed = False
+    activation_observed = False
+    real_fsync_directory = corpus.run_status._fsync_directory
+    real_replace = corpus.os.replace
+
+    def tracking_fsync_directory(path: Path) -> None:
+        nonlocal shard_directory_committed
+        if Path(path).name == "files":
+            shard_directory_committed = True
+        real_fsync_directory(path)
+
+    def tracking_replace(source, destination) -> None:
+        nonlocal activation_observed
+        destination_path = Path(destination)
+        if (
+            destination_path.parent == snapshot_root
+            and destination_path.name.startswith("snapshot_v")
+        ):
+            assert shard_directory_committed
+            activation_observed = True
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", tracking_fsync_directory
+    )
+    monkeypatch.setattr(corpus.os, "replace", tracking_replace)
+
+    decision = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+
+    assert decision.admitted
+    assert shard_directory_committed
+    assert activation_observed
+    assert manager.load_split(decision.manifest_path)[0]
+
+
+def test_shard_directory_commit_failure_cannot_activate_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed files/ commit leaves no pointer and permits a clean retry."""
+    manager = _shard_reuse_manager(tmp_path)
+    replay_dir = tmp_path / "replay"
+    snapshot_root = tmp_path / "snapshots"
+    for index in range(4):
+        _write_replay(
+            replay_dir / f"replay_00_{index}.jsonl", [_entry(index)]
+        )
+
+    real_fsync_directory = corpus.run_status._fsync_directory
+    failed = False
+
+    def fail_first_shard_directory_commit(path: Path) -> None:
+        nonlocal failed
+        if Path(path).name == "files" and not failed:
+            failed = True
+            raise OSError(5, "simulated shard directory sync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(
+        corpus.run_status,
+        "_fsync_directory",
+        fail_first_shard_directory_commit,
+    )
+
+    with pytest.raises(OSError, match="shard directory sync failure"):
+        manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+
+    assert failed
+    assert not manager.current_pointer.exists()
+    assert not (snapshot_root / "current.json").exists()
+    assert not list(snapshot_root.glob("snapshot_v*"))
+    assert not list(snapshot_root.glob(".snapshot_v*"))
+
+    retry = manager.consider_snapshot(_SETTINGS, _NOISE, _GENERATION)
+    assert retry.admitted
+    assert manager.load_split(retry.manifest_path)[0]
 
 
 def test_snapshot_reuse_disabled_copies_everything(tmp_path: Path) -> None:
@@ -2097,10 +2578,88 @@ def test_snapshot_reuse_falls_back_to_copy_when_link_refused(
     assert train_entries
 
 
-def test_snapshot_reuse_detects_corrupted_predecessor_and_copies(
+def test_snapshot_copy_fallback_fsyncs_complete_shard_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied inode must be durable before a manifest can authorize it."""
+    source = tmp_path / "replay_source.jsonl"
+    destination = tmp_path / "stored" / "replay_source.jsonl"
+    destination.parent.mkdir()
+    payload = json.dumps(_entry(7), sort_keys=True).encode("utf-8") + b"\n"
+    source.write_bytes(payload)
+    fsync_sizes = []
+    real_fsync = os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        fsync_sizes.append(os.fstat(fd).st_size)
+        real_fsync(fd)
+
+    monkeypatch.setattr(corpus.os, "fsync", tracking_fsync)
+
+    assert corpus._store_shard(source, destination) == "copy"
+    assert fsync_sizes == [len(payload)]
+    assert destination.read_bytes() == payload
+
+
+def test_snapshot_copy_fsync_failure_removes_uncommitted_shard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed copied-inode sync cannot leave an admissible destination."""
+    source = tmp_path / "replay_source.jsonl"
+    destination = tmp_path / "stored" / "replay_source.jsonl"
+    destination.parent.mkdir()
+    payload = json.dumps(_entry(8), sort_keys=True).encode("utf-8") + b"\n"
+    source.write_bytes(payload)
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError(5, "simulated copied shard sync failure")
+
+    monkeypatch.setattr(corpus.os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="copied shard sync failure"):
+        corpus._store_shard(source, destination)
+
+    assert not destination.exists()
+
+
+def test_snapshot_source_hardlink_fails_closed_on_identity_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source replacement around link publication cannot enter a snapshot."""
+    from dama.ai.ml import corpus
+
+    source = tmp_path / "replay_race.jsonl"
+    destination = tmp_path / "stored.jsonl"
+    payload = json.dumps(_entry(1)).encode("utf-8") + b"\n"
+    source.write_bytes(payload)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    real_link = os.link
+
+    def link_then_replace(src, dst):
+        real_link(src, dst)
+        replacement = source.with_suffix(".replacement")
+        replacement.write_bytes(payload + b" ")
+        os.replace(replacement, source)
+
+    monkeypatch.setattr(corpus.os, "link", link_then_replace)
+    with pytest.raises(RuntimeError, match="changed during snapshot storage"):
+        corpus._store_shard(
+            source,
+            destination,
+            hardlink_source=True,
+            expected_size=len(payload),
+            expected_sha256=expected_sha256,
+        )
+    assert not destination.exists()
+
+
+def test_snapshot_reuse_avoids_corrupted_predecessor(
     tmp_path: Path,
 ) -> None:
-    """A mutated predecessor shard must never be linked: digest mismatch -> copy.
+    """A mutated predecessor is bypassed for the verified live source.
 
     This is the fail-closed half of the contract.  Deliberately corrupts the
     OLD snapshot's stored shard (same size) to prove the digest gate notices;
@@ -2124,9 +2683,13 @@ def test_snapshot_reuse_detects_corrupted_predecessor_and_copies(
     original[0] = original[0] ^ 0xFF
     victim.write_bytes(bytes(original))
 
-    # Live corpus keeps the pristine bytes.
+    # Live corpus keeps pristine bytes under replacement inodes. The first
+    # snapshot remains intentionally corrupt instead of mutating through its
+    # hardlink a second time.
     for name, payload in sources.items():
-        (replay_dir / name).write_bytes(payload)
+        replacement = replay_dir / f".{name}.replacement"
+        replacement.write_bytes(payload)
+        os.replace(replacement, replay_dir / name)
 
     for offset in range(4):
         _write_replay(
@@ -2143,7 +2706,7 @@ def test_snapshot_reuse_detects_corrupted_predecessor_and_copies(
     }
     survivors = first_names & set(storage)
     assert "replay_00_0.jsonl" not in survivors or (
-        storage.get("replay_00_0.jsonl") == "copy"
+        storage.get("replay_00_0.jsonl") == "source_hardlink"
     )
     # The corrupted shard must never be linked; any surviving intact sibling
     # from the previous snapshot should be.
