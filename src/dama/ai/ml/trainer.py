@@ -3622,6 +3622,10 @@ class Trainer:
             f"Immutable validation entries: {len(self._validation_entries):,} "
             "from held-out replay files"
         )
+        # Validation reads only the copied tensors. Background refreshes do
+        # not pass through startup's entry-list cleanup, so release this
+        # redundant mirror here without mutating the caller's input list.
+        self._validation_entries = []
 
     def _evaluate_validation_loss(self) -> Optional[float]:
         dataset = self._validation_dataloader
@@ -6204,6 +6208,7 @@ class Trainer:
 
         def _worker():
             if self._snapshot_manager is not None:
+                pending_snapshot_path = None
                 while not _shutdown_requested():
                     try:
                         while self._paused and not _shutdown_requested():
@@ -6259,16 +6264,23 @@ class Trainer:
                         # rebuild that no consumer can activate.
                         if _shutdown_requested():
                             break
-                        if not decision.admitted:
+                        if decision.admitted:
+                            # Admission advances the durable freshness reference
+                            # before parsing/tensorization can fail. Retain only
+                            # its path until the dataset handoff succeeds, so a
+                            # later rejected cycle can retry the verified load.
+                            pending_snapshot_path = decision.manifest_path
+                        else:
                             print(
                                 "  Corpus candidate not activated: "
                                 f"{decision.reason}"
                             )
+                        if pending_snapshot_path is None:
                             continue
 
                         train_entries, validation_entries, manifest = (
                             self._snapshot_manager.load_split(
-                                decision.manifest_path,
+                                pending_snapshot_path,
                                 max_train_entries=self.config.replay_max_entries,
                             )
                         )
@@ -6287,6 +6299,7 @@ class Trainer:
                             self._bg_selfplay_incremental = None
                             self._bg_snapshot_manifest = manifest
                             self._bg_validation_entries = validation_entries
+                        pending_snapshot_path = None
                         self._data_ready_event.set()
                         print(
                             f"  Corpus snapshot {manifest['version']} ready: "
@@ -6522,10 +6535,14 @@ class Trainer:
             self._current_dataset = bg_dataset
         _is_fast = isinstance(dataloader, FastBatchIterator)
         if _is_fast:
-            _update_src = bg_incremental if bg_incremental is not None else bg_dataset
-            if _update_src is not None:
+            if bg_incremental is not None:
                 dataloader.update_data(
-                    _update_src, max_entries=self.config.replay_max_entries)
+                    bg_incremental, max_entries=self.config.replay_max_entries)
+            elif bg_dataset is not None:
+                # This is the complete admitted snapshot or merged window.
+                # Appending it retains old rows outside its fingerprint and
+                # duplicates overlap whenever the replay cap leaves room.
+                dataloader.replace_data(bg_dataset)
             if bg_dataset is not None:
                 dataloader.dataset = bg_dataset
             # Free CPU dataset references after GPU upload.  The data lives
@@ -7899,6 +7916,9 @@ class Trainer:
             preloaded_dataset=preloaded_validation_dataset,
             cache_metadata=preloaded_validation_cache_metadata,
         )
+        # Validation now owns the cache. This startup local must not keep
+        # its tensors alive after a later snapshot replaces validation.
+        preloaded_validation_dataset = None
         train_entry_count = (
             len(preloaded_dataset)
             if preloaded_dataset is not None else len(train_entries)
@@ -7989,6 +8009,9 @@ class Trainer:
                 cache_metadata=cache_metadata or None,
                 load_existing_cache=not preloaded_cache_checked,
             )
+        # The loader owns the startup data or its uploaded copy. Retaining
+        # this cache local would pin the initial window for the whole run.
+        preloaded_dataset = None
         # Journal Pass 117: on every FastBatchIterator path the parsed entries
         # have already been copied into tensors, so retaining even the held-out
         # list would spend the RAM headroom this cache path is meant to recover.
@@ -8011,6 +8034,13 @@ class Trainer:
         else:
             self._current_dataset = None
         _gpu_resident = getattr(dataloader, 'on_gpu', False)
+        if _is_fast and _gpu_resident and self._snapshot_manager is not None:
+            # Snapshot self-play prepares complete replacements and never
+            # concatenates with this CPU source. The completed GPU upload
+            # owns every training tensor, so release both startup references
+            # before the first epoch and worker fork.
+            self._current_dataset = None
+            dataloader.dataset = None
         _path_label = " (GPU-resident)" if _gpu_resident else (" (fast tensor indexing)" if _is_fast else (" (padded training path)" if self._use_padded else ""))
         print(f"DataLoader ready with {len(dataloader)} batches{_path_label}.")
         sys.stdout.flush()
@@ -8188,6 +8218,9 @@ class Trainer:
                           f"({_desc})...")
                     dataloader, _gpu_resident = self._refresh_dataloader(
                         dataloader, bg_dataset, bg_incremental, effective_workers)
+                    # The loader owns CPU fallback data or has copied it to
+                    # GPU. Do not retain the upload sources for another epoch.
+                    bg_dataset = bg_incremental = None
                     _stale_epochs = 0  # Fresh data arrived — reset counter
                     # Background thread is continuous — no need to restart
                 elif _max_stale > 0 and _stale_epochs >= _max_stale:
@@ -8232,6 +8265,8 @@ class Trainer:
                                   f"— refreshing ({_desc})...")
                             dataloader, _gpu_resident = self._refresh_dataloader(
                                 dataloader, bg_dataset, bg_incremental, effective_workers)
+                            # Match the non-waiting refresh ownership boundary.
+                            bg_dataset = bg_incremental = None
                             _stale_epochs = 0
                             break
                         # No data yet — block until the bg thread signals or
