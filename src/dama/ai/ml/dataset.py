@@ -23,6 +23,7 @@ from ...game_state import GameState
 from ...board import Board
 from .replay import ReplayBuffer, ReplayEntry
 from .move_encoder import encode_board, encode_moves, MOVE_FEATURE_SIZE, BOARD_PLANES
+from .run_status import _fsync_directory
 from .scoring import compute_reward_weight, compute_reward_weights_batch
 
 
@@ -1157,6 +1158,12 @@ class CachedTensorDataset(Dataset):
         }
         cache_path = Path(path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Committing the cache file inside its directory is not enough when
+        # that directory was itself newly created: directory fsync is not
+        # recursive.  Commit the cache namespace before publishing any file,
+        # and retry this boundary on every save in case a prior parent sync
+        # failed after mkdir() became visible.  See Journal Pass 432.
+        _fsync_directory(cache_path.parent.parent)
         temp_path = None
         try:
             # Keep the previous cache readable until the complete replacement
@@ -1185,6 +1192,7 @@ class CachedTensorDataset(Dataset):
                 os.fsync(raw_file.fileno())
             os.replace(temp_path, cache_path)
             temp_path = None
+            _fsync_directory(cache_path.parent)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
