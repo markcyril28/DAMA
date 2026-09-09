@@ -315,8 +315,19 @@ def compute_reward_weight(score: float) -> float:
     # score = 0 -> weight = 1.0 (neutral)
     normalized = 2.0 / (1.0 + math.exp(-score / 5.0))  # Maps to (0, 2)
 
-    # Clamp to configured range
-    return max(REWARD_WEIGHT_MIN, min(REWARD_WEIGHT_MAX, normalized))
+    # Clamp explicitly. The generic nested min/max calls dominate this tiny
+    # scalar helper when self-play ingestion evaluates thousands of replay
+    # rows; direct comparisons preserve the exact float while avoiding four
+    # Python call arguments per score.
+    # Keep the former max(min()) behavior for NaN inputs: Python's ordered
+    # builtins selected the upper bound when all NaN comparisons were false.
+    if normalized != normalized:
+        return REWARD_WEIGHT_MAX
+    if normalized < REWARD_WEIGHT_MIN:
+        return REWARD_WEIGHT_MIN
+    if normalized > REWARD_WEIGHT_MAX:
+        return REWARD_WEIGHT_MAX
+    return normalized
 
 
 def compute_reward_weights_batch(scores: np.ndarray) -> np.ndarray:
