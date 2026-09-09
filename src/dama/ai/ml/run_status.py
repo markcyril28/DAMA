@@ -166,6 +166,13 @@ def begin_run(
     """
     directory = Path(log_dir)
     directory.mkdir(parents=True, exist_ok=True)
+    # The marker's own directory fsync below commits run_status.json, but it
+    # cannot commit this directory's name in its parent.  On the first launch
+    # of a namespace, make the log-directory entry durable before relying on
+    # it to preserve evidence of a later hard kill or host failure.  Repeat
+    # the parent sync on every session so a prior failed sync is retried even
+    # though mkdir() now observes an existing directory.
+    _fsync_directory(directory.parent)
     # Raises ActiveRunError before anything is written when the marker's pid
     # is a live trainer: the "unterminated" verdict below would be false and
     # overwriting the marker would hand two writers one namespace.
@@ -247,13 +254,31 @@ def describe_unterminated(record: Mapping[str, Any]) -> str:
     )
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist a completed rename when the platform exposes directory fds."""
+
+    if os.name == "nt":
+        # Native Windows cannot open a directory through os.open(). Atomic
+        # replacement remains the supported fallback there.
+        return
+    directory_fd = os.open(
+        path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     """Atomically replace ``path`` with ``payload`` as pretty-printed JSON.
 
     Shared implementation for every durable JSON artifact this project writes
     (run markers, acceptance reports, corpus manifests): temp file in the
-    destination directory, fsync, then ``os.replace``.  On failure the temp
-    file is removed and the destination is left untouched.
+    destination directory, file fsync, ``os.replace``, then directory fsync.
+    Before replacement, a failure removes the temp and leaves the destination
+    untouched. After replacement, a directory-fsync failure is reported even
+    though the new complete file may already be visible.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
@@ -264,6 +289,7 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
+        _fsync_directory(path.parent)
     except Exception:
         try:
             os.unlink(temp_name)
