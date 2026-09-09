@@ -9,6 +9,7 @@ runs at all for SIGKILL.
 
 import json
 import os
+import stat
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,72 @@ def _read(log_dir: Path) -> dict:
         (log_dir / run_status.RUN_STATUS_FILENAME).read_text(encoding="utf-8"))
 
 
+def test_atomic_status_write_fsyncs_file_and_directory_around_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complete bytes and then their public pathname become crash-durable."""
+    path = tmp_path / run_status.RUN_STATUS_FILENAME
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append("directory_fsync" if stat.S_ISDIR(mode) else "file_fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(run_status.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(run_status.os, "replace", tracking_replace)
+
+    run_status._write_json_atomic(path, {"status": "running"})
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "running"}
+
+
+def test_atomic_status_write_reports_directory_fsync_failure_without_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed directory commit is visible to callers and strands no temp."""
+    path = tmp_path / run_status.RUN_STATUS_FILENAME
+    path.write_text('{"status": "old"}\n', encoding="utf-8")
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "simulated status directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(run_status.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="status directory fsync failure"):
+        run_status._write_json_atomic(path, {"status": "new"})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "new"}
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_status_directory_fsync_keeps_native_windows_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native Windows keeps atomic replacement without directory descriptors."""
+
+    def fail_open(*_args, **_kwargs):
+        raise AssertionError("native Windows must not open a directory fd")
+
+    monkeypatch.setattr(run_status.os, "name", "nt")
+    monkeypatch.setattr(run_status.os, "open", fail_open)
+
+    run_status._fsync_directory(tmp_path)
+
+
 def test_begin_run_opens_a_running_marker_before_any_training(tmp_path: Path) -> None:
     assert run_status.begin_run(tmp_path, pid=4321) is None
     record = _read(tmp_path)
@@ -33,6 +100,53 @@ def test_begin_run_opens_a_running_marker_before_any_training(tmp_path: Path) ->
     assert record["pid"] == 4321
     assert record["started_at"]
     assert record["ended_at"] is None
+
+
+def test_begin_run_commits_log_directory_before_running_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first-run marker cannot outlive only a volatile directory name."""
+    parent = tmp_path / "logs"
+    parent.mkdir()
+    log_dir = parent / "new_namespace"
+    synced = []
+    real_sync = run_status._fsync_directory
+
+    def tracking_sync(path: Path) -> None:
+        synced.append(Path(path))
+        real_sync(Path(path))
+
+    monkeypatch.setattr(run_status, "_fsync_directory", tracking_sync)
+
+    run_status.begin_run(log_dir, pid=4321)
+
+    assert synced == [parent, log_dir]
+    assert _read(log_dir)["status"] == "running"
+
+
+def test_begin_run_reports_parent_directory_commit_failure_before_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not acknowledge a running marker beneath an uncommitted log dir."""
+    parent = tmp_path / "logs"
+    parent.mkdir()
+    log_dir = parent / "new_namespace"
+
+    def fail_parent_sync(path: Path) -> None:
+        if Path(path) == parent:
+            raise OSError(5, "simulated log-directory commit failure")
+        raise AssertionError("marker publication must not begin")
+
+    monkeypatch.setattr(run_status, "_fsync_directory", fail_parent_sync)
+
+    with pytest.raises(OSError, match="log-directory commit failure"):
+        run_status.begin_run(log_dir, pid=4321)
+
+    assert log_dir.is_dir()
+    assert not (log_dir / run_status.RUN_STATUS_FILENAME).exists()
+    assert not list(log_dir.glob("*.tmp"))
 
 
 @pytest.mark.parametrize("reason", sorted(run_status.TERMINAL_REASONS))
