@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import Future
+from pathlib import Path
 
 import pytest
 import torch
@@ -260,6 +261,64 @@ def test_evaluation_stats_preserve_prior_latest_on_write_failure(
 
     assert latest.read_bytes() == prior
     assert not list(tmp_path.glob("latest_test.json.*.tmp"))
+
+
+def test_evaluation_stats_commit_detail_directory_before_publication(
+    monkeypatch, tmp_path
+) -> None:
+    """A successful detail write first commits its newly created namespace."""
+    stats_dir = tmp_path / "acceptance" / "random_details"
+    stats_dir.parent.mkdir()
+    tester = model_vs_algo.ModelVsAlgoTester(
+        model_path="unused.pt", num_workers=1, stats_dir=str(stats_dir))
+    stats = EvaluationStatistics(
+        model_path="unused.pt",
+        algo_difficulty="easy",
+        opponent_type="random",
+    )
+    events = []
+    real_write = model_vs_algo._write_json_atomic
+
+    def record_sync(path):
+        events.append(("sync", Path(path)))
+
+    def record_write(path, payload):
+        events.append(("write", Path(path)))
+        real_write(path, payload)
+
+    monkeypatch.setattr(model_vs_algo, "_fsync_directory", record_sync)
+    monkeypatch.setattr(model_vs_algo, "_write_json_atomic", record_write)
+
+    tester._save_stats(stats)
+
+    assert events[0] == ("sync", stats_dir.parent)
+    assert [event[0] for event in events[1:]] == ["write", "write"]
+
+
+def test_evaluation_stats_parent_sync_failure_publishes_nothing(
+    monkeypatch, tmp_path
+) -> None:
+    """A lost detail namespace must not be acknowledged through child files."""
+    stats_dir = tmp_path / "acceptance" / "easy_details"
+    stats_dir.parent.mkdir()
+    tester = model_vs_algo.ModelVsAlgoTester(
+        model_path="unused.pt", num_workers=1, stats_dir=str(stats_dir))
+    stats = EvaluationStatistics(
+        model_path="unused.pt",
+        algo_difficulty="easy",
+        opponent_type="algorithm",
+    )
+
+    def fail_parent_sync(_path):
+        raise OSError(5, "simulated evaluation detail directory sync failure")
+
+    monkeypatch.setattr(model_vs_algo, "_fsync_directory", fail_parent_sync)
+
+    with pytest.raises(OSError, match="simulated evaluation detail"):
+        tester._save_stats(stats)
+
+    assert stats_dir.is_dir()
+    assert not list(stats_dir.iterdir())
 
 
 def test_evaluation_worker_limits_pytorch_thread_pools(monkeypatch) -> None:
