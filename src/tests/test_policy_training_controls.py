@@ -2147,6 +2147,131 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
     assert holder._bg_snapshot_manifest["fingerprint"] == "enhanced"
 
 
+@pytest.mark.parametrize("failure_stage", ["load", "tensorize"])
+@pytest.mark.parametrize(
+    "followup", ["rejected", "admitted", "still_fails", "stop", "never_admitted"])
+def test_background_snapshot_retries_admitted_preparation(
+    monkeypatch: pytest.MonkeyPatch, failure_stage: str, followup: str,
+) -> None:
+    """A preparation failure must not lose an already admitted snapshot."""
+    calls = {"cycles": 0, "loads": [], "backoffs": [], "published": []}
+    admitted_path = Path("snapshot_v000002/manifest.json")
+    newer_path = Path("snapshot_v000003/manifest.json")
+
+    class FakeThread:
+        def __init__(self, target, daemon=False):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    def fail_preparation():
+        return len(calls["loads"]) == 1 or followup == "still_fails"
+
+    class Manager:
+        def consider_snapshot(self, **_kwargs):
+            if calls["cycles"] == 1 and followup != "never_admitted":
+                return SnapshotDecision(True, "admitted", admitted_path, {})
+            if calls["cycles"] == 2 and followup == "admitted":
+                return SnapshotDecision(True, "admitted", newer_path, {})
+            return SnapshotDecision(
+                False, "below freshness floor", admitted_path, {})
+
+        def load_split(self, path, max_train_entries=0):
+            assert max_train_entries == 500
+            calls["loads"].append(path)
+            if failure_stage == "load" and fail_preparation():
+                raise OSError("synthetic snapshot read failure")
+            version = 3 if path == newer_path else 2
+            return [f"train-{version}"], [f"validation-{version}"], {
+                "version": version,
+                "metrics": {"fresh_unique_state_rate": 0.5},
+            }
+
+    def tensorize(entries, **_kwargs):
+        if failure_stage == "tensorize" and fail_preparation():
+            raise RuntimeError("synthetic tensor preparation failure")
+        return list(entries)
+
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        replay_max_files=60, replay_max_entries=500, max_moves_per_sample=32,
+    )
+    holder._snapshot_manager = Manager()
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_stop_event = trainer_module.threading.Event()
+    holder._bg_selfplay_lock = trainer_module.threading.Lock()
+    holder._bg_selfplay_dataset = None
+    holder._bg_selfplay_incremental = None
+    holder._bg_selfplay_entries = None
+    holder._bg_snapshot_manifest = None
+    holder._bg_validation_entries = None
+    holder._stopped = holder._paused = False
+    holder._wait_for_selfplay_disk_headroom = lambda: True
+    holder._corpus_settings = lambda **_kwargs: ({}, {}, {})
+    activations = []
+    holder._activate_dataset_manifest = lambda manifest: activations.append(
+        manifest["version"])
+    validations = []
+    holder._set_validation_entries = validations.append
+
+    def collect():
+        # Consume immediately, so later rejected cycles cannot re-publish the
+        # same successful snapshot just because its handoff slot is empty.
+        dataset, incremental = holder._collect_background_selfplay()
+        calls["published"].append(dataset)
+        assert incremental is None
+
+    holder._data_ready_event = SimpleNamespace(set=collect)
+
+    def run_selfplay(*_args, **_kwargs):
+        calls["cycles"] += 1
+        if calls["cycles"] == 4:
+            holder._bg_selfplay_stop_event.set()
+        return 1, 23
+
+    def backoff(timeout=None):
+        calls["backoffs"].append(timeout)
+        if followup == "stop":
+            holder._bg_selfplay_stop_event.set()
+        return holder._bg_selfplay_stop_event.is_set()
+
+    holder.run_selfplay = run_selfplay
+    monkeypatch.setattr(holder._bg_selfplay_stop_event, "wait", backoff)
+    monkeypatch.setattr(trainer_module.threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        trainer_module.CachedTensorDataset, "from_entries", staticmethod(tensorize))
+
+    Trainer._start_background_selfplay(holder, 72)
+
+    if followup == "stop":
+        assert calls == {
+            "cycles": 1, "loads": [admitted_path],
+            "backoffs": [2.0], "published": [],
+        }
+    elif followup == "never_admitted":
+        assert calls == {
+            "cycles": 4, "loads": [], "backoffs": [], "published": [],
+        }
+    elif followup == "still_fails":
+        assert calls == {
+            "cycles": 4, "loads": [admitted_path] * 3,
+            "backoffs": [2.0] * 3, "published": [],
+        }
+    else:
+        version = 3 if followup == "admitted" else 2
+        assert calls == {
+            "cycles": 4,
+            "loads": [admitted_path, newer_path if version == 3 else admitted_path],
+            "backoffs": [2.0], "published": [[f"train-{version}"]],
+        }
+        assert activations == [version]
+        assert validations == [[f"validation-{version}"]]
+    if followup in {"stop", "still_fails", "never_admitted"}:
+        assert activations == validations == []
+
+
 @pytest.mark.parametrize("tensorize_fails", [False, True])
 def test_background_snapshot_releases_cycle_locals(
     monkeypatch: pytest.MonkeyPatch, tensorize_fails: bool,
@@ -5631,6 +5756,78 @@ def test_validation_tensor_cache_persists_verified_leakage_metadata(
     assert cached is not None
     assert cached.metadata["validation_leakage"] == holder._active_snapshot_manifest[
         "validation_leakage"]
+
+
+@pytest.mark.parametrize("stage", ["policy_only", "enhanced"])
+@pytest.mark.parametrize("background_refresh", [False, True])
+def test_validation_tensorization_releases_parsed_rows(
+    stage: str, background_refresh: bool,
+) -> None:
+    """Validation needs tensors after publication, including snapshot refreshes."""
+    import weakref
+
+    import torch
+
+    from dama.ai.ml.replay import ReplayEntry
+    from dama.game_state import GameState
+
+    state = GameState.initial()
+    entries = [
+        ReplayEntry(
+            state=state.to_compact(),
+            legal_moves=[move.to_dict() for move in state.legal_moves()],
+            chosen_index=index, result=1, score=2.5,
+        )
+        for index in range(3)
+    ]
+    refs = [weakref.ref(entry) for entry in entries]
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        policy_stage=stage, max_moves_per_sample=32, batch_size=2,
+        teacher_score_depth=1, teacher_soft_temperature=1.0,
+        teacher_value_scale=1000.0, teacher_hard_label_blend=0.25,
+    )
+    if stage == "enhanced":
+        expected = trainer_module.create_enhanced_dataloader(
+            entries, batch_size=2, max_moves_per_sample=32,
+            teacher_depth=1, temperature=1.0, value_scale=1000.0,
+            hard_label_blend=0.25, shuffle=False, show_progress=False,
+        ).dataset
+    else:
+        expected = trainer_module.CachedTensorDataset.from_entries(
+            entries, max_moves_per_sample=32, show_progress=False)
+
+    if background_refresh:
+        training_dataset = object()
+        manifest = {"version": 2}
+        activated = []
+        holder._activate_dataset_manifest = activated.append
+        holder._bg_selfplay_lock = trainer_module.threading.Lock()
+        holder._bg_selfplay_dataset = training_dataset
+        holder._bg_selfplay_incremental = None
+        holder._bg_snapshot_manifest = manifest
+        holder._bg_validation_entries = entries
+        assert holder._collect_background_selfplay() == (training_dataset, None)
+        assert activated == [manifest]
+        assert holder._bg_validation_entries is None
+    else:
+        holder._set_validation_entries(entries)
+
+    # Do not clear the caller's rows in place; it still owns them until release.
+    assert len(entries) == 3
+    del entries
+    assert all(ref() is None for ref in refs)
+    assert holder._validation_entries == []
+    assert len(holder._validation_dataloader) == 3
+    fields = [
+        "boards", "move_features", "move_counts", "targets",
+        "reward_weights", "value_targets",
+    ]
+    if stage == "enhanced":
+        fields.append("teacher_probabilities")
+    for field in fields:
+        assert torch.equal(
+            getattr(holder._validation_dataloader, field), getattr(expected, field))
 
 
 def test_snapshot_tensor_cache_requires_a_prelaunch_ram_measurement() -> None:
