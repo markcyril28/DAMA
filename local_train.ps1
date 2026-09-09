@@ -165,8 +165,6 @@ function Resolve-ProjectPath {
 $IsPolicyRecovery = (Get-YamlScalar -Path $ConfigPath -Section 'recovery_experiment' -Key 'enabled') -eq 'true'
 $PolicyRecoveryBaselinePath = ''
 $PolicyRecoveryBaselineSha256 = ''
-$PolicyRecoveryLegacyStatsPath = ''
-$PolicyRecoveryStatsPath = ''
 if ($IsPolicyRecovery) {
     $PolicyRecoveryBaselinePath = Resolve-ProjectPath (
         Get-YamlScalar -Path $ConfigPath -Section 'recovery_experiment' -Key 'baseline_checkpoint')
@@ -177,10 +175,6 @@ if ($IsPolicyRecovery) {
         [string]::IsNullOrWhiteSpace($PolicyRecoveryBaselineSha256)) {
         throw "recovery_experiment needs baseline_checkpoint and baseline_sha256 in $ConfigPath"
     }
-    $PolicyRecoveryStatsPath = Resolve-ProjectPath (
-        Get-YamlScalar -Path $ConfigPath -Section 'paths' -Key 'stats_file')
-    $PolicyRecoveryLegacyStatsPath = Resolve-ProjectPath (
-        Get-YamlScalar -Path $ConfigPath -Section 'paths' -Key 'seed_stats_from')
 }
 if ($EnhancedStage -and -not $IsPolicyRecovery) {
     throw '-EnhancedStage is available only with a recovery_experiment config.'
@@ -462,37 +456,6 @@ print("DAMA trainer import: OK")
     if ($ValidateOnly) {
         Write-Host 'Validation-only mode requested. Training was not started.'
         return
-    }
-
-    if ($IsPolicyRecovery -and -not $EnhancedStage -and
-        -not [string]::IsNullOrWhiteSpace($PolicyRecoveryStatsPath) -and
-        -not [string]::IsNullOrWhiteSpace($PolicyRecoveryLegacyStatsPath) -and
-        -not (Test-Path -LiteralPath $PolicyRecoveryStatsPath) -and
-        (Test-Path -LiteralPath $PolicyRecoveryLegacyStatsPath -PathType Leaf)) {
-        # Copy through a temp file and rename. A plain copy that is
-        # interrupted part way leaves a truncated stats file behind, and both
-        # seeders -- this one and the trainer's -- skip when the destination
-        # merely exists, so the run would silently start from a corrupt
-        # history. Matches local_train.sh / train_server.sh.
-        $StatsSeedTemp = $PolicyRecoveryStatsPath + '.seed.tmp'
-        try {
-            Copy-Item -LiteralPath $PolicyRecoveryLegacyStatsPath `
-                -Destination $StatsSeedTemp -Force -ErrorAction Stop
-            Move-Item -LiteralPath $StatsSeedTemp `
-                -Destination $PolicyRecoveryStatsPath -Force -ErrorAction Stop
-            Write-Host (
-                'Recovery stats seeded without modifying the legacy stats file: ' +
-                $PolicyRecoveryStatsPath
-            )
-        } catch {
-            Remove-Item -LiteralPath $StatsSeedTemp -Force `
-                -ErrorAction SilentlyContinue
-            Write-Host (
-                '[warn] Could not seed recovery stats from ' +
-                $PolicyRecoveryLegacyStatsPath +
-                '; the trainer will retry the same one-time copy.'
-            )
-        }
     }
 
     $TrainerArguments = @(
