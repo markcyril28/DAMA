@@ -120,6 +120,78 @@ def test_replay_scan_reuses_metadata_and_preserves_mtime_name_order(tmp_path):
         assert identity == corpus._replay_file_identity(path)
 
 
+def _replay_stats_handoff(replay_dir: Path) -> tuple:
+    with os.scandir(replay_dir) as entries:
+        file_stats = [
+            (Path(entry.path), entry.stat())
+            for entry in entries
+            if entry.name.startswith("replay_")
+            and entry.name.endswith(".jsonl")
+        ]
+    stat_result = os.stat(replay_dir)
+    directory_identity = (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+    return directory_identity, file_stats
+
+
+def test_replay_scan_accepts_validated_cleanup_identity_handoff(
+    tmp_path, monkeypatch,
+):
+    """An unchanged snapshot window does not restat every replay shard."""
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    older = replay_dir / "replay_b.jsonl"
+    tied_a = replay_dir / "replay_a.jsonl"
+    newer = replay_dir / "replay_c.jsonl"
+    for path in (older, tied_a, newer):
+        path.write_text("{}\n", encoding="utf-8")
+    os.utime(older, ns=(10, 10))
+    os.utime(tied_a, ns=(10, 10))
+    os.utime(newer, ns=(20, 20))
+    handoff = _replay_stats_handoff(replay_dir)
+    manager = corpus.CorpusSnapshotManager(
+        str(replay_dir), str(tmp_path / "snapshots"))
+
+    monkeypatch.setattr(
+        corpus,
+        "_directory_entry_stats",
+        lambda _entries: (_ for _ in ()).throw(
+            AssertionError("valid cleanup handoff restatted replay shards")
+        ),
+    )
+    files, identities = manager._replay_files_with_identities(handoff)
+
+    assert files == [tied_a, older, newer]
+    assert set(identities) == set(files)
+    for path, identity in identities.items():
+        assert identity == corpus._replay_file_identity_from_stat(
+            path, dict(handoff[1])[path])
+
+
+def test_changed_cleanup_identity_handoff_falls_back_to_exact_scan(tmp_path):
+    """A concurrent shard publication invalidates, rather than narrows, input."""
+
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    first = replay_dir / "replay_a.jsonl"
+    first.write_text("{}\n", encoding="utf-8")
+    handoff = _replay_stats_handoff(replay_dir)
+    added = replay_dir / "replay_b.jsonl"
+    added.write_text("{}\n", encoding="utf-8")
+    manager = corpus.CorpusSnapshotManager(
+        str(replay_dir), str(tmp_path / "snapshots"))
+
+    files, identities = manager._replay_files_with_identities(handoff)
+
+    assert files == [first, added]
+    assert set(identities) == {first, added}
+
+
 def test_external_validation_exclusion_avoids_full_union() -> None:
     """The small frozen suite is removed without copying the large hold-out."""
 
