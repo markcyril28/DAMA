@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from dama.ai.ml import checkpoint_acceptance
+from dama.ai.ml import run_status
 
 
 _CHECKPOINT_SHA256 = "A" * 64
@@ -160,6 +161,50 @@ def test_direct_acceptance_rejects_checkpoint_hash_mismatch_before_evaluation(
         )
 
     assert not output_dir.exists()
+
+
+def test_direct_acceptance_commits_namespace_before_evaluation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model_step_136000.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    output_dir = tmp_path / "reports"
+
+    def fail_parent_sync(path: Path) -> None:
+        assert Path(path) == output_dir.parent
+        raise OSError("simulated acceptance namespace sync failure")
+
+    def unexpected_worker_pool(**_kwargs):
+        raise AssertionError("acceptance evaluation started before namespace commit")
+
+    monkeypatch.setattr(run_status, "_fsync_directory", fail_parent_sync)
+    monkeypatch.setattr(
+        checkpoint_acceptance, "ProcessPoolExecutor", unexpected_worker_pool)
+
+    with pytest.raises(OSError, match="namespace sync failure"):
+        checkpoint_acceptance.run_checkpoint_acceptance(
+            str(checkpoint),
+            step=136000,
+            teacher_agreement=0.55,
+            opening_plies=(2, 4, 6, 8),
+            opening_seed=20260819,
+            inference_depth=1,
+            max_moves=200,
+            num_workers=2,
+            output_dir=str(output_dir),
+            training_stage="policy_only",
+            task_id=checkpoint_acceptance.acceptance_task_id(
+                str(checkpoint), 136000),
+            checkpoint_sha256=hashlib.sha256(
+                checkpoint.read_bytes()).hexdigest(),
+            suite_fingerprint=_SUITE_FINGERPRINT,
+            teacher_correct_states=2750,
+            teacher_total_states=5000,
+        )
+
+    assert output_dir.is_dir()
+    assert not list(output_dir.iterdir())
 
 
 @pytest.mark.parametrize(
