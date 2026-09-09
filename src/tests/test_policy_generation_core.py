@@ -254,6 +254,35 @@ def test_compiled_generator_emits_opening_and_label_audit_metadata():
     assert entry["game_id"] == "compiled-game"
 
 
+@pytest.mark.skipif(
+    not selfplay._HAS_FAST_GAME,
+    reason="compiled full-game extension is not available in this interpreter",
+)
+@pytest.mark.parametrize("start_player", [1, 2])
+def test_compiled_generator_results_match_each_recorded_perspective(start_player):
+    from dama.ai.algorithmic._fast_search import play_full_game_cy
+
+    result = play_full_game_cy(
+        p1_difficulty="easy",
+        p2_difficulty="easy",
+        max_moves=12,
+        noise_prob=0.0,
+        start_player=start_player,
+        opening_plies=4,
+        opening_seed=2718,
+        trajectory_source="algorithm",
+        game_id=f"result-perspective-{start_player}",
+    )
+
+    for entry in result["entries"]:
+        expected = (
+            0
+            if result["winner"] is None
+            else 1 if entry["state"]["turn"] == result["winner"] else -1
+        )
+        assert entry["result"] == expected
+
+
 def test_incomplete_cycle_quarantine_removes_partial_replay_file(tmp_path):
     """An interrupted cycle must not leave an off-ratio file for corpus scans."""
     pytest.importorskip("torch")
