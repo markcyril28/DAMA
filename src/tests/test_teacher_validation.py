@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 
 import pytest
 import torch
@@ -114,6 +115,173 @@ def test_promotion_can_be_persisted_only_after_checkpoint_write(tmp_path: Path) 
     saved = json.loads(path.read_text(encoding="utf-8").strip())
     assert saved["checkpoint_path"] == "step_2.pt"
     assert saved["promoted"] is True
+
+
+def test_promotion_registry_fsyncs_file_and_directory_around_replace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    registry = PromotionRegistry(str(path), 0.50)
+    decision = registry.consider(
+        "step_2.pt", 2, 0.51, "suite", "data", persist=False
+    )
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append(
+            "directory_fsync" if stat.S_ISDIR(mode) else "file_fsync"
+        )
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(teacher_validation_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(teacher_validation_module.os, "replace", tracking_replace)
+
+    registry.persist(decision)
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert json.loads(path.read_text(encoding="utf-8"))["step"] == 2
+    assert list(tmp_path.glob("promotions.jsonl.*.tmp")) == []
+
+
+def test_promotion_registry_reports_directory_fsync_failure_without_residue(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "promotions.jsonl"
+    registry = PromotionRegistry(str(path), 0.50)
+    decision = registry.consider(
+        "step_2.pt", 2, 0.51, "suite", "data", persist=False
+    )
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "simulated promotion directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(
+        teacher_validation_module.os, "fsync", fail_directory_fsync
+    )
+
+    with pytest.raises(OSError, match="promotion directory fsync failure"):
+        registry.persist(decision)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["step"] == 2
+    assert list(tmp_path.glob("promotions.jsonl.*.tmp")) == []
+
+
+def test_frozen_suite_commits_bytes_before_atomic_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    suite = tmp_path / "frozen.jsonl"
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append(
+            "directory_fsync" if stat.S_ISDIR(mode) else "file_fsync"
+        )
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append(f"replace:{Path(destination).name}")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(teacher_validation_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(teacher_validation_module.os, "replace", tracking_replace)
+    monkeypatch.setattr(
+        teacher_validation_module,
+        "get_best_move",
+        lambda state, *_args, **_kwargs: state.legal_moves()[0],
+    )
+
+    manifest = teacher_validation_module.create_frozen_teacher_suite(
+        str(suite), target_states=1, opening_plies=(0,), max_games=1
+    )
+
+    manifest_path = suite.with_suffix(suite.suffix + ".manifest.json")
+    assert events == [
+        "file_fsync",
+        "replace:frozen.jsonl",
+        "directory_fsync",
+        "file_fsync",
+        "replace:frozen.jsonl.manifest.json",
+        "directory_fsync",
+    ]
+    assert json.loads(suite.read_text(encoding="utf-8"))["chosen_index"] == 0
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+    assert hashlib.sha256(suite.read_bytes()).hexdigest() == manifest["suite_sha256"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_frozen_suite_directory_commit_failure_stops_before_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    suite = tmp_path / "frozen.jsonl"
+    monkeypatch.setattr(
+        teacher_validation_module,
+        "get_best_move",
+        lambda state, *_args, **_kwargs: state.legal_moves()[0],
+    )
+    monkeypatch.setattr(
+        teacher_validation_module,
+        "_fsync_directory",
+        lambda _path: (_ for _ in ()).throw(
+            OSError(5, "simulated suite directory fsync failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="suite directory fsync failure"):
+        teacher_validation_module.create_frozen_teacher_suite(
+            str(suite), target_states=1, opening_plies=(0,), max_games=1
+        )
+
+    assert len(suite.read_text(encoding="utf-8").splitlines()) == 1
+    assert not suite.with_suffix(suite.suffix + ".manifest.json").exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_frozen_suite_manifest_failure_never_exposes_partial_public_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from dama.ai.ml import run_status
+
+    suite = tmp_path / "frozen.jsonl"
+    monkeypatch.setattr(
+        teacher_validation_module,
+        "get_best_move",
+        lambda state, *_args, **_kwargs: state.legal_moves()[0],
+    )
+
+    def fail_after_partial_manifest(_payload, handle, **_kwargs):
+        handle.write('{"partial":')
+        handle.flush()
+        os.fsync(handle.fileno())
+        raise OSError(28, "simulated frozen manifest disk full")
+
+    monkeypatch.setattr(run_status.json, "dump", fail_after_partial_manifest)
+
+    with pytest.raises(OSError, match="frozen manifest disk full"):
+        teacher_validation_module.create_frozen_teacher_suite(
+            str(suite), target_states=1, opening_plies=(0,), max_games=1
+        )
+
+    assert len(suite.read_text(encoding="utf-8").splitlines()) == 1
+    assert not suite.with_suffix(suite.suffix + ".manifest.json").exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_promotion_registry_write_failure_preserves_history_and_retry(
