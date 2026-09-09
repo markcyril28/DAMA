@@ -8,6 +8,8 @@ This module tests:
 - Training loop components
 """
 
+import math
+
 import pytest
 import sys
 import torch
@@ -40,6 +42,8 @@ from dama.ai.ml.dataset import (
 )
 from dama.ai.ml.replay import ReplayEntry
 from dama.ai.ml.scoring import (
+    REWARD_WEIGHT_MAX,
+    REWARD_WEIGHT_MIN,
     compute_material_score,
     compute_material_advantage,
     compute_positional_score,
@@ -518,6 +522,18 @@ class TestScoring:
         w_low = compute_reward_weight(-100.0)
         assert w_high <= 2.0
         assert w_low >= 0.1
+
+    @pytest.mark.parametrize(
+        'score',
+        [-math.inf, -100.0, -5.0, 0.0, 5.0, 100.0, math.inf, math.nan],
+    )
+    def test_reward_weight_matches_legacy_clamp(self, score):
+        """The direct clamp retains the former nested min/max result."""
+        normalized = 2.0 / (1.0 + math.exp(-score / 5.0))
+        expected = max(
+            REWARD_WEIGHT_MIN, min(REWARD_WEIGHT_MAX, normalized))
+
+        assert compute_reward_weight(score) == expected
 
     def test_per_move_score_blending(self):
         """Per-move score should blend position and outcome."""
