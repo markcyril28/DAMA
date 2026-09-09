@@ -2146,7 +2146,7 @@ def play_full_game_cy(
     cdef signed char new_board[64]
     cdef CMoveList moves, teacher_moves, behavior_moves
     cdef Rules rules
-    cdef int player, move_num, i
+    cdef int player, first_record_player, move_num, i, entry_result
     cdef int teacher_idx = 0, played_idx = 0, apply_idx = 0
     cdef int teacher_best_idx = 0, behavior_best_idx = 0
     cdef int opening_i, opening_index, applied_opening_plies = 0
@@ -2192,6 +2192,11 @@ def play_full_game_cy(
         memcpy(board, new_board, 64)
         player = opponent(player)
         applied_opening_plies += 1
+
+    # Every recorded move changes the side to move exactly once, so retain the
+    # first side here instead of recovering it from each nested state dict when
+    # the terminal winner becomes known.
+    first_record_player = player
 
     # Allocate TT once; bump generation once at game start. During the game,
     # TT entries from prior moves are still useful — positions reached from
@@ -2312,16 +2317,18 @@ def play_full_game_cy(
         if moves.count == 0:
             winner_int = opponent(player)
 
-    # Set results for each entry
+    # Set results for each entry. Recorded turns alternate, so the perspective
+    # result alternates too. This avoids rereading entry['state']['turn'] for
+    # every replay row after the game has already established the same order.
     winner_py = winner_int if winner_int != 0 else None
-    for entry_d in entries:
-        turn = entry_d['state']['turn']
-        if winner_int == 0:
+    if winner_int == 0:
+        for entry_d in entries:
             entry_d['result'] = 0  # Draw
-        elif turn == winner_int:
-            entry_d['result'] = 1  # Win
-        else:
-            entry_d['result'] = -1  # Loss
+    else:
+        entry_result = 1 if first_record_player == winner_int else -1
+        for entry_d in entries:
+            entry_d['result'] = entry_result
+            entry_result = -entry_result
 
     # Final state for scoring
     final_state_dict = board_to_compact_dict(
