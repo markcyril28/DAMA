@@ -137,6 +137,36 @@ _SELFPLAY_DISK_HEADROOM_POLL_SECONDS = 30.0
 _GIB = 1024 ** 3
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist a completed rename on platforms that expose directory fds."""
+
+    if os.name == 'nt':
+        # Native Windows does not allow opening a directory this way. The
+        # same-directory replacement remains atomic there, while Linux and
+        # the supported WSL DrvFS path can make its directory entry durable.
+        return
+    directory_fd = os.open(
+        path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _prepare_checkpoint_directory(path: str | Path) -> Path:
+    """Create and commit the checkpoint namespace before model setup."""
+
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    # Numbered checkpoint publication commits names inside this directory, but
+    # directory fsync is not recursive. Commit a newly created namespace in its
+    # parent before a writer can publish into it, and retry on every Trainer
+    # construction after a prior failed parent sync. See Journal Pass 427.
+    _fsync_directory(directory.parent)
+    return directory
+
+
 def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
     """Assign every teacher difficulty to both player positions."""
     return [(p1, p2) for p1 in difficulties for p2 in difficulties]
@@ -153,6 +183,43 @@ def _training_opening_assignment(
 
     choice_index = (game_index + cycle_rotation) % len(opening_choices)
     return int(opening_choices[choice_index]), opening_seed_base + game_index
+
+
+def _stamp_selfplay_tasks(
+    tasks: Iterable[tuple],
+    *,
+    opening_choices: tuple[int, ...],
+    opening_seed_base: int,
+    start_index: int,
+    cycle_rotation: int,
+    trajectory_source: str,
+    game_id_kind: str,
+    cycle_id: int,
+    teacher_difficulty: str,
+    inference_depth: Optional[int] = None,
+) -> list[tuple]:
+    """Add deterministic opening and provenance fields to self-play tasks."""
+
+    stamped = []
+    for local_index, task in enumerate(tasks):
+        game_index = start_index + local_index
+        opening_plies, opening_seed = _training_opening_assignment(
+            opening_choices,
+            opening_seed_base,
+            game_index,
+            cycle_rotation=cycle_rotation,
+        )
+        suffix = (
+            opening_plies,
+            opening_seed,
+            trajectory_source,
+            f"cycle-{cycle_id:06d}-{game_id_kind}-{local_index:06d}",
+            teacher_difficulty,
+        )
+        if inference_depth is not None:
+            suffix += (inference_depth,)
+        stamped.append(task + suffix)
+    return stamped
 
 
 def _stage_runtime_model_checkpoint(
@@ -181,6 +248,10 @@ def _stage_runtime_model_checkpoint(
     serialized = buffer.getbuffer()
     try:
         digest = hashlib.sha256(serialized).hexdigest().upper()
+        # The Linux fork fast path needs only the returned digest and should
+        # not materialize a runtime-model namespace. Spawn and failed-fork
+        # fallbacks create it only when they actually persist worker input.
+        path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         temporary.unlink(missing_ok=True)
         try:
@@ -1408,7 +1479,7 @@ class Trainer:
         print(f"CPU threads: {cpu_threads} intra-op, {interop_threads} inter-op (of {_total_cores} cores)")
 
         # Create directories
-        Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        _prepare_checkpoint_directory(config.checkpoint_dir)
         Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
         # Initialize components
@@ -2564,10 +2635,10 @@ class Trainer:
 
         A continuation namespace starts empty, so without this the progress
         report and every "previous steps" figure restart from zero even though
-        the run resumes a real anchor.  The launcher shells each do this before
-        exec'ing the trainer; doing it here as well is what makes a GUI-spawned
-        or bare ``python -m dama.ai.ml.trainer`` run behave the same.  It is a
-        no-op when the launcher already ran, and it never touches the source.
+        the run resumes a real anchor. The trainer is the sole seeding owner so
+        every launcher, GUI start, and bare CLI start uses the same durability
+        boundary. It is a no-op once the destination exists, and it never
+        touches the source.
         """
         seed = getattr(self.config, 'stats_seed_file', None)
         if not seed or self.config.policy_stage != 'policy_only':
@@ -2581,10 +2652,23 @@ class Trainer:
         temp_path = None
         try:
             stats_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = stats_path.with_name(stats_path.name + '.seed.tmp')
+            fd, temp_name = tempfile.mkstemp(
+                prefix=stats_path.name + '.',
+                suffix='.seed.tmp',
+                dir=stats_path.parent,
+            )
+            temp_path = Path(temp_name)
+            os.close(fd)
             shutil.copyfile(seed_path, temp_path)
+            # Atomic visibility is insufficient for recovery history. Commit
+            # the copied inode before publishing it, then commit the public
+            # name so a successful seed survives an abrupt host or storage
+            # loss just like every later aggregate-statistics replacement.
+            with temp_path.open('r+b') as seed_handle:
+                os.fsync(seed_handle.fileno())
             os.replace(temp_path, stats_path)
             temp_path = None
+            _fsync_directory(stats_path.parent)
         except OSError as exc:
             print(f"Could not seed training stats from {seed_path}: {exc}")
             return
@@ -2704,10 +2788,13 @@ class Trainer:
             if generation < persisted_generation:
                 return True
 
-            # Atomic replace protects against torn files and the lock protects
-            # the complete write plus report-refresh transaction. The generation
-            # check above additionally rejects a delayed checkpoint snapshot
-            # after a newer main-thread progress snapshot has already landed.
+            # The file and directory syncs make the replace a durability
+            # boundary, not merely an atomic-visibility boundary. This matters
+            # for strict acceptance finalizers: they may acknowledge and remove
+            # pending work only after its statistics history survives a sudden
+            # host or storage loss. The lock protects the complete write plus
+            # report-refresh transaction, while the generation check rejects a
+            # delayed checkpoint snapshot after newer progress has landed.
             _tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -2715,7 +2802,10 @@ class Trainer:
                         delete=False) as tmp:
                     _tmp_path = tmp.name
                     json.dump(snapshot, tmp, indent=2)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
                 os.replace(_tmp_path, stats_path)
+                _fsync_directory(stats_path.parent)
             except Exception as e:
                 print(f"Warning: Failed to save stats: {e}")
                 # Clean up temp file on failure
@@ -2913,9 +3003,7 @@ class Trainer:
     def _runtime_models_dir(self) -> Path:
         if self._runtime_model_dir is None:
             root = Path(self.config.runtime_model_root)
-            root.mkdir(parents=True, exist_ok=True)
             self._runtime_model_dir = root / f"process-{os.getpid()}-{time.time_ns()}"
-            self._runtime_model_dir.mkdir(parents=True, exist_ok=True)
         return self._runtime_model_dir
 
     def _runtime_model_path(self, filename: str) -> Path:
@@ -4228,12 +4316,16 @@ class Trainer:
                 'checkpoint_sha256': expected_sha256,
             })
             os.replace(staged, destination)
+            # The verified staging inode is the one that must survive under
+            # the public accepted name. The staging publisher committed its
+            # own name, but this second rename needs its own directory commit.
+            _fsync_directory(destination.parent)
         finally:
             staged.unlink(missing_ok=True)
 
     @staticmethod
     def _publish_checkpoint_alias(source: Path, destination: Path) -> None:
-        """Atomically publish a latest, promoted, or accepted checkpoint alias."""
+        """Durably publish a latest, promoted, or accepted checkpoint alias."""
         import shutil
 
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -4244,7 +4336,13 @@ class Trainer:
                 os.link(str(source), str(temporary))
             except OSError:
                 shutil.copy2(source, temporary)
+                # A copied alias owns a new inode, unlike the preferred
+                # hardlink to the already-durable numbered checkpoint. Flush
+                # those copied bytes before its pathname becomes public.
+                with temporary.open('r+b') as alias_handle:
+                    os.fsync(alias_handle.fileno())
             os.replace(temporary, destination)
+            _fsync_directory(destination.parent)
         finally:
             # A failed copy or replace must not strand a partial checkpoint
             # alias. Keep cleanup best-effort so the publication error remains
@@ -4378,7 +4476,7 @@ class Trainer:
     def _save_generation_cycle_sidecar(
         self, replay_dir: Path, entries: Dict[str, tuple],
     ) -> bool:
-        """Persist per-shard cycle ids atomically; report whether written."""
+        """Persist per-shard cycle ids durably; report whether committed."""
         payload = {
             'schema': 1,
             'entries': {
@@ -4398,6 +4496,10 @@ class Trainer:
                 os.fsync(handle.fileno())
             os.replace(temp_name, sidecar)
             temp_name = ''
+            # This cache avoids an exact replay scan during recovery. Commit
+            # its public name so a sudden host or storage loss cannot roll a
+            # successful rebuild back and reintroduce that startup delay.
+            _fsync_directory(replay_dir)
             return True
         except OSError:
             if temp_name:
@@ -4554,13 +4656,25 @@ class Trainer:
         behavior_checkpoint_sha256: Optional[str],
     ) -> None:
         """Attach additive behavior provenance before raw JSONL persistence."""
-        for entry in entries_data:
-            if not isinstance(entry, dict):
-                continue
-            entry['generation_cycle_id'] = int(cycle_id)
-            entry['model_behavior_step'] = int(behavior_step)
-            entry['model_behavior_id'] = behavior_id
-            if behavior_checkpoint_sha256 is not None:
+        # These values are invariant across a delivered worker batch. Normalize
+        # them once and select the digest shape once instead of repeating both
+        # operations for every replay row in the cycle.
+        normalized_cycle_id = int(cycle_id)
+        normalized_behavior_step = int(behavior_step)
+        if behavior_checkpoint_sha256 is None:
+            for entry in entries_data:
+                if not isinstance(entry, dict):
+                    continue
+                entry['generation_cycle_id'] = normalized_cycle_id
+                entry['model_behavior_step'] = normalized_behavior_step
+                entry['model_behavior_id'] = behavior_id
+        else:
+            for entry in entries_data:
+                if not isinstance(entry, dict):
+                    continue
+                entry['generation_cycle_id'] = normalized_cycle_id
+                entry['model_behavior_step'] = normalized_behavior_step
+                entry['model_behavior_id'] = behavior_id
                 entry['model_behavior_checkpoint_sha256'] = (
                     behavior_checkpoint_sha256)
 
@@ -4832,9 +4946,10 @@ class Trainer:
     def _prune_old_checkpoints(self, keep_path: Path) -> list:
         """Delete all but the newest ``max_retained_checkpoints`` checkpoints.
 
-        Audit Suggestion 10.  Mirrors ``_prune_old_snapshots``: best-effort, so
-        a file held open elsewhere (common on drvfs) never turns a successful
-        checkpoint write into a failure, and the next write retries it.
+        Audit Suggestion 10.  Individual unlinks remain best-effort, so a file
+        held open elsewhere (common on drvfs) does not reject the completed
+        checkpoint write and a later write retries it.  A successful deletion
+        batch is directory-synced before it is reported as reclaimed.
 
         Proofread 2026-08-25 B1: candidates are walked oldest-first until the
         budget is met among unprotected files.  A fixed window sized before
@@ -4883,6 +4998,12 @@ class Trainer:
                 print(f"  [warn] Could not prune checkpoint {path.name}: {exc}")
                 continue
             removed.append(path.name)
+        if removed:
+            # One directory commit covers the whole successful batch. Without
+            # it, a sudden host or storage loss can resurrect large checkpoint
+            # names that retention already reported as reclaimed and consume
+            # the launcher's disk headroom. See Journal Pass 434.
+            _fsync_directory(directory)
         live_count = len(candidates) - len(removed)
         if live_count > keep_count and skipped_protected > 0:
             print(
@@ -5115,7 +5236,19 @@ class Trainer:
                     ) as tmp:
                         tmp_path = Path(tmp.name)
                         torch.save(checkpoint, tmp.name)
+                    # Recovery resumes only from verified numbered
+                    # checkpoints. Make the completed archive durable before
+                    # publishing its pathname so an abrupt host shutdown
+                    # cannot leave an accepted atomic rename backed only by
+                    # volatile cache pages.
+                    with tmp_path.open('r+b') as checkpoint_handle:
+                        os.fsync(checkpoint_handle.fileno())
                     os.replace(tmp_path, checkpoint_path)
+                    # fsyncing the archive alone does not make the renamed
+                    # pathname crash-durable. Recovery discovers numbered
+                    # checkpoints through this directory entry, so commit it
+                    # before publishing any aliases or promotion evidence.
+                    _fsync_directory(checkpoint_path.parent)
                 finally:
                     # The random temporary name cannot be recovered reliably
                     # by a later launch. Remove a partial serialization or a
@@ -5264,7 +5397,9 @@ class Trainer:
             f.write(json.dumps(data) + '\n')
 
     @staticmethod
-    def _balance_side_sample_weights(entry_dicts: list) -> Optional[Dict[str, float]]:
+    def _balance_side_sample_weights(
+        entry_dicts: list,
+    ) -> Optional[Dict[str, float]]:
         """Equalize total reward weight for Player.ONE and Player.TWO entries."""
         if not entry_dicts:
             return None
@@ -5387,16 +5522,6 @@ class Trainer:
         opening_seed_base = (
             int(self.config.selfplay_opening_seed) + cycle_id * 1_000_003)
         task_order_rng = random.Random(opening_seed_base ^ 0xBB67AE8584CAA73B)
-
-        def _opening_for(
-            game_index: int, *, rotate_algorithm: bool = False
-        ) -> tuple[int, int]:
-            return _training_opening_assignment(
-                opening_choices,
-                opening_seed_base,
-                game_index,
-                cycle_rotation=cycle_id if rotate_algorithm else 0,
-            )
 
         opponent_focus = self.config.selfplay_opponent_focus
         side_focus = self.config.selfplay_focus_side
@@ -5523,17 +5648,18 @@ class Trainer:
                             p1_pol, p2_pol, _model_path_str, self.device,
                         ))
 
-        all_ml_tasks = [
-            task + (
-                _opening_for(index)[0],
-                _opening_for(index)[1],
-                'current_model',
-                f"cycle-{cycle_id:06d}-model-{index:06d}",
-                self.config.teacher_difficulty,
-                self.config.inference_depth,
-            )
-            for index, task in enumerate(all_ml_tasks)
-        ]
+        all_ml_tasks = _stamp_selfplay_tasks(
+            all_ml_tasks,
+            opening_choices=opening_choices,
+            opening_seed_base=opening_seed_base,
+            start_index=0,
+            cycle_rotation=0,
+            trajectory_source='current_model',
+            game_id_kind='model',
+            cycle_id=cycle_id,
+            teacher_difficulty=self.config.teacher_difficulty,
+            inference_depth=self.config.inference_depth,
+        )
         task_order_rng.shuffle(all_ml_tasks)
 
         # --- Algo-vs-algo task args: (p1_diff, p2_diff, max_moves, noise, start) ---
@@ -5558,22 +5684,17 @@ class Trainer:
                     start = 1 if g % 2 == 0 else 2
                     all_algo_tasks.append((d1, d2, _max_moves, _noise_prob, start))
 
-            all_algo_tasks = [
-                task + (
-                    _opening_for(
-                        len(all_ml_tasks) + index,
-                        rotate_algorithm=True,
-                    )[0],
-                    _opening_for(
-                        len(all_ml_tasks) + index,
-                        rotate_algorithm=True,
-                    )[1],
-                    'algorithm',
-                    f"cycle-{cycle_id:06d}-algorithm-{index:06d}",
-                    self.config.teacher_difficulty,
-                )
-                for index, task in enumerate(all_algo_tasks)
-            ]
+            all_algo_tasks = _stamp_selfplay_tasks(
+                all_algo_tasks,
+                opening_choices=opening_choices,
+                opening_seed_base=opening_seed_base,
+                start_index=len(all_ml_tasks),
+                cycle_rotation=cycle_id,
+                trajectory_source='algorithm',
+                game_id_kind='algorithm',
+                cycle_id=cycle_id,
+                teacher_difficulty=self.config.teacher_difficulty,
+            )
             task_order_rng.shuffle(all_algo_tasks)
 
         # [Pass 70] Build a CPU model copy for fork-inherited self-play.
@@ -5584,7 +5705,6 @@ class Trainer:
         # persisted only when fork inheritance is unavailable.
         import dama.ai.ml.selfplay as _sp_mod
         if all_ml_tasks:
-            temp_model_path.parent.mkdir(parents=True, exist_ok=True)
             runtime_arch = getattr(self.model, 'arch_params', {
                 'embedding_size': self.config.model_embedding,
                 'num_blocks': self.config.model_blocks,
@@ -6117,10 +6237,20 @@ class Trainer:
                         teacher, noise, generation = self._corpus_settings(
                             model_behavior_step=selfplay_behavior_step
                         )
+                        take_replay_stats = getattr(
+                            self.replay_buffer,
+                            'take_replay_file_stats_handoff',
+                            None,
+                        )
+                        replay_file_stats_handoff = (
+                            take_replay_stats()
+                            if callable(take_replay_stats) else None
+                        )
                         decision = self._snapshot_manager.consider_snapshot(
                             teacher_settings=teacher,
                             noise_settings=noise,
                             generation_settings=generation,
+                            replay_file_stats_handoff=replay_file_stats_handoff,
                         )
                         # Admission is already durable. If STOP arrived while
                         # the manager was auditing or publishing it, leave the
