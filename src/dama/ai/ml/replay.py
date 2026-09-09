@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Iterator, Optional, Dict, Any
 
+from .run_status import _fsync_directory
+
 # Use orjson (Rust-backed, 3-5x faster) when available, fall back to stdlib json.
 try:
     import orjson as _json_mod
@@ -97,12 +99,12 @@ def _load_entry_count_sidecar(replay_dir: Path) -> Dict[str, tuple]:
 
 
 def _save_entry_count_sidecar(replay_dir: Path, entries: Dict[str, tuple]) -> bool:
-    """Persist per-shard line counts atomically; report whether written.
+    """Persist per-shard line counts durably; report whether committed.
 
-    Always temp file + fsync + ``os.replace``: an in-place rewrite would go
-    through a shared inode when the replay directory is a hardlink copy of
-    another one (probes build such copies), and a torn write must never be
-    observable.
+    Always temp file + file fsync + ``os.replace`` + directory fsync: an
+    in-place rewrite would go through a shared inode when the replay directory
+    is a hardlink copy of another one (probes build such copies), and neither a
+    torn write nor a rename lost after sudden host failure may be acknowledged.
     """
     payload = {
         'schema': _ENTRY_COUNT_SIDECAR_SCHEMA,
@@ -122,6 +124,7 @@ def _save_entry_count_sidecar(replay_dir: Path, entries: Dict[str, tuple]) -> bo
             os.fsync(handle.fileno())
         os.replace(temp_name, sidecar)
         temp_name = ''
+        _fsync_directory(replay_dir)
         return True
     except OSError:
         if temp_name:
@@ -283,6 +286,13 @@ class ReplayBuffer:
     ):
         self.replay_dir = Path(replay_dir)
         self.replay_dir.mkdir(parents=True, exist_ok=True)
+        # A shard close fsyncs this directory, but directory fsync is not
+        # recursive: it cannot commit a newly created replay namespace's name
+        # in its parent.  Commit that name before any writer can publish the
+        # first cycle, and retry the boundary on later constructions in case a
+        # prior parent sync failed after mkdir() became visible.  See Journal
+        # Pass 426.
+        _fsync_directory(self.replay_dir.parent)
         self.max_files = max_files
         # Legacy training reads replay through load_all_entries(), where keeping
         # newly written entries avoids an immediate JSON parse.  Snapshot-mode
@@ -323,9 +333,17 @@ class ReplayBuffer:
         self._entry_count_cache: Dict[str, tuple] = {}
         self._entry_count_sidecar_loaded = False
         self._entry_count_dirty = False
+        # Buffer telemetry, replay rotation, and corpus admission run
+        # back-to-back after every persisted snapshot cycle. Retain that one
+        # point-in-time identity snapshot so both consumers can avoid
+        # restatting the same immutable shards. The handoff is one-shot and is
+        # accepted only while the directory identity and exact replay-name set
+        # remain unchanged.
+        self._cleanup_file_stats: Optional[tuple] = None
 
     def start_new_file(self) -> Path:
         """Start a new replay file."""
+        self._cleanup_file_stats = None
         self._close_current()
 
         # [Pass 109] The name has only second resolution. Every cycle persists,
@@ -448,10 +466,22 @@ class ReplayBuffer:
         """Close the current file and promote session entries to file cache."""
         if self._current_writer is not None:
             close_error = None
+            publication_error = None
+            writer = self._current_writer
             try:
-                self._current_writer.close()
+                if self._buffer_snapshot_cycle:
+                    # The hidden shard is the only complete copy of this
+                    # generation cycle.  Make its bytes durable before the
+                    # atomic public hardlink can expose it to corpus scans.
+                    writer.flush()
+                    os.fsync(writer.fileno())
             except OSError as exc:
                 close_error = exc
+            try:
+                writer.close()
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
             finally:
                 self._current_writer = None
             if close_error is not None and self._buffer_snapshot_cycle:
@@ -490,6 +520,17 @@ class ReplayBuffer:
                     # and remains ignored by all replay readers.
                     pass
                 self._current_staging_file = None
+                try:
+                    # Commit both the public link and best-effort removal of
+                    # the hidden staging name.  On native Windows the shared
+                    # helper retains the established atomic-link fallback.
+                    _fsync_directory(self.replay_dir)
+                except OSError as exc:
+                    # The complete public shard may already be visible after
+                    # a directory-sync failure. Finish the in-memory close so
+                    # a retry cannot overwrite its bookkeeping, then report
+                    # the durability failure after cleanup below.
+                    publication_error = exc
             # Promote in-memory entries to file cache so load_all_entries()
             # skips re-parsing the file we just wrote.  Snapshot-mode callers
             # opt out: their batches were already validated before writing, so
@@ -536,6 +577,8 @@ class ReplayBuffer:
                         except OSError:
                             pass
             self._current_file = None
+            if publication_error is not None:
+                raise publication_error
 
     def close(self) -> None:
         """Close the buffer."""
@@ -554,6 +597,7 @@ class ReplayBuffer:
         # wasted work, and ReplayEntry.from_dict() on a half-written cycle can
         # raise — which would leave the partial file on disk, the exact outcome
         # this method exists to prevent.
+        self._cleanup_file_stats = None
         path = self._current_file
         staging_path = self._current_staging_file
         if self._current_writer is not None:
@@ -605,9 +649,12 @@ class ReplayBuffer:
 
     def get_replay_files(self) -> List[Path]:
         """Get all replay files, sorted by modification time (newest first)."""
-        files = list(self.replay_dir.glob("replay_*.jsonl"))
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return files
+        # Reuse the DirEntry metadata captured by the shared one-scan helper.
+        # Path.glob() followed by Path.stat() makes every shard pay a separate
+        # pathname lookup on DrvFS, even though scandir already owns the entry.
+        file_stats = self._replay_file_stats(strict=True)
+        file_stats.sort(key=lambda item: item[1].st_mtime, reverse=True)
+        return [path for path, _stat in file_stats]
 
     def cleanup_old_files(self) -> int:
         """Remove old files beyond max_files limit. Returns number deleted.
@@ -618,19 +665,30 @@ class ReplayBuffer:
         max_files <= 0 disables pruning.
         """
         if self.max_files <= 0:
+            self._cleanup_file_stats = None
             return 0
-        files = self.get_replay_files()
-        if len(files) <= self.max_files:
+        file_stats = self._take_cleanup_file_stats()
+        if file_stats is None:
+            file_stats = self._replay_file_stats(strict=True)
+        file_stats.sort(key=lambda item: item[1].st_mtime, reverse=True)
+        if len(file_stats) <= self.max_files:
+            # Corpus admission immediately follows cleanup in snapshot mode.
+            # Restage the unchanged identities so that transaction can avoid
+            # another complete DrvFS stat pass.
+            self._stage_cleanup_file_stats(file_stats)
             return 0
 
         deleted = 0
-        for f in files[self.max_files:]:
+        retained_stats = list(file_stats[:self.max_files])
+        for f, stat_result in file_stats[self.max_files:]:
             if f == self._current_file:
+                retained_stats.append((f, stat_result))
                 continue                     # never unlink the open writer
             try:
                 f.unlink()
                 deleted += 1
             except OSError:
+                retained_stats.append((f, stat_result))
                 continue
             # Drop the parsed copy too, otherwise the cache keeps the entries
             # of a file that no longer exists alive for the whole session.
@@ -640,6 +698,20 @@ class ReplayBuffer:
             self._session_entry_counts.pop(f, None)
             self._forget_entry_count(f.name)
 
+        if deleted:
+            # Snapshot admission consumes the reduced replay window immediately
+            # after rotation.  Commit the batched unlink operations before
+            # handing that view to the corpus manager, otherwise an abrupt host
+            # loss can resurrect shards that cleanup reported as pruned.  One
+            # directory sync covers every successful deletion in this batch.
+            # See Journal Pass 433.
+            _fsync_directory(self.replay_dir)
+
+        # Capture the post-prune directory identity. Corpus validates it and
+        # the exact replay-name set before accepting these immutable stats;
+        # any failed deletion or concurrent publisher therefore falls back to
+        # its ordinary full scan.
+        self._stage_cleanup_file_stats(retained_stats)
         return deleted
 
     def clear_files(self) -> int:
@@ -648,6 +720,7 @@ class ReplayBuffer:
         Call this after loading entries into memory to free disk space and
         prevent re-training on the same data.
         """
+        self._cleanup_file_stats = None
         self._close_current()
         files = self.get_replay_files()
         deleted = 0
@@ -740,25 +813,111 @@ class ReplayBuffer:
             # into a training-session failure.
             return
 
-    def _replay_file_stats(self) -> List[tuple]:
-        """Capture each replay shard and its identity in one directory scan."""
+    def _replay_file_stats(self, *, strict: bool = False) -> List[tuple]:
+        """Capture each replay shard and its identity in one directory scan.
+
+        Buffer telemetry remains best-effort, while public replay listing uses
+        strict mode to preserve its fail-closed behavior for inaccessible
+        directories or shard identities.
+        """
         records = []
         try:
-            with os.scandir(self.replay_dir) as directory:
-                for entry in directory:
-                    name = entry.name
-                    if not (name.startswith('replay_') and name.endswith('.jsonl')):
-                        continue
-                    try:
-                        stat = entry.stat()
-                    except OSError:
-                        # A shard rotated between enumeration and stat is not
-                        # part of this point-in-time buffer view.
-                        continue
-                    records.append((Path(entry.path), stat))
-        except OSError:
+            directory = os.scandir(self.replay_dir)
+        except FileNotFoundError:
             return []
+        except OSError:
+            if strict:
+                raise
+            return []
+        with directory:
+            for entry in directory:
+                name = entry.name
+                if not (name.startswith('replay_') and name.endswith('.jsonl')):
+                    continue
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    if strict:
+                        raise
+                    # A shard rotated between enumeration and stat is not
+                    # part of this point-in-time telemetry view.
+                    continue
+                records.append((Path(entry.path), stat))
         return records
+
+    @staticmethod
+    def _directory_identity(path: Path) -> tuple:
+        """Return the fields that change when a directory entry changes."""
+        stat = os.stat(path)
+        return (
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
+
+    def _stage_cleanup_file_stats(self, file_stats: List[tuple]) -> None:
+        """Offer one immutable telemetry scan to the next cleanup call."""
+        self._cleanup_file_stats = None
+        if not self._buffer_snapshot_cycle or self._current_writer is not None:
+            # Only snapshot-mode public shards carry the write-once contract.
+            # Legacy callers can modify visible shards outside this instance,
+            # so they retain the ordinary strict cleanup identity scan.
+            return
+        try:
+            identity = self._directory_identity(self.replay_dir)
+        except OSError:
+            return
+        self._cleanup_file_stats = (identity, list(file_stats))
+
+    def _take_cleanup_file_stats(self) -> Optional[List[tuple]]:
+        """Consume a still-current telemetry scan or request strict fallback.
+
+        Public replay shards are write-once after close.  A stable replay
+        directory identity plus the exact same shard-name set therefore proves
+        that their captured modification times still define the cleanup order.
+        Concurrent publication, rotation, a partial best-effort telemetry scan,
+        or any directory race rejects the handoff and makes the caller perform
+        the established strict identity scan.
+        """
+        cached = self._cleanup_file_stats
+        self._cleanup_file_stats = None
+        if cached is None:
+            return None
+        expected_identity, file_stats = cached
+        try:
+            before = self._directory_identity(self.replay_dir)
+            with os.scandir(self.replay_dir) as directory:
+                live_names = {
+                    entry.name
+                    for entry in directory
+                    if entry.name.startswith('replay_')
+                    and entry.name.endswith('.jsonl')
+                }
+            after = self._directory_identity(self.replay_dir)
+        except FileNotFoundError:
+            return None
+        expected_names = {path.name for path, _stat in file_stats}
+        if (
+            before != expected_identity
+            or after != before
+            or live_names != expected_names
+        ):
+            return None
+        return file_stats
+
+    def take_replay_file_stats_handoff(self) -> Optional[tuple]:
+        """Consume the post-cleanup identity snapshot for corpus admission.
+
+        The corpus manager, not this producer, validates the recorded
+        directory identity and complete replay-name set. Keeping that proof at
+        the consumer makes a stale or malformed handoff an ordinary cache miss
+        while avoiding a second validation scan here.
+        """
+
+        cached = self._cleanup_file_stats
+        self._cleanup_file_stats = None
+        return cached
 
     def _count_entries_from_stats(self, file_stats: List[tuple]) -> int:
         """Count entries using an already captured shard identity snapshot.
@@ -852,9 +1011,14 @@ class ReplayBuffer:
             else:
                 file_stats.append((self._current_file, staging_stat))
         if not file_stats:
+            self._stage_cleanup_file_stats(file_stats)
             return 0, 0, 0
         total_entries = self._count_entries_from_stats(file_stats)
         total_bytes = sum(stat.st_size for _, stat in file_stats)
+        # Stage only after count-sidecar publication, which can itself replace
+        # a name in this directory.  Cleanup validates this final identity and
+        # the replay-only name set before reusing any captured shard metadata.
+        self._stage_cleanup_file_stats(file_stats)
         return total_entries, len(file_stats), total_bytes
 
     def count_entries(self) -> int:
