@@ -90,8 +90,6 @@ _abs_project_path() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$P
 IS_POLICY_RECOVERY=false
 POLICY_RECOVERY_BASELINE=""
 POLICY_RECOVERY_SHA256=""
-POLICY_RECOVERY_LEGACY_STATS=""
-POLICY_RECOVERY_STATS=""
 # PyYAML resolves True/yes/on (any case) as booleans, and the trainer reads this
 # same key through yaml.safe_load -- so the launcher must accept the same spellings
 # or it silently skips every recovery guard below on a config that says `enabled: Yes`.
@@ -114,10 +112,6 @@ if [ "$IS_POLICY_RECOVERY" = true ]; then
         exit 1
     fi
     POLICY_RECOVERY_BASELINE="$(_abs_project_path "$_baseline_rel")"
-    _stats_rel="$(_yaml_scalar "$CONFIG_FILE" paths stats_file)"
-    _seed_stats_rel="$(_yaml_scalar "$CONFIG_FILE" paths seed_stats_from)"
-    [ -n "$_stats_rel" ] && POLICY_RECOVERY_STATS="$(_abs_project_path "$_stats_rel")"
-    [ -n "$_seed_stats_rel" ] && POLICY_RECOVERY_LEGACY_STATS="$(_abs_project_path "$_seed_stats_rel")"
 fi
 USE_RESUME_CONTINUATION=false
 
@@ -308,27 +302,6 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "=== Dama - ML Training ==="
 echo ""
-if [ "$IS_POLICY_RECOVERY" = true ] &&
-   [ "$ENHANCED_STAGE" = false ] &&
-   [ -n "$POLICY_RECOVERY_STATS" ] &&
-   [ ! -e "$POLICY_RECOVERY_STATS" ] &&
-   [ -n "$POLICY_RECOVERY_LEGACY_STATS" ] &&
-   [ -f "$POLICY_RECOVERY_LEGACY_STATS" ]; then
-    # Copy through a temp file and rename. A plain cp that is killed
-    # part way leaves a truncated stats file behind, and both seeders
-    # -- this one and the trainer's -- skip when the destination merely
-    # exists, so the run would silently start from a corrupt history.
-    _stats_seed_tmp="${POLICY_RECOVERY_STATS}.seed.tmp"
-    if cp -- "$POLICY_RECOVERY_LEGACY_STATS" "$_stats_seed_tmp" &&
-       mv -- "$_stats_seed_tmp" "$POLICY_RECOVERY_STATS"; then
-        echo "Recovery stats seeded without modifying the legacy stats file: ${POLICY_RECOVERY_STATS}"
-    else
-        rm -f -- "$_stats_seed_tmp"
-        echo "[warn] Could not seed recovery stats from ${POLICY_RECOVERY_LEGACY_STATS};"
-        echo "[warn] the trainer will retry the same one-time copy."
-    fi
-    echo ""
-fi
 
 # One shared guard owns exact-ABI target discovery, staleness checks, mapped
 # binary refusal, forced builds, post-build publication checks, and imports.
