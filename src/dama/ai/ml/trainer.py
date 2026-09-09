@@ -81,7 +81,7 @@ warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
 warnings.filterwarnings('ignore', message='.*pynvml package is deprecated.*')
 
 from .model import MoveScorerNet, create_model, save_model, load_model
-from .move_encoder import ENCODING_VERSION
+from .move_encoder import BOARD_PLANES, ENCODING_VERSION, MOVE_FEATURE_SIZE
 from .replay import ReplayBuffer
 from .selfplay import (
     allocate_policy_distillation_games,
@@ -989,6 +989,18 @@ def newest_verified_recovery_continuation(
     return None
 
 
+# Hand-off sentinel from the background producer to the collector: the freshly
+# admitted snapshot's held-out entry set is provably identical to the one behind
+# the currently published validation tensors, so the collector must keep those
+# tensors instead of clearing or rebuilding them.
+_VALIDATION_TENSORS_CURRENT = object()
+
+# Free-RAM floor that must remain after the producer retains the assembled
+# train window's CPU tensors between admissions for per-shard reuse. Below it
+# the cache is dropped and the next admission takes the full parse path.
+_TRAIN_WINDOW_CACHE_MIN_FREE_GB = 4.0
+
+
 @dataclass
 class TrainingConfig:
     """Training configuration."""
@@ -1577,6 +1589,14 @@ class Trainer:
         self._bg_selfplay_incremental: Optional[CachedTensorDataset] = None
         self._bg_snapshot_manifest: Optional[dict] = None
         self._bg_validation_entries: Optional[list] = None
+        # Identity of the held-out entry set a hand-off was built from, and the
+        # identity plus leakage accounting behind the currently published
+        # validation tensors. Guarded by _bg_selfplay_lock: the producer reads
+        # the published identity to decide whether re-parsing and re-tensorizing
+        # an unchanged hold-out can be skipped for a fresh admission.
+        self._bg_validation_identity: Optional[dict] = None
+        self._validation_tensor_identity: Optional[dict] = None
+        self._pending_validation_reuse_identity: Optional[dict] = None
         self._bg_selfplay_lock = threading.Lock()
         # Self-play copies live tensors while the training thread performs
         # forwards and optimizer updates. Keep those short state boundaries
@@ -3263,6 +3283,297 @@ class Trainer:
             # verified in-memory validation dataset usable for this session.
             print(f"Warning: could not save validation tensor cache: {exc}")
 
+    def _validation_reuse_identity(self, context) -> Optional[dict]:
+        """Parse-free identity of the held-out entry list a context would yield.
+
+        Mid-run reuse of already-materialized validation tensors is exact only
+        when the verified validation manifest and the ledger-fingerprint subset
+        that filters its entries are both unchanged.  The persisted cache's
+        full-ledger digest cannot serve here because the ledger legitimately
+        grows with every admission while that filtered subset stays fixed
+        whenever the hold-out itself did not change.
+        """
+
+        if getattr(self.config, "policy_stage", None) != "policy_only":
+            return None
+        manager = getattr(self, "_snapshot_manager", None)
+        leak_getter = getattr(manager, "validation_leak_fingerprints", None)
+        if not callable(leak_getter):
+            return None
+        stored_keys = getattr(context, "stored_validation_keys", None)
+        validation_manifest = getattr(context, "validation_manifest", None)
+        if not stored_keys or not isinstance(validation_manifest, Mapping):
+            return None
+        return {
+            "validation_manifest_sha256": self._manifest_cache_digest(
+                validation_manifest),
+            "leak_fingerprints": leak_getter(context),
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+        }
+
+    def _commit_validation_tensor_identity(self, reuse_identity) -> None:
+        """Publish or clear the identity behind the current held-out tensors.
+
+        Called after every validation tensor publication.  An identity is
+        recorded only for a non-empty dataset whose activated manifest carries
+        validated leakage accounting; anything less clears the record so the
+        producer can never skip a rebuild it cannot prove redundant.
+        """
+
+        record = None
+        dataset = getattr(self, "_validation_dataloader", None)
+        if reuse_identity is not None and dataset is not None and len(dataset) > 0:
+            leakage = self._validated_validation_leakage(
+                getattr(self, "_active_snapshot_manifest", {}).get(
+                    "validation_leakage"),
+                len(dataset),
+            )
+            if leakage is not None:
+                record = {
+                    "identity": reuse_identity,
+                    "leakage": {
+                        key: leakage[key]
+                        for key in (
+                            "removed_validation_entry_count",
+                            "removed_validation_state_count",
+                            "retained_validation_entry_count",
+                        )
+                    },
+                }
+        with self._bg_selfplay_lock:
+            self._validation_tensor_identity = record
+
+    def _load_or_reuse_validation_entries(self, context):
+        """Return (entries_or_sentinel, reuse_identity) for a fresh admission.
+
+        When the verified held-out inputs are provably identical to the ones
+        behind the currently published validation tensors, skip the whole
+        validation shard parse and hand the sentinel instead, so the collector
+        keeps the existing tensors rather than rebuilding equal ones.  Any
+        missing proof falls through to the exact load path.
+        """
+
+        manager = self._snapshot_manager
+        identity = self._validation_reuse_identity(context)
+        if identity is not None:
+            with self._bg_selfplay_lock:
+                current = getattr(self, "_validation_tensor_identity", None)
+            if current is not None and current.get("identity") == identity:
+                leakage_counts = dict(current.get("leakage") or {})
+                context.manifest["validation_leakage"] = {
+                    "ledger_enabled": manager.trained_ledger_enabled,
+                    "all_time_trained_state_count": len(
+                        context.historically_trained),
+                    **leakage_counts,
+                }
+                print(
+                    "Validation hold-out unchanged: reusing "
+                    f"{leakage_counts.get('retained_validation_entry_count', 0):,} "
+                    "held-out tensor entry/entries without re-parsing"
+                )
+                return _VALIDATION_TENSORS_CURRENT, identity
+        return manager.load_validation_entries(context), identity
+
+    @staticmethod
+    def _train_shard_identity(record) -> Optional[tuple]:
+        """Immutable identity of one manifest train shard, or None if unproven.
+
+        Both consecutive manifests are integrity-verified before this runs, so
+        equal (relative path, size, SHA-256) triples pin equal shard bytes.
+        """
+
+        if not isinstance(record, Mapping):
+            return None
+        path = record.get("path")
+        size = record.get("size_bytes")
+        sha256 = record.get("sha256")
+        if not path or not sha256 or size is None:
+            return None
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return None
+        return (str(path), size, str(sha256).lower())
+
+    def _train_window_reuse_params(self) -> Optional[dict]:
+        """Static tensorization inputs that must match for shard-row reuse."""
+
+        if getattr(self.config, "policy_stage", None) != "policy_only":
+            return None
+        return {
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+        }
+
+    def _load_or_reuse_train_dataset(self, context, should_abort=None):
+        """Build the admitted window's train tensors, reusing unchanged shards.
+
+        Per manifest shard, the filtered entry list is a pure function of the
+        manifest-pinned shard bytes and ``context.validation_keys`` (no
+        cross-shard state; the entry cap samples the assembled window), and
+        every tensor row is a pure per-entry function of the entry, the move
+        padding, and the encoding version.  A shard whose identity and filter
+        inputs match the previously assembled window therefore reuses its
+        tensor rows without re-parsing; anything unproven takes the exact
+        per-shard parse path.  The producer thread is the only reader and
+        writer of the retained window.  Returns None only when aborted.
+        """
+
+        manager = self._snapshot_manager
+        params = self._train_window_reuse_params()
+        cache = getattr(self, "_train_tensor_window", None)
+        if cache is not None and (
+            params is None
+            or cache.get("params") != params
+            or cache.get("filter_keys") != context.validation_keys
+        ):
+            cache = None
+        cached_files = cache.get("files") if cache is not None else None
+        cached_dataset = cache.get("dataset") if cache is not None else None
+        if cached_dataset is None:
+            cached_files = None
+
+        records = list(context.manifest.get("files") or [])
+        pieces = []  # (identity, cached (start, end) span, miss index)
+        miss_records = []
+        reused_rows = 0
+        for record in records:
+            identity = self._train_shard_identity(record)
+            span = (
+                cached_files.get(identity)
+                if cached_files is not None and identity is not None
+                else None
+            )
+            if span is not None:
+                pieces.append((identity, span, None))
+                reused_rows += span[1] - span[0]
+            else:
+                pieces.append((identity, None, len(miss_records)))
+                miss_records.append(record)
+
+        if reused_rows:
+            print(
+                f"  Train window: reusing tensor rows for "
+                f"{len(records) - len(miss_records)}/{len(records)} unchanged "
+                f"shard(s) ({reused_rows} row(s)); parsing "
+                f"{len(miss_records)} shard(s)"
+            )
+        miss_counts: list = []
+        miss_entries: list = []
+        for record in miss_records:
+            if should_abort is not None and should_abort():
+                return None
+            entries = manager.load_train_file_entries(context, record)
+            miss_counts.append(len(entries))
+            miss_entries.extend(entries)
+            entries = None
+        if should_abort is not None and should_abort():
+            return None
+        if miss_entries:
+            miss_dataset = CachedTensorDataset.from_entries(
+                miss_entries,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                show_progress=True,
+            )
+        else:
+            miss_dataset = None
+        miss_entries = None
+        if should_abort is not None and should_abort():
+            return None
+
+        miss_offsets = []
+        start = 0
+        for count in miss_counts:
+            miss_offsets.append((start, start + count))
+            start += count
+
+        fields = (
+            "boards", "move_features", "move_counts",
+            "targets", "reward_weights", "value_targets",
+        )
+        assembled = {}
+        for field in fields:
+            parts = []
+            for identity, span, miss_index in pieces:
+                if span is not None:
+                    parts.append(
+                        getattr(cached_dataset, field)[span[0]:span[1]])
+                else:
+                    low, high = miss_offsets[miss_index]
+                    if high > low:
+                        parts.append(
+                            getattr(miss_dataset, field)[low:high])
+            if parts:
+                # torch.cat copies, so the window never aliases the previous
+                # cache's storage and replacing the cache frees the old rows.
+                assembled[field] = torch.cat(parts, dim=0)
+        miss_dataset = None
+        if assembled:
+            window_dataset = CachedTensorDataset(**assembled)
+        else:
+            window_dataset = CachedTensorDataset(
+                torch.empty(0, BOARD_PLANES, 8, 8),
+                torch.empty(
+                    0, int(self.config.max_moves_per_sample),
+                    MOVE_FEATURE_SIZE),
+                torch.empty(0, dtype=torch.int32),
+                torch.empty(0, dtype=torch.int32),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+            )
+        assembled = None
+
+        indices = manager.train_cap_sample_indices(
+            len(window_dataset), context.max_train_entries)
+        if indices is not None:
+            index_tensor = torch.tensor(indices, dtype=torch.int64)
+            handed = CachedTensorDataset(
+                *(getattr(window_dataset, field)[index_tensor]
+                  for field in fields))
+        else:
+            handed = window_dataset
+
+        retain = params is not None
+        if retain:
+            window_bytes = sum(
+                getattr(window_dataset, field).element_size()
+                * getattr(window_dataset, field).nelement()
+                for field in fields
+            )
+            try:
+                import psutil
+                available = psutil.virtual_memory().available
+            except Exception:
+                available = None
+            retain = (
+                available is not None
+                and (available - window_bytes)
+                >= _TRAIN_WINDOW_CACHE_MIN_FREE_GB * (1024 ** 3)
+            )
+        if retain:
+            files_map = {}
+            row = 0
+            for identity, span, miss_index in pieces:
+                length = (
+                    span[1] - span[0]
+                    if span is not None else miss_counts[miss_index]
+                )
+                if identity is not None:
+                    files_map[identity] = (row, row + length)
+                row += length
+            self._train_tensor_window = {
+                "params": params,
+                "filter_keys": frozenset(context.validation_keys),
+                "files": files_map,
+                "dataset": window_dataset,
+            }
+        else:
+            self._train_tensor_window = None
+        return handed
+
     def _snapshot_train_cache_metadata(
         self,
         manifest: Mapping[str, Any],
@@ -3321,6 +3632,7 @@ class Trainer:
         self._preloaded_snapshot_cache_checked = False
         self._preloaded_validation_dataset = None
         self._preloaded_validation_cache_metadata = None
+        self._pending_validation_reuse_identity = None
         if self._snapshot_manager is not None:
             behavior_step = int(self.step)
             teacher, noise, generation = self._corpus_settings(
@@ -3423,6 +3735,11 @@ class Trainer:
                     decision.manifest_path,
                     max_train_entries=self.config.replay_max_entries,
                 )
+                # Recorded after the startup tensors are published, so the
+                # first mid-run admission with an unchanged hold-out can skip
+                # its redundant validation re-parse and re-tensorization.
+                self._pending_validation_reuse_identity = (
+                    self._validation_reuse_identity(split_context))
                 validation_cache_metadata = (
                     self._validation_tensor_cache_metadata(split_context))
                 cached_validation = (
@@ -6278,19 +6595,60 @@ class Trainer:
                         if pending_snapshot_path is None:
                             continue
 
-                        train_entries, validation_entries, manifest = (
-                            self._snapshot_manager.load_split(
+                        manager = self._snapshot_manager
+                        dataset = None
+                        train_entries = None
+                        staged_split = all(
+                            callable(getattr(manager, name, None))
+                            for name in (
+                                "prepare_split",
+                                "load_validation_entries",
+                                "load_train_entries",
+                            )
+                        )
+                        if staged_split:
+                            split_context = manager.prepare_split(
                                 pending_snapshot_path,
                                 max_train_entries=self.config.replay_max_entries,
                             )
-                        )
+                            validation_entries, validation_identity = (
+                                self._load_or_reuse_validation_entries(
+                                    split_context))
+                            per_file_split = all(
+                                callable(getattr(manager, name, None))
+                                for name in (
+                                    "load_train_file_entries",
+                                    "train_cap_sample_indices",
+                                )
+                            )
+                            if per_file_split:
+                                dataset = self._load_or_reuse_train_dataset(
+                                    split_context,
+                                    should_abort=_shutdown_requested,
+                                )
+                                if dataset is None:
+                                    break
+                            else:
+                                train_entries = manager.load_train_entries(
+                                    split_context)
+                            manifest = split_context.manifest
+                            split_context = None
+                        else:
+                            train_entries, validation_entries, manifest = (
+                                manager.load_split(
+                                    pending_snapshot_path,
+                                    max_train_entries=self.config.replay_max_entries,
+                                )
+                            )
+                            validation_identity = None
                         if _shutdown_requested():
                             break
-                        dataset = CachedTensorDataset.from_entries(
-                            train_entries,
-                            max_moves_per_sample=self.config.max_moves_per_sample,
-                            show_progress=True,
-                        )
+                        if dataset is None:
+                            dataset = CachedTensorDataset.from_entries(
+                                train_entries,
+                                max_moves_per_sample=self.config.max_moves_per_sample,
+                                show_progress=True,
+                            )
                         if _shutdown_requested():
                             break
                         with self._bg_selfplay_lock:
@@ -6299,6 +6657,7 @@ class Trainer:
                             self._bg_selfplay_incremental = None
                             self._bg_snapshot_manifest = manifest
                             self._bg_validation_entries = validation_entries
+                            self._bg_validation_identity = validation_identity
                         pending_snapshot_path = None
                         self._data_ready_event.set()
                         print(
@@ -6318,6 +6677,7 @@ class Trainer:
                         # generating again or retrying a failed preparation;
                         # parsed training rows were copied into the tensors.
                         train_entries = validation_entries = dataset = None
+                        split_context = validation_identity = None
                 return
 
             _existing = getattr(self, '_current_dataset', None)
@@ -6512,11 +6872,19 @@ class Trainer:
             self._bg_selfplay_entries = None
             manifest = self._bg_snapshot_manifest
             validation_entries = self._bg_validation_entries
+            validation_identity = getattr(self, "_bg_validation_identity", None)
             self._bg_snapshot_manifest = None
             self._bg_validation_entries = None
+            self._bg_validation_identity = None
         if manifest is not None:
             self._activate_dataset_manifest(manifest)
-            self._set_validation_entries(validation_entries or [])
+            if validation_entries is _VALIDATION_TENSORS_CURRENT:
+                # The producer proved the held-out inputs unchanged, so the
+                # published tensors and their recorded identity stay current.
+                pass
+            else:
+                self._set_validation_entries(validation_entries or [])
+                self._commit_validation_tensor_identity(validation_identity)
         return dataset, incremental
 
     def _refresh_dataloader(self, dataloader, bg_dataset, bg_incremental,
@@ -7916,6 +8284,9 @@ class Trainer:
             preloaded_dataset=preloaded_validation_dataset,
             cache_metadata=preloaded_validation_cache_metadata,
         )
+        self._commit_validation_tensor_identity(
+            getattr(self, "_pending_validation_reuse_identity", None))
+        self._pending_validation_reuse_identity = None
         # Validation now owns the cache. This startup local must not keep
         # its tensors alive after a later snapshot replaces validation.
         preloaded_validation_dataset = None
@@ -8295,6 +8666,9 @@ class Trainer:
                 train_entries, validation_entries = self._prepare_training_split(
                     use_train_cache=False)
                 self._set_validation_entries(validation_entries)
+                self._commit_validation_tensor_identity(
+                    getattr(self, "_pending_validation_reuse_identity", None))
+                self._pending_validation_reuse_identity = None
                 train_balance = self._balance_side_sample_weights(train_entries)
                 if train_balance is not None:
                     print(
