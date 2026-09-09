@@ -44,10 +44,24 @@ except ImportError:
 
 import torch
 
+from .run_status import _fsync_directory
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _prepare_stats_output_directory(path: str | Path) -> Path:
+    """Create and commit the telemetry namespace before its first flush."""
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    # A later atomic report write commits its public name inside this
+    # directory, but directory fsync is not recursive. Commit the namespace
+    # itself in its parent first, and retry this boundary on every collector
+    # construction after a prior sync failure. See Journal Pass 429.
+    _fsync_directory(directory.parent)
+    return directory
+
 
 @contextmanager
 def _atomic_text_writer(
@@ -55,7 +69,7 @@ def _atomic_text_writer(
     *,
     newline: Optional[str] = None,
 ) -> Iterator[TextIO]:
-    """Publish one text artifact only after its complete durable write."""
+    """Publish one text artifact only after its file and name are durable."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
         prefix=path.name + ".",
@@ -75,6 +89,7 @@ def _atomic_text_writer(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if fd >= 0:
             try:
@@ -239,8 +254,7 @@ class StatsCollector:
         buffer_size: int = 50000,
         flush_every: int = 5000,
     ):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = _prepare_stats_output_directory(output_dir)
 
         self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_start = datetime.now()
