@@ -269,6 +269,36 @@ class ReplayEntry:
             game_id=(str(data['game_id']) if data.get('game_id') is not None else None),
         )
 
+    @staticmethod
+    def validate_dict(data: dict) -> None:
+        """Run ``from_dict`` validation without allocating a ``ReplayEntry``."""
+
+        legal_moves = data['legal_moves']
+        chosen_index = data['chosen_index']
+        if legal_moves and (chosen_index < 0 or chosen_index >= len(legal_moves)):
+            raise ValueError(
+                f"chosen_index {chosen_index} out of bounds for {len(legal_moves)} legal moves"
+            )
+        played_index = data.get('played_index')
+        if (played_index is not None and legal_moves
+                and (played_index < 0 or played_index >= len(legal_moves))):
+            raise ValueError(
+                f"played_index {played_index} out of bounds for {len(legal_moves)} legal moves"
+            )
+        # Preserve the exact fail-closed field access and conversion order from
+        # from_dict(). Snapshot writers discard these values after the check,
+        # so they can avoid one dataclass allocation per generated replay row.
+        data['state']
+        data.get('result', 0)
+        data.get('score', 0.0)
+        float(data.get('sample_weight', 1.0))
+        data.get('trajectory_source')
+        data.get('was_exploration')
+        data.get('teacher_difficulty')
+        int(data.get('opening_plies', 0))
+        if data.get('game_id') is not None:
+            str(data['game_id'])
+
 
 class ReplayBuffer:
     """
@@ -443,11 +473,11 @@ class ReplayBuffer:
             return
         if self._buffer_snapshot_cycle:
             # Validate the exact objects about to be serialized, before any
-            # bytes from this batch can enter the durable shard. Constructed
-            # wrappers are released immediately instead of keeping the whole
-            # cycle's nested dictionary graph alive until close().
+            # bytes from this batch can enter the durable shard. Validate every
+            # conversion used by ReplayEntry.from_dict() without allocating an
+            # object that this writer would immediately discard.
             for record in dicts:
-                ReplayEntry.from_dict(record)
+                ReplayEntry.validate_dict(record)
         if self._current_writer is None:
             self.start_new_file()
         lines = [_json_dumps(d) for d in dicts]
