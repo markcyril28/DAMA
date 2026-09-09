@@ -6299,6 +6299,12 @@ class Trainer:
                         traceback.print_exc()
                         if not _shutdown_requested():
                             self._bg_selfplay_stop_event.wait(timeout=2.0)
+                    finally:
+                        # The pending handoff owns tensors and validation rows
+                        # after publication. Keep no cycle-local payloads while
+                        # generating again or retrying a failed preparation;
+                        # parsed training rows were copied into the tensors.
+                        train_entries = validation_entries = dataset = None
                 return
 
             _existing = getattr(self, '_current_dataset', None)
