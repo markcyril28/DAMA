@@ -1,6 +1,7 @@
 """Quick verification of batched stats_collector methods."""
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,110 @@ import dama.ai.ml.stats_collector as stats_collector_module
 from dama.ai.ml.stats_collector import StatsCollector
 from dama.ai.ml.model import MoveScorerNet
 from scripts import analyze_training_stats
+
+
+def test_stats_collector_commits_output_directory_before_collecting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A collector must not accept writes under an uncommitted namespace."""
+    parent = tmp_path / "session"
+    parent.mkdir()
+    output_dir = parent / "stats"
+    output_dir.mkdir()
+    commits = []
+
+    def record_commit(path):
+        assert output_dir.is_dir()
+        commits.append(Path(path))
+
+    monkeypatch.setattr(
+        stats_collector_module, "_fsync_directory", record_commit)
+
+    collector = StatsCollector(output_dir=str(output_dir))
+    retry = StatsCollector(output_dir=str(output_dir))
+
+    assert collector.output_dir == output_dir
+    assert retry.output_dir == output_dir
+    assert commits == [parent, parent]
+
+
+def test_stats_collector_stops_when_output_directory_commit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not begin a telemetry session past a failed namespace boundary."""
+    parent = tmp_path / "session"
+    parent.mkdir()
+    output_dir = parent / "stats"
+
+    def fail_commit(path):
+        assert Path(path) == parent
+        raise OSError(5, "simulated stats namespace sync failure")
+
+    monkeypatch.setattr(
+        stats_collector_module, "_fsync_directory", fail_commit)
+
+    with pytest.raises(OSError, match="stats namespace sync failure"):
+        StatsCollector(output_dir=str(output_dir))
+
+    assert output_dir.is_dir()
+    assert not list(output_dir.iterdir())
+
+
+def test_atomic_stats_write_fsyncs_file_and_directory_around_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complete bytes and then their public pathname become crash-durable."""
+    path = tmp_path / "session_report.json"
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append("directory_fsync" if stat.S_ISDIR(mode) else "file_fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(stats_collector_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(stats_collector_module.os, "replace", tracking_replace)
+
+    with stats_collector_module._atomic_text_writer(path) as handle:
+        json.dump({"status": "complete"}, handle)
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "status": "complete",
+    }
+
+
+def test_atomic_stats_write_reports_directory_fsync_failure_without_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed directory commit is visible and leaves no staging file."""
+    path = tmp_path / "session_report.json"
+    path.write_text('{"status": "old"}', encoding="utf-8")
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "simulated stats directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(stats_collector_module.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="stats directory fsync failure"):
+        with stats_collector_module._atomic_text_writer(path) as handle:
+            json.dump({"status": "new"}, handle)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "new"}
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def _make_model_with_grads():
