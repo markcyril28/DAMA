@@ -1,5 +1,6 @@
 """Recovery output paths must not reuse the preserved model lineage."""
 
+import os
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -121,19 +122,20 @@ def test_recovery_configs_isolate_all_mutable_model_outputs(
     "launcher",
     ["local_train.sh", "train_server.sh", "local_train.ps1"],
 )
-def test_recovery_launchers_seed_isolated_stats_without_overwriting_legacy(
+def test_recovery_launchers_leave_stats_seeding_to_the_trainer(
     launcher: str,
 ) -> None:
-    """The seed is config-driven now, so no launcher may hardcode an anchor.
+    """No launcher may bypass the trainer's durable one-time seed writer.
 
-    All three used to carry their own copy of the step-134000 path, digest, and
-    stats filenames.  Moving the anchor to step 174000 would then require four
-    edits (three launchers plus the config) with nothing detecting a miss.
+    The seed remains config-driven inside ``TrainingConfig``. Keeping its
+    copy, file fsync, atomic replacement, and directory fsync in one Python
+    owner also covers GUI and bare-CLI starts without three weaker launcher
+    implementations preempting it.
     """
     text = (PROJECT_ROOT / launcher).read_text(encoding="utf-8")
 
-    assert "seed_stats_from" in text
-    assert "without modifying the legacy stats file" in text
+    assert "seed_stats_from" not in text
+    assert ".seed.tmp" not in text
     assert "model_step_134000.pt" not in text, (
         f"{launcher} still hardcodes the superseded step-134000 anchor")
     assert "7238CD80F2EF6DC9D8487D2579DE4BDF35AF4B85DCB2B3BD271659E795B14D27" not in text, (
@@ -209,17 +211,13 @@ def test_recovery_launchers_select_the_continuation_config(launcher: str) -> Non
     assert "training_config_policy_distillation_c174k.yaml" in text
 
 
-def test_trainer_seeds_the_stats_file_the_same_way_the_launchers_do(
+def test_trainer_seeds_the_stats_file_for_every_launch_path(
     tmp_path: Path,
 ) -> None:
-    """`paths.seed_stats_from` was implemented only in the launcher shells.
+    """`paths.seed_stats_from` is honored by the shared trainer path.
 
-    Nothing under src/ read the key, so a GUI-spawned run or a bare
-    `python -m dama.ai.ml.trainer --config ...` started the continuation
-    namespace with no training history at all -- silently, since an empty
-    stats file is indistinguishable from a first run. The trainer now applies
-    the same one-time copy, with the launchers' guards: only into a file that
-    does not exist, never mutating the source.
+    GUI, shell, PowerShell, and bare CLI launches all reach this one-time copy:
+    only into a file that does not exist, never mutating the source.
     """
     legacy = tmp_path / "training_stats_wd1e4.json"
     legacy.write_text('{"total_steps": 174000}', encoding="utf-8")
@@ -230,6 +228,57 @@ def test_trainer_seeds_the_stats_file_the_same_way_the_launchers_do(
     Trainer._seed_stats_file(SimpleNamespace(config=config))
 
     assert target.read_text(encoding="utf-8") == '{"total_steps": 174000}'
+    assert legacy.read_text(encoding="utf-8") == '{"total_steps": 174000}'
+    assert not list(target.parent.glob("*.seed.tmp"))
+
+
+def test_trainer_stats_seed_commits_bytes_and_public_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"total_steps": 174000}', encoding="utf-8")
+    target = tmp_path / "new" / "live.json"
+    events = []
+    real_fsync = os.fsync
+
+    def tracked_fsync(fd: int) -> None:
+        events.append("file")
+        real_fsync(fd)
+
+    def tracked_directory(path: Path) -> None:
+        events.append(("directory", Path(path)))
+
+    monkeypatch.setattr("dama.ai.ml.trainer.os.fsync", tracked_fsync)
+    monkeypatch.setattr(
+        "dama.ai.ml.trainer._fsync_directory", tracked_directory)
+    config = TrainingConfig(
+        stats_file=str(target), stats_seed_file=str(legacy))
+
+    Trainer._seed_stats_file(SimpleNamespace(config=config))
+
+    assert target.read_text(encoding="utf-8") == '{"total_steps": 174000}'
+    assert events == ["file", ("directory", target.parent)]
+    assert not list(target.parent.glob("*.seed.tmp"))
+
+
+def test_trainer_stats_seed_sync_failure_does_not_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"total_steps": 174000}', encoding="utf-8")
+    target = tmp_path / "new" / "live.json"
+
+    monkeypatch.setattr(
+        "dama.ai.ml.trainer.os.fsync",
+        lambda _fd: (_ for _ in ()).throw(
+            OSError(5, "simulated stats seed fsync failure")),
+    )
+    config = TrainingConfig(
+        stats_file=str(target), stats_seed_file=str(legacy))
+
+    Trainer._seed_stats_file(SimpleNamespace(config=config))
+
+    assert not target.exists()
     assert legacy.read_text(encoding="utf-8") == '{"total_steps": 174000}'
     assert not list(target.parent.glob("*.seed.tmp"))
 
