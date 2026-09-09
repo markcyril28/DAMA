@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +57,55 @@ def test_algorithm_opening_schedule_rotates_full_strata_across_cycles() -> None:
     holder.step = 0
     generation = Trainer._corpus_settings(holder)[2]
     assert generation["algorithm_opening_schedule"] == "cycle_rotated_v1"
+
+
+def test_selfplay_task_stamping_computes_each_opening_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def assign(choices, seed_base, game_index, *, cycle_rotation=0):
+        calls.append((choices, seed_base, game_index, cycle_rotation))
+        return choices[(game_index + cycle_rotation) % len(choices)], seed_base + game_index
+
+    monkeypatch.setattr(trainer_module, "_training_opening_assignment", assign)
+    tasks = [("easy",), ("hard",)]
+    stamped = trainer_module._stamp_selfplay_tasks(
+        tasks,
+        opening_choices=(2, 4, 6, 8),
+        opening_seed_base=100,
+        start_index=72,
+        cycle_rotation=3,
+        trajectory_source="algorithm",
+        game_id_kind="algorithm",
+        cycle_id=7,
+        teacher_difficulty="hard",
+    )
+    model_stamped = trainer_module._stamp_selfplay_tasks(
+        [("medium", "ml")],
+        opening_choices=(2, 4),
+        opening_seed_base=200,
+        start_index=0,
+        cycle_rotation=0,
+        trajectory_source="current_model",
+        game_id_kind="model",
+        cycle_id=8,
+        teacher_difficulty="hard",
+        inference_depth=1,
+    )
+
+    assert stamped == [
+        ("easy", 8, 172, "algorithm", "cycle-000007-algorithm-000000", "hard"),
+        ("hard", 2, 173, "algorithm", "cycle-000007-algorithm-000001", "hard"),
+    ]
+    assert model_stamped == [
+        ("medium", "ml", 2, 200, "current_model", "cycle-000008-model-000000", "hard", 1),
+    ]
+    assert calls == [
+        ((2, 4, 6, 8), 100, 72, 3),
+        ((2, 4, 6, 8), 100, 73, 3),
+        ((2, 4), 200, 0, 0),
+    ]
 
 
 def test_selfplay_executor_shutdown_captures_workers_before_nonblocking_shutdown() -> None:
@@ -582,6 +632,106 @@ def test_latest_checkpoint_copy_failure_removes_partial_temporary(
     assert not temporary.exists()
 
 
+@pytest.mark.parametrize("copy_fallback", [False, True])
+def test_checkpoint_alias_commits_bytes_and_directory_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    copy_fallback: bool,
+) -> None:
+    """A successful alias has durable bytes and a durable public pathname."""
+    import shutil
+
+    source = tmp_path / "source.pt"
+    destination = tmp_path / "latest.pt"
+    source.write_bytes(b"complete checkpoint")
+    events = []
+    real_fsync = os.fsync
+    real_link = os.link
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append("directory_fsync" if stat.S_ISDIR(mode) else "file_fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(source_path, destination_path):
+        events.append("replace")
+        return real_replace(source_path, destination_path)
+
+    if copy_fallback:
+        def fail_hardlink(_source, _destination):
+            raise OSError("forced hardlink fallback")
+
+        monkeypatch.setattr(trainer_module.os, "link", fail_hardlink)
+    else:
+        monkeypatch.setattr(trainer_module.os, "link", real_link)
+    monkeypatch.setattr(shutil, "copy2", shutil.copy2)
+    monkeypatch.setattr(trainer_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(trainer_module.os, "replace", tracking_replace)
+
+    Trainer._publish_checkpoint_alias(source, destination)
+
+    expected = (
+        ["file_fsync", "replace", "directory_fsync"]
+        if copy_fallback else ["replace", "directory_fsync"]
+    )
+    assert events == expected
+    assert destination.read_bytes() == source.read_bytes()
+
+
+def test_checkpoint_alias_copy_fsync_failure_preserves_previous_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Copied bytes must reach storage before replacing a usable alias."""
+    import shutil
+
+    source = tmp_path / "source.pt"
+    destination = tmp_path / "latest.pt"
+    temporary = tmp_path / "latest.pt.tmp"
+    source.write_bytes(b"complete checkpoint")
+    destination.write_bytes(b"previous checkpoint")
+
+    def fail_hardlink(_source, _destination):
+        raise OSError("forced hardlink fallback")
+
+    def fail_file_fsync(_fd):
+        raise OSError(5, "simulated alias file fsync failure")
+
+    monkeypatch.setattr(trainer_module.os, "link", fail_hardlink)
+    monkeypatch.setattr(shutil, "copy2", shutil.copy2)
+    monkeypatch.setattr(trainer_module.os, "fsync", fail_file_fsync)
+
+    with pytest.raises(OSError, match="alias file fsync failure"):
+        Trainer._publish_checkpoint_alias(source, destination)
+
+    assert destination.read_bytes() == b"previous checkpoint"
+    assert not temporary.exists()
+
+
+def test_checkpoint_alias_reports_directory_fsync_failure_without_residue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A post-replace commit failure remains visible to checkpoint recovery."""
+    source = tmp_path / "source.pt"
+    destination = tmp_path / "latest.pt"
+    temporary = tmp_path / "latest.pt.tmp"
+    source.write_bytes(b"complete checkpoint")
+    destination.write_bytes(b"previous checkpoint")
+
+    def fail_directory_fsync(_path):
+        raise OSError(5, "simulated alias directory fsync failure")
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="alias directory fsync failure"):
+        Trainer._publish_checkpoint_alias(source, destination)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert not temporary.exists()
+
+
 def test_checkpoint_writer_failure_propagates_after_join(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -639,11 +789,15 @@ def test_checkpoint_writer_failure_propagates_after_join(
     assert not Path(holder.config.latest_path).exists()
 
 
+@pytest.mark.parametrize(
+    "failure_stage", ["serialization", "file_fsync", "directory_fsync"],
+)
 def test_checkpoint_serialization_failure_removes_partial_temporary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure_stage: str,
 ) -> None:
-    """A failed numbered serialization must not consume disk indefinitely."""
+    """A failed numbered write must not publish or consume disk indefinitely."""
     import torch
 
     checkpoint_dir = tmp_path / "checkpoints"
@@ -681,16 +835,186 @@ def test_checkpoint_serialization_failure_removes_partial_temporary(
         Path(destination).write_bytes(b"partial checkpoint")
         raise OSError(28, "simulated checkpoint disk full")
 
-    monkeypatch.setattr(trainer_module.torch, "save", _fail_partial_save)
+    if failure_stage == "serialization":
+        monkeypatch.setattr(trainer_module.torch, "save", _fail_partial_save)
+        error_text = "simulated checkpoint disk full"
+    elif failure_stage == "file_fsync":
+        def _fail_fsync(_fd):
+            raise OSError(5, "simulated checkpoint file fsync failure")
+
+        monkeypatch.setattr(trainer_module.os, "fsync", _fail_fsync)
+        error_text = "simulated checkpoint file fsync failure"
+    else:
+        real_fsync = os.fsync
+        fsync_calls = 0
+
+        def _fail_directory_fsync(fd):
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError(5, "simulated checkpoint directory fsync failure")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(
+            trainer_module.os, "fsync", _fail_directory_fsync,
+        )
+        error_text = "simulated checkpoint directory fsync failure"
 
     Trainer._save_checkpoint(holder, loss=0.5)
     with pytest.raises(
-        RuntimeError, match="simulated checkpoint disk full",
+        RuntimeError, match=error_text,
     ):
         Trainer._wait_for_checkpoint_writer(holder)
 
-    assert list(checkpoint_dir.iterdir()) == []
+    expected_paths = (
+        [checkpoint_dir / "model_step_002000.pt"]
+        if failure_stage == "directory_fsync" else []
+    )
+    assert list(checkpoint_dir.iterdir()) == expected_paths
     assert not Path(holder.config.latest_path).exists()
+
+
+def test_numbered_checkpoint_and_directory_are_fsynced_before_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Recovery bytes and their directory entry precede alias publication."""
+    import torch
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint_path = checkpoint_dir / "model_step_002000.pt"
+    holder = object.__new__(Trainer)
+    holder.config = TrainingConfig(
+        checkpoint_dir=str(checkpoint_dir),
+        latest_path=str(tmp_path / "latest.pt"),
+    )
+    holder.model = SimpleNamespace(
+        state_dict=lambda: {"weight": torch.tensor([1.0])},
+        arch_params={},
+    )
+    holder.optimizer = SimpleNamespace(
+        state_dict=lambda: {"state": {}, "param_groups": []})
+    holder.stats = TrainingStats()
+    holder.step = 2000
+    holder.epoch = 1
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats_collector = None
+    holder.log_file = str(tmp_path / "train.jsonl")
+    holder.device = torch.device("cpu")
+    holder._checkpoint_thread = None
+    holder._active_snapshot_manifest = {}
+    holder._evaluate_validation_loss = lambda: None
+    holder._evaluate_teacher_promotion = lambda _path: None
+    holder._live_optimizer_context = lambda: {}
+    holder._snapshot_stats = lambda: {}
+    holder._save_stats = lambda **_kwargs: None
+    holder._put_status = lambda _message: None
+    holder._prune_old_checkpoints = lambda _path: []
+
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append("directory_fsync" if stat.S_ISDIR(mode) else "file_fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        if Path(destination) == checkpoint_path:
+            events.append("numbered_replace")
+        return real_replace(source, destination)
+
+    def tracking_alias(_self, source, destination):
+        events.append("latest_alias")
+        os.link(source, destination)
+
+    monkeypatch.setattr(trainer_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(trainer_module.os, "replace", tracking_replace)
+    monkeypatch.setattr(Trainer, "_publish_checkpoint_alias", tracking_alias)
+
+    Trainer._save_checkpoint(holder, loss=0.5)
+    Trainer._wait_for_checkpoint_writer(holder, timeout=30)
+
+    assert events == [
+        "file_fsync", "numbered_replace", "directory_fsync", "latest_alias",
+    ]
+    assert torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False,
+    )["step"] == 2000
+
+
+def test_checkpoint_directory_fsync_keeps_native_windows_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Native Windows keeps atomic rename without unsupported directory fds."""
+
+    def fail_open(*_args, **_kwargs):
+        raise AssertionError("native Windows must not open a directory fd")
+
+    monkeypatch.setattr(trainer_module.os, "name", "nt")
+    monkeypatch.setattr(trainer_module.os, "open", fail_open)
+
+    trainer_module._fsync_directory(tmp_path)
+
+
+def test_checkpoint_namespace_commits_parent_on_every_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A numbered checkpoint directory is durable before writers can use it."""
+    checkpoint_dir = tmp_path / "models" / "checkpoints"
+    checkpoint_dir.parent.mkdir()
+    synced = []
+
+    def tracking_sync(path: Path) -> None:
+        assert checkpoint_dir.is_dir()
+        assert not list(checkpoint_dir.iterdir())
+        synced.append(Path(path))
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", tracking_sync)
+
+    assert trainer_module._prepare_checkpoint_directory(
+        checkpoint_dir) == checkpoint_dir
+    assert trainer_module._prepare_checkpoint_directory(
+        checkpoint_dir) == checkpoint_dir
+    assert synced == [checkpoint_dir.parent, checkpoint_dir.parent]
+
+
+def test_checkpoint_namespace_commit_failure_precedes_model_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A missing namespace boundary must stop construction before the model."""
+    checkpoint_dir = tmp_path / "models" / "checkpoints"
+    checkpoint_dir.parent.mkdir()
+    log_dir = tmp_path / "logs"
+
+    def fail_parent_sync(path: Path) -> None:
+        assert Path(path) == checkpoint_dir.parent
+        assert checkpoint_dir.is_dir()
+        raise OSError(5, "simulated checkpoint namespace sync failure")
+
+    def unexpected_model(*_args, **_kwargs):
+        raise AssertionError("model construction must follow namespace commit")
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", fail_parent_sync)
+    monkeypatch.setattr(trainer_module, "create_model", unexpected_model)
+
+    config = TrainingConfig(
+        device="cpu",
+        checkpoint_dir=str(checkpoint_dir),
+        log_dir=str(log_dir),
+    )
+    with pytest.raises(OSError, match="checkpoint namespace sync failure"):
+        Trainer(config)
+
+    assert checkpoint_dir.is_dir()
+    assert not list(checkpoint_dir.iterdir())
+    assert not log_dir.exists()
 
 
 @pytest.mark.parametrize("drop_point", ["numbered", "latest"])
@@ -958,6 +1282,87 @@ def test_delayed_stats_snapshot_cannot_replace_newer_progress(
     assert stored["total_steps"] == 200
     assert [entry["step"] for entry in stored["loss_history"]] == [100, 200]
     assert trainer_module._STATS_WRITE_GENERATION_KEY not in stored
+
+
+def test_stats_writer_commits_bytes_and_public_name_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Strict stats success means both data and its directory entry landed."""
+    import threading
+
+    holder = object.__new__(Trainer)
+    stats_path = tmp_path / "training_stats.json"
+    holder.config = SimpleNamespace(stats_file=str(stats_path))
+    holder.stats = TrainingStats()
+    holder.step = 140000
+    holder._stats_write_lock = threading.RLock()
+    holder._stats_snapshot_generation = 0
+    holder._stats_persisted_generation = -1
+    holder._update_training_progress_report = lambda _path: None
+
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd: int) -> None:
+        events.append("file_fsync")
+        real_fsync(fd)
+
+    def tracking_replace(source, destination) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    def tracking_directory_fsync(path: Path) -> None:
+        events.append("directory_fsync")
+        assert Path(path) == stats_path.parent
+
+    monkeypatch.setattr(trainer_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(trainer_module.os, "replace", tracking_replace)
+    monkeypatch.setattr(
+        trainer_module, "_fsync_directory", tracking_directory_fsync)
+
+    assert holder._save_stats(_raise_on_error=True) is True
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert json.loads(stats_path.read_text(encoding="utf-8"))["total_steps"] == 140000
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_stats_writer_does_not_acknowledge_directory_commit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A visible replacement is retriable until its directory is committed."""
+    import threading
+
+    holder = object.__new__(Trainer)
+    stats_path = tmp_path / "training_stats.json"
+    holder.config = SimpleNamespace(stats_file=str(stats_path))
+    holder.stats = TrainingStats()
+    holder.step = 140000
+    holder._stats_write_lock = threading.RLock()
+    holder._stats_snapshot_generation = 0
+    holder._stats_persisted_generation = -1
+    holder._update_training_progress_report = lambda _path: None
+
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError(5, "simulated stats directory commit failure")
+
+    monkeypatch.setattr(
+        trainer_module, "_fsync_directory", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="stats directory commit failure"):
+        holder._save_stats(_raise_on_error=True)
+
+    # The complete replacement may already be visible, but the failed call
+    # must not advance the acknowledged generation or strand its temporary.
+    assert json.loads(stats_path.read_text(encoding="utf-8"))["total_steps"] == 140000
+    assert holder._stats_persisted_generation == -1
+    assert not list(tmp_path.glob("*.tmp"))
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", lambda _path: None)
+    assert holder._save_stats(_raise_on_error=True) is True
+    assert holder._stats_persisted_generation == 2
 
 
 def test_checkpoint_collision_fails_closed_without_overwriting(
@@ -1314,6 +1719,63 @@ def test_generation_cycle_sidecar_prunes_all_removed_shards(tmp_path):
     assert sidecar["entries"] == {}
 
 
+def test_generation_cycle_sidecar_commits_its_public_name(
+    tmp_path, monkeypatch,
+):
+    """A successful restart-cache publication commits bytes then its name."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    holder = object.__new__(Trainer)
+    entries = {"replay_a.jsonl": (123, 456, 17)}
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        events.append("file_fsync")
+        real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append("replace")
+        real_replace(source, destination)
+
+    def tracking_directory_fsync(path):
+        events.append("directory_fsync")
+        assert Path(path) == replay_dir
+
+    monkeypatch.setattr(trainer_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(trainer_module.os, "replace", tracking_replace)
+    monkeypatch.setattr(
+        trainer_module, "_fsync_directory", tracking_directory_fsync)
+
+    assert holder._save_generation_cycle_sidecar(replay_dir, entries) is True
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert holder._load_generation_cycle_sidecar(replay_dir) == entries
+    assert not list(replay_dir.glob(".generation_cycle_cache.*.tmp"))
+
+
+def test_generation_cycle_sidecar_reports_directory_commit_failure(
+    tmp_path, monkeypatch,
+):
+    """The optional cache stays fail-open when its directory cannot sync."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    holder = object.__new__(Trainer)
+    entries = {"replay_a.jsonl": (123, 456, 17)}
+
+    def fail_directory_fsync(_path):
+        raise OSError(5, "simulated generation-cache directory commit failure")
+
+    monkeypatch.setattr(
+        trainer_module, "_fsync_directory", fail_directory_fsync)
+    assert holder._save_generation_cycle_sidecar(replay_dir, entries) is False
+    assert holder._load_generation_cycle_sidecar(replay_dir) == entries
+    assert not list(replay_dir.glob(".generation_cycle_cache.*.tmp"))
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", lambda _path: None)
+    assert holder._save_generation_cycle_sidecar(replay_dir, entries) is True
+
+
 def test_generation_cycle_scan_skips_shard_deleted_before_exact_fallback(
     tmp_path, monkeypatch,
 ):
@@ -1355,7 +1817,10 @@ def test_generation_cycle_truncated_tail_uses_exact_scan(tmp_path, monkeypatch):
     assert sidecar["entries"]["replay_a.jsonl"][2] == 15
 
 
-def test_selfplay_entries_record_cycle_and_behavior_provenance() -> None:
+@pytest.mark.parametrize("checkpoint_sha256", ["AB" * 32, None])
+def test_selfplay_entries_record_cycle_and_behavior_provenance(
+    checkpoint_sha256,
+) -> None:
     entries = [{"game_id": "cycle-000028-model-000001"}, "not-a-dict"]
 
     Trainer._annotate_selfplay_entries(
@@ -1363,13 +1828,23 @@ def test_selfplay_entries_record_cycle_and_behavior_provenance() -> None:
         cycle_id=28,
         behavior_step=136000,
         behavior_id="trainer-step-136000",
-        behavior_checkpoint_sha256="AB" * 32,
+        behavior_checkpoint_sha256=checkpoint_sha256,
     )
 
     assert entries[0]["generation_cycle_id"] == 28
     assert entries[0]["model_behavior_step"] == 136000
     assert entries[0]["model_behavior_id"] == "trainer-step-136000"
-    assert entries[0]["model_behavior_checkpoint_sha256"] == "AB" * 32
+    if checkpoint_sha256 is None:
+        assert "model_behavior_checkpoint_sha256" not in entries[0]
+    else:
+        assert entries[0]["model_behavior_checkpoint_sha256"] == checkpoint_sha256
+    assert list(entries[0]) == [
+        "game_id",
+        "generation_cycle_id",
+        "model_behavior_step",
+        "model_behavior_id",
+        *(["model_behavior_checkpoint_sha256"] if checkpoint_sha256 else []),
+    ]
 
 
 def test_changed_stage_contract_waits_for_matching_snapshot(
@@ -1578,6 +2053,8 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
 ) -> None:
     new_manifest = Path("snapshot_v000002")
     observed_steps = []
+    observed_handoffs = []
+    replay_stats_handoff = object()
 
     class _FakeThread:
         def __init__(self, target, daemon=False):
@@ -1602,6 +2079,7 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
             observed_steps.append(
                 int(kwargs["generation_settings"]["model_behavior_step"])
             )
+            observed_handoffs.append(kwargs["replay_file_stats_handoff"])
             return SnapshotDecision(
                 True,
                 "admitted",
@@ -1625,7 +2103,10 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
     holder._snapshot_manager = FakeSnapshotManager()
     holder.config = SimpleNamespace(replay_max_files=60, replay_max_entries=500)
     holder.config.max_moves_per_sample = 32
-    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder.replay_buffer = SimpleNamespace(
+        cleanup_old_files=lambda: 0,
+        take_replay_file_stats_handoff=lambda: replay_stats_handoff,
+    )
     holder._bg_selfplay_thread = None
     holder._bg_selfplay_dataset = None
     holder._bg_selfplay_entries = None
@@ -1662,6 +2143,7 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
     Trainer._start_background_selfplay(holder, 72)
 
     assert observed_steps == [23]
+    assert observed_handoffs == [replay_stats_handoff]
     assert holder._bg_snapshot_manifest["fingerprint"] == "enhanced"
 
 
@@ -2006,6 +2488,7 @@ def test_runtime_model_root_and_cleanup_removes_temporary_files(
 
     temp_path = holder._runtime_model_path("temp_selfplay_model.pt")
     temp_path2 = holder._runtime_model_path("temp_async_test.pt")
+    assert not temp_path.parent.exists()
     temp_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path.write_text("temporary", encoding="utf-8")
     temp_path2.write_text("shared", encoding="utf-8")
@@ -2035,7 +2518,7 @@ def test_runtime_model_checkpoint_staging_skips_only_optional_disk_copy(
         "encoding_version": 2,
         "step": 17,
     }
-    path = tmp_path / "temp_selfplay_model.pt"
+    path = tmp_path / "runtime_models" / "process-test" / "temp_selfplay_model.pt"
     created_sinks = []
     real_sink = trainer_module._RuntimeCheckpointHashSink
 
@@ -2051,6 +2534,7 @@ def test_runtime_model_checkpoint_staging_skips_only_optional_disk_copy(
         checkpoint, path, persist_to_disk=False)
 
     assert not path.exists()
+    assert not path.parent.exists()
     assert len(memory_digest) == 64
     assert memory_digest == memory_digest.upper()
     assert len(created_sinks) == 1
@@ -3855,6 +4339,70 @@ def test_checkpoint_retention_keeps_only_the_newest_n(tmp_path: Path) -> None:
     ]
 
 
+def test_checkpoint_retention_commits_deleted_names_once(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """One directory sync commits the complete retention deletion batch."""
+    holder = _retention_holder(tmp_path, keep=2)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000, 8000])
+    syncs = []
+
+    def track_sync(path: Path) -> None:
+        assert not (directory / "model_step_002000.pt").exists()
+        assert not (directory / "model_step_004000.pt").exists()
+        syncs.append(Path(path))
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", track_sync)
+
+    removed = Trainer._prune_old_checkpoints(
+        holder, directory / "model_step_008000.pt")
+
+    assert sorted(removed) == [
+        "model_step_002000.pt",
+        "model_step_004000.pt",
+    ]
+    assert syncs == [directory]
+
+
+def test_checkpoint_retention_directory_sync_failure_is_not_acknowledged(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A failed deletion commit must remain visible to the writer thread."""
+    holder = _retention_holder(tmp_path, keep=2)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000, 6000, 8000])
+
+    def fail_sync(path: Path) -> None:
+        assert Path(path) == directory
+        raise OSError(5, "simulated checkpoint retention directory sync failure")
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", fail_sync)
+
+    with pytest.raises(
+        OSError, match="simulated checkpoint retention directory sync failure",
+    ):
+        Trainer._prune_old_checkpoints(
+            holder, directory / "model_step_008000.pt")
+
+
+def test_checkpoint_retention_without_deletions_does_not_sync_directory(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A checkpoint set already within its bound pays no retention sync."""
+    holder = _retention_holder(tmp_path, keep=2)
+    directory = Path(holder.config.checkpoint_dir)
+    _write_steps(directory, [2000, 4000])
+
+    def unexpected_sync(_path: Path) -> None:
+        raise AssertionError("retention synced without deleting a checkpoint")
+
+    monkeypatch.setattr(trainer_module, "_fsync_directory", unexpected_sync)
+
+    assert Trainer._prune_old_checkpoints(
+        holder, directory / "model_step_004000.pt") == []
+
+
 def test_checkpoint_retention_never_deletes_a_promoted_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -4327,6 +4875,123 @@ def test_cached_tensor_dataset_save_compresses_and_preserves_prior_cache(
 
     assert cache_file.read_bytes() == before
     assert not list(tmp_path.glob(f".{cache_file.name}.*.tmp"))
+
+
+def test_cached_tensor_dataset_save_commits_public_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable cache name is committed after its complete file bytes."""
+    from dama.ai.ml import dataset as dataset_module
+    from dama.ai.ml.dataset import CachedTensorDataset
+
+    dataset = CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    cache_file = tmp_path / "cache.pt"
+    events = []
+    real_fsync = dataset_module.os.fsync
+    real_replace = dataset_module.os.replace
+
+    def tracking_fsync(fd):
+        events.append("file_fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    def tracking_directory_fsync(path):
+        if Path(path) == tmp_path.parent:
+            events.append("namespace_fsync")
+        else:
+            events.append("directory_fsync")
+            assert Path(path) == tmp_path
+
+    monkeypatch.setattr(dataset_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(dataset_module.os, "replace", tracking_replace)
+    monkeypatch.setattr(
+        dataset_module, "_fsync_directory", tracking_directory_fsync)
+
+    dataset.save(str(cache_file), metadata={"source": "test"}, compress=True)
+
+    assert events == [
+        "namespace_fsync", "file_fsync", "replace", "directory_fsync",
+    ]
+    assert cache_file.is_file()
+    assert not list(tmp_path.glob(f".{cache_file.name}.*.tmp"))
+
+
+def test_cached_tensor_dataset_reports_directory_commit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed directory commit is visible while complete bytes stay readable."""
+    import torch
+
+    from dama.ai.ml import dataset as dataset_module
+    from dama.ai.ml.dataset import CachedTensorDataset
+
+    dataset = CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    cache_file = tmp_path / "cache.pt"
+
+    def fail_directory_fsync(path):
+        if Path(path) == tmp_path:
+            raise OSError("simulated cache directory fsync failure")
+
+    monkeypatch.setattr(dataset_module, "_fsync_directory", fail_directory_fsync)
+    with pytest.raises(OSError, match="simulated cache directory fsync failure"):
+        dataset.save(
+            str(cache_file), metadata={"source": "replacement"}, compress=True)
+
+    restored = CachedTensorDataset.load(str(cache_file), require_complete=True)
+    assert restored.metadata["source"] == "replacement"
+    for field in (
+        "boards", "move_features", "move_counts", "targets",
+        "reward_weights", "value_targets",
+    ):
+        assert torch.equal(getattr(restored, field), getattr(dataset, field))
+    assert not list(tmp_path.glob(f".{cache_file.name}.*.tmp"))
+
+
+def test_cached_tensor_dataset_commits_namespace_before_serialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache namespace must be durable before a file can be published."""
+    from dama.ai.ml import dataset as dataset_module
+    from dama.ai.ml.dataset import CachedTensorDataset
+
+    dataset = CachedTensorDataset.from_entries(
+        _tiny_replay_entries(), max_moves_per_sample=8, show_progress=False)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    cache_dir = parent / "cache_namespace"
+    cache_file = cache_dir / "cache.pt"
+    save_called = False
+    real_directory_fsync = dataset_module._fsync_directory
+
+    def fail_namespace_fsync(path):
+        if Path(path) == parent:
+            raise OSError("simulated cache namespace fsync failure")
+        return real_directory_fsync(path)
+
+    def unexpected_save(*_args, **_kwargs):
+        nonlocal save_called
+        save_called = True
+
+    monkeypatch.setattr(
+        dataset_module, "_fsync_directory", fail_namespace_fsync)
+    monkeypatch.setattr(dataset_module.torch, "save", unexpected_save)
+
+    with pytest.raises(OSError, match="simulated cache namespace fsync failure"):
+        dataset.save(str(cache_file), metadata={"source": "test"})
+
+    assert not save_called
+    assert not cache_file.exists()
+    assert not list(cache_dir.glob(f".{cache_file.name}.*.tmp"))
+
+    monkeypatch.undo()
+    dataset.save(str(cache_file), metadata={"source": "retry"})
+    restored = CachedTensorDataset.load(str(cache_file), require_complete=True)
+    assert restored.metadata["source"] == "retry"
 
 
 def test_cached_tensor_dataset_loads_legacy_raw_cache(tmp_path: Path) -> None:
