@@ -16,7 +16,7 @@ import random
 from ...types import Move, Player
 from ...game_state import GameState
 from .acceptance import WILSON_95_METHOD, wdl_summary
-from .run_status import _write_json_atomic
+from .run_status import _fsync_directory, _write_json_atomic
 
 
 _EVALUATION_FORKSERVER_PRELOAD = (
@@ -1007,6 +1007,10 @@ class ModelVsAlgoTester:
     def _save_stats(self, stats: TestStatistics) -> str:
         """Atomically save timestamped and latest test statistics."""
         self.stats_dir.mkdir(parents=True, exist_ok=True)
+        # Atomic file publication commits names inside this directory, but
+        # that fsync is not recursive. Commit the detail namespace in its
+        # parent first, and retry on every save after an earlier sync failure.
+        _fsync_directory(self.stats_dir.parent)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"test_{timestamp}.json"
