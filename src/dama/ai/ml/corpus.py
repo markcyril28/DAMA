@@ -1301,6 +1301,39 @@ def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
     run_status._write_json_atomic(path, value)
 
 
+def _write_text_atomic(path: Path, value: str) -> None:
+    """Atomically publish a small text control file and its directory entry."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temp_name)
+    try:
+        raw_handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        fd = -1
+        with raw_handle as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        run_status._fsync_directory(path.parent)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup is best-effort and must not mask the write, replace, or
+            # directory-sync failure that determines the public pointer state.
+            pass
+
+
 def _write_jsonl_atomic(
     path: Path,
     rows: Iterable[Mapping[str, Any]],
@@ -1465,34 +1498,42 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     existing = _iter_state_keys(path) if path.is_file() else iter(())
     pending = next(existing, None)
     try:
-        with gzip.open(
-            temporary,
-            "wt",
-            encoding="ascii",
-            newline="\n",
-            compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
-        ) as handle:
-            index = 0
-            write_batch: List[str] = []
-            while pending is not None or index < len(additions):
-                if pending is not None and (
-                    index >= len(additions) or pending <= additions[index]
-                ):
-                    write_batch.append(pending)
-                    if index < len(additions) and pending == additions[index]:
+        # Keep the raw descriptor open across gzip finalization so the CRC and
+        # size trailer reach stable storage before the canonical ledger name is
+        # replaced. Snapshot key files already use this durability contract;
+        # the all-time ledger is at least as important because it prevents
+        # trained states from entering future validation hold-outs.
+        with temporary.open("wb") as raw_handle:
+            with gzip.open(
+                raw_handle,
+                "wt",
+                encoding="ascii",
+                newline="\n",
+                compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
+            ) as handle:
+                index = 0
+                write_batch: List[str] = []
+                while pending is not None or index < len(additions):
+                    if pending is not None and (
+                        index >= len(additions) or pending <= additions[index]
+                    ):
+                        write_batch.append(pending)
+                        if index < len(additions) and pending == additions[index]:
+                            index += 1
+                        pending = next(existing, None)
+                    else:
+                        write_batch.append(additions[index])
+                        added += 1
                         index += 1
-                    pending = next(existing, None)
-                else:
-                    write_batch.append(additions[index])
-                    added += 1
-                    index += 1
-                if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+                    if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+                        handle.write("\n".join(write_batch))
+                        handle.write("\n")
+                        write_batch.clear()
+                if write_batch:
                     handle.write("\n".join(write_batch))
                     handle.write("\n")
-                    write_batch.clear()
-            if write_batch:
-                handle.write("\n".join(write_batch))
-                handle.write("\n")
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
         os.replace(temporary, path)
     except BaseException:
         # The canonical ledger is still authoritative until os.replace().  A
@@ -1512,6 +1553,10 @@ def _store_shard(
     source: Path,
     destination: Path,
     previous_files_dir: Optional[Path] = None,
+    *,
+    hardlink_source: bool = False,
+    expected_size: Optional[int] = None,
+    expected_sha256: Optional[str] = None,
 ) -> str:
     """Store one replay shard into a snapshot; return the storage mode used.
 
@@ -1526,8 +1571,34 @@ def _store_shard(
     link is made, and load-time integrity verification re-hashes every stored
     shard afterwards, so a corrupted or mutated candidate degrades to a plain
     copy rather than ever admitting wrong bytes.  Any filesystem refusal
-    (cross-device, permission, link exhaustion) also falls back to copy.
+    (cross-device, permission, link exhaustion) also falls back to copy. A
+    copied inode is file-synced before success; the snapshot or validation
+    transaction commits its directory before publishing the manifest.
+
+    A newly rotated shard has no predecessor copy, but the live replay source
+    is governed by the same write-once contract.  When ``hardlink_source`` is
+    enabled, link that already-audited inode directly instead of duplicating
+    it.  Recheck its manifest size, digest, and complete stat identity around
+    the link so a violated immutability contract fails closed; an ordinary
+    filesystem refusal retains the portable copy fallback.
     """
+    source_identity: Optional[_ReplayFileIdentity] = None
+    if hardlink_source:
+        if expected_size is None or expected_sha256 is None:
+            raise ValueError(
+                "source hardlinking requires the manifest size and SHA-256"
+            )
+        source_identity = _replay_file_identity(source)
+        digest = _replay_file_sha256_for_identity(source, source_identity)
+        verified_identity = _replay_file_identity(source)
+        if (
+            source_identity.as_key() != verified_identity.as_key()
+            or source_identity.st_size != int(expected_size)
+            or digest.lower() != str(expected_sha256).lower()
+        ):
+            raise RuntimeError(
+                f"Replay shard changed before snapshot storage: {source}"
+            )
     if previous_files_dir is not None:
         candidate = previous_files_dir / source.name
         try:
@@ -1540,7 +1611,60 @@ def _store_shard(
                 return "hardlink"
         except OSError:
             pass
-    shutil.copy2(source, destination)
+    if hardlink_source:
+        assert source_identity is not None
+        try:
+            os.link(str(source), str(destination))
+        except OSError:
+            pass
+        else:
+            try:
+                final_source = _replay_file_identity(source)
+                stored = _replay_file_identity(destination)
+                source_fields = (
+                    source_identity.st_dev,
+                    source_identity.st_ino,
+                    source_identity.st_size,
+                    source_identity.st_mtime_ns,
+                )
+                if source_fields == (
+                    final_source.st_dev,
+                    final_source.st_ino,
+                    final_source.st_size,
+                    final_source.st_mtime_ns,
+                ) == (
+                    stored.st_dev,
+                    stored.st_ino,
+                    stored.st_size,
+                    stored.st_mtime_ns,
+                ):
+                    return "source_hardlink"
+            except OSError:
+                pass
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"Replay shard changed during snapshot storage: {source}"
+            )
+    try:
+        shutil.copy2(source, destination)
+        # Hardlinks reuse an inode that the replay publisher already made
+        # durable. A copy owns new data pages, so committing only the files/
+        # directory and manifest could otherwise authorize bytes that vanish
+        # or truncate after sudden host or storage loss.
+        with destination.open("r+b") as stored_handle:
+            os.fsync(stored_handle.fileno())
+    except BaseException:
+        # Snapshot staging is removed by its outer transaction, but validation
+        # growth writes into a persistent directory. Remove the uncommitted
+        # destination here so a failed sync cannot leave misleading residue.
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return "copy"
 
 
@@ -1695,6 +1819,7 @@ class CorpusSnapshotManager:
 
     def _replay_files_with_identities(
         self,
+        replay_file_stats_handoff: Optional[tuple] = None,
     ) -> Tuple[List[Path], Dict[Path, _ReplayFileIdentity]]:
         """Scan the replay window once and retain each file's exact identity.
 
@@ -1704,6 +1829,11 @@ class CorpusSnapshotManager:
         audit, digest, and analysis phases of one admission transaction.  The
         caller must recheck them before publishing any decision.
         """
+
+        handed_off = self._validated_replay_file_stats_handoff(
+            replay_file_stats_handoff)
+        if handed_off is not None:
+            return handed_off
 
         records: List[Tuple[int, str, Path, _ReplayFileIdentity]] = []
         try:
@@ -1729,16 +1859,99 @@ class CorpusSnapshotManager:
         files = [record[2] for record in records]
         return files, {record[2]: record[3] for record in records}
 
+    def _validated_replay_file_stats_handoff(
+        self,
+        handoff: Optional[tuple],
+    ) -> Optional[Tuple[List[Path], Dict[Path, _ReplayFileIdentity]]]:
+        """Validate cleanup's immutable shard identities or return a miss.
+
+        ReplayBuffer captured every stat for telemetry, used those same stats
+        for rotation, and recorded the post-cleanup directory identity. A
+        stable directory plus the exact same replay-name set proves that this
+        is the same initial admission window without repeating all shard
+        stats. The mandatory closing identity transaction below still detects
+        in-place edits, replacements, and disappearances during analysis.
+        """
+
+        if not isinstance(handoff, tuple) or len(handoff) != 2:
+            return None
+        expected_directory, file_stats = handoff
+        if (
+            not isinstance(expected_directory, tuple)
+            or len(expected_directory) != 4
+        ):
+            return None
+        if not isinstance(file_stats, list):
+            return None
+
+        replay_parent = os.path.abspath(str(self.replay_dir))
+        records: List[Tuple[int, str, Path, _ReplayFileIdentity]] = []
+        expected_names: Set[str] = set()
+        try:
+            for item in file_stats:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    return None
+                raw_path, stat_result = item
+                path = Path(raw_path)
+                name = path.name
+                if (
+                    os.path.abspath(str(path.parent)) != replay_parent
+                    or not name.startswith("replay_")
+                    or not name.endswith(".jsonl")
+                    or name in expected_names
+                    or not stat_module.S_ISREG(stat_result.st_mode)
+                ):
+                    return None
+                identity = _replay_file_identity_from_stat(path, stat_result)
+                expected_names.add(name)
+                records.append((identity.st_mtime_ns, name, path, identity))
+
+            before_stat = os.stat(self.replay_dir)
+            before = (
+                int(before_stat.st_dev),
+                int(before_stat.st_ino),
+                int(before_stat.st_mtime_ns),
+                int(before_stat.st_ctime_ns),
+            )
+            with os.scandir(self.replay_dir) as entries:
+                live_names = {
+                    entry.name
+                    for entry in entries
+                    if entry.name.startswith("replay_")
+                    and entry.name.endswith(".jsonl")
+                }
+            after_stat = os.stat(self.replay_dir)
+            after = (
+                int(after_stat.st_dev),
+                int(after_stat.st_ino),
+                int(after_stat.st_mtime_ns),
+                int(after_stat.st_ctime_ns),
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+        if (
+            before != expected_directory
+            or after != before
+            or live_names != expected_names
+        ):
+            return None
+
+        records.sort(key=lambda record: (record[0], record[1]))
+        files = [record[2] for record in records]
+        return files, {record[2]: record[3] for record in records}
+
     def replay_files(self) -> List[Path]:
         files, _identities = self._replay_files_with_identities()
         return files
 
     def _eligible_replay_files_with_identities(
         self,
+        replay_file_stats_handoff: Optional[tuple] = None,
     ) -> Tuple[List[Path], Dict[str, dict], Dict[Path, _ReplayFileIdentity]]:
         """Return contract-valid files plus their initial stat identities."""
 
-        files, identities = self._replay_files_with_identities()
+        files, identities = self._replay_files_with_identities(
+            replay_file_stats_handoff)
         if not self.enforce_policy_contract:
             return files, {}, identities
         eligible = []
@@ -2181,14 +2394,77 @@ class CorpusSnapshotManager:
         return metrics, unique_keys, new_unique
 
     def current_manifest_path(self) -> Optional[Path]:
+        path, expected_fingerprint = self._current_manifest_reference()
+        if path is None:
+            return None
+        if expected_fingerprint is not None:
+            # ``current.json`` is a recovery path used only when CURRENT is
+            # absent. Verify its redundant fingerprint before treating it as
+            # authority, rather than weakening the lineage gate to a pathname.
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                        return None
+                    manifest = json.load(handle)
+            except (FileNotFoundError, IsADirectoryError):
+                return None
+            if (
+                not isinstance(manifest, Mapping)
+                or str(manifest.get("fingerprint", "")).lower()
+                != expected_fingerprint
+            ):
+                raise RuntimeError(
+                    "Corpus current.json fingerprint does not match its "
+                    f"snapshot manifest: {path}"
+                )
+            return path
+        return path if path.is_file() else None
+
+    def _current_manifest_reference(self) -> Tuple[Optional[Path], Optional[str]]:
+        """Resolve CURRENT, falling back to the redundant durable JSON pointer.
+
+        The ordinary CURRENT path remains the zero-JSON-decode hot path. A
+        missing pointer can occur after an abrupt host or filesystem loss, so
+        recover it from ``current.json`` only when that record has a complete
+        manifest path and SHA-256 fingerprint. The caller verifies the latter
+        against the target manifest before consuming the snapshot.
+        """
+
         try:
             relative = self.current_pointer.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
-            return None
+            json_pointer = self.snapshot_root / "current.json"
+            try:
+                with json_pointer.open("r", encoding="utf-8") as handle:
+                    record = json.load(handle)
+            except FileNotFoundError:
+                return None, None
+            except (OSError, ValueError, TypeError) as exc:
+                raise RuntimeError(
+                    f"Corpus snapshot pointer is unreadable: {json_pointer}"
+                ) from exc
+            if not isinstance(record, Mapping):
+                raise RuntimeError(
+                    f"Corpus snapshot pointer is invalid: {json_pointer}"
+                )
+            relative = record.get("manifest")
+            fingerprint = record.get("fingerprint")
+            if (
+                not isinstance(relative, str)
+                or not relative.strip()
+                or not isinstance(fingerprint, str)
+                or re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint) is None
+            ):
+                raise RuntimeError(
+                    f"Corpus snapshot pointer is invalid: {json_pointer}"
+                )
+            return (
+                self.snapshot_root / _read_relpath(relative.strip()),
+                fingerprint.lower(),
+            )
         if not relative:
-            return None
-        path = self.snapshot_root / _read_relpath(relative)
-        return path if path.is_file() else None
+            return None, None
+        return self.snapshot_root / _read_relpath(relative), None
 
     def _load_manifest(self, path: Path) -> dict:
         with path.open("r", encoding="utf-8") as handle:
@@ -2197,28 +2473,38 @@ class CorpusSnapshotManager:
     def _load_current_manifest(self) -> Tuple[Optional[Path], Optional[dict]]:
         """Resolve CURRENT and load its regular-file target in one open.
 
-        ``current_manifest_path()`` must remain a path-only public lookup, so it
-        uses ``is_file()`` before returning. Admission immediately opened that
-        path again to parse it, paying a redundant metadata round trip on
-        drvfs. Opening the target and checking the opened descriptor preserves
-        the missing and non-regular target semantics without a separate path
-        stat or a path-check/open race.
+        On the ordinary CURRENT path, ``current_manifest_path()`` remains a
+        path-only public lookup and uses ``is_file()`` before returning.
+        Admission immediately opened that path again to parse it, paying a
+        redundant metadata round trip on drvfs. Opening the target and checking
+        the opened descriptor preserves the missing and non-regular target
+        semantics without a separate path stat or a path-check/open race. The
+        rare current.json recovery path also verifies its redundant fingerprint.
         """
 
-        try:
-            relative = self.current_pointer.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
+        path, expected_fingerprint = self._current_manifest_reference()
+        if path is None:
             return None, None
-        if not relative:
-            return None, None
-        path = self.snapshot_root / _read_relpath(relative)
         try:
             with path.open("r", encoding="utf-8") as handle:
                 if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
                     return None, None
-                return path, json.load(handle)
+                manifest = json.load(handle)
         except (FileNotFoundError, IsADirectoryError):
             return None, None
+        if (
+            expected_fingerprint is not None
+            and (
+                not isinstance(manifest, Mapping)
+                or str(manifest.get("fingerprint", "")).lower()
+                != expected_fingerprint
+            )
+        ):
+            raise RuntimeError(
+                "Corpus current.json fingerprint does not match its snapshot "
+                f"manifest: {path}"
+            )
+        return path, manifest
 
     def _cached_state_key_file(
         self, path: Path,
@@ -2759,8 +3045,20 @@ class CorpusSnapshotManager:
         ):
             return None
 
-    def _write_ledger_fingerprint_sidecar(self, fingerprints: Set[int]) -> None:
-        """Best-effort atomically persist a verified compact ledger index."""
+    def _write_ledger_fingerprint_sidecar(
+        self,
+        fingerprints: Set[int],
+        *,
+        commit_directory: bool = True,
+    ) -> None:
+        """Best-effort atomically persist a verified compact ledger index.
+
+        Cold-start rebuilds have no later ledger transaction to make the
+        replacement durable, so they commit the directory here. Admission
+        passes ``commit_directory=False`` because its shared ledger commit
+        orders every authoritative replacement and this derived cache before
+        snapshot activation.
+        """
 
         source_path = self._ledger_state_keys_path
         sidecar_path = self._ledger_fingerprints_path
@@ -2804,11 +3102,15 @@ class CorpusSnapshotManager:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_name, sidecar_path)
+            if commit_directory:
+                run_status._fsync_directory(sidecar_path.parent)
             temp_name = None
         except (OSError, ValueError, TypeError, OverflowError, RuntimeError) as exc:
             # A sidecar must never make the authoritative ledger unavailable.
-            # Leave a previous sidecar in place, where its source identity will
-            # reject it after a successful canonical-ledger rewrite.
+            # A pre-replace failure leaves the previous sidecar in place. A
+            # post-replace directory-sync failure may leave the complete new
+            # sidecar visible, but it remains only a verified acceleration and
+            # the in-memory canonical-ledger result is still authoritative.
             print(f"[warn] Could not cache trained-ledger fingerprints: {exc}")
         finally:
             if temp_name is not None:
@@ -3037,7 +3339,24 @@ class CorpusSnapshotManager:
         known_fingerprints |= {
             _state_key_fingerprint(key) for key in state_keys}
         if added_states:
-            self._write_ledger_fingerprint_sidecar(known_fingerprints)
+            self._write_ledger_fingerprint_sidecar(
+                known_fingerprints,
+                commit_directory=False,
+            )
+        try:
+            # CURRENT is committed in the snapshot root, not in ledger/.  The
+            # authoritative shard and state-key replacements must therefore
+            # commit their own directory transaction before snapshot
+            # activation can depend on them.  Sync even when this call found
+            # no additions so a retry can finish a previously failed commit.
+            run_status._fsync_directory(self.trained_ledger_dir)
+        except OSError:
+            # Both sets returned by _load_trained_ledger may have been mutated
+            # above.  Reload the visible on-disk transaction before a retry so
+            # it neither duplicates shard rows nor trusts uncommitted memory.
+            self._trained_ledger_cache = None
+            self._trained_ledger_source_sha256 = None
+            raise
         self._trained_ledger_cache = (known_names, known_fingerprints)
         if new_rows or added_states:
             print(
@@ -3209,6 +3528,13 @@ class CorpusSnapshotManager:
                 "storage": link_mode,
             })
 
+        # Each copied inode is durable, but the files/ directory is a separate
+        # transaction from the validation manifest's parent. Commit the new
+        # shard names before a later manifest replacement can authorize them.
+        # A failure leaves the prior manifest authoritative; a retry recopies
+        # and recommits the same deterministic append-only members.
+        run_status._fsync_directory(files_dir)
+
         # Audit Suggestion 9: the canonical states this growth event moved from
         # training into the hold-out.  Analysis is per-file cached, so this is
         # a dictionary lookup for shards the caller has already measured.
@@ -3370,45 +3696,62 @@ class CorpusSnapshotManager:
         selected = ranked[:desired]
         validation_dir = manifest_path.parent
         files_dir = validation_dir / "files"
-        files_dir.mkdir(parents=True, exist_ok=False)
+        created_validation_dir = not validation_dir.exists()
+        try:
+            files_dir.mkdir(parents=True, exist_ok=False)
 
-        file_records = []
-        for source in selected:
-            destination = files_dir / source.name
-            link_mode = _store_shard(source, destination)
-            file_records.append({
-                "name": source.name,
-                "path": (Path("files") / source.name).as_posix(),
-                "sha256": replay_file_sha256(source),
-                "size_bytes": source.stat().st_size,
-                "storage": link_mode,
-            })
+            file_records = []
+            for source in selected:
+                destination = files_dir / source.name
+                link_mode = _store_shard(source, destination)
+                file_records.append({
+                    "name": source.name,
+                    "path": (Path("files") / source.name).as_posix(),
+                    "sha256": replay_file_sha256(source),
+                    "size_bytes": source.stat().st_size,
+                    "storage": link_mode,
+                })
 
-        metrics, state_keys = analyze_replay_files(selected)
-        state_keys_file = "canonical_state_keys.txt.gz"
-        _write_state_keys(validation_dir / state_keys_file, state_keys)
-        manifest = {
-            "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            "kind": "immutable_validation",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "split": {
-                "unit": "replay_file",
-                "version": self.validation_split_version,
-                "fraction": self.validation_fraction,
-                "seed": self.split_seed,
-                **self._realized_split_share(
-                    validation_files=len(file_records),
-                    total_files=len(files),
-                    present_files=len(file_records),
-                ),
-            },
-            "encoding_version": ENCODING_VERSION,
-            "rules_id": CANONICAL_RULES_ID,
-            "files": file_records,
-            "state_keys_file": state_keys_file,
-            "metrics": metrics,
-        }
-        _write_json_atomic(manifest_path, manifest)
+            # The manifest writer commits names in validation_dir, not inside
+            # its nested files/ directory. Commit every copied shard name first
+            # so no durable manifest can outlive one of its declared members.
+            run_status._fsync_directory(files_dir)
+
+            metrics, state_keys = analyze_replay_files(selected)
+            state_keys_file = "canonical_state_keys.txt.gz"
+            _write_state_keys(validation_dir / state_keys_file, state_keys)
+            manifest = {
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                "kind": "immutable_validation",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "split": {
+                    "unit": "replay_file",
+                    "version": self.validation_split_version,
+                    "fraction": self.validation_fraction,
+                    "seed": self.split_seed,
+                    **self._realized_split_share(
+                        validation_files=len(file_records),
+                        total_files=len(files),
+                        present_files=len(file_records),
+                    ),
+                },
+                "encoding_version": ENCODING_VERSION,
+                "rules_id": CANONICAL_RULES_ID,
+                "files": file_records,
+                "state_keys_file": state_keys_file,
+                "metrics": metrics,
+            }
+            _write_json_atomic(manifest_path, manifest)
+        except BaseException:
+            # Only remove a namespace created by this call and only before its
+            # manifest becomes visible. A post-replace directory-sync failure
+            # retains the complete manifest so the next call can verify it.
+            if created_validation_dir and not manifest_path.exists():
+                try:
+                    shutil.rmtree(validation_dir)
+                except OSError:
+                    pass
+            raise
         return manifest, state_keys
 
     def _snapshot_dirs(self) -> List[Tuple[int, Path]]:
@@ -3434,7 +3777,8 @@ class CorpusSnapshotManager:
         fingerprint rather than by path -- so older directories are audit
         history, not live inputs.  Deleting is best-effort: a shard held open
         by another process (common on drvfs) must never abort an admission,
-        and the next admission retries the same directory.
+        and the next admission retries the same directory.  Commit each
+        successful deletion batch before reporting reclaimed storage.
         """
         if self.max_retained_snapshots <= 0:
             return []
@@ -3453,6 +3797,12 @@ class CorpusSnapshotManager:
                 print(f"[warn] Could not prune corpus snapshot {path.name}: {exc}")
                 continue
             removed.append(path.name)
+        if removed:
+            # The public pointers already authorize the newer snapshot, but
+            # retention also protects the launcher's finite disk headroom.
+            # Commit the removed directory names as one batch before claiming
+            # their space was reclaimed. See Journal Pass 435.
+            run_status._fsync_directory(self.snapshot_root)
         return removed
 
     def _next_version(self) -> int:
@@ -3470,11 +3820,13 @@ class CorpusSnapshotManager:
         teacher_settings: Mapping[str, Any],
         noise_settings: Mapping[str, Any],
         generation_settings: Mapping[str, Any],
+        replay_file_stats_handoff: Optional[tuple] = None,
     ) -> SnapshotDecision:
         """Admit a new immutable snapshot if its fresh-state gate passes."""
 
         files, rejected_files, replay_identities = (
-            self._eligible_replay_files_with_identities())
+            self._eligible_replay_files_with_identities(
+                replay_file_stats_handoff))
         if not files:
             raise RuntimeError(
                 "No replay files satisfy the repaired policy-distillation contract"
@@ -3769,17 +4121,37 @@ class CorpusSnapshotManager:
             stored_files = []
             reused_count = 0
             reused_bytes = 0
+            source_linked_count = 0
+            source_linked_bytes = 0
             for source, record in zip(train_files, file_records):
                 destination = files_dir / source.name
-                link_mode = _store_shard(source, destination, previous_files_dir)
+                link_mode = _store_shard(
+                    source,
+                    destination,
+                    previous_files_dir,
+                    hardlink_source=self.reuse_previous_shards,
+                    expected_size=int(record["size_bytes"]),
+                    expected_sha256=str(record["sha256"]),
+                )
                 if link_mode == "hardlink":
                     reused_count += 1
                     reused_bytes += int(record["size_bytes"])
+                elif link_mode == "source_hardlink":
+                    source_linked_count += 1
+                    source_linked_bytes += int(record["size_bytes"])
                 stored_files.append({
                     **record,
                     "path": (Path("files") / source.name).as_posix(),
                     "storage": link_mode,
                 })
+
+            # Snapshot activation later commits the staging directory into the
+            # snapshot root, but a parent-directory fsync is not recursive.
+            # Commit every hardlink or copied shard name in the nested files/
+            # directory before the manifest and CURRENT can make them
+            # authoritative. The linked source inodes are already durable;
+            # this closes the remaining directory-entry durability boundary.
+            run_status._fsync_directory(files_dir)
 
             state_keys_file = "canonical_state_keys.txt.gz"
             _write_state_keys(staging / state_keys_file, train_keys)
@@ -3811,7 +4183,11 @@ class CorpusSnapshotManager:
                     # the predecessor, so they cost no additional disk.
                     "reused_shard_count": reused_count,
                     "reused_shard_bytes": reused_bytes,
-                    "copied_shard_count": len(stored_files) - reused_count,
+                    "source_linked_shard_count": source_linked_count,
+                    "source_linked_shard_bytes": source_linked_bytes,
+                    "copied_shard_count": (
+                        len(stored_files) - reused_count - source_linked_count
+                    ),
                 },
                 "metrics": metrics,
             }
@@ -3837,9 +4213,10 @@ class CorpusSnapshotManager:
                 self.snapshot_root / "current.json",
                 {"manifest": (Path(final_dir.name) / "manifest.json").as_posix(), "fingerprint": fingerprint},
             )
-            pointer_temp = self.snapshot_root / "CURRENT.tmp"
-            pointer_temp.write_text((Path(final_dir.name) / "manifest.json").as_posix() + "\n", encoding="utf-8")
-            os.replace(pointer_temp, self.current_pointer)
+            _write_text_atomic(
+                self.current_pointer,
+                (Path(final_dir.name) / "manifest.json").as_posix() + "\n",
+            )
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging)
