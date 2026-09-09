@@ -9,6 +9,7 @@ every historically trained state.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -614,6 +615,108 @@ def test_failed_ledger_shard_append_preserves_prior_records(
     }
 
 
+def test_trained_ledger_commits_its_directory_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ledger replacements must be committed before CURRENT can use them."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    manager._ensure_trained_ledger()
+    events = []
+
+    monkeypatch.setattr(
+        corpus.run_status,
+        "_fsync_directory",
+        lambda path: events.append(Path(path)),
+    )
+    manager._record_trained_ledger(
+        version=1,
+        file_records=[{"name": "first.jsonl", "sha256": "a" * 64}],
+        state_keys={"1" * 64},
+    )
+
+    assert events == [manager.trained_ledger_dir]
+    assert manager.trained_ledger_shard_names() == {"first.jsonl"}
+    assert manager.trained_ledger_state_keys() == {"1" * 64}
+
+
+def test_ledger_directory_commit_failure_reloads_before_clean_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed directory commit must not cache or duplicate visible rows."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    manager._ensure_trained_ledger()
+    calls = 0
+
+    def fail_first_commit(path: Path) -> None:
+        nonlocal calls
+        assert Path(path) == manager.trained_ledger_dir
+        calls += 1
+        if calls == 1:
+            raise OSError(5, "simulated ledger directory sync failure")
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", fail_first_commit)
+    record = {"name": "retry.jsonl", "sha256": "b" * 64}
+    with pytest.raises(OSError, match="simulated ledger directory sync failure"):
+        manager._record_trained_ledger(
+            version=1,
+            file_records=[record],
+            state_keys={"2" * 64},
+        )
+
+    assert manager._trained_ledger_cache is None
+    assert manager._trained_ledger_source_sha256 is None
+    manager._record_trained_ledger(
+        version=1,
+        file_records=[record],
+        state_keys={"2" * 64},
+    )
+
+    rows = [
+        json.loads(line)
+        for line in manager._ledger_shards_path.read_text(
+            encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert calls == 2
+    assert [row["name"] for row in rows] == ["retry.jsonl"]
+    assert manager.trained_ledger_state_keys() == {"2" * 64}
+
+
+def test_ledger_directory_commit_failure_does_not_activate_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pointer cannot outlive the ledger directory transaction it needs."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    for index in range(4):
+        _write_replay(replay_dir / f"replay_{index}.jsonl", [index])
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    manager._ensure_trained_ledger()
+    real_fsync_directory = corpus.run_status._fsync_directory
+
+    def fail_ledger_directory(path: Path) -> None:
+        if Path(path) == manager.trained_ledger_dir:
+            raise OSError(5, "simulated ledger directory sync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", fail_ledger_directory)
+    with pytest.raises(OSError, match="simulated ledger directory sync failure"):
+        manager.consider_snapshot(TEACHER, NOISE, GENERATION)
+
+    assert not manager.current_pointer.exists()
+    assert not (root / "current.json").exists()
+    assert (root / "snapshot_v000001" / "manifest.json").is_file()
+
+
 @pytest.mark.parametrize(
     "malformed_row",
     ['{"name":', "[]\n", '{"name":""}\n'],
@@ -715,6 +818,81 @@ def test_ledger_fingerprint_sidecar_skips_text_parse_only_after_verification(
     monkeypatch.setattr(corpus, "_iter_state_keys", unexpected_text_parse)
     reopened = _manager(replay_dir, root, trained_ledger_enabled=True)
     assert reopened.trained_ledger_state_fingerprints() == expected
+
+
+def test_ledger_fingerprint_sidecar_commits_its_public_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A standalone cache rebuild must commit bytes and its directory entry."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    manager._ensure_trained_ledger()
+    state_key = "1" * 64
+    assert corpus._merge_state_keys_file(
+        manager._ledger_state_keys_path, {state_key}
+    ) == 1
+    fingerprints = {corpus._state_key_fingerprint(state_key)}
+    events = []
+    real_fsync = corpus.os.fsync
+    real_replace = corpus.os.replace
+
+    def tracking_fsync(fd: int) -> None:
+        events.append("file_fsync")
+        real_fsync(fd)
+
+    def tracking_replace(source, destination) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(corpus.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(corpus.os, "replace", tracking_replace)
+    monkeypatch.setattr(
+        corpus.run_status,
+        "_fsync_directory",
+        lambda path: events.append(("directory_fsync", Path(path))),
+    )
+
+    manager._write_ledger_fingerprint_sidecar(fingerprints)
+
+    assert events == [
+        "file_fsync",
+        "replace",
+        ("directory_fsync", manager.trained_ledger_dir),
+    ]
+    assert manager._load_ledger_fingerprint_sidecar() == fingerprints
+    assert not list(manager.trained_ledger_dir.glob(
+        "trained_state_fingerprints.v1.bin.*.tmp"))
+
+
+def test_ledger_fingerprint_sidecar_reports_directory_commit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """The optional cache remains usable after a visible post-replace fault."""
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    root = tmp_path / "root"
+    manager = _manager(replay_dir, root, trained_ledger_enabled=True)
+    manager._ensure_trained_ledger()
+    state_key = "2" * 64
+    assert corpus._merge_state_keys_file(
+        manager._ledger_state_keys_path, {state_key}
+    ) == 1
+    fingerprints = {corpus._state_key_fingerprint(state_key)}
+
+    def fail_directory_sync(path: Path) -> None:
+        assert Path(path) == manager.trained_ledger_dir
+        raise OSError(5, "simulated fingerprint directory sync failure")
+
+    monkeypatch.setattr(
+        corpus.run_status, "_fsync_directory", fail_directory_sync)
+    manager._write_ledger_fingerprint_sidecar(fingerprints)
+
+    assert "simulated fingerprint directory sync failure" in capsys.readouterr().out
+    assert manager._load_ledger_fingerprint_sidecar() == fingerprints
+    assert not list(manager.trained_ledger_dir.glob(
+        "trained_state_fingerprints.v1.bin.*.tmp"))
 
 
 def test_trained_ledger_source_digest_tracks_the_verified_canonical_gzip(
@@ -922,6 +1100,32 @@ def test_streamed_ledger_merge_uses_fast_gzip_level(
     assert corpus._read_state_keys(path) == keys
 
 
+def test_streamed_ledger_merge_fsyncs_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The complete gzip member must be durable before replacing the ledger."""
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd):
+        events.append("fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(corpus.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(corpus.os, "replace", tracking_replace)
+    path = tmp_path / "keys.txt.gz"
+
+    assert corpus._merge_state_keys_file(path, {"a" * 64}) == 1
+
+    assert events == ["fsync", "replace"]
+    assert corpus._read_state_keys(path) == {"a" * 64}
+
+
 def test_streamed_ledger_merge_cleans_partial_file_after_write_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -952,7 +1156,8 @@ def test_streamed_ledger_merge_cleans_partial_file_after_write_failure(
     def fail_temporary_write(target, *args, **kwargs):
         handle = real_open(target, *args, **kwargs)
         mode = args[0] if args else kwargs.get("mode", "rb")
-        if Path(target) == temporary and "w" in mode:
+        target_name = getattr(target, "name", target)
+        if Path(target_name) == temporary and "w" in mode:
             return FailingWriter(handle)
         return handle
 
