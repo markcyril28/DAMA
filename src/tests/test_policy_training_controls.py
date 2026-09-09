@@ -2147,6 +2147,107 @@ def test_background_selfplay_uses_snapshot_step_from_selfplay_start(
     assert holder._bg_snapshot_manifest["fingerprint"] == "enhanced"
 
 
+@pytest.mark.parametrize("tensorize_fails", [False, True])
+def test_background_snapshot_releases_cycle_locals(
+    monkeypatch: pytest.MonkeyPatch, tensorize_fails: bool,
+) -> None:
+    """Only the pending handoff may own payloads during the next generation."""
+    import weakref
+
+    class Payload(list):
+        pass
+
+    class FakeThread:
+        def __init__(self, target, daemon=False):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    refs = {}
+    observations = {}
+
+    class Manager:
+        def consider_snapshot(self, **_kwargs):
+            return SimpleNamespace(admitted=True, manifest_path="snapshot")
+
+        def load_split(self, *_args, **_kwargs):
+            train = Payload(["train"])
+            validation = Payload(["validation"])
+            refs["train"] = weakref.ref(train)
+            refs["validation"] = weakref.ref(validation)
+            return train, validation, {
+                "version": 2, "metrics": {"fresh_unique_state_rate": 0.5},
+            }
+
+    def tensorize(entries, **_kwargs):
+        assert entries == ["train"]
+        if tensorize_fails:
+            raise RuntimeError("synthetic tensorization failure")
+        dataset = Payload(["copied tensors"])
+        refs["dataset"] = weakref.ref(dataset)
+        return dataset
+
+    holder = object.__new__(Trainer)
+    holder.config = SimpleNamespace(
+        replay_max_files=60, replay_max_entries=500, max_moves_per_sample=32,
+    )
+    holder._snapshot_manager = Manager()
+    holder.replay_buffer = SimpleNamespace(cleanup_old_files=lambda: 0)
+    holder._bg_selfplay_thread = None
+    holder._bg_selfplay_stop_event = trainer_module.threading.Event()
+    holder._bg_selfplay_lock = trainer_module.threading.Lock()
+    holder._data_ready_event = trainer_module.threading.Event()
+    holder._bg_selfplay_dataset = None
+    holder._bg_selfplay_incremental = None
+    holder._bg_selfplay_entries = None
+    holder._bg_snapshot_manifest = None
+    holder._bg_validation_entries = None
+    holder._stopped = holder._paused = False
+    holder._wait_for_selfplay_disk_headroom = lambda: True
+    holder._corpus_settings = lambda **_kwargs: ({}, {}, {})
+    holder._activate_dataset_manifest = lambda manifest: observations.update(
+        version=manifest["version"])
+    holder._set_validation_entries = lambda entries: observations.update(
+        validation=list(entries))
+
+    def run_selfplay(*_args, **_kwargs):
+        if refs:
+            holder._bg_selfplay_stop_event.set()
+            observations["train_released"] = refs["train"]() is None
+            if not tensorize_fails:
+                observations["pending_owned"] = (
+                    refs["dataset"]() is holder._bg_selfplay_dataset
+                    and refs["validation"]() is holder._bg_validation_entries
+                )
+                dataset, incremental = holder._collect_background_selfplay()
+                observations["dataset"] = list(dataset)
+                observations["incremental"] = incremental
+                del dataset
+                observations["dataset_released"] = refs["dataset"]() is None
+            observations["validation_released"] = refs["validation"]() is None
+        return 1, 23
+
+    holder.run_selfplay = run_selfplay
+    monkeypatch.setattr(trainer_module.threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        trainer_module.CachedTensorDataset, "from_entries", staticmethod(tensorize))
+    Trainer._start_background_selfplay(holder, 72)
+
+    assert observations["train_released"]
+    assert observations["validation_released"]
+    if tensorize_fails:
+        assert holder._bg_selfplay_dataset is None
+        assert not holder._data_ready_event.is_set()
+    else:
+        assert observations["pending_owned"]
+        assert observations["dataset"] == ["copied tensors"]
+        assert observations["incremental"] is None
+        assert observations["validation"] == ["validation"]
+        assert observations["version"] == 2
+        assert observations["dataset_released"]
+
+
 def test_background_selfplay_stop_event_prevents_another_snapshot_cycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
