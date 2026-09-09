@@ -21,6 +21,7 @@ from ..algorithmic.search import get_best_move
 from .corpus import canonical_state_key
 from .dataset import CachedTensorDataset
 from .replay import ReplayEntry
+from .run_status import _fsync_directory, _write_json_atomic
 
 
 SUITE_SCHEMA_VERSION = 1
@@ -77,6 +78,7 @@ def _append_jsonl_atomic(path: Path, record: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if fd >= 0:
             try:
@@ -230,6 +232,10 @@ def create_frozen_teacher_suite(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
+        # The manifest authorizes these immutable bytes. Commit the suite name
+        # before publishing that authority so an abrupt host loss cannot leave
+        # a durable manifest pointing at a rename that never reached storage.
+        _fsync_directory(path.parent)
     except Exception:
         try:
             os.unlink(temp_name)
@@ -256,11 +262,10 @@ def create_frozen_teacher_suite(
     }
     if manifest_path.exists():
         raise RuntimeError(f"Frozen suite manifest unexpectedly exists: {manifest_path}")
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    # Do not expose a partial manifest if serialization or storage fails. The
+    # shared writer file-fsyncs, atomically replaces, and directory-fsyncs the
+    # public name before this creation is reported as complete.
+    _write_json_atomic(manifest_path, manifest)
     return manifest
 
 
