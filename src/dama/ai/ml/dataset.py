@@ -638,6 +638,21 @@ def _preprocess_dicts_fork_shm(args: Tuple[int, int]) -> None:
         shm_vt.close()
 
 
+def _clone_shared_array(shm, shape, dtype) -> torch.Tensor:
+    """Own one worker output, then retire its redundant shared storage."""
+    tensor = torch.from_numpy(
+        np.ndarray(shape, dtype=dtype, buffer=shm.buf)).clone()
+    # Workers have exited and clone owns its bytes. Release each segment
+    # before copying the next; the caller's finally still retries cleanup
+    # on a partial copy or an unsuccessful close/unlink.
+    try:
+        shm.close()
+        shm.unlink()
+    except Exception:
+        pass
+    return tensor
+
+
 def preprocess_entries_to_tensors(
     entries: List[ReplayEntry],
     max_moves_per_sample: int = 32,
@@ -762,12 +777,14 @@ def preprocess_entries_to_tensors(
                     # to own memory.  clone() is one copy (shm → tensor); the
                     # alternative (np.copy + from_numpy) would be two copies
                     # (shm → numpy copy → tensor share).
-                    boards = torch.from_numpy(np.ndarray((n, BOARD_PLANES, 8, 8), dtype=np.float32, buffer=shm_boards.buf)).clone()
-                    all_move_features = torch.from_numpy(np.ndarray((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32, buffer=shm_mf.buf)).clone()
-                    move_counts = torch.from_numpy(np.ndarray(n, dtype=np.int32, buffer=shm_mc.buf)).clone()
-                    targets = torch.from_numpy(np.ndarray(n, dtype=np.int32, buffer=shm_tgt.buf)).clone()
-                    reward_weights = torch.from_numpy(np.ndarray(n, dtype=np.float32, buffer=shm_rw.buf)).clone()
-                    value_targets = torch.from_numpy(np.ndarray(n, dtype=np.float32, buffer=shm_vt.buf)).clone()
+                    boards = _clone_shared_array(
+                        shm_boards, (n, BOARD_PLANES, 8, 8), np.float32)
+                    all_move_features = _clone_shared_array(
+                        shm_mf, (n, max_moves_per_sample, MOVE_FEATURE_SIZE), np.float32)
+                    move_counts = _clone_shared_array(shm_mc, n, np.int32)
+                    targets = _clone_shared_array(shm_tgt, n, np.int32)
+                    reward_weights = _clone_shared_array(shm_rw, n, np.float32)
+                    value_targets = _clone_shared_array(shm_vt, n, np.float32)
                     # Mark as using shm path — skip from_numpy below
                     _shm_tensors = True
 
@@ -1066,20 +1083,14 @@ class CachedTensorDataset(Dataset):
                                      initializer=_preprocess_pool_init) as pool:
                             list(pool.map(_preprocess_dicts_fork_shm, args))
 
-                        boards = torch.from_numpy(np.ndarray(
-                            (n, BOARD_PLANES, 8, 8), dtype=np.float32,
-                            buffer=shm_boards.buf)).clone()
-                        mf = torch.from_numpy(np.ndarray(
-                            (n, max_moves_per_sample, MOVE_FEATURE_SIZE),
-                            dtype=np.float32, buffer=shm_mf.buf)).clone()
-                        mc = torch.from_numpy(np.ndarray(
-                            n, dtype=np.int32, buffer=shm_mc.buf)).clone()
-                        tgt = torch.from_numpy(np.ndarray(
-                            n, dtype=np.int32, buffer=shm_tgt.buf)).clone()
-                        rw = torch.from_numpy(np.ndarray(
-                            n, dtype=np.float32, buffer=shm_rw.buf)).clone()
-                        vt = torch.from_numpy(np.ndarray(
-                            n, dtype=np.float32, buffer=shm_vt.buf)).clone()
+                        boards = _clone_shared_array(
+                            shm_boards, (n, BOARD_PLANES, 8, 8), np.float32)
+                        mf = _clone_shared_array(
+                            shm_mf, (n, max_moves_per_sample, MOVE_FEATURE_SIZE), np.float32)
+                        mc = _clone_shared_array(shm_mc, n, np.int32)
+                        tgt = _clone_shared_array(shm_tgt, n, np.int32)
+                        rw = _clone_shared_array(shm_rw, n, np.float32)
+                        vt = _clone_shared_array(shm_vt, n, np.float32)
 
                         if show_progress:
                             print(f"  Pre-processing complete: {n} entries")
@@ -1412,9 +1423,11 @@ class FastBatchIterator:
 
                 if alloc_n > self.n:
                     # Pre-allocate to capacity and fill the first n entries
-                    self._boards = torch.empty(alloc_n, *b_shape, device=device,
-                                               dtype=_sd).contiguous(
-                                                   memory_format=torch.channels_last)
+                    # Allocate the final layout directly; converting an empty
+                    # buffer copies uninitialized data and doubles board storage.
+                    self._boards = torch.empty(
+                        (alloc_n, *b_shape), device=device, dtype=_sd,
+                        memory_format=torch.channels_last)
                     self._boards[:self.n] = dataset.boards.to(
                         device, dtype=_sd, memory_format=torch.channels_last)
                     self._move_features = torch.empty(alloc_n, *mf_shape, device=device,
@@ -1594,15 +1607,34 @@ class FastBatchIterator:
         existing GPU data is shifted in-place (GPU→GPU memcpy, ~10× faster
         than CPU→GPU upload for the same size).
 
-        Falls back to full replacement when:
-        - Not GPU-resident (CPU pinned path — rebuild is cheap anyway)
-        - Buffer capacity is insufficient and reallocation is needed
+        CPU mode concatenates the datasets; insufficient GPU capacity allocates
+        larger buffers. Use ``replace_data`` for a complete snapshot instead
+        of an incremental payload.
         """
+        self._update_buffers(new_dataset, max_entries=max_entries, replace=False)
+
+    def replace_data(self, dataset: CachedTensorDataset) -> None:
+        """Replace every active row with a complete, already bounded dataset.
+
+        Reuse resident capacity where possible, without retaining any rows from
+        the previous snapshot. CPU mode binds the replacement directly.
+        """
+        self._update_buffers(dataset, max_entries=0, replace=True)
+
+    def _update_buffers(
+        self,
+        new_dataset: CachedTensorDataset,
+        *,
+        max_entries: int,
+        replace: bool,
+    ) -> None:
         new_n = len(new_dataset)
-        if new_n == 0:
+        if new_n == 0 and not replace:
             return
 
-        if max_entries > 0 and self.n + new_n > max_entries:
+        if replace:
+            keep_old = 0
+        elif max_entries > 0 and self.n + new_n > max_entries:
             keep_old = max(0, max_entries - new_n)
         else:
             keep_old = self.n
@@ -1675,9 +1707,9 @@ class FastBatchIterator:
             print(f"  GPU buffer realloc: {buf_cap} → {new_cap} capacity")
             b_shape = self._boards.shape[1:]
             mf_shape = self._move_features.shape[1:]
-            new_boards = torch.empty(new_cap, *b_shape, device=dev,
-                                     dtype=self._boards.dtype).contiguous(
-                                         memory_format=torch.channels_last)
+            new_boards = torch.empty(
+                (new_cap, *b_shape), device=dev, dtype=self._boards.dtype,
+                memory_format=torch.channels_last)
             new_mf = torch.empty(new_cap, *mf_shape, device=dev,
                                  dtype=self._move_features.dtype)
             new_mc = torch.empty(new_cap, device=dev, dtype=self._move_counts.dtype)
@@ -1719,7 +1751,8 @@ class FastBatchIterator:
             return
 
         # CPU path: rebuild from scratch (pinning is fast, no PCIe bottleneck)
-        merged = self.dataset.concat(new_dataset, max_entries=max_entries)
+        merged = (new_dataset if replace else
+                  self.dataset.concat(new_dataset, max_entries=max_entries))
         self.dataset = merged
         self.n = len(merged)
         _should_pin = torch.cuda.is_available()
