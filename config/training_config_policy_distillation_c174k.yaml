@@ -142,14 +142,10 @@ corpus_snapshots:
   # read-only; nothing here writes into them.
   root: "data/corpus_snapshots/policy_distillation_recovery_c174k"
   minimum_fresh_state_fraction: 0.50
-  # Every admission copies the whole replay corpus (~0.9 GB at
-  # replay_max_files: 60) and nothing reclaimed it, so the 48h run exhausted
-  # the volume around the 24h mark. Keep a rolling audit window instead.
-  # 0 restores the old keep-everything behaviour.
+  # Bound immutable snapshot history and unique rotated-shard retention. See Journal Pass 114.
   max_retained_snapshots: 10
-  # Hardlink unchanged shards from the previous snapshot instead of copying
-  # ~0.9 GB per admission (digest-verified before linking and on every load).
-  reuse_previous_shards: true  # Cuts per-admission snapshot growth to only new/rotated shards. See Journal Pass 114.
+  # Avoid duplicate replay/snapshot blocks via verified immutable hardlinks. See Journal Pass 407.
+  reuse_previous_shards: true
 
   # Audit Suggestion 3 / F5: v11 is the last valid predecessor. v12 was
   # admitted with a lost CURRENT pointer -- its recorded 100% freshness was an
