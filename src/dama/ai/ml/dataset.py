@@ -791,6 +791,11 @@ def preprocess_entries_to_tensors(
 
                     except Exception as e:
                         # SharedMemory failed — fall back to legacy fork path
+                        # Completed copies are unusable after a later copy
+                        # fails. Release them before the fallback allocates
+                        # another complete set of output arrays.
+                        boards = all_move_features = move_counts = None
+                        targets = reward_weights = value_targets = None
                         if show_progress:
                             print(f"  SharedMemory failed ({e}), using legacy fork path...")
                         _shm_ok = False
@@ -1103,6 +1108,8 @@ class CachedTensorDataset(Dataset):
                         return cls(boards, mf, mc, tgt, rw, vt)
 
                     except Exception as e:
+                        # No partial copied output survives into the retry.
+                        boards = mf = mc = tgt = rw = vt = None
                         if show_progress:
                             print(f"  SharedMemory failed ({e}), using spawn path...")
                         _shm_ok = False
