@@ -865,17 +865,10 @@ def _iter_entry_dicts(path: Path) -> Iterator[dict]:
     chunk_chars = 4 * 1024 * 1024
     pending = ""
     line_number = 0
-    # Keep only one read ahead. The executor joins before the file closes,
-    # including on parse errors or iterator close, so no reader survives into
-    # the caller's later fork-based tensor encoding.
-    with path.open("r", encoding="utf-8") as handle, ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="dama-replay-read",
-    ) as reader:
-        pending_read = reader.submit(handle.read, chunk_chars)
+    with path.open("r", encoding="utf-8") as handle:
         while True:
-            chunk = pending_read.result()
+            chunk = handle.read(chunk_chars)
             if chunk:
-                pending_read = reader.submit(handle.read, chunk_chars)
                 lines = (pending + chunk).split("\n")
                 pending = lines.pop()
             else:
