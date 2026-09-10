@@ -601,7 +601,12 @@ def canonical_state_payload(state: Mapping[str, Any]) -> bytes:
         _bitboard(opp_kings),
     )
     header = f"{CANONICAL_RULES_ID}|encoding={ENCODING_VERSION}|".encode("ascii")
-    return header + b"".join(v.to_bytes(8, "big", signed=False) for v in values)
+    return header + b"".join((
+        values[0].to_bytes(8, "big", signed=False),
+        values[1].to_bytes(8, "big", signed=False),
+        values[2].to_bytes(8, "big", signed=False),
+        values[3].to_bytes(8, "big", signed=False),
+    ))
 
 
 def canonical_state_key(state: Mapping[str, Any]) -> str:
