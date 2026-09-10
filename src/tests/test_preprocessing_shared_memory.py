@@ -5,6 +5,7 @@ from functools import partial
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import os
+import weakref
 
 import pytest
 import torch
@@ -116,7 +117,7 @@ def test_completed_shared_outputs_are_released_before_next_copy(
 
 
 @pytest.mark.parametrize("kind", ["entries", "dicts"])
-@pytest.mark.parametrize("failed_copy", [2, 6])
+@pytest.mark.parametrize("failed_copy", range(1, 7))
 def test_partial_copy_failure_keeps_exact_fallback_and_cleans_segments(
     monkeypatch, parallel_input, kind, failed_copy,
 ):
@@ -125,6 +126,9 @@ def test_partial_copy_failure_keeps_exact_fallback_and_cleans_segments(
     original_clone = torch.Tensor.clone
     copies = 0
     parent = os.getpid()
+    partial_outputs = []
+    original_pool = dataset.ProcessPoolExecutor
+    pool_calls = 0
 
     def clone(tensor, *args, **kwargs):
         nonlocal copies
@@ -132,11 +136,27 @@ def test_partial_copy_failure_keeps_exact_fallback_and_cleans_segments(
             copies += 1
             if copies == failed_copy:
                 raise RuntimeError("injected tensor copy failure")
-        return original_clone(tensor, *args, **kwargs)
+        result = original_clone(tensor, *args, **kwargs)
+        if os.getpid() == parent:
+            partial_outputs.append(weakref.ref(result))
+        return result
+
+    def pool(**kwargs):
+        nonlocal pool_calls
+        pool_calls += 1
+        if pool_calls == 2:
+            # Failed shared copies have no consumer. A memory-constrained
+            # retry must not inherit them alongside its new output arrays.
+            assert len(partial_outputs) == failed_copy - 1
+            assert all(ref() is None for ref in partial_outputs)
+            assert all(segment.buf is None for segment in segments)
+        return original_pool(**kwargs)
 
     monkeypatch.setattr(torch.Tensor, "clone", clone)
+    monkeypatch.setattr(dataset, "ProcessPoolExecutor", pool)
     outputs = _prepare(kind, entries)
     assert copies == failed_copy
+    assert pool_calls == 2
     _assert_outputs_and_cleanup(outputs, oracle, segments, original_shared)
 
 
