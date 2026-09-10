@@ -723,100 +723,106 @@ def preprocess_entries_to_tensors(
             # Workers read entries from inherited global, write to pre-allocated
             # shared memory blocks.  No pickle, no concatenate.
             global _fork_entries, _fork_max_moves, _fork_shm_names, _fork_total_n
-            _fork_entries = entries
-            _fork_max_moves = max_moves_per_sample
-            _fork_total_n = n
-
-            args = [
-                (start, min(start + chunk_size, n))
-                for start in range(0, n, chunk_size)
-            ]
-
-            _shm_ok = True
             try:
-                from multiprocessing.shared_memory import SharedMemory as _SHM
-            except ImportError:
-                _shm_ok = False
-            _shm_tensors = False  # set True if shm path produces tensors directly
+                _fork_entries = entries
+                _fork_max_moves = max_moves_per_sample
+                _fork_total_n = n
 
-            if _shm_ok:
-                # Pre-allocate shared memory for all output arrays
-                _boards_sz = n * BOARD_PLANES * 8 * 8 * 4  # float32
-                _mf_sz = n * max_moves_per_sample * MOVE_FEATURE_SIZE * 4
-                _mc_sz = n * 4  # int32
-                _tgt_sz = n * 4
-                _rw_sz = n * 4  # float32
-                _vt_sz = n * 4
+                args = [
+                    (start, min(start + chunk_size, n))
+                    for start in range(0, n, chunk_size)
+                ]
 
-                shm_list = []
+                _shm_ok = True
                 try:
-                    # Append incrementally so partially-allocated segments are
-                    # cleaned up by the finally block if a later allocation fails.
-                    shm_boards = _SHM(create=True, size=max(1, _boards_sz)); shm_list.append(shm_boards)
-                    shm_mf = _SHM(create=True, size=max(1, _mf_sz)); shm_list.append(shm_mf)
-                    shm_mc = _SHM(create=True, size=max(1, _mc_sz)); shm_list.append(shm_mc)
-                    shm_tgt = _SHM(create=True, size=max(1, _tgt_sz)); shm_list.append(shm_tgt)
-                    shm_rw = _SHM(create=True, size=max(1, _rw_sz)); shm_list.append(shm_rw)
-                    shm_vt = _SHM(create=True, size=max(1, _vt_sz)); shm_list.append(shm_vt)
-
-                    _fork_shm_names = {
-                        'boards': shm_boards.name,
-                        'move_features': shm_mf.name,
-                        'move_counts': shm_mc.name,
-                        'targets': shm_tgt.name,
-                        'reward_weights': shm_rw.name,
-                        'value_targets': shm_vt.name,
-                    }
-
-                    # Workers write directly to shared memory — return nothing
-                    with ProcessPoolExecutor(max_workers=num_workers,
-                                     initializer=_preprocess_pool_init) as pool:
-                        list(pool.map(_preprocess_chunk_fork_shm, args))
-
-                    # Create torch tensors from shared memory views, then clone
-                    # to own memory.  clone() is one copy (shm → tensor); the
-                    # alternative (np.copy + from_numpy) would be two copies
-                    # (shm → numpy copy → tensor share).
-                    boards = _clone_shared_array(
-                        shm_boards, (n, BOARD_PLANES, 8, 8), np.float32)
-                    all_move_features = _clone_shared_array(
-                        shm_mf, (n, max_moves_per_sample, MOVE_FEATURE_SIZE), np.float32)
-                    move_counts = _clone_shared_array(shm_mc, n, np.int32)
-                    targets = _clone_shared_array(shm_tgt, n, np.int32)
-                    reward_weights = _clone_shared_array(shm_rw, n, np.float32)
-                    value_targets = _clone_shared_array(shm_vt, n, np.float32)
-                    # Mark as using shm path — skip from_numpy below
-                    _shm_tensors = True
-
-                except Exception as e:
-                    # SharedMemory failed — fall back to legacy fork path
-                    if show_progress:
-                        print(f"  SharedMemory failed ({e}), using legacy fork path...")
+                    from multiprocessing.shared_memory import SharedMemory as _SHM
+                except ImportError:
                     _shm_ok = False
-                finally:
-                    _fork_shm_names = None
-                    for shm in shm_list:
-                        try:
-                            shm.close()
-                            shm.unlink()
-                        except Exception:
-                            pass
+                _shm_tensors = False  # set True if shm path produces tensors directly
 
-            if not _shm_ok:
-                # Legacy fork path: workers return arrays via pickle
-                with ProcessPoolExecutor(max_workers=num_workers,
-                                     initializer=_preprocess_pool_init) as pool:
-                    results = list(pool.map(_preprocess_chunk_fork, args))
+                if _shm_ok:
+                    # Pre-allocate shared memory for all output arrays
+                    _boards_sz = n * BOARD_PLANES * 8 * 8 * 4  # float32
+                    _mf_sz = n * max_moves_per_sample * MOVE_FEATURE_SIZE * 4
+                    _mc_sz = n * 4  # int32
+                    _tgt_sz = n * 4
+                    _rw_sz = n * 4  # float32
+                    _vt_sz = n * 4
 
-                boards = np.concatenate([r[0] for r in results], axis=0)
-                all_move_features = np.concatenate([r[1] for r in results], axis=0)
-                move_counts = np.concatenate([r[2] for r in results])
-                targets = np.concatenate([r[3] for r in results])
-                reward_weights = np.concatenate([r[4] for r in results])
-                value_targets = np.concatenate([r[5] for r in results])
+                    shm_list = []
+                    try:
+                        # Append incrementally so partially-allocated segments are
+                        # cleaned up by the finally block if a later allocation fails.
+                        shm_boards = _SHM(create=True, size=max(1, _boards_sz)); shm_list.append(shm_boards)
+                        shm_mf = _SHM(create=True, size=max(1, _mf_sz)); shm_list.append(shm_mf)
+                        shm_mc = _SHM(create=True, size=max(1, _mc_sz)); shm_list.append(shm_mc)
+                        shm_tgt = _SHM(create=True, size=max(1, _tgt_sz)); shm_list.append(shm_tgt)
+                        shm_rw = _SHM(create=True, size=max(1, _rw_sz)); shm_list.append(shm_rw)
+                        shm_vt = _SHM(create=True, size=max(1, _vt_sz)); shm_list.append(shm_vt)
 
-            _fork_entries = None  # Release reference (runs for both shm and legacy paths)
-            _fork_total_n = 0
+                        _fork_shm_names = {
+                            'boards': shm_boards.name,
+                            'move_features': shm_mf.name,
+                            'move_counts': shm_mc.name,
+                            'targets': shm_tgt.name,
+                            'reward_weights': shm_rw.name,
+                            'value_targets': shm_vt.name,
+                        }
+
+                        # Workers write directly to shared memory — return nothing
+                        with ProcessPoolExecutor(max_workers=num_workers,
+                                         initializer=_preprocess_pool_init) as pool:
+                            list(pool.map(_preprocess_chunk_fork_shm, args))
+
+                        # Create torch tensors from shared memory views, then clone
+                        # to own memory.  clone() is one copy (shm → tensor); the
+                        # alternative (np.copy + from_numpy) would be two copies
+                        # (shm → numpy copy → tensor share).
+                        boards = _clone_shared_array(
+                            shm_boards, (n, BOARD_PLANES, 8, 8), np.float32)
+                        all_move_features = _clone_shared_array(
+                            shm_mf, (n, max_moves_per_sample, MOVE_FEATURE_SIZE), np.float32)
+                        move_counts = _clone_shared_array(shm_mc, n, np.int32)
+                        targets = _clone_shared_array(shm_tgt, n, np.int32)
+                        reward_weights = _clone_shared_array(shm_rw, n, np.float32)
+                        value_targets = _clone_shared_array(shm_vt, n, np.float32)
+                        # Mark as using shm path — skip from_numpy below
+                        _shm_tensors = True
+
+                    except Exception as e:
+                        # SharedMemory failed — fall back to legacy fork path
+                        if show_progress:
+                            print(f"  SharedMemory failed ({e}), using legacy fork path...")
+                        _shm_ok = False
+                    finally:
+                        _fork_shm_names = None
+                        for shm in shm_list:
+                            try:
+                                shm.close()
+                                shm.unlink()
+                            except Exception:
+                                pass
+
+                if not _shm_ok:
+                    # Legacy fork path: workers return arrays via pickle
+                    with ProcessPoolExecutor(max_workers=num_workers,
+                                         initializer=_preprocess_pool_init) as pool:
+                        results = list(pool.map(_preprocess_chunk_fork, args))
+
+                    boards = np.concatenate([r[0] for r in results], axis=0)
+                    all_move_features = np.concatenate([r[1] for r in results], axis=0)
+                    move_counts = np.concatenate([r[2] for r in results])
+                    targets = np.concatenate([r[3] for r in results])
+                    reward_weights = np.concatenate([r[4] for r in results])
+                    value_targets = np.concatenate([r[5] for r in results])
+
+            finally:
+                # Pools have exited before this cleanup. Even a failed legacy
+                # fallback or an interruption must release the parsed window
+                # before the caller retries with another snapshot.
+                _fork_entries = None
+                _fork_shm_names = None
+                _fork_total_n = 0
         else:
             # Spawn path: serialize entries to dicts for pickling across processes.
             entry_dicts = [e.to_dict() for e in entries]
