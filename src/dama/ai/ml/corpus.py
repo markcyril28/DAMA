@@ -862,13 +862,20 @@ def _iter_entry_dicts(path: Path) -> Iterator[dict]:
     # Large text reads avoid TextIOWrapper's small iterator refills on slow
     # mounts. Keep its UTF-8 decoding and universal-newline translation, and
     # split only LF so Unicode separators inside JSON strings stay intact.
-    chunk_chars = 1024 * 1024
+    chunk_chars = 4 * 1024 * 1024
     pending = ""
     line_number = 0
-    with path.open("r", encoding="utf-8") as handle:
+    # Keep only one read ahead. The executor joins before the file closes,
+    # including on parse errors or iterator close, so no reader survives into
+    # the caller's later fork-based tensor encoding.
+    with path.open("r", encoding="utf-8") as handle, ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="dama-replay-read",
+    ) as reader:
+        pending_read = reader.submit(handle.read, chunk_chars)
         while True:
-            chunk = handle.read(chunk_chars)
+            chunk = pending_read.result()
             if chunk:
+                pending_read = reader.submit(handle.read, chunk_chars)
                 lines = (pending + chunk).split("\n")
                 pending = lines.pop()
             else:
