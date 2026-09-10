@@ -8,7 +8,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 from typing import List, Iterator, Optional, Dict, Any
@@ -197,7 +197,7 @@ def _entry_count_sidecar_lock(replay_dir: Path):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-@dataclass
+@dataclass(slots=True, weakref_slot=True)
 class ReplayEntry:
     """A single training example from a game."""
     state: dict           # Compact state representation
@@ -213,6 +213,24 @@ class ReplayEntry:
     teacher_difficulty: Optional[str] = None
     opening_plies: int = 0
     game_id: Optional[str] = None
+
+    def __getstate__(self) -> dict:
+        # Keep the former dictionary pickle format, including exact unrounded
+        # values. JSON serialization deliberately rounds some of these fields.
+        state = {field.name: getattr(self, field.name) for field in fields(self)}
+        state.update(getattr(self, "__dict__", {}))
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        # Older pickles can predate optional audit fields. Slotted defaults
+        # live on instances, so restore the defaults before applying the row.
+        for field in fields(self):
+            if field.default is not MISSING:
+                setattr(self, field.name, field.default)
+            elif field.default_factory is not MISSING:
+                setattr(self, field.name, field.default_factory())
+        for name, value in state.items():
+            setattr(self, name, value)
 
     def to_dict(self) -> dict:
         d = {
