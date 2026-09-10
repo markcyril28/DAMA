@@ -653,6 +653,21 @@ def _clone_shared_array(shm, shape, dtype) -> torch.Tensor:
     return tensor
 
 
+def _concatenate_worker_results(
+    results: List[Tuple[np.ndarray, ...]],
+) -> Tuple[np.ndarray, ...]:
+    """Consume private worker results, retiring each field after its copy."""
+    columns = list(zip(*results))
+    results.clear()
+    outputs = []
+    for index in range(len(columns)):
+        outputs.append(np.concatenate(columns[index], axis=0))
+        # The combined output owns its bytes. Drop the redundant worker
+        # arrays before allocating another complete field during recovery.
+        columns[index] = ()
+    return tuple(outputs)
+
+
 def preprocess_entries_to_tensors(
     entries: List[ReplayEntry],
     max_moves_per_sample: int = 32,
@@ -814,12 +829,8 @@ def preprocess_entries_to_tensors(
                                          initializer=_preprocess_pool_init) as pool:
                         results = list(pool.map(_preprocess_chunk_fork, args))
 
-                    boards = np.concatenate([r[0] for r in results], axis=0)
-                    all_move_features = np.concatenate([r[1] for r in results], axis=0)
-                    move_counts = np.concatenate([r[2] for r in results])
-                    targets = np.concatenate([r[3] for r in results])
-                    reward_weights = np.concatenate([r[4] for r in results])
-                    value_targets = np.concatenate([r[5] for r in results])
+                    (boards, all_move_features, move_counts, targets,
+                     reward_weights, value_targets) = _concatenate_worker_results(results)
 
             finally:
                 # Pools have exited before this cleanup. Even a failed legacy
@@ -841,12 +852,8 @@ def preprocess_entries_to_tensors(
                                      initializer=_preprocess_pool_init) as pool:
                 results = list(pool.map(_preprocess_chunk, chunks))
 
-            boards = np.concatenate([r[0] for r in results], axis=0)
-            all_move_features = np.concatenate([r[1] for r in results], axis=0)
-            move_counts = np.concatenate([r[2] for r in results])
-            targets = np.concatenate([r[3] for r in results])
-            reward_weights = np.concatenate([r[4] for r in results])
-            value_targets = np.concatenate([r[5] for r in results])
+            (boards, all_move_features, move_counts, targets,
+             reward_weights, value_targets) = _concatenate_worker_results(results)
 
         if show_progress:
             print(f"  Pre-processing complete: {n} entries")
@@ -1136,12 +1143,7 @@ class CachedTensorDataset(Dataset):
                                      initializer=_preprocess_pool_init) as pool:
                 results = list(pool.map(_preprocess_chunk, chunks))
 
-            boards = np.concatenate([r[0] for r in results], axis=0)
-            mf = np.concatenate([r[1] for r in results], axis=0)
-            mc = np.concatenate([r[2] for r in results])
-            tgt = np.concatenate([r[3] for r in results])
-            rw = np.concatenate([r[4] for r in results])
-            vt = np.concatenate([r[5] for r in results])
+            boards, mf, mc, tgt, rw, vt = _concatenate_worker_results(results)
         else:
             if show_progress:
                 print(f"  Pre-processing {n} dicts (direct path)...")
@@ -1356,6 +1358,22 @@ def _batch_count(n: int, batch_size: int, drop_last: bool) -> int:
     return (n + batch_size - 1) // batch_size
 
 
+_GPU_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _copy_resident_tensor(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    memory_format: torch.memory_format = torch.preserve_format,
+) -> None:
+    """Upload rows directly into the destination's existing dtype and layout."""
+    row_bytes = math.prod(source.shape[1:]) * source.element_size()
+    chunk_rows = max(1, _GPU_UPLOAD_CHUNK_BYTES // max(1, row_bytes))
+    for start in range(0, len(source), chunk_rows):
+        end = start + chunk_rows
+        destination[start:end].copy_(source[start:end], non_blocking=True)
+
+
 class FastBatchIterator:
     """Direct tensor-indexing batch iterator for CachedTensorDataset.
 
@@ -1441,23 +1459,23 @@ class FastBatchIterator:
                     self._boards = torch.empty(
                         (alloc_n, *b_shape), device=device, dtype=_sd,
                         memory_format=torch.channels_last)
-                    self._boards[:self.n] = dataset.boards.to(
-                        device, dtype=_sd, memory_format=torch.channels_last)
+                    _copy_resident_tensor(self._boards[:self.n], dataset.boards,
+                                          torch.channels_last)
                     self._move_features = torch.empty(alloc_n, *mf_shape, device=device,
                                                       dtype=_sd)
-                    self._move_features[:self.n] = dataset.move_features.to(device, dtype=_sd)
+                    _copy_resident_tensor(self._move_features[:self.n], dataset.move_features)
                     self._move_counts = torch.empty(alloc_n, device=device,
                                                     dtype=dataset.move_counts.dtype)
-                    self._move_counts[:self.n] = dataset.move_counts.to(device)
+                    _copy_resident_tensor(self._move_counts[:self.n], dataset.move_counts)
                     self._targets = torch.empty(alloc_n, device=device,
                                                 dtype=dataset.targets.dtype)
-                    self._targets[:self.n] = dataset.targets.to(device)
+                    _copy_resident_tensor(self._targets[:self.n], dataset.targets)
                     self._reward_weights = torch.empty(alloc_n, device=device,
                                                        dtype=dataset.reward_weights.dtype)
-                    self._reward_weights[:self.n] = dataset.reward_weights.to(device)
+                    _copy_resident_tensor(self._reward_weights[:self.n], dataset.reward_weights)
                     self._value_targets = torch.empty(alloc_n, device=device,
                                                       dtype=dataset.value_targets.dtype)
-                    self._value_targets[:self.n] = dataset.value_targets.to(device)
+                    _copy_resident_tensor(self._value_targets[:self.n], dataset.value_targets)
                     _dtype_label = "fp16" if _use_half else "fp32"
                     print(f"  GPU-resident dataset: {self.n} entries in "
                           f"{alloc_n}-capacity buffer "
@@ -1682,19 +1700,13 @@ class FastBatchIterator:
 
                 # Upload only new entries (small PCIe transfer).
                 # Match storage dtype (float16 when AMP) for consistency.
-                _sd = self._storage_dtype
-                self._boards[keep_old:total] = new_dataset.boards.to(
-                    dev, dtype=_sd, memory_format=torch.channels_last, non_blocking=True)
-                self._move_features[keep_old:total] = new_dataset.move_features.to(
-                    dev, dtype=_sd, non_blocking=True)
-                self._move_counts[keep_old:total] = new_dataset.move_counts.to(
-                    dev, non_blocking=True)
-                self._targets[keep_old:total] = new_dataset.targets.to(
-                    dev, non_blocking=True)
-                self._reward_weights[keep_old:total] = new_dataset.reward_weights.to(
-                    dev, non_blocking=True)
-                self._value_targets[keep_old:total] = new_dataset.value_targets.to(
-                    dev, non_blocking=True)
+                _copy_resident_tensor(self._boards[keep_old:total], new_dataset.boards,
+                                      torch.channels_last)
+                _copy_resident_tensor(self._move_features[keep_old:total], new_dataset.move_features)
+                _copy_resident_tensor(self._move_counts[keep_old:total], new_dataset.move_counts)
+                _copy_resident_tensor(self._targets[keep_old:total], new_dataset.targets)
+                _copy_resident_tensor(self._reward_weights[keep_old:total], new_dataset.reward_weights)
+                _copy_resident_tensor(self._value_targets[keep_old:total], new_dataset.value_targets)
                 # No explicit synchronize() needed: all non_blocking transfers are
                 # enqueued on the default stream.  The next GPU operation (training
                 # forward pass) is also on the default stream and will automatically
@@ -1740,15 +1752,13 @@ class FastBatchIterator:
                 new_vt[:keep_old] = self._value_targets[offset:offset + keep_old]
 
             # Upload new entries (small PCIe transfer, match storage dtype)
-            _sd = self._storage_dtype
-            new_boards[keep_old:total] = new_dataset.boards.to(
-                dev, dtype=_sd, memory_format=torch.channels_last, non_blocking=True)
-            new_mf[keep_old:total] = new_dataset.move_features.to(dev, dtype=_sd,
-                                                                   non_blocking=True)
-            new_mc[keep_old:total] = new_dataset.move_counts.to(dev, non_blocking=True)
-            new_tgt[keep_old:total] = new_dataset.targets.to(dev, non_blocking=True)
-            new_rw[keep_old:total] = new_dataset.reward_weights.to(dev, non_blocking=True)
-            new_vt[keep_old:total] = new_dataset.value_targets.to(dev, non_blocking=True)
+            _copy_resident_tensor(new_boards[keep_old:total], new_dataset.boards,
+                                  torch.channels_last)
+            _copy_resident_tensor(new_mf[keep_old:total], new_dataset.move_features)
+            _copy_resident_tensor(new_mc[keep_old:total], new_dataset.move_counts)
+            _copy_resident_tensor(new_tgt[keep_old:total], new_dataset.targets)
+            _copy_resident_tensor(new_rw[keep_old:total], new_dataset.reward_weights)
+            _copy_resident_tensor(new_vt[keep_old:total], new_dataset.value_targets)
             # No explicit sync — same-stream ordering guarantees (see in-place path).
 
             # Swap buffers — old ones freed by refcount
