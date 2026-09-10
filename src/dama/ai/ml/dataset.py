@@ -858,7 +858,17 @@ def preprocess_entries_to_tensors(
             torch.from_numpy(value_targets),
         )
 
-    # Sequential fallback for small datasets — uses fast-path encoding
+    return _preprocess_entries_serial(entries, max_moves_per_sample, show_progress)
+
+
+def _preprocess_entries_serial(
+    entries: List[ReplayEntry],
+    max_moves_per_sample: int = 32,
+    show_progress: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode one bounded, caller-owned batch without creating worker pools."""
+    n = len(entries)
+    # Keep the same compiled encoder and Python fallback as ordinary loading.
     boards = np.zeros((n, BOARD_PLANES, 8, 8), dtype=np.float32)
     all_move_features = np.zeros((n, max_moves_per_sample, MOVE_FEATURE_SIZE), dtype=np.float32)
     move_counts = np.zeros(n, dtype=np.int32)
