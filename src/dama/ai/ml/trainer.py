@@ -93,6 +93,7 @@ from .dataset import (
     create_dataloader, create_dataloader_from_dataset, prepare_training_data,
     CachedTensorDataset, CUDAPrefetcher, FastBatchIterator,
     load_matching_cached_tensor_dataset,
+    _preprocess_entries_serial,
 )
 from .scoring import compute_reward_weight
 from .stats_collector import StatsCollector
@@ -1001,7 +1002,7 @@ _VALIDATION_TENSORS_CURRENT = object()
 _TRAIN_WINDOW_CACHE_MIN_FREE_GB = 4.0
 # Tensorize at shard boundaries so parsing does not retain a whole window's
 # Python object graph beside the old cache and forked preprocessing workers.
-_TRAIN_WINDOW_PARSE_CHUNK_ENTRIES = 250_000
+_TRAIN_WINDOW_PARSE_CHUNK_ENTRIES = 1
 
 
 @dataclass
@@ -3474,11 +3475,18 @@ class Trainer:
         miss_tensors = []
 
         def encode_misses():
-            dataset = CachedTensorDataset.from_entries(
-                miss_entries,
-                max_moves_per_sample=self.config.max_moves_per_sample,
-                show_progress=True,
-            )
+            if 2_000 <= len(miss_entries) <= 50_000:
+                dataset = CachedTensorDataset(*_preprocess_entries_serial(
+                    miss_entries,
+                    max_moves_per_sample=self.config.max_moves_per_sample,
+                    show_progress=True,
+                ))
+            else:
+                dataset = CachedTensorDataset.from_entries(
+                    miss_entries,
+                    max_moves_per_sample=self.config.max_moves_per_sample,
+                    show_progress=True,
+                )
             miss_tensors.append({field: getattr(dataset, field) for field in fields})
             # from_entries has joined its workers and copied every output.
             # Only the tensors need to survive while the next shards parse.
