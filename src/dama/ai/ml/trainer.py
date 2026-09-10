@@ -999,6 +999,9 @@ _VALIDATION_TENSORS_CURRENT = object()
 # train window's CPU tensors between admissions for per-shard reuse. Below it
 # the cache is dropped and the next admission takes the full parse path.
 _TRAIN_WINDOW_CACHE_MIN_FREE_GB = 4.0
+# Tensorize at shard boundaries so parsing does not retain a whole window's
+# Python object graph beside the old cache and forked preprocessing workers.
+_TRAIN_WINDOW_PARSE_CHUNK_ENTRIES = 250_000
 
 
 @dataclass
@@ -3461,56 +3464,70 @@ class Trainer:
                 f"shard(s) ({reused_rows} row(s)); parsing "
                 f"{len(miss_records)} shard(s)"
             )
+        fields = (
+            "boards", "move_features", "move_counts",
+            "targets", "reward_weights", "value_targets",
+        )
         miss_counts: list = []
         miss_entries: list = []
+        miss_offsets = []
+        miss_tensors = []
+
+        def encode_misses():
+            dataset = CachedTensorDataset.from_entries(
+                miss_entries,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                show_progress=True,
+            )
+            miss_tensors.append({field: getattr(dataset, field) for field in fields})
+            # from_entries has joined its workers and copied every output.
+            # Only the tensors need to survive while the next shards parse.
+            miss_entries.clear()
+
         for record in miss_records:
             if should_abort is not None and should_abort():
                 return None
             entries = manager.load_train_file_entries(context, record)
             miss_counts.append(len(entries))
+            miss_offsets.append((
+                len(miss_tensors), len(miss_entries),
+                len(miss_entries) + len(entries),
+            ))
             miss_entries.extend(entries)
             entries = None
+            if len(miss_entries) >= _TRAIN_WINDOW_PARSE_CHUNK_ENTRIES:
+                if should_abort is not None and should_abort():
+                    return None
+                encode_misses()
         if should_abort is not None and should_abort():
             return None
         if miss_entries:
-            miss_dataset = CachedTensorDataset.from_entries(
-                miss_entries,
-                max_moves_per_sample=self.config.max_moves_per_sample,
-                show_progress=True,
-            )
-        else:
-            miss_dataset = None
+            encode_misses()
         miss_entries = None
         if should_abort is not None and should_abort():
             return None
 
-        miss_offsets = []
-        start = 0
-        for count in miss_counts:
-            miss_offsets.append((start, start + count))
-            start += count
-
-        fields = (
-            "boards", "move_features", "move_counts",
-            "targets", "reward_weights", "value_targets",
-        )
+        # These freshly encoded arrays have no consumer outside this assembly.
+        # Retire each source after its independent copy instead of keeping the
+        # temporary chunks alive beside all six completed outputs.
         assembled = {}
         for field in fields:
+            miss_arrays = [tensors.pop(field) for tensors in miss_tensors]
             parts = []
             for identity, span, miss_index in pieces:
                 if span is not None:
                     parts.append(
                         getattr(cached_dataset, field)[span[0]:span[1]])
                 else:
-                    low, high = miss_offsets[miss_index]
+                    chunk, low, high = miss_offsets[miss_index]
                     if high > low:
-                        parts.append(
-                            getattr(miss_dataset, field)[low:high])
+                        parts.append(miss_arrays[chunk][low:high])
             if parts:
                 # torch.cat copies, so the window never aliases the previous
                 # cache's storage and replacing the cache frees the old rows.
                 assembled[field] = torch.cat(parts, dim=0)
-        miss_dataset = None
+            parts = None
+            miss_arrays = None
         if assembled:
             window_dataset = CachedTensorDataset(**assembled)
         else:
