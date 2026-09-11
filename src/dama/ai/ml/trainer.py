@@ -19,15 +19,15 @@ import traceback
 import warnings
 import numpy as np
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import platform
 import threading
 import multiprocessing as mp
 from queue import Empty, Queue
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any, Iterable, Mapping
-from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field, replace
 
 # Set multiprocessing start method before any other multiprocessing imports
 # 'fork' is faster on Linux but can cause issues with CUDA
@@ -98,6 +98,7 @@ from .scoring import compute_reward_weight
 from .stats_collector import StatsCollector
 from .corpus import (
     CorpusSnapshotManager,
+    _SnapshotSplitContext,
     analyze_replay_files,
     canonical_state_key,
     replay_file_sha256,
@@ -152,6 +153,58 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+# A forked worker inherits every open file description. On the WSL DrvFS
+# project volume, a child still holding a writer's temporary makes the replaced
+# public name unopenable (ENOENT while it remains listed) until that child
+# exits. Self-play pools fork from the producer thread while other threads
+# publish statistics and checkpoints, so those writers register the temporary
+# for as long as it is open.
+_FORK_CHILD_DROPPED_FDS: set[int] = set()
+
+
+def _drop_registered_fds_in_fork_child() -> None:
+    """Point registered writer descriptors at the null device in a fork child."""
+
+    descriptors = tuple(_FORK_CHILD_DROPPED_FDS)
+    _FORK_CHILD_DROPPED_FDS.clear()
+    if not descriptors:
+        return
+    try:
+        null_fd = os.open(os.devnull, os.O_RDWR)
+    except OSError:
+        return
+    try:
+        for descriptor in descriptors:
+            # dup2 releases the inherited file without freeing its number, so
+            # a stray flush from a copied file object cannot reach a new file.
+            try:
+                os.dup2(null_fd, descriptor)
+            except OSError:
+                pass
+    finally:
+        os.close(null_fd)
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_drop_registered_fds_in_fork_child)
+
+
+@contextmanager
+def _fork_children_drop_fd(descriptor: int) -> Iterator[None]:
+    """Keep an open writer descriptor out of processes forked in this block.
+
+    Enter only after the descriptor is open and leave before closing it.
+    ``os.fork()`` holds the GIL, so a child that sees the registration
+    inherited this exact open file rather than a reused descriptor number.
+    """
+
+    _FORK_CHILD_DROPPED_FDS.add(descriptor)
+    try:
+        yield
+    finally:
+        _FORK_CHILD_DROPPED_FDS.discard(descriptor)
 
 
 def _prepare_checkpoint_directory(path: str | Path) -> Path:
@@ -2824,9 +2877,11 @@ class Trainer:
                         mode='w', dir=stats_path.parent, suffix='.tmp',
                         delete=False) as tmp:
                     _tmp_path = tmp.name
-                    json.dump(snapshot, tmp, indent=2)
-                    tmp.flush()
-                    os.fsync(tmp.fileno())
+                    # A self-play pool can fork during this multi-second dump.
+                    with _fork_children_drop_fd(tmp.fileno()):
+                        json.dump(snapshot, tmp, indent=2)
+                        tmp.flush()
+                        os.fsync(tmp.fileno())
                 os.replace(_tmp_path, stats_path)
                 _fsync_directory(stats_path.parent)
             except Exception as e:
@@ -3512,6 +3567,8 @@ class Trainer:
         # temporary chunks alive beside all six completed outputs.
         assembled = {}
         for field in fields:
+            if should_abort is not None and should_abort():
+                return None
             miss_arrays = [tensors.pop(field) for tensors in miss_tensors]
             parts = []
             for identity, span, miss_index in pieces:
@@ -3528,6 +3585,8 @@ class Trainer:
                 assembled[field] = torch.cat(parts, dim=0)
             parts = None
             miss_arrays = None
+        if should_abort is not None and should_abort():
+            return None
         if assembled:
             window_dataset = CachedTensorDataset(**assembled)
         else:
@@ -3545,13 +3604,21 @@ class Trainer:
 
         indices = manager.train_cap_sample_indices(
             len(window_dataset), context.max_train_entries)
+        if should_abort is not None and should_abort():
+            return None
         if indices is not None:
             index_tensor = torch.tensor(indices, dtype=torch.int64)
-            handed = CachedTensorDataset(
-                *(getattr(window_dataset, field)[index_tensor]
-                  for field in fields))
+            sampled = {}
+            for field in fields:
+                if should_abort is not None and should_abort():
+                    return None
+                sampled[field] = getattr(window_dataset, field)[index_tensor]
+            handed = CachedTensorDataset(**sampled)
+            sampled = None
         else:
             handed = window_dataset
+        if should_abort is not None and should_abort():
+            return None
 
         retain = params is not None
         if retain:
@@ -3570,6 +3637,9 @@ class Trainer:
                 and (available - window_bytes)
                 >= _TRAIN_WINDOW_CACHE_MIN_FREE_GB * (1024 ** 3)
             )
+        if should_abort is not None and should_abort():
+            return None
+        next_cache = None
         if retain:
             files_map = {}
             row = 0
@@ -3581,14 +3651,17 @@ class Trainer:
                 if identity is not None:
                     files_map[identity] = (row, row + length)
                 row += length
-            self._train_tensor_window = {
+            next_cache = {
                 "params": params,
                 "filter_keys": frozenset(context.validation_keys),
                 "files": files_map,
                 "dataset": window_dataset,
             }
-        else:
-            self._train_tensor_window = None
+        # A stop during assembly must leave the previous reusable window intact.
+        # Only publish after every allocation and retention check has completed.
+        if should_abort is not None and should_abort():
+            return None
+        self._train_tensor_window = next_cache
         return handed
 
     def _snapshot_train_cache_metadata(
@@ -3778,6 +3851,13 @@ class Trainer:
                         split_context)
                     self._preloaded_validation_cache_metadata = (
                         validation_cache_metadata)
+                if (type(manager) is CorpusSnapshotManager
+                        and type(split_context) is _SnapshotSplitContext):
+                    # Validation, leakage accounting and cache identities are
+                    # complete. Retire startup's full-ledger copy before train
+                    # loading, preserving external aliases and custom contracts.
+                    split_context = replace(
+                        split_context, historically_trained=set())
                 manifest = split_context.manifest
                 cache_metadata = self._snapshot_train_cache_metadata(
                     manifest, split_context.validation_keys)
@@ -5569,18 +5649,37 @@ class Trainer:
             def _write_numbered_checkpoint() -> None:
                 tmp_path = None
                 try:
-                    with tempfile.NamedTemporaryFile(
-                        delete=False, dir=self.config.checkpoint_dir,
-                    ) as tmp:
-                        tmp_path = Path(tmp.name)
-                        torch.save(checkpoint, tmp.name)
-                    # Recovery resumes only from verified numbered
-                    # checkpoints. Make the completed archive durable before
-                    # publishing its pathname so an abrupt host shutdown
-                    # cannot leave an accepted atomic rename backed only by
-                    # volatile cache pages.
-                    with tmp_path.open('r+b') as checkpoint_handle:
-                        os.fsync(checkpoint_handle.fileno())
+                    # Serialize in memory, then write through the one
+                    # registered temporary handle. ``torch.save`` by name opens
+                    # a second descriptor that a concurrent self-play fork can
+                    # inherit, which hides the published name on DrvFS until
+                    # that worker exits.
+                    buffer = io.BytesIO()
+                    torch.save(checkpoint, buffer)
+                    serialized = buffer.getbuffer()
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            delete=False, dir=self.config.checkpoint_dir,
+                        ) as tmp:
+                            tmp_path = Path(tmp.name)
+                            with _fork_children_drop_fd(tmp.fileno()):
+                                written = tmp.write(serialized)
+                                if written != len(serialized):
+                                    raise OSError(
+                                        f"short checkpoint write: "
+                                        f"{written}/{len(serialized)} bytes"
+                                    )
+                                tmp.flush()
+                                # Recovery resumes only from verified numbered
+                                # checkpoints. Make the completed archive
+                                # durable before publishing its pathname so an
+                                # abrupt host shutdown cannot leave an accepted
+                                # atomic rename backed only by volatile cache
+                                # pages.
+                                os.fsync(tmp.fileno())
+                    finally:
+                        serialized.release()
+                        buffer.close()
                     os.replace(tmp_path, checkpoint_path)
                     # fsyncing the archive alone does not make the renamed
                     # pathname crash-durable. Recovery discovers numbered
@@ -6628,9 +6727,25 @@ class Trainer:
                                 pending_snapshot_path,
                                 max_train_entries=self.config.replay_max_entries,
                             )
+                            # Verification can outlive STOP. Do not begin a
+                            # new materialization phase without a consumer.
+                            if _shutdown_requested():
+                                break
                             validation_entries, validation_identity = (
                                 self._load_or_reuse_validation_entries(
                                     split_context))
+                            if _shutdown_requested():
+                                break
+                            if (type(manager) is CorpusSnapshotManager
+                                    and type(split_context) is _SnapshotSplitContext):
+                                # Validation and its leakage accounting are
+                                # complete. Training uses only the exclusions,
+                                # so retire this producer's full-ledger copy
+                                # before allocating train tensors. Replace the
+                                # context to preserve any external aliases;
+                                # custom managers retain their own contracts.
+                                split_context = replace(
+                                    split_context, historically_trained=set())
                             per_file_split = all(
                                 callable(getattr(manager, name, None))
                                 for name in (
