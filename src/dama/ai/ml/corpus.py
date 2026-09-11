@@ -1480,9 +1480,17 @@ def _read_state_keys(path: Path) -> Set[str]:
         return {line.strip() for line in handle if line.strip()}
 
 
+# gzip requests small compressed chunks even while streaming a large ledger.
+# Bound raw read-ahead so those requests do not each cross the DrvFS boundary.
+_STATE_KEYS_READ_BUFFER_BYTES = 4 * 1024 * 1024
+
+
 def _iter_state_keys(path: Path) -> Iterator[str]:
     """Stream a sorted key file without materialising the whole set."""
-    with gzip.open(path, "rt", encoding="ascii") as handle:
+    with (
+        path.open("rb", buffering=_STATE_KEYS_READ_BUFFER_BYTES) as raw_handle,
+        gzip.open(raw_handle, "rt", encoding="ascii") as handle,
+    ):
         for line in handle:
             key = line.strip()
             if key:
@@ -1558,6 +1566,16 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
             os.fsync(raw_handle.fileno())
         os.replace(temporary, path)
     except BaseException:
+        # Output failure can leave the input generator suspended at a yield.
+        # Close it now so a retained traceback cannot pin its descriptor and
+        # read buffer across retries. Normal merges exhaust and close it.
+        try:
+            close_existing = getattr(existing, "close", None)
+            if close_existing is not None:
+                close_existing()
+        except BaseException:
+            # Cleanup must not replace the original failure or interruption.
+            pass
         # The canonical ledger is still authoritative until os.replace().  A
         # failed gzip write used to strand its partial sibling indefinitely;
         # one production capacity-exhaustion incident left a partial file while
@@ -2419,92 +2437,86 @@ class CorpusSnapshotManager:
         path, expected_fingerprint = self._current_manifest_reference()
         if path is None:
             return None
-        if expected_fingerprint is not None:
-            # ``current.json`` is a recovery path used only when CURRENT is
-            # absent. Verify its redundant fingerprint before treating it as
-            # authority, rather than weakening the lineage gate to a pathname.
-            try:
-                with path.open("r", encoding="utf-8") as handle:
-                    if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                        return None
-                    manifest = json.load(handle)
-            except (FileNotFoundError, IsADirectoryError):
-                return None
-            if (
-                not isinstance(manifest, Mapping)
-                or str(manifest.get("fingerprint", "")).lower()
-                != expected_fingerprint
-            ):
-                raise RuntimeError(
-                    "Corpus current.json fingerprint does not match its "
-                    f"snapshot manifest: {path}"
-                )
-            return path
-        return path if path.is_file() else None
+        if expected_fingerprint is None:
+            if path.is_file():
+                return path
+            path, expected_fingerprint = self._current_json_manifest_reference()
+        return self._load_manifest_reference(path, expected_fingerprint)[0]
 
     def _current_manifest_reference(self) -> Tuple[Optional[Path], Optional[str]]:
-        """Resolve CURRENT, falling back to the redundant durable JSON pointer.
+        """Resolve CURRENT, recovering absent or empty text through current.json.
 
-        The ordinary CURRENT path remains the zero-JSON-decode hot path. A
-        missing pointer can occur after an abrupt host or filesystem loss, so
-        recover it from ``current.json`` only when that record has a complete
-        manifest path and SHA-256 fingerprint. The caller verifies the latter
-        against the target manifest before consuming the snapshot.
+        A valid CURRENT remains the zero-JSON-decode hot path. Callers also
+        retry the redundant pointer if CURRENT's target is no longer a file.
+        Recovery always checks the recorded fingerprint against the manifest.
         """
 
         try:
             relative = self.current_pointer.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
-            json_pointer = self.snapshot_root / "current.json"
-            try:
-                with json_pointer.open("r", encoding="utf-8") as handle:
-                    record = json.load(handle)
-            except FileNotFoundError:
-                return None, None
-            except (OSError, ValueError, TypeError) as exc:
-                raise RuntimeError(
-                    f"Corpus snapshot pointer is unreadable: {json_pointer}"
-                ) from exc
-            if not isinstance(record, Mapping):
-                raise RuntimeError(
-                    f"Corpus snapshot pointer is invalid: {json_pointer}"
-                )
-            relative = record.get("manifest")
-            fingerprint = record.get("fingerprint")
-            if (
-                not isinstance(relative, str)
-                or not relative.strip()
-                or not isinstance(fingerprint, str)
-                or re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint) is None
-            ):
-                raise RuntimeError(
-                    f"Corpus snapshot pointer is invalid: {json_pointer}"
-                )
-            return (
-                self.snapshot_root / _read_relpath(relative.strip()),
-                fingerprint.lower(),
-            )
-        if not relative:
+            relative = ""
+        if relative:
+            return self.snapshot_root / _read_relpath(relative), None
+        return self._current_json_manifest_reference()
+
+    def _current_json_manifest_reference(
+        self,
+    ) -> Tuple[Optional[Path], Optional[str]]:
+        """Read the complete manifest reference from the redundant pointer."""
+
+        json_pointer = self.snapshot_root / "current.json"
+        try:
+            with json_pointer.open("r", encoding="utf-8") as handle:
+                record = json.load(handle)
+        except FileNotFoundError:
             return None, None
-        return self.snapshot_root / _read_relpath(relative), None
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(
+                f"Corpus snapshot pointer is unreadable: {json_pointer}"
+            ) from exc
+        if not isinstance(record, Mapping):
+            raise RuntimeError(
+                f"Corpus snapshot pointer is invalid: {json_pointer}"
+            )
+        relative = record.get("manifest")
+        fingerprint = record.get("fingerprint")
+        if (
+            not isinstance(relative, str)
+            or not relative.strip()
+            or not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint) is None
+        ):
+            raise RuntimeError(
+                f"Corpus snapshot pointer is invalid: {json_pointer}"
+            )
+        return (
+            self.snapshot_root / _read_relpath(relative.strip()),
+            fingerprint.lower(),
+        )
 
     def _load_manifest(self, path: Path) -> dict:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
 
     def _load_current_manifest(self) -> Tuple[Optional[Path], Optional[dict]]:
-        """Resolve CURRENT and load its regular-file target in one open.
+        """Open CURRENT's regular-file target once, with no target pre-stat.
 
-        On the ordinary CURRENT path, ``current_manifest_path()`` remains a
-        path-only public lookup and uses ``is_file()`` before returning.
-        Admission immediately opened that path again to parse it, paying a
-        redundant metadata round trip on drvfs. Opening the target and checking
-        the opened descriptor preserves the missing and non-regular target
-        semantics without a separate path stat or a path-check/open race. The
-        rare current.json recovery path also verifies its redundant fingerprint.
+        An absent or non-regular target can use the same fingerprint-verified
+        JSON recovery path as missing or empty CURRENT text.
         """
 
         path, expected_fingerprint = self._current_manifest_reference()
+        loaded = self._load_manifest_reference(path, expected_fingerprint)
+        if path is not None and loaded[0] is None and expected_fingerprint is None:
+            loaded = self._load_manifest_reference(
+                *self._current_json_manifest_reference())
+        return loaded
+
+    def _load_manifest_reference(
+        self, path: Optional[Path], expected_fingerprint: Optional[str],
+    ) -> Tuple[Optional[Path], Optional[dict]]:
+        """Load one regular-file target and check any redundant SHA-256 pin."""
+
         if path is None:
             return None, None
         try:
@@ -3049,6 +3061,9 @@ class CorpusSnapshotManager:
             if values.itemsize != _LEDGER_FINGERPRINT_BYTES:
                 return None
             values.frombytes(payload)
+            # The array owns a copy. Retire the verified byte buffer before
+            # allocating the much larger membership set and its resize storage.
+            del payload
             if sys.byteorder != "little":
                 values.byteswap()
             fingerprints = set(values)
@@ -3846,6 +3861,22 @@ class CorpusSnapshotManager:
     ) -> SnapshotDecision:
         """Admit a new immutable snapshot if its fresh-state gate passes."""
 
+        # An external lineage base is only the first admission's predecessor.
+        # Losing the active reference in an established namespace must never
+        # compare replay against that older base or grow validation first.
+        current_path, current = self._load_current_manifest()
+        if current_path is None:
+            snapshots = self._snapshot_dirs()
+            if snapshots:
+                raise RuntimeError(
+                    "Corpus snapshot pointer is missing while "
+                    f"{len(snapshots)} snapshot(s) exist under "
+                    f"{self.snapshot_root}. The minimum-fresh-state gate cannot be "
+                    "evaluated without the previous corpus, so no admission is "
+                    "possible until CURRENT/current.json is restored to the "
+                    "intended snapshot."
+                )
+
         files, rejected_files, replay_identities = (
             self._eligible_replay_files_with_identities(
                 replay_file_stats_handoff))
@@ -3872,7 +3903,6 @@ class CorpusSnapshotManager:
         if not train_files:
             raise RuntimeError("No replay files remain after the immutable validation split")
 
-        current_path, current = self._load_current_manifest()
         previous_keys: Set[str] = set()
         previous_keys_digest: Optional[str] = None
         previous_fingerprint = None
@@ -4026,18 +4056,6 @@ class CorpusSnapshotManager:
         # during the transaction fails closed instead of publishing mixed data.
         self._verify_replay_file_identities(replay_identities)
 
-        # A lost pointer must fail before any early freshness return.  Otherwise
-        # a stale candidate could hide the lineage corruption merely by missing
-        # the admission threshold.
-        if current_path is None and previous_source is None and self._snapshot_dirs():
-            raise RuntimeError(
-                "Corpus snapshot pointer is missing while "
-                f"{len(self._snapshot_dirs())} snapshot(s) exist under "
-                f"{self.snapshot_root}. The minimum-fresh-state gate cannot be "
-                "evaluated without the previous corpus, so no admission is "
-                "possible until CURRENT/current.json is restored to the "
-                "intended snapshot."
-            )
         if withheld_fresh:
             print(
                 "  Hold-out growth cost this cycle: "
