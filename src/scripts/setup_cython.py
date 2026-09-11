@@ -95,6 +95,17 @@ def _refuse_mapped_inplace_build(
     )
 
 
+def _fsync_file(path: Path, *, windows: bool = os.name == "nt") -> None:
+    """Flush a completed binary before it replaces the live extension."""
+    # Windows implements os.fsync with FlushFileBuffers, which rejects a
+    # read-only handle (EBADF), so a read-only flush aborted every in-place
+    # .pyd publication there. The writable open assumes setuptools' normal
+    # writable .pyd output. POSIX keeps the read-only descriptor, which still
+    # works after preserve_mode copies a mode without owner write.
+    with path.open("r+b" if windows else "rb") as stream:
+        os.fsync(stream.fileno())
+
+
 class AtomicBuildExt(build_ext):
     """Publish in-place extension binaries with one atomic replacement."""
 
@@ -133,8 +144,7 @@ class AtomicBuildExt(build_ext):
                 )
             if preserve_mode:
                 os.chmod(temporary, source_stat.st_mode)
-            with temporary.open("rb") as stream:
-                os.fsync(stream.fileno())
+            _fsync_file(temporary)
             os.replace(temporary, target)
             try:
                 directory_fd = os.open(
