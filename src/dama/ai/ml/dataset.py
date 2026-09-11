@@ -1556,6 +1556,7 @@ class FastBatchIterator:
     def __iter__(self):
         # Generate indices on the same device as data — GPU randperm is faster
         _dev = self._boards.device
+        indices = None
 
         if self.shuffle and self._can_preshuffle:
             # Pre-shuffle: gather all data once per epoch with a random
@@ -1567,35 +1568,42 @@ class FastBatchIterator:
             # re-checking VRAM every epoch.
             b = mf = mc = tgt = rw = vt = None
             try:
-                perm = torch.randperm(self.n, device=_dev)
-                # Fancy indexing may not preserve channels_last memory format.
-                # Explicit conversion here (1× per epoch) avoids the model's
-                # forward pass converting every batch (61× per epoch).
-                b = self._boards[perm].contiguous(memory_format=torch.channels_last)
-                mf = self._move_features[perm]
-                mc = self._move_counts[perm]
-                tgt = self._targets[perm]
-                rw = self._reward_weights[perm]
-                vt = self._value_targets[perm]
-                del perm
-
-                for start in range(0, self.n, self.batch_size):
-                    end = min(start + self.batch_size, self.n)
-                    if self.drop_last and (end - start) < self.batch_size:
-                        break
-                    yield (b[start:end], mf[start:end], mc[start:end],
-                           tgt[start:end], rw[start:end], vt[start:end])
+                indices = torch.randperm(self.n, device=_dev)
+                try:
+                    # Fancy indexing may not preserve channels_last memory format.
+                    # Convert once per epoch instead of on every model forward.
+                    b = self._boards[indices].contiguous(memory_format=torch.channels_last)
+                    mf = self._move_features[indices]
+                    mc = self._move_counts[indices]
+                    tgt = self._targets[indices]
+                    rw = self._reward_weights[indices]
+                    vt = self._value_targets[indices]
+                except torch.cuda.OutOfMemoryError:
+                    # The cached budget can become stale as training allocates.
+                    # Retire partial copies in finally, then gather per batch
+                    # with this same permutation. Only optional gathers retry;
+                    # permutation failures and errors after yielding propagate.
+                    self._can_preshuffle = False
+                else:
+                    del indices
+                    for start in range(0, self.n, self.batch_size):
+                        end = min(start + self.batch_size, self.n)
+                        if self.drop_last and (end - start) < self.batch_size:
+                            break
+                        yield (b[start:end], mf[start:end], mc[start:end],
+                               tgt[start:end], rw[start:end], vt[start:end])
+                    return
             finally:
                 # Free shuffled copies immediately — they can be ~1.2GB on GPU.
                 # Without explicit del, generator frame locals persist until GC.
                 # Also covers OOM during gather: partially-allocated tensors freed.
                 del b, mf, mc, tgt, rw, vt
-            return
 
         # Fallback: CPU data, non-shuffle, or low VRAM
         if self.shuffle:
             # Shuffle requires fancy indexing (gather kernel per batch)
-            indices = torch.randperm(self.n, device=_dev)
+            if indices is None:
+                indices = torch.randperm(self.n, device=_dev)
             for start in range(0, self.n, self.batch_size):
                 end = min(start + self.batch_size, self.n)
                 if self.drop_last and (end - start) < self.batch_size:
