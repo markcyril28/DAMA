@@ -34,7 +34,7 @@ def test_replay_text_reader_preserves_long_unicode_records(
 def test_replay_text_reader_reports_first_error_after_long_record(
     tmp_path: Path, invalid: str, message: str,
 ) -> None:
-    entry = {"text": "x" * (2 * 1024 * 1024 + 17)}
+    entry = {"text": "x" * (4 * 1024 * 1024 + 17)}
     path = tmp_path / "invalid.jsonl"
     path.write_text(
         "\n" + json.dumps(entry) + "\r\n\n" + invalid + "\n{later",
