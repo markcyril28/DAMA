@@ -20,8 +20,10 @@ from .run_status import _fsync_directory, _write_json_atomic
 
 
 _EVALUATION_FORKSERVER_PRELOAD = (
-    "torch",
+    # Initialize NumPy's MKL runtime before PyTorch loads libgomp. Reversing
+    # this order can abort the fresh forkserver on Conda MKL installations.
     "numpy",
+    "torch",
     "dama.ai.ml.inference",
     "dama.ai.ml.dataset",
     "dama.ai.ml.model_vs_algo",
