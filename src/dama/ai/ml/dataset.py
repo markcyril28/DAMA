@@ -9,6 +9,7 @@ import time
 import os
 import random
 import tempfile
+import threading
 from numbers import Real
 import psutil
 from concurrent.futures import ProcessPoolExecutor
@@ -430,6 +431,22 @@ _fork_max_moves: int = 32
 _fork_shm_names: Optional[dict] = None  # {'boards': name, 'move_features': name, ...}
 _fork_total_n: int = 0  # total dataset size
 
+# Workers inherit the globals above when their pool forks. The training thread
+# (frozen-suite promotion, validation publication) and the background producer
+# (snapshot preparation) can tensorize at the same time, so one call owns them
+# from staging until its pools have exited and the globals are reset.
+_fork_preprocess_lock = threading.Lock()
+
+
+def _reset_fork_preprocess_lock() -> None:
+    """Replace a lock inherited mid-hold: its holder does not exist in the child."""
+    global _fork_preprocess_lock
+    _fork_preprocess_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_fork_preprocess_lock)
+
 
 def _preprocess_chunk_fork_shm(args: Tuple[int, int]) -> None:
     """Worker that reads from fork-inherited global and writes to shared memory.
@@ -738,6 +755,9 @@ def preprocess_entries_to_tensors(
             # Workers read entries from inherited global, write to pre-allocated
             # shared memory blocks.  No pickle, no concatenate.
             global _fork_entries, _fork_max_moves, _fork_shm_names, _fork_total_n
+            # Own the inherited inputs until this call's pools have exited.
+            preprocess_lock = _fork_preprocess_lock
+            preprocess_lock.acquire()
             try:
                 _fork_entries = entries
                 _fork_max_moves = max_moves_per_sample
@@ -839,6 +859,7 @@ def preprocess_entries_to_tensors(
                 _fork_entries = None
                 _fork_shm_names = None
                 _fork_total_n = 0
+                preprocess_lock.release()
         else:
             # Spawn path: serialize entries to dicts for pickling across processes.
             entry_dicts = [e.to_dict() for e in entries]
@@ -1054,10 +1075,6 @@ class CachedTensorDataset(Dataset):
             if _use_fork:
                 # Fork path: zero input serialization + SharedMemory output
                 global _fork_entries, _fork_max_moves, _fork_shm_names, _fork_total_n
-                _fork_entries = entry_dicts
-                _fork_max_moves = max_moves_per_sample
-                _fork_total_n = n
-
                 args = [
                     (start, min(start + chunk_size, n))
                     for start in range(0, n, chunk_size)
@@ -1078,7 +1095,14 @@ class CachedTensorDataset(Dataset):
                     _vt_sz = n * 4
 
                     shm_list = []
+                    # Stage inherited inputs only while this call owns them.
+                    # The spawn fallback below pickles its own chunks instead.
+                    preprocess_lock = _fork_preprocess_lock
+                    preprocess_lock.acquire()
                     try:
+                        _fork_entries = entry_dicts
+                        _fork_max_moves = max_moves_per_sample
+                        _fork_total_n = n
                         # Append incrementally so partially-allocated segments
                         # are cleaned up by the finally block on failure.
                         shm_boards = _SHM(create=True, size=max(1, _boards_sz)); shm_list.append(shm_boards)
@@ -1124,15 +1148,13 @@ class CachedTensorDataset(Dataset):
                         _fork_shm_names = None
                         _fork_entries = None
                         _fork_total_n = 0
+                        preprocess_lock.release()
                         for shm in shm_list:
                             try:
                                 shm.close()
                                 shm.unlink()
                             except Exception:
                                 pass
-
-                _fork_entries = None
-                _fork_total_n = 0
 
             # Spawn path: pickle dict chunks across processes
             chunks = [
@@ -1452,52 +1474,60 @@ class FastBatchIterator:
                 mf_shape = dataset.move_features.shape[1:]
                 _sd = self._storage_dtype
 
-                if alloc_n > self.n:
-                    # Pre-allocate to capacity and fill the first n entries
-                    # Allocate the final layout directly; converting an empty
-                    # buffer copies uninitialized data and doubles board storage.
-                    self._boards = torch.empty(
-                        (alloc_n, *b_shape), device=device, dtype=_sd,
-                        memory_format=torch.channels_last)
-                    _copy_resident_tensor(self._boards[:self.n], dataset.boards,
-                                          torch.channels_last)
-                    self._move_features = torch.empty(alloc_n, *mf_shape, device=device,
-                                                      dtype=_sd)
-                    _copy_resident_tensor(self._move_features[:self.n], dataset.move_features)
-                    self._move_counts = torch.empty(alloc_n, device=device,
-                                                    dtype=dataset.move_counts.dtype)
-                    _copy_resident_tensor(self._move_counts[:self.n], dataset.move_counts)
-                    self._targets = torch.empty(alloc_n, device=device,
-                                                dtype=dataset.targets.dtype)
-                    _copy_resident_tensor(self._targets[:self.n], dataset.targets)
-                    self._reward_weights = torch.empty(alloc_n, device=device,
-                                                       dtype=dataset.reward_weights.dtype)
-                    _copy_resident_tensor(self._reward_weights[:self.n], dataset.reward_weights)
-                    self._value_targets = torch.empty(alloc_n, device=device,
-                                                      dtype=dataset.value_targets.dtype)
-                    _copy_resident_tensor(self._value_targets[:self.n], dataset.value_targets)
-                    _dtype_label = "fp16" if _use_half else "fp32"
-                    print(f"  GPU-resident dataset: {self.n} entries in "
-                          f"{alloc_n}-capacity buffer "
-                          f"({budget_bytes / 1e6:.0f}MB reserved, "
-                          f"{available / 1e6:.0f}MB available, {_dtype_label}, channels_last)")
+                try:
+                    if alloc_n > self.n:
+                        # Pre-allocate to capacity and fill the first n entries
+                        # Allocate the final layout directly; converting an empty
+                        # buffer copies uninitialized data and doubles board storage.
+                        self._boards = torch.empty(
+                            (alloc_n, *b_shape), device=device, dtype=_sd,
+                            memory_format=torch.channels_last)
+                        _copy_resident_tensor(self._boards[:self.n], dataset.boards,
+                                              torch.channels_last)
+                        self._move_features = torch.empty(alloc_n, *mf_shape, device=device,
+                                                          dtype=_sd)
+                        _copy_resident_tensor(self._move_features[:self.n], dataset.move_features)
+                        self._move_counts = torch.empty(alloc_n, device=device,
+                                                        dtype=dataset.move_counts.dtype)
+                        _copy_resident_tensor(self._move_counts[:self.n], dataset.move_counts)
+                        self._targets = torch.empty(alloc_n, device=device,
+                                                    dtype=dataset.targets.dtype)
+                        _copy_resident_tensor(self._targets[:self.n], dataset.targets)
+                        self._reward_weights = torch.empty(alloc_n, device=device,
+                                                           dtype=dataset.reward_weights.dtype)
+                        _copy_resident_tensor(self._reward_weights[:self.n], dataset.reward_weights)
+                        self._value_targets = torch.empty(alloc_n, device=device,
+                                                          dtype=dataset.value_targets.dtype)
+                        _copy_resident_tensor(self._value_targets[:self.n], dataset.value_targets)
+                        _dtype_label = "fp16" if _use_half else "fp32"
+                        print(f"  GPU-resident dataset: {self.n} entries in "
+                              f"{alloc_n}-capacity buffer "
+                              f"({budget_bytes / 1e6:.0f}MB reserved, "
+                              f"{available / 1e6:.0f}MB available, {_dtype_label}, channels_last)")
+                    else:
+                        self._boards = dataset.boards.to(device, dtype=_sd,
+                                                         memory_format=torch.channels_last)
+                        self._move_features = dataset.move_features.to(device, dtype=_sd)
+                        self._move_counts = dataset.move_counts.to(device)
+                        self._targets = dataset.targets.to(device)
+                        self._reward_weights = dataset.reward_weights.to(device)
+                        self._value_targets = dataset.value_targets.to(device)
+                        dataset_bytes = self.n * _per_entry
+                        _dtype_label = "fp16" if _use_half else "fp32"
+                        print(f"  GPU-resident dataset: {dataset_bytes / 1e6:.0f}MB on GPU "
+                              f"({available / 1e6:.0f}MB available, {_dtype_label}, channels_last)")
+                except torch.cuda.OutOfMemoryError:
+                    # The budget is an estimate; other allocations can race it.
+                    # Release every partial resident field before CPU pinning.
+                    self._boards = self._move_features = self._move_counts = None
+                    self._targets = self._reward_weights = self._value_targets = None
+                    print("  GPU dataset allocation failed: using CPU+pin")
                 else:
-                    self._boards = dataset.boards.to(device, dtype=_sd,
-                                                     memory_format=torch.channels_last)
-                    self._move_features = dataset.move_features.to(device, dtype=_sd)
-                    self._move_counts = dataset.move_counts.to(device)
-                    self._targets = dataset.targets.to(device)
-                    self._reward_weights = dataset.reward_weights.to(device)
-                    self._value_targets = dataset.value_targets.to(device)
-                    dataset_bytes = self.n * _per_entry
-                    _dtype_label = "fp16" if _use_half else "fp32"
-                    print(f"  GPU-resident dataset: {dataset_bytes / 1e6:.0f}MB on GPU "
-                          f"({available / 1e6:.0f}MB available, {_dtype_label}, channels_last)")
-                self.on_gpu = True
-                self._device = device
-                # Cache the pre-shuffle VRAM decision so __iter__ doesn't re-check
-                # VRAM every epoch.  Invalidated by update_data() when buffer grows.
-                self._can_preshuffle = self._check_preshuffle_budget()
+                    self.on_gpu = True
+                    self._device = device
+                    # Cache the pre-shuffle VRAM decision so __iter__ doesn't re-check
+                    # VRAM every epoch.  Invalidated by update_data() when buffer grows.
+                    self._can_preshuffle = self._check_preshuffle_budget()
             else:
                 print(f"  Dataset too large for GPU cache ({budget_bytes / 1e6:.0f}MB, "
                       f"{available / 1e6:.0f}MB available) — using CPU+pin")
@@ -1657,6 +1687,7 @@ class FastBatchIterator:
 
         Reuse resident capacity where possible, without retaining any rows from
         the previous snapshot. CPU mode binds the replacement directly.
+        Refresh errors propagate; old storage may already have been retired.
         """
         self._update_buffers(dataset, max_entries=0, replace=True)
 
@@ -1740,15 +1771,24 @@ class FastBatchIterator:
             print(f"  GPU buffer realloc: {buf_cap} → {new_cap} capacity")
             b_shape = self._boards.shape[1:]
             mf_shape = self._move_features.shape[1:]
+            b_dtype, mf_dtype = self._boards.dtype, self._move_features.dtype
+            mc_dtype, tgt_dtype = self._move_counts.dtype, self._targets.dtype
+            rw_dtype, vt_dtype = self._reward_weights.dtype, self._value_targets.dtype
+            if replace:
+                # A complete snapshot owns every required row. Retire obsolete
+                # buffers before allocating its larger window; source tensors
+                # and outstanding batch views retain their own storage.
+                self._boards = self._move_features = self._move_counts = None
+                self._targets = self._reward_weights = self._value_targets = None
             new_boards = torch.empty(
-                (new_cap, *b_shape), device=dev, dtype=self._boards.dtype,
+                (new_cap, *b_shape), device=dev, dtype=b_dtype,
                 memory_format=torch.channels_last)
             new_mf = torch.empty(new_cap, *mf_shape, device=dev,
-                                 dtype=self._move_features.dtype)
-            new_mc = torch.empty(new_cap, device=dev, dtype=self._move_counts.dtype)
-            new_tgt = torch.empty(new_cap, device=dev, dtype=self._targets.dtype)
-            new_rw = torch.empty(new_cap, device=dev, dtype=self._reward_weights.dtype)
-            new_vt = torch.empty(new_cap, device=dev, dtype=self._value_targets.dtype)
+                                 dtype=mf_dtype)
+            new_mc = torch.empty(new_cap, device=dev, dtype=mc_dtype)
+            new_tgt = torch.empty(new_cap, device=dev, dtype=tgt_dtype)
+            new_rw = torch.empty(new_cap, device=dev, dtype=rw_dtype)
+            new_vt = torch.empty(new_cap, device=dev, dtype=vt_dtype)
 
             # Copy old data (GPU→GPU, fast)
             if keep_old > 0:
@@ -1788,6 +1828,12 @@ class FastBatchIterator:
         self.n = len(merged)
         _should_pin = torch.cuda.is_available()
         if _should_pin:
+            # The merged dataset owns every replacement row. Retire obsolete
+            # pinned copies before allocating the next window, so the old
+            # window does not overlap the first new pinned field. Caller-owned
+            # tensors and outstanding batch views retain their own references.
+            self._boards = self._move_features = self._move_counts = None
+            self._targets = self._reward_weights = self._value_targets = None
             self._boards = merged.boards.pin_memory()
             self._move_features = merged.move_features.pin_memory()
             self._move_counts = merged.move_counts.pin_memory()
