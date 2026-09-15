@@ -1,8 +1,8 @@
 """Evaluate one checkpoint and emit one compact JSON record to stdout.
 
 This module must live in a real Python file because ModelVsAlgoTester uses
-multiprocessing with the spawn start method. Running the same code through
-``python -`` makes child processes try to import ``<stdin>``, which fails.
+forkserver on Linux and spawn elsewhere. Both methods import the main module;
+running through ``python -`` makes children import ``<stdin>``, which fails.
 """
 
 from __future__ import annotations
