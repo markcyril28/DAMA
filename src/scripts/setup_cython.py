@@ -11,6 +11,7 @@ import sysconfig
 import tempfile
 
 from Cython.Build import cythonize
+from Cython.Compiler.Options import parse_directive_list
 import numpy as np
 from setuptools import Distribution, Extension, setup
 from setuptools.command.build_ext import build_ext
@@ -84,12 +85,12 @@ def _mapped_inplace_extension_owner(
     return None
 
 
-def _build_command_flag_requested(
+def _build_command_option(
     arguments: list[str], command: str, name: str,
-) -> bool:
-    """Read an explicit command flag with setuptools' command-line parser."""
+) -> object:
+    """Read an explicit command option with setuptools' command-line parser."""
     if command not in arguments:
-        return False
+        return None
     distribution = HermeticBuildDistribution({
         "script_args": arguments,
         "cmdclass": {"build_ext": build_ext},
@@ -100,7 +101,14 @@ def _build_command_flag_requested(
     with redirect_stdout(StringIO()):
         distribution.parse_command_line()
     options = distribution.command_options.get(command, {})
-    return bool(options.get(name, (None, False))[1])
+    return options.get(name, (None, None))[1]
+
+
+def _build_command_flag_requested(
+    arguments: list[str], command: str, name: str,
+) -> bool:
+    """Read a boolean command flag without treating option values as flags."""
+    return bool(_build_command_option(arguments, command, name))
 
 
 def _build_ext_flag_requested(arguments: list[str], name: str) -> bool:
@@ -139,6 +147,13 @@ def _fsync_file(path: Path, *, windows: bool = os.name == "nt") -> None:
 
 class AtomicBuildExt(build_ext):
     """Publish in-place extension binaries with one atomic replacement."""
+
+    def finalize_options(self):
+        # Cython's CLI stores this option as text, while build_extension()
+        # expects a mapping. The same directives already drove cythonize below.
+        if isinstance(self.cython_directives, str):
+            self.cython_directives = parse_directive_list(self.cython_directives)
+        return super().finalize_options()
 
     def run(self):
         # develop and editable_wheel enable inplace after CLI parsing. Check
@@ -282,9 +297,19 @@ _force_cython = (
     or _build_command_flag_requested(sys.argv[1:], "build", "force")
 )
 
+# The first cythonize call replaces .pyx sources with generated C, so applying
+# CLI directives only in build_ext would be too late. Force regeneration for
+# an override even when the existing C is newer than its .pyx source.
+_directive_option = _build_command_option(
+    sys.argv[1:], "build_ext", "cython_directives")
+_directive_overrides = (
+    parse_directive_list(_directive_option)
+    if isinstance(_directive_option, str) else {}
+)
+
 ext_modules = cythonize(
     extensions,
-    force=_force_cython,
+    force=_force_cython or bool(_directive_overrides),
     compiler_directives={
         "boundscheck": False,
         "wraparound": False,
@@ -292,6 +317,7 @@ ext_modules = cythonize(
         "language_level": "3",
         "profile": False,
         "linetrace": False,
+        **_directive_overrides,
     },
 )
 
