@@ -190,3 +190,41 @@ def test_shared_unlink_failure_is_retried_at_final_cleanup(
     outputs = _prepare(kind, entries)
     _assert_outputs_and_cleanup(outputs, oracle, segments, original_shared)
     assert attempts[segments[0].name] == 2
+
+
+@pytest.mark.parametrize("kind", ["entries", "dicts"])
+@pytest.mark.parametrize("mode", ["fallback", "spawn"])
+def test_combined_worker_outputs_release_consumed_source_fields(
+    monkeypatch, parallel_input, kind, mode,
+):
+    entries, oracle = parallel_input
+    # Exercise the real spawn threshold as well as fork's recovery path.
+    entries = entries * 3
+    oracle = tuple(torch.cat([tensor] * 3) for tensor in oracle)
+    if mode == "spawn":
+        monkeypatch.setattr(mp, "get_start_method", lambda: "spawn")
+        monkeypatch.setattr(dataset, "ProcessPoolExecutor", partial(
+            ProcessPoolExecutor, mp_context=mp.get_context("spawn")))
+    else:
+        _track_segments(monkeypatch, fail_allocation=1)
+
+    original_concatenate = dataset.np.concatenate
+    consumed = []
+    calls = 0
+
+    def concatenate(arrays, *args, **kwargs):
+        nonlocal calls
+        # Completed fields have independent combined outputs. Their worker
+        # arrays must be gone before allocating the next combined field.
+        assert all(ref() is None for ref in consumed)
+        result = original_concatenate(arrays, *args, **kwargs)
+        consumed.extend(weakref.ref(array) for array in arrays)
+        calls += 1
+        return result
+
+    monkeypatch.setattr(dataset.np, "concatenate", concatenate)
+    outputs = _prepare(kind, entries)
+    assert calls == 6
+    assert all(ref() is None for ref in consumed)
+    for actual, expected in zip(outputs, oracle):
+        assert torch.equal(actual, expected)
