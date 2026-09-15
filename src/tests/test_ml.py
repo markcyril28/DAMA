@@ -375,7 +375,7 @@ class TestModel:
     def test_cpu_checkpoint_mmap_preserves_legacy_archive_compatibility(
         self, monkeypatch, tmp_path
     ):
-        """CPU inference maps current archives and retries only legacy format."""
+        """CPU inference maps pinned archives or uses the portable eager path."""
         from dama.ai.ml import model as model_module
 
         network = model_module.create_model()
@@ -398,18 +398,19 @@ class TestModel:
             return real_load(*args, **kwargs)
 
         monkeypatch.setattr(model_module.torch, 'load', recording_load)
+        mmap_available = Path('/proc/self/fd').is_dir()
 
         assert model_module.load_model(
             str(current_path), torch.device('cpu')) is not None
-        assert calls == [True]
+        assert calls == ([True] if mmap_available else [None])
 
         calls.clear()
         assert model_module.load_model(
             str(legacy_path), torch.device('cpu')) is not None
-        assert calls == [True, None]
+        assert calls == ([True, None] if mmap_available else [None])
 
     def test_cpu_checkpoint_mmap_does_not_mask_other_load_errors(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         """A corrupt mmap load fails closed instead of retrying unverified data."""
         from dama.ai.ml import model as model_module
@@ -420,10 +421,12 @@ class TestModel:
             calls.append(kwargs.get('mmap'))
             raise RuntimeError('checkpoint payload is corrupt')
 
+        checkpoint_path = tmp_path / 'corrupt.pt'
+        checkpoint_path.write_bytes(b'corrupt checkpoint')
         monkeypatch.setattr(model_module.torch, 'load', broken_load)
         with pytest.raises(RuntimeError, match='payload is corrupt'):
-            model_module.load_model('corrupt.pt', torch.device('cpu'))
-        assert calls == [True]
+            model_module.load_model(str(checkpoint_path), torch.device('cpu'))
+        assert calls == ([True] if Path('/proc/self/fd').is_dir() else [None])
 
     def test_teacher_difficulties_are_assigned_to_both_sides(self):
         """Mixed teacher strengths must be generated in both orientations."""
