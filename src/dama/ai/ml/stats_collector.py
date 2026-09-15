@@ -239,6 +239,8 @@ class MetricBuffer:
             'running_max': self.running_max,
             'recent_mean': _safe_mean(recent),
             'recent_stdev': _safe_stdev(recent),
+            # Extrema keep nonfinite values, and NaN makes min/max order-dependent
+            # (kept only when oldest). Use the recent counts as nonfinite evidence.
             'recent_min': min(recent) if recent else 0.0,
             'recent_max': max(recent) if recent else 0.0,
             'recent_finite_max': max(
@@ -462,10 +464,13 @@ class StatsCollector:
             if batch_size > 0:
                 self.batch_size_actual.append(batch_size, step)
 
-            if step_time is not None and step_time > 0:
+            if step_time is not None and (step_time > 0 or not math.isfinite(step_time)):
                 self.step_time_sec.append(step_time, step)
                 if batch_size > 0:
-                    self.throughput_samples_sec.append(batch_size / step_time, step)
+                    # Preserve invalid timing evidence; division by infinity
+                    # would otherwise invent a measured zero sample rate.
+                    rate = batch_size / step_time if math.isfinite(step_time) else float('nan')
+                    self.throughput_samples_sec.append(rate, step)
 
             if grad_norm is not None:
                 self.grad_norm_global.append(grad_norm, step)
@@ -1243,22 +1248,30 @@ class StatsCollector:
 
             # Throughput statistics
             throughput_recent = self.throughput_samples_sec.last_n_values(100)
+            step_times = self.step_time_sec.last_n_values(100)
+            invalid_throughput = sum(not math.isfinite(value) for value in throughput_recent)
+            invalid_timings = sum(not math.isfinite(value) for value in step_times)
             if throughput_recent:
-                metrics['throughput_mean'] = _safe_mean(throughput_recent)
-                metrics['throughput_stdev'] = _safe_stdev(throughput_recent)
-                # Throughput stability (lower = more stable)
-                if _safe_mean(throughput_recent) > 0:
-                    metrics['throughput_cv'] = (
-                        _safe_stdev(throughput_recent) / _safe_mean(throughput_recent)
-                    )
-                else:
-                    metrics['throughput_cv'] = 0
+                finite_count = len(throughput_recent) - invalid_throughput
+                metrics['throughput_recent_finite_count'] = finite_count
+                metrics['throughput_recent_nonfinite_count'] = invalid_throughput
+                mean = _safe_mean(throughput_recent) if finite_count else None
+                stdev = _safe_stdev(throughput_recent) if finite_count else None
+                metrics['throughput_mean'] = mean
+                metrics['throughput_stdev'] = stdev
+                # Finite subsets remain descriptive, but invalid measurements
+                # in either series cannot support dataloader tuning.
+                metrics['throughput_cv'] = None
+                if finite_count and not (invalid_throughput or invalid_timings):
+                    metrics['throughput_cv'] = stdev / mean if mean > 0 else 0.0
 
             # Step time statistics
-            step_times = self.step_time_sec.last_n_values(100)
             if step_times:
-                metrics['step_time_mean_sec'] = _safe_mean(step_times)
-                metrics['step_time_stdev_sec'] = _safe_stdev(step_times)
+                finite_count = len(step_times) - invalid_timings
+                metrics['step_time_recent_finite_count'] = finite_count
+                metrics['step_time_recent_nonfinite_count'] = invalid_timings
+                metrics['step_time_mean_sec'] = _safe_mean(step_times) if finite_count else None
+                metrics['step_time_stdev_sec'] = _safe_stdev(step_times) if finite_count else None
 
             # ELO progress from evaluations
             if len(self.eval_records) >= 2:
@@ -1355,8 +1368,19 @@ class StatsCollector:
                 })
 
             # --- Throughput ---
-            cv = conv.get('throughput_cv', 0)
-            if cv > 0.5:
+            cv = conv.get('throughput_cv')
+            if (conv.get('throughput_recent_nonfinite_count', 0)
+                    or conv.get('step_time_recent_nonfinite_count', 0)):
+                hints.append({
+                    'area': 'performance',
+                    'severity': 'warning',
+                    'hint': (
+                        "Nonfinite throughput or step-time observations in the last "
+                        "100 sampled records. Inspect timing and sample-count telemetry "
+                        "before tuning the dataloader."
+                    ),
+                })
+            elif cv is not None and cv > 0.5:
                 hints.append({
                     'area': 'performance',
                     'severity': 'warning',
@@ -1369,10 +1393,23 @@ class StatsCollector:
 
             # --- GPU memory ---
             gpu_recent = self.gpu_mem_allocated_mb.last_n_values(10)
-            if gpu_recent and torch.cuda.is_available():
+            invalid_gpu_count = sum(not math.isfinite(value) for value in gpu_recent)
+            if invalid_gpu_count:
+                hints.append({
+                    'area': 'performance',
+                    'severity': 'warning',
+                    'hint': (
+                        f"{invalid_gpu_count} nonfinite GPU allocated-memory observations "
+                        "in the last 10 sampled records. Inspect memory telemetry "
+                        "before tuning the training batch size."
+                    ),
+                })
+            elif gpu_recent and torch.cuda.is_available():
                 total_vram = torch.cuda.get_device_properties(0).total_memory / 1e6
-                utilization = max(gpu_recent) / total_vram if total_vram > 0 else 0
-                if utilization < 0.3:
+                # Unknown capacity cannot establish a measured utilization.
+                utilization = (max(gpu_recent) / total_vram
+                               if math.isfinite(total_vram) and total_vram > 0 else None)
+                if utilization is not None and utilization < 0.3:
                     hints.append({
                         'area': 'performance',
                         'severity': 'info',
@@ -1381,7 +1418,7 @@ class StatsCollector:
                             "You could increase batch_size to better utilize the GPU."
                         ),
                     })
-                elif utilization > 0.95:
+                elif utilization is not None and utilization > 0.95:
                     hints.append({
                         'area': 'performance',
                         'severity': 'warning',
@@ -2016,9 +2053,18 @@ class StatsCollector:
 
             # Throughput
             tp = self.throughput_samples_sec.summary(100)
-            if tp['total_count'] > 0:
+            timing = self.step_time_sec.summary(100)
+            if tp['total_count'] > 0 or timing['total_count'] > 0:
                 print(f"\n  Throughput:")
-                print(f"    Samples/sec:        {tp['recent_mean']:.1f} (std={tp['recent_stdev']:.1f})")
+                for label, summary in (('Samples/sec', tp), ('Step time (sec)', timing)):
+                    value = (f"{summary['recent_mean']:.1f} (std={summary['recent_stdev']:.1f})"
+                             if summary['recent_finite_count'] else
+                             "Unavailable (no finite observations)")
+                    print(f"    {label + ':':20s}{value}")
+                    if summary['recent_nonfinite_count']:
+                        print(f"    Nonfinite {label} (last 100): "
+                              f"{summary['recent_nonfinite_count']} "
+                              "(statistics use finite observations only)")
                 sps = conv.get('overall_steps_per_hour', 0)
                 if sps:
                     print(f"    Steps/hour:         {sps:,.0f}")
@@ -2052,7 +2098,13 @@ class StatsCollector:
             gpu_s = self.gpu_mem_allocated_mb.summary(10)
             if gpu_s['total_count'] > 0:
                 print(f"\n  GPU Memory:")
-                print(f"    Allocated:          {gpu_s['recent_mean']:.0f} MB")
+                allocated = (f"{gpu_s['recent_mean']:.0f} MB"
+                             if gpu_s['recent_finite_count'] else
+                             "Unavailable (no finite observations)")
+                print(f"    Allocated:          {allocated}")
+                if gpu_s['recent_nonfinite_count']:
+                    print(f"    Nonfinite (last 10): {gpu_s['recent_nonfinite_count']} "
+                          "(statistics use finite observations only)")
 
             # Evaluations
             if self.eval_records:
