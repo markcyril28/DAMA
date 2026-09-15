@@ -1,5 +1,8 @@
 """Neural network model for move scoring."""
 
+import io
+import os
+from pathlib import Path
 import warnings
 
 import torch
@@ -7,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .move_encoder import BOARD_PLANES, MOVE_FEATURE_SIZE, ENCODING_VERSION
+from .fork_writers import fork_safe_temporary_file
 
 
 # Evaluation and spawn-based inference copy every checkpoint tensor into a new
@@ -440,10 +444,10 @@ def _infer_arch_from_state_dict(state_dict: dict) -> dict:
     w = state_dict.get('board_encoder.input_conv.weight')
     channels = w.shape[0] if w is not None else 64
 
+    # Preserve zero for supported backbones without residual blocks.
     num_blocks = 0
     while f'board_encoder.blocks.{num_blocks}.conv1.weight' in state_dict:
         num_blocks += 1
-    num_blocks = num_blocks or 4
 
     b = state_dict.get('board_encoder.fc.bias')
     embedding_size = b.shape[0] if b is not None else 128
@@ -478,16 +482,23 @@ def load_model(path: str, device: torch.device = None) -> MoveScorerNet:
         'weights_only': False,
     }
     if device.type == 'cpu' and _CPU_CHECKPOINT_MMAP:
-        try:
-            checkpoint = torch.load(path, mmap=True, **load_kwargs)
-        except RuntimeError as exc:
-            # Pre-1.6 checkpoints can use PyTorch's legacy non-zip format,
-            # which does not support mmap. Preserve their established loading
-            # path, but never turn corruption or another load failure into an
-            # unverified retry.
-            if _LEGACY_MMAP_ERROR not in str(exc):
-                raise
-            checkpoint = torch.load(path, **load_kwargs)
+        with open(path, 'rb') as checkpoint_file:
+            # torch.load reopens its path to mmap tensor storage after reading
+            # ZIP metadata. Pin both opens to this inode, even when latest.pt
+            # is replaced between them. Hosts without procfs use this handle.
+            descriptor_path = Path(f'/proc/self/fd/{checkpoint_file.fileno()}')
+            if descriptor_path.exists():
+                try:
+                    checkpoint = torch.load(descriptor_path, mmap=True, **load_kwargs)
+                except RuntimeError as exc:
+                    # Legacy non-ZIP files cannot be mapped. Retry only that
+                    # format error, and retain the same checkpoint revision.
+                    if _LEGACY_MMAP_ERROR not in str(exc):
+                        raise
+                    checkpoint_file.seek(0)
+                    checkpoint = torch.load(checkpoint_file, **load_kwargs)
+            else:
+                checkpoint = torch.load(checkpoint_file, **load_kwargs)
     else:
         checkpoint = torch.load(path, **load_kwargs)
 
@@ -584,7 +595,7 @@ def fold_batchnorm(model: MoveScorerNet) -> MoveScorerNet:
 
 
 def save_model(model: MoveScorerNet, path: str, **kwargs) -> None:
-    """Save a model checkpoint with architecture params for portable loading."""
+    """Atomically save a checkpoint with architecture params for portable loading."""
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'arch_params': getattr(model, 'arch_params', {
@@ -593,4 +604,30 @@ def save_model(model: MoveScorerNet, path: str, **kwargs) -> None:
         'encoding_version': ENCODING_VERSION,
         **kwargs
     }
-    torch.save(checkpoint, path)
+    target = Path(path)
+    temporary_path = None
+    try:
+        # Complete serialization before opening a writer. Publish through one
+        # registered handle so concurrent forks cannot retain its temporary.
+        with io.BytesIO() as buffer:
+            torch.save(checkpoint, buffer)
+            with buffer.getbuffer() as serialized:
+                with fork_safe_temporary_file(
+                    dir=target.parent, prefix=f".{target.name}.",
+                    suffix=".tmp", delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    written = temporary.write(serialized)
+                    if written != len(serialized):
+                        raise OSError(
+                            f"short checkpoint write: {written}/{len(serialized)} bytes"
+                        )
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
