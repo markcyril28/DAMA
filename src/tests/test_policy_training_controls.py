@@ -569,27 +569,32 @@ def test_latest_checkpoint_copy_fallback_is_atomic(
     copy_opened = threading.Event()
     allow_copy_to_finish = threading.Event()
     copy_destinations = []
-    real_copy2 = shutil.copy2
+    real_copyfileobj = shutil.copyfileobj
 
     def _fail_hardlink(_source, _destination):
         raise OSError("forced hardlink fallback")
 
-    def _paused_copy2(source, destination, *args, **kwargs):
-        destination = Path(destination)
-        copy_destinations.append(destination)
-        destination.write_bytes(b"partial checkpoint")
+    def _paused_copyfileobj(source, destination, *args, **kwargs):
+        copy_destinations.append(Path(destination.name))
+        destination.write(b"partial checkpoint")
+        destination.flush()
         copy_opened.set()
         assert allow_copy_to_finish.wait(timeout=5)
-        return real_copy2(source, destination, *args, **kwargs)
+        destination.seek(0)
+        destination.truncate()
+        return real_copyfileobj(source, destination, *args, **kwargs)
 
     monkeypatch.setattr(trainer_module.os, "link", _fail_hardlink)
-    monkeypatch.setattr(shutil, "copy2", _paused_copy2)
+    monkeypatch.setattr(shutil, "copyfileobj", _paused_copyfileobj)
 
     Trainer._save_checkpoint(holder, loss=0.5)
     assert copy_opened.wait(timeout=5)
     try:
         assert latest_path.read_bytes() == previous_latest
-        assert copy_destinations == [tmp_path / "latest.pt.tmp"]
+        assert len(copy_destinations) == 1
+        assert copy_destinations[0].parent == tmp_path
+        assert copy_destinations[0].name.startswith("latest.pt.")
+        assert copy_destinations[0].suffix == ".tmp"
     finally:
         allow_copy_to_finish.set()
 
@@ -619,17 +624,18 @@ def test_latest_checkpoint_copy_failure_removes_partial_temporary(
         raise OSError("forced hardlink fallback")
 
     def _fail_partial_copy(_source, destination, *_args, **_kwargs):
-        Path(destination).write_bytes(b"partial checkpoint")
+        destination.write(b"partial checkpoint")
         raise OSError(28, "simulated alias disk full")
 
     monkeypatch.setattr(trainer_module.os, "link", _fail_hardlink)
-    monkeypatch.setattr(shutil, "copy2", _fail_partial_copy)
+    monkeypatch.setattr(shutil, "copyfileobj", _fail_partial_copy)
 
     with pytest.raises(OSError, match="simulated alias disk full"):
         Trainer._publish_checkpoint_alias(source, latest_path)
 
     assert latest_path.read_bytes() == b"verified previous latest checkpoint"
     assert not temporary.exists()
+    assert list(tmp_path.glob("latest.pt.*.tmp")) == []
 
 
 @pytest.mark.parametrize("copy_fallback", [False, True])
@@ -707,6 +713,7 @@ def test_checkpoint_alias_copy_fsync_failure_preserves_previous_alias(
 
     assert destination.read_bytes() == b"previous checkpoint"
     assert not temporary.exists()
+    assert list(tmp_path.glob("latest.pt.*.tmp")) == []
 
 
 def test_checkpoint_alias_reports_directory_fsync_failure_without_residue(
@@ -832,7 +839,11 @@ def test_checkpoint_serialization_failure_removes_partial_temporary(
     holder._put_status = lambda _message: None
 
     def _fail_partial_save(_payload, destination):
-        Path(destination).write_bytes(b"partial checkpoint")
+        # The writer serializes into memory before its temporary exists.
+        if hasattr(destination, "write"):
+            destination.write(b"partial checkpoint")
+        else:
+            Path(destination).write_bytes(b"partial checkpoint")
         raise OSError(28, "simulated checkpoint disk full")
 
     if failure_stage == "serialization":
@@ -2947,8 +2958,22 @@ def test_cpu_behavior_fallback_owns_tensor_storage() -> None:
         assert value.data_ptr() != model.state_dict()[key].data_ptr()
 
 
-def test_recorded_step_time_includes_forward_and_backward_work() -> None:
-    """Throughput timing covers compute, not only optimizer submission."""
+@pytest.mark.parametrize(
+    "accum_steps,batch_sizes,record_every",
+    [
+        (1, (2,), 1),
+        (1, (2, 1), 1),
+        (2, (2, 2), 1),
+        (2, (2, 1), 1),
+        (3, (2, 2, 1), 1),
+        (2, (2, 1, 1, 1), 1),
+        (2, (2, 2, 2, 1), 2),
+    ],
+)
+def test_recorded_step_time_includes_forward_and_backward_work(
+    accum_steps, batch_sizes, record_every,
+) -> None:
+    """Throughput counts and timing cover every accumulated microbatch."""
     import threading
     import time
 
@@ -2979,13 +3004,13 @@ def test_recorded_step_time_includes_forward_and_backward_work() -> None:
 
     holder = object.__new__(Trainer)
     holder.config = SimpleNamespace(
-        gradient_accumulation_steps=1,
-        stats_record_every=1,
+        gradient_accumulation_steps=accum_steps,
+        stats_record_every=record_every,
         stats_score_dist_every=100,
         stats_system_every=100,
         stats_model_health_every=100,
         checkpoint_every=100,
-        train_steps=1,
+        train_steps=len(batch_sizes) // accum_steps,
         grad_clip_norm=None,
         amp=False,
         value_head_enabled=False,
@@ -3033,10 +3058,16 @@ def test_recorded_step_time_includes_forward_and_backward_work() -> None:
         torch.ones(2),
         torch.zeros(2),
     )
-    holder.train_epoch([batch])
+    holder.train_epoch([tuple(field[:size] for field in batch) for size in batch_sizes])
 
-    assert len(holder.stats_collector.steps) == 1
-    assert holder.stats_collector.steps[0]["step_time"] >= 0.04
+    expected_sizes = [
+        sum(batch_sizes[start:start + accum_steps])
+        for start in range(0, len(batch_sizes), accum_steps)
+        if (start // accum_steps + 1) % record_every == 0
+    ]
+    recorded = holder.stats_collector.steps
+    assert [record["batch_size"] for record in recorded] == expected_sizes
+    assert all(record["step_time"] >= 0.04 * accum_steps for record in recorded)
 
 
 def test_existing_frozen_suite_overlap_is_filtered_on_restart(
@@ -4975,8 +5006,16 @@ def test_recovery_enforced_race_fallback_skips_unstamped_files(
     loaded = []
     holder._load_checkpoint = lambda path: loaded.append(path)
 
+    holder.config.resume = str(tmp_path / "model_step_000000.pt")
+    holder.step = 4000
+    selector_calls = 0
+
     def vanishing_verified_pick():
-        raise FileNotFoundError(str(directory / "model_step_999999.pt"))
+        nonlocal selector_calls
+        selector_calls += 1
+        if selector_calls == 1:
+            raise FileNotFoundError(str(directory / "model_step_999999.pt"))
+        return Trainer._verified_recovery_rollback_checkpoint(holder)
 
     holder._verified_recovery_rollback_checkpoint = vanishing_verified_pick
     holder._rollback_checkpoint_candidates = (
