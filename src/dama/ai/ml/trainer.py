@@ -2389,16 +2389,31 @@ class Trainer:
 
         # Load with strict=False to handle old checkpoints that lack value_head keys.
         # New value_head parameters will keep their random initialization.
-        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        # In-run rollback can target the model-only torch.compile wrapper,
+        # whose state-dict keys still have the prefix removed above. Load the
+        # shared original parameters without replacing the live wrapper.
+        checkpoint_model = getattr(self.model, '_orig_mod', self.model)
+        missing, unexpected = checkpoint_model.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"  New parameters (randomly initialized): {missing}")
         if unexpected:
             print(f"  Unexpected keys (ignored): {unexpected}")
 
-        # Try to restore optimizer state; skip if model architecture changed
+        # Restore usable optimizer state, or keep the weights with fresh moments.
         try:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # Finite weights do not prove that saved Adam moments or step
+            # counters are usable. A bad buffer poisons the next update even
+            # when the newly computed loss and gradients are finite.
+            for state in getattr(self.optimizer, 'state', {}).values():
+                for name, value in state.items():
+                    if (isinstance(value, torch.Tensor)
+                            and not torch.isfinite(value).all()):
+                        raise ValueError(f"non-finite optimizer state: {name}")
         except (ValueError, KeyError) as e:
+            # Rollback reuses an already-trained optimizer. Failed restore
+            # must not retain its later (possibly nonfinite) moment buffers.
+            self.optimizer.state.clear()
             print(f"  Warning: Could not restore optimizer state ({e}). "
                   f"Using fresh optimizer — momentum/variance buffers will be re-estimated.")
 
@@ -2634,7 +2649,12 @@ class Trainer:
         The snapshot is taken once per attempt so the retry loop below sees a
         consistent view; vanishing entries are tolerated by the caller.
         """
-        return sorted(Path(self.config.checkpoint_dir).glob(pattern))
+        # The six-digit format is a minimum width; lexical order breaks at
+        # step 1,000,000 and each later power of ten.
+        return sorted(
+            Path(self.config.checkpoint_dir).glob(pattern),
+            key=_checkpoint_step_number,
+        )
 
     def _rollback_after_dead_epoch(self, reason: str) -> None:
         """Load the newest usable checkpoint after repeated dead epochs.
