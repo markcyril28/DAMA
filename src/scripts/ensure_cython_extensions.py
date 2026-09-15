@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import platform
 import shlex
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -63,6 +64,20 @@ _BUILD_ENVIRONMENT_VARIABLES = (
     "LDFLAGS",
     "LDSHARED",
     "RANLIB",
+    # GCC/Clang and MSVC also consume these directly, without setuptools
+    # adding them to its command line or changing the compiler's banner.
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "LIBRARY_PATH",
+    "COMPILER_PATH",
+    "GCC_EXEC_PREFIX",
+    "INCLUDE",
+    "LIB",
+    "CL",
+    "_CL_",
+    "LINK",
+    "_LINK_",
 )
 _BUILD_SYSCONFIG_VARIABLES = (
     "AR",
@@ -188,9 +203,23 @@ def _extension_layout(
     return sources, modules, targets
 
 
+@contextmanager
+def _regular_file_reader(path: Path, mode: str, *, encoding: str | None = None):
+    """Reject nonregular build artifacts without waiting on a FIFO open."""
+    def open_nonblocking(name: str, flags: int) -> int:
+        return os.open(name, flags | getattr(os, "O_NONBLOCK", 0))
+
+    with open(path, mode, encoding=encoding, opener=open_nonblocking) as stream:
+        # Validate the opened descriptor so a path replacement cannot turn a
+        # preceding regular-file check into a blocking or unbounded read.
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "Expected a regular build file", str(path))
+        yield stream
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with _regular_file_reader(path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -371,7 +400,8 @@ def _manifest_matches(
 ) -> bool:
     manifest_path = source_root / _BUILD_MANIFEST
     try:
-        stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+        with _regular_file_reader(manifest_path, "r", encoding="utf-8") as stream:
+            stored = json.load(stream)
         expected = _build_manifest_payload(
             source_root,
             extension_suffix=extension_suffix,
@@ -428,11 +458,36 @@ def write_build_manifest(
     )
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        try:
+            # Retain raw ownership if stream construction partially succeeds
+            # before raising; a wrapper must not release a reusable fd number.
+            stream = os.fdopen(
+                fd, "w", encoding="utf-8", newline="\n", closefd=False,
+            )
+            try:
+                json.dump(payload, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            except BaseException:
+                # Buffered close can fail too; retain the original write or
+                # interruption error while still releasing the stream.
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+                raise
+            else:
+                stream.close()
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        else:
+            # Close once before publication, including on native Windows.
+            os.close(fd)
         os.replace(temporary, manifest_path)
         try:
             directory_fd = os.open(
@@ -449,10 +504,9 @@ def write_build_manifest(
             pass
     except BaseException:
         try:
-            os.close(fd)
+            temporary.unlink(missing_ok=True)
         except OSError:
             pass
-        temporary.unlink(missing_ok=True)
         raise
     return manifest_path
 
