@@ -78,6 +78,11 @@ def get_model(model_path: str, device: Optional[torch.device] = None) -> MoveSco
             )
             device = torch.device('cpu')
 
+    # An unindexed CUDA request follows the calling thread's current GPU.
+    # Resolve it before caching so a device switch cannot reuse another GPU's model.
+    if device.type == 'cuda' and device.index is None:
+        device = torch.device('cuda', torch.cuda.current_device())
+
     cache_key = (model_path, str(device))
     path = _resolve_model_path(model_path)
 
