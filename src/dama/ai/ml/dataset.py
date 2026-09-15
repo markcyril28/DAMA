@@ -8,7 +8,6 @@ import math
 import time
 import os
 import random
-import tempfile
 import threading
 from numbers import Real
 import psutil
@@ -24,6 +23,7 @@ from ...game_state import GameState
 from ...board import Board
 from .replay import ReplayBuffer, ReplayEntry
 from .move_encoder import encode_board, encode_moves, MOVE_FEATURE_SIZE, BOARD_PLANES
+from .fork_writers import fork_safe_temporary_file
 from .run_status import _fsync_directory
 from .scoring import compute_reward_weight, compute_reward_weights_batch
 
@@ -1218,7 +1218,7 @@ class CachedTensorDataset(Dataset):
             # has been serialized and flushed.  A cache is optional, but a
             # torn write should still degrade to a safe cache miss, not consume
             # the only usable warm-start artifact.
-            with tempfile.NamedTemporaryFile(
+            with fork_safe_temporary_file(
                 mode='wb',
                 prefix=f'.{cache_path.name}.',
                 suffix='.tmp',
@@ -1227,13 +1227,24 @@ class CachedTensorDataset(Dataset):
             ) as raw_file:
                 temp_path = Path(raw_file.name)
                 if compress:
-                    with gzip.GzipFile(
+                    compressed_file = gzip.GzipFile(
                         fileobj=raw_file,
                         mode='wb',
                         compresslevel=_TENSOR_CACHE_GZIP_COMPRESSLEVEL,
                         mtime=0,
-                    ) as compressed_file:
+                    )
+                    try:
                         torch.save(payload, compressed_file)
+                    except BaseException:
+                        # Preserve serialization failure or interruption if
+                        # finalizing buffered gzip output also fails.
+                        try:
+                            compressed_file.close()
+                        except OSError:
+                            pass
+                        raise
+                    else:
+                        compressed_file.close()
                 else:
                     torch.save(payload, raw_file)
                 raw_file.flush()
@@ -1243,7 +1254,12 @@ class CachedTensorDataset(Dataset):
             _fsync_directory(cache_path.parent)
         finally:
             if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    # Cleanup cannot replace the failure that prevented a
+                    # complete cache from being published.
+                    pass
         cache_kind = "compressed " if compress else ""
         print(f"Saved {cache_kind}cached dataset to {cache_path}")
     
@@ -1278,6 +1294,17 @@ class CachedTensorDataset(Dataset):
                 raise ValueError(
                     "Cached dataset is missing required tensor field(s): "
                     f"{', '.join(sorted(missing))}"
+                )
+            # Reject null optional fields before the legacy constructor can
+            # replace the cache's missing weights or outcomes with defaults.
+            invalid = sorted(
+                field for field in required
+                if not isinstance(data[field], torch.Tensor)
+            )
+            if invalid:
+                raise ValueError(
+                    "Cached dataset has non-tensor required field(s): "
+                    f"{', '.join(invalid)}"
                 )
         return cls(
             data['boards'],
@@ -1358,13 +1385,17 @@ class CUDAPrefetcher:
             )
 
     def __next__(self):
-        torch.cuda.current_stream().wait_stream(self.stream)
+        # The caller's current device may differ from the transfer target.
+        # Order consumption and retain storage on the target's training stream.
+        # Stream.device also resolves an unindexed "cuda" request once.
+        consumer_stream = torch.cuda.current_stream(self.stream.device)
+        consumer_stream.wait_stream(self.stream)
         batch = self._next_batch
         if batch is None:
             raise StopIteration
         for t in batch:
             if isinstance(t, torch.Tensor) and t.is_cuda:
-                t.record_stream(torch.cuda.current_stream())
+                t.record_stream(consumer_stream)
         self._prefetch()
         return batch
 
@@ -1436,6 +1467,9 @@ class FastBatchIterator:
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.n = len(dataset)
+        # Refreshes must retain the caller's opt-in even though pin_memory
+        # below is cleared to disable redundant per-batch pinning.
+        self._pin_memory_requested = pin_memory
 
         # GPU-resident mode: move entire dataset to VRAM once.
         # Eliminates all pin_memory + CUDAPrefetcher + H2D transfer overhead.
@@ -1536,7 +1570,7 @@ class FastBatchIterator:
             # Pin memory once at construction — eliminates per-batch pin_memory()
             # overhead (~5μs/tensor/batch).  Pinned pages enable truly asynchronous
             # H2D transfers via CUDAPrefetcher's non_blocking=True.
-            _should_pin = pin_memory and torch.cuda.is_available()
+            _should_pin = self._pin_memory_requested and torch.cuda.is_available()
             if _should_pin:
                 self._boards = dataset.boards.pin_memory()
                 self._move_features = dataset.move_features.pin_memory()
@@ -1826,7 +1860,7 @@ class FastBatchIterator:
                   self.dataset.concat(new_dataset, max_entries=max_entries))
         self.dataset = merged
         self.n = len(merged)
-        _should_pin = torch.cuda.is_available()
+        _should_pin = self._pin_memory_requested and torch.cuda.is_available()
         if _should_pin:
             # The merged dataset owns every replacement row. Retire obsolete
             # pinned copies before allocating the next window, so the old
@@ -2010,16 +2044,28 @@ def load_matching_cached_tensor_dataset(
                     cached_metadata.get("side_weight_balance"))
             )
         )
-        if (
-            isinstance(cached_metadata, Mapping)
-            and _cache_metadata_matches(cached_metadata, expected_metadata)
-            and has_required_balance
-            and isinstance(expected_count, int)
-            and not isinstance(expected_count, bool)
-            and expected_count == len(cached_dataset)
-            and _cached_tensor_dataset_is_consistent(
-                cached_dataset, expected_metadata)
+        mismatch_reason = None
+        if not isinstance(cached_metadata, Mapping):
+            mismatch_reason = "metadata is not a mapping"
+        elif not _cache_metadata_matches(cached_metadata, expected_metadata):
+            changed_keys = [
+                str(key) for key, value in expected_metadata.items()
+                if cached_metadata.get(key) != value
+            ]
+            mismatch_reason = "source metadata differs: " + ", ".join(changed_keys)
+        elif not has_required_balance:
+            mismatch_reason = "invalid side_weight_balance metadata"
+        elif (
+            not isinstance(expected_count, int)
+            or isinstance(expected_count, bool)
+            or expected_count != len(cached_dataset)
         ):
+            mismatch_reason = "entry_count metadata does not match tensor rows"
+        elif not _cached_tensor_dataset_is_consistent(
+            cached_dataset, expected_metadata
+        ):
+            mismatch_reason = "tensor schema does not match expected shapes/dtypes"
+        if mismatch_reason is None:
             print("Loaded matching RAM cache from file.")
             if migrate_to_compressed:
                 try:
@@ -2034,9 +2080,15 @@ def load_matching_cached_tensor_dataset(
                         f"{cache_path}: {exc}"
                     )
             return cached_dataset
-        print("RAM cache file metadata mismatch; rebuilding cache.")
+        print(
+            "RAM cache file metadata mismatch; rebuilding cache. "
+            f"Path: {cache_path}; reason: {mismatch_reason}"
+        )
     except Exception as exc:
-        print(f"RAM cache file invalid ({exc}); rebuilding cache.")
+        print(
+            f"RAM cache file invalid ({type(exc).__name__}: {exc}); "
+            f"rebuilding cache. Path: {cache_path}"
+        )
     return None
 
 
