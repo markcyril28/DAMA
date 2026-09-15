@@ -19,14 +19,14 @@ import traceback
 import warnings
 import numpy as np
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 import platform
 import threading
 import multiprocessing as mp
 from queue import Empty, Queue
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any, Iterable, Iterator, Mapping
+from typing import Optional, Dict, Any, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 
 # Set multiprocessing start method before any other multiprocessing imports
@@ -96,6 +96,11 @@ from .dataset import (
 )
 from .scoring import compute_reward_weight
 from .stats_collector import StatsCollector
+from .fork_writers import (
+    _FORK_CHILD_DROPPED_FDS,
+    _fork_children_drop_fd,
+    fork_safe_temporary_file,
+)
 from .corpus import (
     CorpusSnapshotManager,
     _SnapshotSplitContext,
@@ -153,58 +158,6 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-
-
-# A forked worker inherits every open file description. On the WSL DrvFS
-# project volume, a child still holding a writer's temporary makes the replaced
-# public name unopenable (ENOENT while it remains listed) until that child
-# exits. Self-play pools fork from the producer thread while other threads
-# publish statistics and checkpoints, so those writers register the temporary
-# for as long as it is open.
-_FORK_CHILD_DROPPED_FDS: set[int] = set()
-
-
-def _drop_registered_fds_in_fork_child() -> None:
-    """Point registered writer descriptors at the null device in a fork child."""
-
-    descriptors = tuple(_FORK_CHILD_DROPPED_FDS)
-    _FORK_CHILD_DROPPED_FDS.clear()
-    if not descriptors:
-        return
-    try:
-        null_fd = os.open(os.devnull, os.O_RDWR)
-    except OSError:
-        return
-    try:
-        for descriptor in descriptors:
-            # dup2 releases the inherited file without freeing its number, so
-            # a stray flush from a copied file object cannot reach a new file.
-            try:
-                os.dup2(null_fd, descriptor)
-            except OSError:
-                pass
-    finally:
-        os.close(null_fd)
-
-
-if hasattr(os, 'register_at_fork'):
-    os.register_at_fork(after_in_child=_drop_registered_fds_in_fork_child)
-
-
-@contextmanager
-def _fork_children_drop_fd(descriptor: int) -> Iterator[None]:
-    """Keep an open writer descriptor out of processes forked in this block.
-
-    Enter only after the descriptor is open and leave before closing it.
-    ``os.fork()`` holds the GIL, so a child that sees the registration
-    inherited this exact open file rather than a reused descriptor number.
-    """
-
-    _FORK_CHILD_DROPPED_FDS.add(descriptor)
-    try:
-        yield
-    finally:
-        _FORK_CHILD_DROPPED_FDS.discard(descriptor)
 
 
 def _prepare_checkpoint_directory(path: str | Path) -> Path:
@@ -562,6 +515,49 @@ def _selfplay_batch_result_is_complete(entries_data, batch) -> bool:
     return seen == expected.keys()
 
 
+def _summarize_selfplay_batch(
+    entries_data: list[dict], num_games: int,
+) -> tuple[dict[str, int], list[int]]:
+    """Count outcomes once per game and recorded plies after the opening.
+
+    Called only after game/source completeness validation. Results are relative
+    to each row's player, and interleaved workers need not group rows by game.
+    Malformed or conflicting outcomes stay unknown; telemetry must not invent
+    draws or reject a batch that the existing generation contract accepts.
+    """
+    games = {}
+    for entry in entries_data:
+        game_id = entry['game_id']
+        result = entry.get('result')
+        state = entry.get('state')
+        turn = state.get('turn') if isinstance(state, dict) else None
+        outcome = 'unknown'
+        if (not isinstance(turn, bool) and not isinstance(result, bool)
+                and turn in (1, 2) and result in (-1, 0, 1)):
+            if result == 0:
+                outcome = 'draw'
+            else:
+                winner = turn if result == 1 else 3 - turn
+                outcome = 'p1_win' if winner == 1 else 'p2_win'
+        if game_id in games:
+            game = games[game_id]
+            game[0] += 1
+            if game[1] != outcome:
+                game[1] = 'unknown'
+        else:
+            games[game_id] = [1, outcome]
+
+    # Zero-move tasks legitimately return no rows. Their outcome is unavailable
+    # through this worker protocol, but they must still appear in length stats.
+    missing = max(0, num_games - len(games))
+    results = {'p1_win': 0, 'p2_win': 0, 'draw': 0, 'unknown': missing}
+    lengths = [0] * missing
+    for length, outcome in games.values():
+        results[outcome] += 1
+        lengths.append(length)
+    return results, lengths
+
+
 def _make_compiled_fwd_loss(model, compile_mode):
     """Build and compile a fused forward_padded + loss function.
 
@@ -569,9 +565,10 @@ def _make_compiled_fwd_loss(model, compile_mode):
     kernels across the boundary and capture everything in a single CUDAGraph,
     eliminating per-kernel launch overhead from separate forward and loss calls.
 
-    NaN/Inf loss is replaced with 0.0 inside the graph via nan_to_num, so the
-    caller never needs ``torch.isfinite(loss)`` (which forces a CUDA sync).
-    Zero loss produces zero gradients; the optimizer step becomes a near-no-op.
+    NaN/Inf loss is replaced with 0.0 inside the graph via nan_to_num. Return
+    the detached original scalar as well, so sampled diagnostics can distinguish
+    that replacement from a legitimate zero without a per-step CUDA sync.
+    Sanitizing the scalar does not establish that backward gradients are finite.
     """
     def _fwd_loss(boards, move_features, move_counts, targets, reward_weights):
         # Forward — model.forward_padded is inlined by the compiler
@@ -594,13 +591,11 @@ def _make_compiled_fwd_loss(model, compile_mode):
         tw = w.sum().clamp(min=1.0)
         loss = -(chosen_lp * w).sum() / tw
 
-        # Sanitize NaN/Inf loss inside the graph to eliminate the per-step
-        # ``not torch.isfinite(loss)`` CUDA sync in the training loop.
-        # Zero loss → zero gradients → optimizer applies only weight decay
-        # (negligible for the rare NaN batch).
+        # Preserve the original scalar for sampled sanitization diagnostics.
+        raw_loss = loss.detach()
         loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
-        return loss, scores.detach()
+        return loss, scores.detach(), raw_loss
 
     return torch.compile(_fwd_loss, mode=compile_mode, fullgraph=True)
 
@@ -637,9 +632,10 @@ def _make_compiled_fwd_loss_value(model, compile_mode, value_weight):
 
         loss = policy_loss + value_weight * value_loss
 
+        raw_loss = loss.detach()
         loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
-        return loss, scores.detach()
+        return loss, scores.detach(), raw_loss
 
     return torch.compile(_fwd_loss_value, mode=compile_mode, fullgraph=True)
 
@@ -2067,19 +2063,26 @@ class Trainer:
         print(f"{'=' * 50}")
         sys.stdout.flush()
 
-        # Sleep in small increments so we can still respond to stop signals
+        # Service GUI controls during cooldown even without a self-play thread.
         end_time = time.time() + rest_secs
-        while time.time() < end_time:
+        while True:
+            if self._control_queue is not None:
+                self._service_control_queue()
             if self._stopped:
+                print("Thermal rest interrupted by stop request.")
+                sys.stdout.flush()
+                return
+            remaining = end_time - time.time()
+            if remaining <= 0:
                 break
-            time.sleep(min(5.0, end_time - time.time()))
+            time.sleep(min(5.0, remaining))
 
         # Log temps after resting
         gpu_after = self._get_gpu_temperature()
         cpu_after = self._get_cpu_temperature()
         print(f"Thermal rest complete. Temps now — "
               f"GPU: {gpu_after or 'N/A'}°C, CPU: {cpu_after or 'N/A'}°C")
-        print("Resuming training...")
+        print("Training remains paused." if self._paused else "Resuming training...")
         sys.stdout.flush()
         self._last_thermal_check = time.time()
 
@@ -2873,15 +2876,13 @@ class Trainer:
             # delayed checkpoint snapshot after newer progress has landed.
             _tmp_path = None
             try:
-                with tempfile.NamedTemporaryFile(
+                with fork_safe_temporary_file(
                         mode='w', dir=stats_path.parent, suffix='.tmp',
                         delete=False) as tmp:
                     _tmp_path = tmp.name
-                    # A self-play pool can fork during this multi-second dump.
-                    with _fork_children_drop_fd(tmp.fileno()):
-                        json.dump(snapshot, tmp, indent=2)
-                        tmp.flush()
-                        os.fsync(tmp.fileno())
+                    json.dump(snapshot, tmp, indent=2)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
                 os.replace(_tmp_path, stats_path)
                 _fsync_directory(stats_path.parent)
             except Exception as e:
@@ -4753,11 +4754,17 @@ class Trainer:
             try:
                 os.link(str(source), str(temporary))
             except OSError:
-                shutil.copy2(source, temporary)
-                # A copied alias owns a new inode, unlike the preferred
-                # hardlink to the already-durable numbered checkpoint. Flush
-                # those copied bytes before its pathname becomes public.
-                with temporary.open('r+b') as alias_handle:
+                # Copy and sync through one protected writer: copy2 opens an
+                # unregistered destination that self-play forks can inherit.
+                with fork_safe_temporary_file(
+                    delete=False, dir=destination.parent,
+                    prefix=destination.name + '.', suffix='.tmp',
+                ) as alias_handle:
+                    temporary = Path(alias_handle.name)
+                    with source.open('rb') as source_handle:
+                        shutil.copyfileobj(source_handle, alias_handle, 1024 * 1024)
+                    alias_handle.flush()
+                    shutil.copystat(source, temporary)
                     os.fsync(alias_handle.fileno())
             os.replace(temporary, destination)
             _fsync_directory(destination.parent)
@@ -5526,19 +5533,22 @@ class Trainer:
         # Each individual .cpu() call forces a stream sync (~50μs); with ~120
         # parameter tensors, batching saves ~6ms per checkpoint (120 × 50μs).
         _opt_sd = self.optimizer.state_dict()
+        _cpu_state = {}
+        for k, v in _opt_sd['state'].items():
+            _cpu_state[k] = {
+                sk: sv.to('cpu', non_blocking=True, copy=True)
+                if isinstance(sv, torch.Tensor) else sv
+                for sk, sv in v.items()
+            }
+        _opt_sd = {'state': _cpu_state, 'param_groups': _opt_sd['param_groups']}
+        # copy=True also isolates CPU training and Adam's CPU step counters
+        # on CUDA hosts before the asynchronous writer can inspect them.
+        _model_sd = {
+            k: v.to('cpu', non_blocking=True, copy=True)
+            for k, v in self.model.state_dict().items()}
         if self.device.type == 'cuda':
-            _cpu_state = {}
-            for k, v in _opt_sd['state'].items():
-                _cpu_state[k] = {
-                    sk: sv.to('cpu', non_blocking=True) if isinstance(sv, torch.Tensor) else sv
-                    for sk, sv in v.items()
-                }
-            _opt_sd = {'state': _cpu_state, 'param_groups': _opt_sd['param_groups']}
-            _model_sd = {k: v.to('cpu', non_blocking=True) for k, v in self.model.state_dict().items()}
             # Single sync: all D2H copies are on the default stream; wait for all.
             torch.cuda.current_stream().synchronize()
-        else:
-            _model_sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
         checkpoint = {
             'model_state_dict': _model_sd,
             'optimizer_state_dict': _opt_sd,
@@ -5555,6 +5565,8 @@ class Trainer:
             ),
             'validation_loss': validation_loss,
             'epoch': self.epoch,
+            # Resume can outlive its optional stats sidecar and replay window.
+            'generation_cycles_completed': self.stats.generation_cycles_completed,
             'arch_params': getattr(self.model, 'arch_params', {
                 'embedding_size': self.config.model_embedding,
                 'num_blocks': self.config.model_blocks,
@@ -5643,6 +5655,10 @@ class Trainer:
 
         # Offload disk I/O to background thread — GPU resumes training immediately.
         def _write_checkpoint():
+            # Measure this writer's serialization/publication work, including
+            # its statistics, retention, promotion and acceptance task writes.
+            # Main-thread validation and CPU snapshot copies are not save I/O time.
+            write_started = time.perf_counter()
             stage = 'checkpoint serialization'
             numbered_rewrite_attempted = False
 
@@ -5658,25 +5674,24 @@ class Trainer:
                     torch.save(checkpoint, buffer)
                     serialized = buffer.getbuffer()
                     try:
-                        with tempfile.NamedTemporaryFile(
+                        with fork_safe_temporary_file(
                             delete=False, dir=self.config.checkpoint_dir,
                         ) as tmp:
                             tmp_path = Path(tmp.name)
-                            with _fork_children_drop_fd(tmp.fileno()):
-                                written = tmp.write(serialized)
-                                if written != len(serialized):
-                                    raise OSError(
-                                        f"short checkpoint write: "
-                                        f"{written}/{len(serialized)} bytes"
-                                    )
-                                tmp.flush()
-                                # Recovery resumes only from verified numbered
-                                # checkpoints. Make the completed archive
-                                # durable before publishing its pathname so an
-                                # abrupt host shutdown cannot leave an accepted
-                                # atomic rename backed only by volatile cache
-                                # pages.
-                                os.fsync(tmp.fileno())
+                            written = tmp.write(serialized)
+                            if written != len(serialized):
+                                raise OSError(
+                                    f"short checkpoint write: "
+                                    f"{written}/{len(serialized)} bytes"
+                                )
+                            tmp.flush()
+                            # Recovery resumes only from verified numbered
+                            # checkpoints. Make the completed archive
+                            # durable before publishing its pathname so an
+                            # abrupt host shutdown cannot leave an accepted
+                            # atomic rename backed only by volatile cache
+                            # pages.
+                            os.fsync(tmp.fileno())
                     finally:
                         serialized.release()
                         buffer.close()
@@ -5790,18 +5805,22 @@ class Trainer:
                         f", plus promoted and resumed)"
                     )
 
-                if _stats_collector:
-                    ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
-                    _stats_collector.record_checkpoint(
-                        step=_step, loss=loss, path=str(checkpoint_path),
-                        file_size_mb=ckpt_size,
-                    )
                 if selection and selection.get('promotion', {}).get('promoted'):
                     stage = 'promoted checkpoint publication'
                     self._publish_checkpoint_alias(
                         checkpoint_path, Path(self.config.promoted_path))
                     stage = 'acceptance task enqueue'
                     self._enqueue_checkpoint_acceptance(checkpoint_path, selection)
+                # Record completion only after every required publication has
+                # succeeded, including promoted aliases and acceptance tasks.
+                stage = 'checkpoint telemetry'
+                if _stats_collector:
+                    ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
+                    _stats_collector.record_checkpoint(
+                        step=_step, loss=loss, path=str(checkpoint_path),
+                        save_time_sec=time.perf_counter() - write_started,
+                        file_size_mb=ckpt_size,
+                    )
                 print(f"Checkpoint saved: {checkpoint_path}")
                 # Notify the GUI so the panel can log the checkpoint and
                 # refresh its stats view (no-op when training headless).
@@ -6264,6 +6283,8 @@ class Trainer:
             'p1_weight_after': 0.0,
             'p2_weight_after': 0.0,
         }
+        selfplay_results = {'p1_win': 0, 'p2_win': 0, 'draw': 0, 'unknown': 0}
+        selfplay_lengths = []
 
         # --- Submit ALL to one ProcessPoolExecutor ---
         # initializer reseeds each worker's RNG: forked workers otherwise
@@ -6305,6 +6326,12 @@ class Trainer:
             if _preprocess_chunks is not None and entries_data:
                 _preprocess_chunks.append(
                     _pp_chunk((entries_data, _pp_max_moves)))
+            if self.stats_collector:
+                batch_results, batch_lengths = _summarize_selfplay_batch(
+                    entries_data, batch_game_count)
+                for outcome, count in batch_results.items():
+                    selfplay_results[outcome] += count
+                selfplay_lengths.extend(batch_lengths)
             completed_total += batch_game_count
             if callback:
                 callback(completed_total, grand_total)
@@ -6532,6 +6559,9 @@ class Trainer:
                 num_games=grand_total,
                 num_entries=entries,
                 elapsed_sec=_selfplay_elapsed,
+                result_distribution=selfplay_results,
+                game_lengths=selfplay_lengths,
+                game_length_basis='recorded_post_opening_plies',
             )
 
             # Record replay buffer state (skip when replay I/O was bypassed —
@@ -7351,10 +7381,25 @@ class Trainer:
             return _call_under_model_state_lock(
                 _model_state_lock, operation, *args)
 
-        def _apply_scaled_optimizer_step() -> None:
-            _scaler.step(_optimizer)
+        def _apply_scaled_optimizer_step() -> bool:
+            # With GradScaler active the trainer uses an unfused optimizer,
+            # whose step is not called when nonfinite gradients reject it.
+            # Observe that call directly instead of guessing from scale changes.
+            updated = False
+
+            def _mark_updated(*_args):
+                nonlocal updated
+                updated = True
+
+            handle = _optimizer.register_step_post_hook(_mark_updated)
+            try:
+                _scaler.step(_optimizer)
+            finally:
+                handle.remove()
             _scaler.update()
-            self.step += 1
+            if updated:
+                self.step += 1
+            return updated
 
         def _apply_plain_optimizer_step() -> None:
             _optimizer.step()
@@ -7398,6 +7443,190 @@ class Trainer:
         else:
             iter_loader = dataloader
 
+        def _finish_optimizer_step(
+            loss, _raw_loss, _current_scores, move_counts, microbatches,
+        ) -> bool:
+            # A short final window contains fewer scaled losses. Restore its
+            # mean gradient before unscaling/clipping so the update has the
+            # same normalization as an ordinary full window.
+            if microbatches < accum_steps:
+                correction = accum_steps / microbatches
+                for parameter in _model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(correction)
+            _grad_norm = None
+            _grad_norms_per_layer = None
+            # Gradient clipping + stats.  clip_grad_norm_ returns the total
+            # (unclipped) grad norm, so we capture it instead of iterating all
+            # parameters a second time in compute_gradient_stats.  Per-layer
+            # norms are only collected at model_health frequency (much lower)
+            # to avoid ~40 .item() CUDA syncs per stats step.
+            # Defer .item() on grad norm: store the GPU tensor and call .item()
+            # only when we already sync for loss.item() — avoids an extra CUDA
+            # sync on every stats interval (~50μs saved per recorded step).
+            # [Pass 84] _will_record already computes the same condition as
+            # _want_grad_stats — reuse it to avoid a redundant modulo per step.
+            _clip_norm_tensor = None  # GPU tensor, deferred .item()
+
+            if _use_amp and _scaler is not None:
+                if _grad_clip_norm is not None:
+                    _scaler.unscale_(_optimizer)
+                    _clip_norm = torch.nn.utils.clip_grad_norm_(
+                        _model_params, _grad_clip_norm,
+                        foreach=True)
+                    if _will_record:
+                        _clip_norm_tensor = _clip_norm
+                updated = _run_model_operation(_apply_scaled_optimizer_step)
+                if not updated:
+                    details = 'Non-finite gradients; optimizer update skipped'
+                    if _clip_norm_tensor is not None:
+                        details += f'; grad_norm={_clip_norm_tensor.item()!r}'
+                    print(f"  Warning: {details}")
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
+                            self.step, 'grad_scaler', details)
+                    # A rejected window consumes no optimizer-step budget and
+                    # cannot advance LR, checkpoint or healthy-step telemetry.
+                    return False
+            else:
+                if _grad_clip_norm is not None:
+                    _clip_norm = torch.nn.utils.clip_grad_norm_(
+                        _model_params, _grad_clip_norm,
+                        foreach=True)
+                    if _will_record:
+                        _clip_norm_tensor = _clip_norm
+                _run_model_operation(_apply_plain_optimizer_step)
+
+            _step_elapsed = 0.0
+
+            # Step the LR scheduler (per-step, not per-epoch)
+            if _scheduler is not None:
+                _scheduler.step()
+
+            # Only call loss.item() (CUDA sync) when we actually need the scalar.
+            # Avoid hardcoded intervals — piggyback on stats_record_every to
+            # eliminate extra CUDA sync points on the critical path.
+            # [Pass 81] Pre-compute all modulo flags once per step instead of
+            # repeating the same checks in 6+ locations below.
+            _step = self.step  # cache for repeated use below
+            _is_stats_step = (_step % _stats_record_every == 0)
+            _is_checkpoint_step = (_step % _checkpoint_every == 0)
+            _need_loss_val = _is_stats_step or _is_checkpoint_step
+            # `loss` was divided by accum_steps for gradient scaling; undo that
+            # for human-readable reporting (no extra sync — same .item() call).
+            # Piggyback grad_norm .item() on the same CUDA sync as loss.item()
+            # to avoid a separate sync (both values are ready after optimizer.step).
+            _loss_val = (loss.item() * accum_steps) if _need_loss_val else None
+            # [Pass 82] Only .item() grad norm when loss sync already happened
+            # (coalesced — same CUDA stream, second sync is a no-op).
+            # Without this guard, _clip_norm_tensor.item() triggers an
+            # independent CUDA sync (~30-50μs) when _need_loss_val is False.
+            if _need_loss_val and _clip_norm_tensor is not None:
+                _grad_norm = _clip_norm_tensor.item()  # coalesced with loss sync
+                _clip_norm_tensor = None
+            if _will_record:
+                _step_elapsed = time.perf_counter() - _step_start
+
+            # Zero can be valid (forced moves, saturated scores or zero weights).
+            # Consult the original scalar only for a sampled zero, after the
+            # existing loss sync, before claiming nan_to_num replaced NaN/Inf.
+            if _loss_val is not None and _loss_val == 0.0 and _step > 0:
+                _raw_loss_val = _raw_loss.item()
+                if not math.isfinite(_raw_loss_val):
+                    if self._repair_batchnorm_stats():
+                        print("  Repaired corrupted BatchNorm running stats (NaN/Inf loss detected)")
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
+                            _step, 'nan_to_num',
+                            f'NaN/Inf loss replaced with 0 by nan_to_num; raw_loss={_raw_loss_val!r}')
+
+            # Compute current LR only at stats/checkpoint boundaries (not every step).
+            # get_last_lr() creates a list copy; deferring it to where it's consumed
+            # eliminates ~99% of calls (stats_record_every=100 → only 1% of steps).
+            if _need_loss_val:
+                current_lr = (_scheduler.get_last_lr()[0]
+                              if _scheduler is not None
+                              else _cfg.learning_rate)
+
+            # Record step stats every N steps (to avoid excessive memory usage)
+            if _loss_val is not None and _is_stats_step:
+                self._record_step_stats(_loss_val, current_lr)
+
+                # Enhanced stats collection
+                if _stats_collector:
+                    # Score distribution stats
+                    _score_stats = None
+                    if (_current_scores is not None and
+                            _step % _stats_score_dist_every == 0):
+                        if _use_padded:
+                            _score_stats = StatsCollector.compute_score_stats_padded(
+                                _current_scores, move_counts)
+                        else:
+                            _score_stats = StatsCollector.compute_score_stats(
+                                _current_scores, move_counts)
+
+                    _stats_collector.record_training_step(
+                        step=_step,
+                        loss=_loss_val,
+                        lr=current_lr,
+                        batch_size=_step_samples,
+                        step_time=_step_elapsed,
+                        grad_norm=_grad_norm,
+                        grad_norms_per_layer=_grad_norms_per_layer,
+                        score_stats=_score_stats,
+                    )
+
+            # System metrics (lower frequency)
+            if _stats_collector and _step % _stats_system_every == 0:
+                _stats_collector.record_system_metrics(_step)
+
+            # Model health (even lower frequency)
+            if _stats_collector and _step % _stats_model_health_every == 0:
+                _stats_collector.record_model_health(_model, _step)
+
+            # Checkpoint — reuse _loss_val if already computed at this step
+            # (avoids a redundant .item() CUDA sync when checkpoint and stats
+            # recording align on the same step).
+            if _is_checkpoint_step:
+                if _loss_val is not None:
+                    avg_loss = _loss_val
+                else:
+                    avg_loss = (total_loss_acc / max(num_batches, 1)).item()
+                # Log entry written in the background thread alongside the
+                # checkpoint — keeps file open/write/close off the training thread.
+                gpu_mem = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                self._save_checkpoint(avg_loss, log_entry={
+                    'step': _step,
+                    'loss': avg_loss,
+                    'lr': current_lr,
+                    'gpu_mem_mb': gpu_mem,
+                })
+
+            # Progress — print at the stats interval (which already computed .item()).
+            # Avoids extra CUDA syncs from a separate hardcoded interval.
+            if _loss_val is not None and _is_stats_step:
+                self._update_process_title(_step, _loss_val)
+                print(f"  Step {_step}, Loss: {_loss_val:.4f}")
+
+            return _step >= _train_steps
+
+        def _wait_for_training_controls() -> bool:
+            if _service_control is not None:
+                _service_control()
+            if self._stopped:
+                return False
+            if _thermal_enabled:
+                self._check_thermal_and_rest()
+            while self._paused:
+                if _service_control is not None:
+                    _service_control()
+                time.sleep(0.1)
+                if self._stopped:
+                    break
+            return not self._stopped
+
+        _pending_loss = _pending_raw_loss = None
+        _pending_scores = _pending_move_counts = None
         for batch in iter_loader:
             if len(batch) == 7:
                 (boards, move_features, move_counts, targets, reward_weights,
@@ -7419,26 +7648,13 @@ class Trainer:
                 )
                 if _will_record:
                     _step_start = time.perf_counter()
+                    _step_samples = 0
             if first_batch:
                 print(f"  First batch loaded. Processing {total_batches} batches...")
                 sys.stdout.flush()
 
-            if _service_control is not None:
-                _service_control()
-
-            if self._stopped:
+            if not _wait_for_training_controls():
                 break
-
-            while self._paused:
-                if _service_control is not None:
-                    _service_control()
-                time.sleep(0.1)
-                if self._stopped:
-                    break
-
-            # Thermal protection: only check when enabled (avoid method call overhead)
-            if _thermal_enabled:
-                self._check_thermal_and_rest()
 
             # Move to device — skip when CUDAPrefetcher already transferred
             # or when data is GPU-resident (already on device)
@@ -7494,23 +7710,23 @@ class Trainer:
                 if _value_head_enabled:
                     if _use_amp:
                         with autocast(device_type='cuda', dtype=_amp_dtype):
-                            loss, _current_scores = _run_model_operation(
+                            loss, _current_scores, _raw_loss = _run_model_operation(
                                 _compiled_fwd_loss,
                                 boards, move_features, move_counts, targets,
                                 reward_weights, value_targets)
                     else:
-                        loss, _current_scores = _run_model_operation(
+                        loss, _current_scores, _raw_loss = _run_model_operation(
                             _compiled_fwd_loss,
                             boards, move_features, move_counts, targets,
                             reward_weights, value_targets)
                 else:
                     if _use_amp:
                         with autocast(device_type='cuda', dtype=_amp_dtype):
-                            loss, _current_scores = _run_model_operation(
+                            loss, _current_scores, _raw_loss = _run_model_operation(
                                 _compiled_fwd_loss,
                                 boards, move_features, move_counts, targets, reward_weights)
                     else:
-                        loss, _current_scores = _run_model_operation(
+                        loss, _current_scores, _raw_loss = _run_model_operation(
                             _compiled_fwd_loss,
                             boards, move_features, move_counts, targets, reward_weights)
 
@@ -7625,11 +7841,10 @@ class Trainer:
                 if _loss_scale is not None:
                     loss = loss * _loss_scale
 
-                # NaN-safe: replace non-finite loss with 0 to avoid CUDA sync.
-                # GradScaler path: scaler.step() already detects NaN grads and
-                # skips the optimizer step, so this is just belt-and-suspenders.
-                # No-scaler (bfloat16) path: prevents NaN gradient corruption.
-                # Zero loss → zero gradients → optimizer step is a near-no-op.
+                # Retain the original scalar for diagnostics before replacing
+                # nonfinite loss. This does not guarantee finite gradients;
+                # GradScaler, when enabled, separately checks them at step().
+                _raw_loss = loss.detach()
                 loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
                 if _scaler is not None:
@@ -7692,173 +7907,52 @@ class Trainer:
                 if _loss_scale is not None:
                     loss = loss * _loss_scale
 
-                # NaN-safe: replace non-finite loss with 0 (no CUDA sync needed).
-                # No-AMP path typically runs on CPU where sync isn't a concern,
-                # but consistency with AMP path and no behavioral change.
+                # Preserve pre-sanitization evidence, as in the AMP path.
+                _raw_loss = loss.detach()
                 loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
                 loss.backward()
 
             _micro_step += 1
+            if _will_record:
+                # Match sample throughput to the complete timed optimizer
+                # window, including smaller final microbatches.
+                _step_samples += boards.shape[0]
             first_batch = False
 
-            # --- Optimizer step: only after accumulating enough gradients ---
-            if _micro_step < accum_steps:
-                # Accumulate loss for reporting (unscaled).  In-place add_
-                # with alpha avoids a temporary tensor from loss * accum_steps.
-                total_loss_acc.add_(loss.detach(), alpha=accum_steps)
-                num_batches += 1
-                continue
-
-            # Accumulated enough — clip, step, and reset
-            _micro_step = 0
-
-            # Gradient clipping + stats.  clip_grad_norm_ returns the total
-            # (unclipped) grad norm, so we capture it instead of iterating all
-            # parameters a second time in compute_gradient_stats.  Per-layer
-            # norms are only collected at model_health frequency (much lower)
-            # to avoid ~40 .item() CUDA syncs per stats step.
-            # Defer .item() on grad norm: store the GPU tensor and call .item()
-            # only when we already sync for loss.item() — avoids an extra CUDA
-            # sync on every stats interval (~50μs saved per recorded step).
-            # [Pass 84] _will_record already computes the same condition as
-            # _want_grad_stats — reuse it to avoid a redundant modulo per step.
-            _clip_norm_tensor = None  # GPU tensor, deferred .item()
-
-            if _use_amp and _scaler is not None:
-                if _grad_clip_norm is not None:
-                    _scaler.unscale_(_optimizer)
-                    _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        _model_params, _grad_clip_norm,
-                        foreach=True)
-                    if _will_record:
-                        _clip_norm_tensor = _clip_norm
-                _run_model_operation(_apply_scaled_optimizer_step)
-            else:
-                if _grad_clip_norm is not None:
-                    _clip_norm = torch.nn.utils.clip_grad_norm_(
-                        _model_params, _grad_clip_norm,
-                        foreach=True)
-                    if _will_record:
-                        _clip_norm_tensor = _clip_norm
-                _run_model_operation(_apply_plain_optimizer_step)
-
-            # Accumulate on GPU — no sync. Only .item() when needed for logging.
-            # Undo the /accum_steps scaling so total_loss_acc reflects true loss.
-            # In-place add_ with alpha avoids a temporary tensor allocation.
+            # Accumulate the epoch loss once per successful backward.
             total_loss_acc.add_(loss.detach(), alpha=accum_steps)
             num_batches += 1
-            _step_elapsed = 0.0
+            if _micro_step < accum_steps:
+                # Independent scalars survive a later compiled forward or a
+                # rejected batch without retaining its autograd graph. These
+                # copies occur only when gradient accumulation is enabled.
+                _pending_loss = loss.detach().clone()
+                _pending_raw_loss = _raw_loss.detach().clone()
+                if (_will_record
+                        and (self.step + 1) % _stats_score_dist_every == 0):
+                    # Preserve the last successful sample across trailing
+                    # rejects without retaining compiled graph output storage.
+                    _pending_scores = _current_scores.clone()
+                    _pending_move_counts = move_counts.clone()
+                continue
 
-            # Step the LR scheduler (per-step, not per-epoch)
-            if _scheduler is not None:
-                _scheduler.step()
+            _micro_step = 0
+            _pending_loss = _pending_raw_loss = None
+            _pending_scores = _pending_move_counts = None
 
-            # Only call loss.item() (CUDA sync) when we actually need the scalar.
-            # Avoid hardcoded intervals — piggyback on stats_record_every to
-            # eliminate extra CUDA sync points on the critical path.
-            # [Pass 81] Pre-compute all modulo flags once per step instead of
-            # repeating the same checks in 6+ locations below.
-            _step = self.step  # cache for repeated use below
-            _is_stats_step = (_step % _stats_record_every == 0)
-            _is_checkpoint_step = (_step % _checkpoint_every == 0)
-            _need_loss_val = _is_stats_step or _is_checkpoint_step
-            # `loss` was divided by accum_steps for gradient scaling; undo that
-            # for human-readable reporting (no extra sync — same .item() call).
-            # Piggyback grad_norm .item() on the same CUDA sync as loss.item()
-            # to avoid a separate sync (both values are ready after optimizer.step).
-            _loss_val = (loss.item() * accum_steps) if _need_loss_val else None
-            # [Pass 82] Only .item() grad norm when loss sync already happened
-            # (coalesced — same CUDA stream, second sync is a no-op).
-            # Without this guard, _clip_norm_tensor.item() triggers an
-            # independent CUDA sync (~30-50μs) when _need_loss_val is False.
-            if _need_loss_val and _clip_norm_tensor is not None:
-                _grad_norm = _clip_norm_tensor.item()  # coalesced with loss sync
-                _clip_norm_tensor = None
-            if _will_record:
-                _step_elapsed = time.perf_counter() - _step_start
-
-            # Periodic NaN monitoring: piggyback on the stats sync to check
-            # for NaN losses without an extra CUDA sync.  nan_to_num converts
-            # NaN → 0.0, so a zero loss at a stats interval signals a bad batch.
-            if _loss_val is not None and _loss_val == 0.0 and _step > 0:
-                # loss == 0.0 is extremely unlikely in normal training (cross-entropy
-                # is always > 0 for non-degenerate data).  Likely a nan_to_num replacement.
-                if self._repair_batchnorm_stats():
-                    print("  Repaired corrupted BatchNorm running stats (NaN loss detected)")
-                if _stats_collector:
-                    _stats_collector.record_non_finite_event(
-                        _step, 'nan_to_num', 'NaN/Inf loss replaced with 0 by nan_to_num')
-
-            # Compute current LR only at stats/checkpoint boundaries (not every step).
-            # get_last_lr() creates a list copy; deferring it to where it's consumed
-            # eliminates ~99% of calls (stats_record_every=100 → only 1% of steps).
-            if _need_loss_val:
-                current_lr = (_scheduler.get_last_lr()[0]
-                              if _scheduler is not None
-                              else _cfg.learning_rate)
-
-            # Record step stats every N steps (to avoid excessive memory usage)
-            if _loss_val is not None and _is_stats_step:
-                self._record_step_stats(_loss_val, current_lr)
-
-                # Enhanced stats collection
-                if _stats_collector:
-                    # Score distribution stats
-                    _score_stats = None
-                    if (_current_scores is not None and
-                            _step % _stats_score_dist_every == 0):
-                        if _use_padded:
-                            _score_stats = StatsCollector.compute_score_stats_padded(
-                                _current_scores, move_counts)
-                        else:
-                            _score_stats = StatsCollector.compute_score_stats(
-                                _current_scores, move_counts)
-
-                    _stats_collector.record_training_step(
-                        step=_step,
-                        loss=_loss_val,
-                        lr=current_lr,
-                        batch_size=boards.shape[0],
-                        step_time=_step_elapsed,
-                        grad_norm=_grad_norm,
-                        grad_norms_per_layer=_grad_norms_per_layer,
-                        score_stats=_score_stats,
-                    )
-
-            # System metrics (lower frequency)
-            if _stats_collector and _step % _stats_system_every == 0:
-                _stats_collector.record_system_metrics(_step)
-
-            # Model health (even lower frequency)
-            if _stats_collector and _step % _stats_model_health_every == 0:
-                _stats_collector.record_model_health(_model, _step)
-
-            # Checkpoint — reuse _loss_val if already computed at this step
-            # (avoids a redundant .item() CUDA sync when checkpoint and stats
-            # recording align on the same step).
-            if _is_checkpoint_step:
-                if _loss_val is not None:
-                    avg_loss = _loss_val
-                else:
-                    avg_loss = (total_loss_acc / max(num_batches, 1)).item()
-                # Log entry written in the background thread alongside the
-                # checkpoint — keeps file open/write/close off the training thread.
-                gpu_mem = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
-                self._save_checkpoint(avg_loss, log_entry={
-                    'step': _step,
-                    'loss': avg_loss,
-                    'lr': current_lr,
-                    'gpu_mem_mb': gpu_mem,
-                })
-
-            # Progress — print at the stats interval (which already computed .item()).
-            # Avoids extra CUDA syncs from a separate hardcoded interval.
-            if _loss_val is not None and _is_stats_step:
-                self._update_process_title(_step, _loss_val)
-                print(f"  Step {_step}, Loss: {_loss_val:.4f}")
-
-            if _step >= _train_steps:
+            if _finish_optimizer_step(
+                loss, _raw_loss, _current_scores, move_counts, accum_steps,
+            ):
                 break
+
+        # Natural exhaustion still owns the last successful microbatches,
+        # even when trailing batches failed a sanity check. Explicit STOP
+        # discards pending work, matching the per-batch cancellation contract.
+        if _micro_step and _wait_for_training_controls():
+            _finish_optimizer_step(
+                _pending_loss, _pending_raw_loss, _pending_scores,
+                _pending_move_counts, _micro_step,
+            )
 
         epoch_time = time.time() - epoch_start_time
 
@@ -8572,7 +8666,7 @@ class Trainer:
         # epoch via .zero_().  Eliminates ~650 torch.tensor() GPU allocations per
         # self-play cycle (one per epoch) that each go through CUDA caching allocator.
         _total_loss_acc = torch.tensor(0.0, device=self.device)
-        _consecutive_dead_epochs = 0  # epochs where all batches were skipped (non-finite)
+        _consecutive_dead_epochs = 0  # rejected inputs or an unusable gradient scale
         _DEAD_EPOCH_RECOVERY_THRESHOLD = 3  # trigger checkpoint rollback after this many
         _stale_epochs = 0  # epochs since last data refresh
         _max_stale = self.config.max_stale_epochs  # 0 = unlimited
@@ -8685,14 +8779,22 @@ class Trainer:
                       f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
 
             # --- Dead-epoch recovery: detect & recover from stuck non-finite state ---
-            if getattr(self, '_last_epoch_batches', -1) == 0:
+            # Successful backward calls can still end in rejected AMP updates.
+            # A finite positive scale may need several warm-up reductions, but
+            # zero/NaN/Inf cannot recover through GradScaler's multiplicative update.
+            _epoch_scaler = getattr(self, 'scaler', None)
+            _epoch_scale = (_epoch_scaler.get_scale()
+                            if _epoch_scaler is not None else 1.0)
+            _unusable_scale = not (0.0 < _epoch_scale < math.inf)
+            if getattr(self, '_last_epoch_batches', -1) == 0 or _unusable_scale:
                 _consecutive_dead_epochs += 1
                 if _consecutive_dead_epochs >= _DEAD_EPOCH_RECOVERY_THRESHOLD:
                     print(f"\n{'='*60}")
                     print(f"WARNING: {_consecutive_dead_epochs} consecutive epochs with "
-                          f"all batches skipped (non-finite scores).")
-                    weights_corrupted = self._has_non_finite_tensors()
-                    if weights_corrupted:
+                          f"unusable training progress.")
+                    if _unusable_scale:
+                        print(f"  Cause: GradScaler scale is unusable ({_epoch_scale!r})")
+                    elif self._has_non_finite_tensors():
                         print("  Cause: model weights contain NaN/Inf")
                     else:
                         print("  Cause: FP16 overflow (weights finite in FP32, "
