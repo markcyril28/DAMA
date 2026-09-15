@@ -140,6 +140,14 @@ def _fsync_file(path: Path, *, windows: bool = os.name == "nt") -> None:
 class AtomicBuildExt(build_ext):
     """Publish in-place extension binaries with one atomic replacement."""
 
+    def run(self):
+        # develop and editable_wheel enable inplace after CLI parsing. Check
+        # the finalized option before setuptools clears it while compiling.
+        if self.inplace:
+            _refuse_mapped_inplace_build(
+                self.extensions, argv=["build_ext", "--inplace"])
+        return super().run()
+
     def copy_file(
         self,
         infile,
