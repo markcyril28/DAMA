@@ -23,8 +23,9 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import tempfile
 from typing import Any, Mapping, Optional
+
+from .fork_writers import fork_safe_mkstemp
 
 
 RUN_STATUS_SCHEMA_VERSION = 1
@@ -281,18 +282,37 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     though the new complete file may already be visible.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temp_name = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        with fork_safe_mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent,
+        ) as (fd, temp_name):
+            # Retain raw ownership through partial stream construction: its
+            # cleanup must not free a number another thread could reuse. The
+            # outer owner also protects open/close against self-play forks.
+            handle = os.fdopen(
+                fd, "w", encoding="utf-8", newline="\n", closefd=False,
+            )
+            try:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            except BaseException:
+                # A buffered close failure must not replace the first error.
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+                raise
+            else:
+                handle.close()
         os.replace(temp_name, path)
         _fsync_directory(path.parent)
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
+    except BaseException:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
         raise
