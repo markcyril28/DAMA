@@ -1654,6 +1654,16 @@ class StatsCollector:
                     'latest': dict(latest[-1]) if latest else None,
                 }
 
+            memory_diagnostics = {}
+            for name in ('gpu_mem_allocated_mb', 'gpu_mem_reserved_mb',
+                         'process_rss_gb'):
+                buffer = getattr(self, name)
+                latest = buffer.last_n(1)
+                memory_diagnostics[name] = {
+                    **buffer.summary(100),
+                    'latest': dict(latest[-1]) if latest else None,
+                }
+
             report: Dict[str, Any] = {
                 'meta': {
                     'session_id': self.session_id,
@@ -1723,14 +1733,14 @@ class StatsCollector:
                     'top1_margin_summary': self.top1_margin.summary(1000),
                 },
                 'gpu_memory': {
-                    'allocated_mb': self.gpu_mem_allocated_mb.summary(100),
-                    'reserved_mb': self.gpu_mem_reserved_mb.summary(100),
+                    'allocated_mb': memory_diagnostics['gpu_mem_allocated_mb'],
+                    'reserved_mb': memory_diagnostics['gpu_mem_reserved_mb'],
                 },
                 'system': {
                     'gpu_utilization': self.gpu_utilization_pct.summary(100),
                     'cpu_percent': self.cpu_percent.summary(100),
                     'ram_used_gb': self.ram_used_gb.summary(100),
-                    'process_rss_gb': self.process_rss_gb.summary(100),
+                    'process_rss_gb': memory_diagnostics['process_rss_gb'],
                     # Throttle diagnostics (NVML; empty on ROCm/no-NVML).
                     **gpu_diagnostics,
                 },
