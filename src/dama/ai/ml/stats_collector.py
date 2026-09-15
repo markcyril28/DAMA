@@ -25,7 +25,6 @@ import os
 import csv
 import json
 import math
-import tempfile
 import time
 import platform
 import statistics
@@ -44,6 +43,7 @@ except ImportError:
 
 import torch
 
+from .fork_writers import fork_safe_mkstemp
 from .run_status import _fsync_directory
 
 
@@ -71,37 +71,39 @@ def _atomic_text_writer(
 ) -> Iterator[TextIO]:
     """Publish one text artifact only after its file and name are durable."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temp_name)
+    temp_name = None
     try:
-        with os.fdopen(
-            fd,
-            "w",
-            encoding="utf-8",
-            newline=newline,
-        ) as handle:
-            fd = -1
-            yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        with fork_safe_mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent,
+        ) as (fd, temp_name):
+            # The raw owner protects the complete lifetime against forks.
+            # Partial wrapper construction must not release its fd early.
+            handle = os.fdopen(
+                fd, "w", encoding="utf-8", newline=newline, closefd=False,
+            )
+            try:
+                yield handle
+                handle.flush()
+                os.fsync(handle.fileno())
+            except BaseException:
+                # Closing buffered output can fail too. Preserve the write or
+                # interruption error while still releasing the stream.
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+                raise
+            else:
+                handle.close()
+        os.replace(temp_name, path)
         _fsync_directory(path.parent)
     finally:
-        if fd >= 0:
+        if temp_name is not None:
             try:
-                os.close(fd)
+                Path(temp_name).unlink(missing_ok=True)
             except OSError:
+                # Cleanup must not hide the originating publication failure.
                 pass
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            # Cleanup is best-effort and must not hide the originating write
-            # or replace failure.
-            pass
 
 
 def _append_jsonl_atomic(path: Path, row: Dict[str, Any]) -> None:
@@ -223,8 +225,14 @@ class MetricBuffer:
     def summary(self, window: int = 100) -> Dict[str, Any]:
         """Compute summary stats over the last `window` entries."""
         recent = self.last_n_values(window)
+        recent_finite_count = sum(math.isfinite(value) for value in recent)
         return {
             'total_count': self._total_count,
+            # A safe mean of zero is unavailable when no sample is finite.
+            'finite_count': self._finite_count,
+            'nonfinite_count': self._total_count - self._finite_count,
+            'recent_finite_count': recent_finite_count,
+            'recent_nonfinite_count': len(recent) - recent_finite_count,
             'buffered_count': len(self._data),
             'running_mean': self.running_mean,
             'running_min': self.running_min,
@@ -233,6 +241,8 @@ class MetricBuffer:
             'recent_stdev': _safe_stdev(recent),
             'recent_min': min(recent) if recent else 0.0,
             'recent_max': max(recent) if recent else 0.0,
+            'recent_finite_max': max(
+                (value for value in recent if math.isfinite(value)), default=None),
         }
 
 
@@ -343,6 +353,8 @@ class StatsCollector:
         self._loss_ema = None
         self._loss_ema_alpha = 0.01  # Slow EMA for convergence detection
         self._loss_plateau_steps = 0
+        self._loss_plateau_observations = 0
+        self._loss_previous_step: Optional[int] = None
         self._loss_plateau_threshold = 1e-4
         self._step_since_last_flush = 0
         # Wall-clock fallback: force flush every N seconds even if record-count
@@ -350,6 +362,7 @@ class StatsCollector:
         # advances slowly (simultaneous mode) or the run exits before flush_every.
         self._last_flush_time = time.time()
         self._flush_max_seconds = 60.0
+        self._incremental_flush_failures = 0
 
         # Global checkpoint steps are sparse observations, not a count of
         # optimizer steps.  Track the resumed session's step range explicitly
@@ -432,9 +445,10 @@ class StatsCollector:
             step: Global step number.
             loss: Training loss for this step.
             lr: Current learning rate.
-            batch_size: Actual batch size for this step.
+            batch_size: Total samples processed during this optimizer step,
+                including every gradient-accumulation microbatch.
             step_time: Wall-clock time for this step in seconds.
-            grad_norm: Global gradient norm (post-clipping).
+            grad_norm: Global gradient norm before clipping (clip_grad_norm_ return).
             grad_norms_per_layer: Per-layer gradient norms.
             score_stats: Dict with keys 'mean', 'std', 'entropy', 'top1_margin'.
         """
@@ -472,17 +486,30 @@ class StatsCollector:
                 if 'top1_margin' in score_stats:
                     self.top1_margin.append(score_stats['top1_margin'], step)
 
-            # Convergence tracking (EMA of loss)
+            # The EMA consumes sampled losses, but durations use their actual
+            # optimizer steps. Missing or non-monotonic evidence starts a new
+            # chain instead of extending a plateau across an unknown interval.
             if math.isfinite(loss):
-                if self._loss_ema is None:
+                previous_step = self._loss_previous_step
+                if previous_step is None or step <= previous_step:
                     self._loss_ema = loss
+                    self._loss_plateau_steps = 0
+                    self._loss_plateau_observations = 1
                 else:
                     prev_ema = self._loss_ema
                     self._loss_ema = self._loss_ema_alpha * loss + (1 - self._loss_ema_alpha) * self._loss_ema
                     if abs(self._loss_ema - prev_ema) < self._loss_plateau_threshold:
-                        self._loss_plateau_steps += 1
+                        self._loss_plateau_steps += step - previous_step
+                        self._loss_plateau_observations += 1
                     else:
                         self._loss_plateau_steps = 0
+                        self._loss_plateau_observations = 1
+                self._loss_previous_step = step
+            else:
+                self._loss_ema = None
+                self._loss_previous_step = None
+                self._loss_plateau_steps = 0
+                self._loss_plateau_observations = 0
 
             # Auto-flush: fire on either record-count threshold OR wall-clock interval.
             self._step_since_last_flush += 1
@@ -821,14 +848,19 @@ class StatsCollector:
             valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
 
             valid_scores = scores[valid_mask]
+            if valid_scores.numel() == 0:
+                return result
             finite_mask = torch.isfinite(valid_scores)
             finite_scores = valid_scores[finite_mask]
-            if finite_scores.numel() == 0:
-                return result
-
-            result['mean'] = finite_scores.mean().item()
-            result['std'] = (finite_scores.std().item()
-                             if finite_scores.numel() > 1 else 0.0)
+            if finite_scores.numel() == valid_scores.numel():
+                result['mean'] = finite_scores.mean().item()
+                result['std'] = (finite_scores.std().item()
+                                 if finite_scores.numel() > 1 else 0.0)
+            else:
+                # These summaries describe the complete sampled distribution.
+                # Finite rows cannot hide invalid forced-move scores, which
+                # supply no entropy observation of their own.
+                result['mean'] = result['std'] = float('nan')
 
             # Filter to positions with >1 move for entropy / margin
             multi = move_counts > 1
@@ -848,7 +880,7 @@ class StatsCollector:
 
             # top-1 margin
             ss = ms.clone()
-            ss[~mm] = -1e9
+            ss[~mm] = float('-inf')
             sorted_s, _ = ss.sort(dim=1, descending=True)
             result['top1_margin'] = (sorted_s[:, 0] - sorted_s[:, 1]).mean().item()
 
@@ -869,13 +901,16 @@ class StatsCollector:
         """
         result: Dict[str, float] = {}
         with torch.no_grad():
-            finite_scores = scores[torch.isfinite(scores)]
-            if finite_scores.numel() == 0:
+            if scores.numel() == 0:
                 return result
-
-            result['mean'] = finite_scores.mean().item()
-            result['std'] = (finite_scores.std().item()
-                             if finite_scores.numel() > 1 else 0.0)
+            finite_scores = scores[torch.isfinite(scores)]
+            if finite_scores.numel() == scores.numel():
+                result['mean'] = finite_scores.mean().item()
+                result['std'] = (finite_scores.std().item()
+                                 if finite_scores.numel() > 1 else 0.0)
+            else:
+                # Preserve the same invalid-sample contract as the padded path.
+                result['mean'] = result['std'] = float('nan')
 
             batch_size = move_counts.shape[0]
             max_moves = move_counts.max().item()
@@ -907,7 +942,7 @@ class StatsCollector:
             result['entropy'] = ent.sum(dim=1).mean().item()
 
             ss = ms.clone()
-            ss[~mm] = -1e9
+            ss[~mm] = float('-inf')
             sorted_s, _ = ss.sort(dim=1, descending=True)
             result['top1_margin'] = (sorted_s[:, 0] - sorted_s[:, 1]).mean().item()
 
@@ -984,6 +1019,7 @@ class StatsCollector:
         result_distribution: Optional[Dict[str, int]] = None,
         game_lengths: Optional[List[int]] = None,
         avg_moves_per_position: Optional[float] = None,
+        game_length_basis: Optional[str] = None,
     ) -> None:
         """Record statistics for a self-play data generation epoch."""
         with self._lock:
@@ -1003,6 +1039,8 @@ class StatsCollector:
                 record['result_distribution'] = result_distribution
             if game_lengths:
                 sorted_lengths = sorted(game_lengths)
+                if game_length_basis is not None:
+                    record['game_length_basis'] = game_length_basis
                 record['game_length_stats'] = {
                     'mean': _safe_mean(game_lengths),
                     'median': _safe_median(game_lengths),
@@ -1146,32 +1184,62 @@ class StatsCollector:
             # Loss EMA and plateau detection
             metrics['loss_ema'] = self._loss_ema
             metrics['loss_plateau_steps'] = self._loss_plateau_steps
+            metrics['loss_plateau_observations'] = self._loss_plateau_observations
             metrics['loss_is_plateauing'] = self._loss_plateau_steps > 500
 
-            # Loss improvement rate (over different windows)
+            # Keep the public step-window keys, using only observations within
+            # (latest_step - window, latest_step]. Sparse sampling cannot supply
+            # a short-window trend. A repeated/decreasing step begins a new
+            # history segment, so rollback observations cannot mix revisions.
+            entries = self.loss.all_entries()
+            latest_step = entries[-1]['step'] if entries else 0
+            recent_entries = []
+            next_step = latest_step + 1
+            for entry in reversed(entries):
+                step = entry['step']
+                if step >= next_step or step <= latest_step - 5000:
+                    break
+                recent_entries.append(entry)
+                next_step = step
+            metrics['loss_window_basis'] = 'optimizer_steps'
+            metrics['loss_window_sample_counts'] = {}
             for window_name, n in [('100', 100), ('1000', 1000), ('5000', 5000)]:
-                recent = self.loss.last_n_values(n)
-                if len(recent) >= 10:
-                    first_half = _safe_mean(recent[:len(recent) // 2])
-                    second_half = _safe_mean(recent[len(recent) // 2:])
+                recent = [entry for entry in recent_entries
+                          if entry['step'] > latest_step - n
+                          and math.isfinite(entry['value'])]
+                midpoint = latest_step - n / 2
+                first = [entry['value'] for entry in recent if entry['step'] <= midpoint]
+                second = [entry['value'] for entry in recent if entry['step'] > midpoint]
+                metrics['loss_window_sample_counts'][window_name] = len(recent)
+                metrics[f'loss_improvement_{window_name}'] = None
+                metrics[f'loss_improvement_pct_{window_name}'] = None
+                if len(recent) >= 10 and first and second:
+                    first_half = _safe_mean(first)
+                    second_half = _safe_mean(second)
                     improvement = first_half - second_half  # positive = improving
                     metrics[f'loss_improvement_{window_name}'] = improvement
                     # Relative improvement
                     if first_half > 0:
                         metrics[f'loss_improvement_pct_{window_name}'] = improvement / first_half * 100
-                else:
-                    metrics[f'loss_improvement_{window_name}'] = None
 
             # Gradient health
             grad_recent = self.grad_norm_global.last_n_values(100)
             if grad_recent:
-                metrics['grad_norm_mean'] = _safe_mean(grad_recent)
-                metrics['grad_norm_stdev'] = _safe_stdev(grad_recent)
-                metrics['grad_norm_max'] = max(grad_recent) if grad_recent else 0
-                # Gradient explosion indicator
-                metrics['grad_exploding'] = any(g > 100.0 for g in grad_recent)
-                # Gradient vanishing indicator
-                metrics['grad_vanishing'] = _safe_mean(grad_recent) < 1e-6
+                finite_grads = [g for g in grad_recent if math.isfinite(g)]
+                invalid_count = len(grad_recent) - len(finite_grads)
+                metrics['grad_norm_recent_finite_count'] = len(finite_grads)
+                metrics['grad_norm_recent_nonfinite_count'] = invalid_count
+                metrics['grad_norm_mean'] = (
+                    _safe_mean(finite_grads) if finite_grads else None)
+                metrics['grad_norm_stdev'] = (
+                    _safe_stdev(finite_grads) if finite_grads else None)
+                metrics['grad_norm_max'] = max(finite_grads, default=None)
+                # Invalid observations are stability evidence, not a measured
+                # zero or a finite explosion that ordinary clipping can fix.
+                metrics['grad_exploding'] = any(g > 100.0 for g in finite_grads)
+                metrics['grad_vanishing'] = bool(
+                    finite_grads and not invalid_count
+                    and metrics['grad_norm_mean'] < 1e-6)
 
             # Throughput statistics
             throughput_recent = self.throughput_samples_sec.last_n_values(100)
@@ -1229,19 +1297,43 @@ class StatsCollector:
             conv = self.get_convergence_metrics()
 
             # --- Loss plateau ---
-            if conv.get('loss_is_plateauing'):
+            loss_summary = self.loss.summary(100)
+            if loss_summary['nonfinite_count']:
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"{loss_summary['nonfinite_count']} nonfinite loss observations "
+                        "across the session. Inspect loss computation and numerical-"
+                        "stability events before interpreting convergence or tuning training."
+                    ),
+                })
+            elif conv.get('loss_is_plateauing'):
                 hints.append({
                     'area': 'convergence',
                     'severity': 'warning',
                     'hint': (
-                        f"Loss has been plateauing for {conv['loss_plateau_steps']} steps. "
+                        "Sampled loss EMA has stayed nearly constant across "
+                        f"{conv['loss_plateau_observations']} observations spanning "
+                        f"{conv['loss_plateau_steps']} optimizer steps. "
                         "Consider: (1) reducing learning rate, (2) increasing self-play "
                         "diversity (noise_prob), (3) adding data from harder difficulties."
                     ),
                 })
 
             # --- Gradient issues ---
-            if conv.get('grad_exploding'):
+            if conv.get('grad_norm_recent_nonfinite_count', 0):
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"{conv['grad_norm_recent_nonfinite_count']} nonfinite gradient "
+                        "norm observations in the last 100 sampled records. Inspect "
+                        "backward-pass numerical stability and model weights before "
+                        "tuning the learning rate or gradient clipping."
+                    ),
+                })
+            elif conv.get('grad_exploding'):
                 hints.append({
                     'area': 'stability',
                     'severity': 'critical',
@@ -1332,9 +1424,43 @@ class StatsCollector:
                             ),
                         })
 
+            # Forced single-move batches have no entropy sample. Their invalid
+            # score summaries still override older confidence evidence.
+            invalid_score_counts = {
+                name: sum(not math.isfinite(value) for value in buffer.last_n_values(100))
+                for name, buffer in (("mean", self.score_mean), ("std", self.score_std))
+            }
+            invalid_score_counts = {
+                name: count for name, count in invalid_score_counts.items() if count
+            }
+            if invalid_score_counts:
+                detail = ", ".join(
+                    f"{name}: {count}" for name, count in invalid_score_counts.items())
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"Recorded nonfinite score distribution observations ({detail}) "
+                        "in the last 100 sampled records per metric. Inspect model "
+                        "scores and score statistics before tuning exploration."
+                    ),
+                })
+
             # --- Score entropy ---
             entropy_recent = self.score_entropy.last_n_values(100)
-            if entropy_recent:
+            invalid_entropy_count = sum(
+                not math.isfinite(value) for value in entropy_recent)
+            if invalid_entropy_count:
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"{invalid_entropy_count} nonfinite score entropy observations "
+                        "in the last 100 sampled records. Inspect model scores and "
+                        "entropy computation before tuning exploration."
+                    ),
+                })
+            elif entropy_recent and not invalid_score_counts:
                 avg_entropy = _safe_mean(entropy_recent)
                 if avg_entropy < 0.1:
                     hints.append({
@@ -1361,10 +1487,12 @@ class StatsCollector:
                 elapsed = max(
                     0.0, (datetime.now() - self.session_start).total_seconds())
 
-                def _metric_snapshot(buffer: MetricBuffer) -> Dict[str, Any]:
+                def _metric_snapshot(
+                    buffer: MetricBuffer, recent_n: int = 100,
+                ) -> Dict[str, Any]:
                     latest = buffer.last_n(1)
                     return {
-                        **buffer.summary(100),
+                        **buffer.summary(recent_n),
                         'latest': dict(latest[-1]) if latest else None,
                     }
 
@@ -1401,6 +1529,15 @@ class StatsCollector:
                     'grad_norm_summary': self.grad_norm_global.summary(100),
                     'throughput_summary': self.throughput_samples_sec.summary(100),
                     'step_time_summary': self.step_time_sec.summary(100),
+                    # Preserve sampled score evidence when shutdown skips the
+                    # terminal report. Match its 1000-observation summaries;
+                    # latest steps distinguish score cadence from loss cadence.
+                    'score_distribution': {
+                        'mean_summary': _metric_snapshot(self.score_mean, 1000),
+                        'std_summary': _metric_snapshot(self.score_std, 1000),
+                        'entropy_summary': _metric_snapshot(self.score_entropy, 1000),
+                        'top1_margin_summary': _metric_snapshot(self.top1_margin, 1000),
+                    },
                     'system_summary': {
                         'gpu_mem_allocated_mb': _metric_snapshot(
                             self.gpu_mem_allocated_mb),
@@ -1417,6 +1554,27 @@ class StatsCollector:
                         'gpu_temp_c': _metric_snapshot(self.gpu_temp_c),
                         'gpu_throttle_reasons': _metric_snapshot(
                             self.gpu_throttle_reasons),
+                    },
+                    # Reuse already-sampled CPU values: interrupted runs may
+                    # never export the terminal model-health report. Latest
+                    # sample steps disclose the lower-frequency cadence.
+                    'model_health': {
+                        'param_norm_summaries': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.param_norms.items()
+                        },
+                        'weight_update_ratio_summaries': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.weight_update_ratios.items()
+                        },
+                        'bn_running_mean_norms': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.bn_running_mean_norms.items()
+                        },
+                        'bn_running_var_means': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.bn_running_var_means.items()
+                        },
                     },
                     'latest_records': {
                         'selfplay': (
@@ -1447,8 +1605,31 @@ class StatsCollector:
                     'convergence': self.get_convergence_metrics(),
                 }
                 _append_jsonl_atomic(path, snapshot)
-            except Exception:
-                pass  # Non-critical — don't disrupt training
+            except Exception as exc:
+                self._incremental_flush_failures += 1
+                if self._incremental_flush_failures == 1:
+                    # Report the first failure in a streak without flooding
+                    # the console on every automatic retry. Keep telemetry
+                    # fail-open even when the console itself is unavailable.
+                    try:
+                        print(
+                            f"Warning: Could not flush incremental statistics {path}: "
+                            f"{type(exc).__name__}: {exc}. "
+                            "Training continues; will retry at the next flush."
+                        )
+                    except (OSError, ValueError):
+                        pass
+            else:
+                failures = self._incremental_flush_failures
+                self._incremental_flush_failures = 0
+                if failures:
+                    try:
+                        print(
+                            f"Incremental statistics recovered: {path} "
+                            f"({failures} failed flushes)."
+                        )
+                    except (OSError, ValueError):
+                        pass
 
     # ===================================================================
     # Session report generation
@@ -1464,6 +1645,14 @@ class StatsCollector:
         with self._lock:
             session_end = datetime.now()
             elapsed = (session_end - self.session_start).total_seconds()
+
+            gpu_diagnostics = {}
+            for name, buffer in self._gpu_telemetry_buffers.items():
+                latest = buffer.last_n(1)
+                gpu_diagnostics[name] = {
+                    **buffer.summary(100),
+                    'latest': dict(latest[-1]) if latest else None,
+                }
 
             report: Dict[str, Any] = {
                 'meta': {
@@ -1543,10 +1732,7 @@ class StatsCollector:
                     'ram_used_gb': self.ram_used_gb.summary(100),
                     'process_rss_gb': self.process_rss_gb.summary(100),
                     # Throttle diagnostics (NVML; empty on ROCm/no-NVML).
-                    'gpu_power_w': self.gpu_power_w.summary(100),
-                    'gpu_sm_clock_mhz': self.gpu_sm_clock_mhz.summary(100),
-                    'gpu_temp_c': self.gpu_temp_c.summary(100),
-                    'gpu_throttle_reasons': self.gpu_throttle_reasons.summary(100),
+                    **gpu_diagnostics,
                 },
                 'model_health': {
                     'param_norm_summaries': {
@@ -1797,13 +1983,25 @@ class StatsCollector:
             # Loss
             loss_s = self.loss.summary(100)
             print(f"\n  Loss:")
-            print(f"    Latest (avg 100):   {loss_s['recent_mean']:.6f}")
-            print(f"    Best:               {loss_s['running_min']:.6f}")
-            print(f"    Std (last 100):     {loss_s['recent_stdev']:.6f}")
-            if self._loss_ema is not None:
+            recent_mean = (f"{loss_s['recent_mean']:.6f}"
+                           if loss_s['recent_finite_count'] else
+                           "Unavailable (no finite observations)")
+            recent_std = (f"{loss_s['recent_stdev']:.6f}"
+                          if loss_s['recent_finite_count'] else
+                          "Unavailable (no finite observations)")
+            best = (f"{loss_s['running_min']:.6f}" if loss_s['finite_count'] else
+                    "Unavailable (no finite observations)")
+            print(f"    Latest (avg 100):   {recent_mean}")
+            print(f"    Best:               {best}")
+            print(f"    Std (last 100):     {recent_std}")
+            if loss_s['nonfinite_count']:
+                print(f"    Nonfinite (all time): {loss_s['nonfinite_count']} "
+                      "(statistics use finite observations only)")
+                print(f"    Nonfinite (last 100): {loss_s['recent_nonfinite_count']}")
+            if self._loss_ema is not None and not loss_s['nonfinite_count']:
                 print(f"    EMA:                {self._loss_ema:.6f}")
             imp = conv.get('loss_improvement_1000')
-            if imp is not None:
+            if imp is not None and not loss_s['nonfinite_count']:
                 print(f"    Improvement (1K):   {imp:+.6f}")
 
             # Throughput
@@ -1831,8 +2029,14 @@ class StatsCollector:
             gs = self.grad_norm_global.summary(100)
             if gs['total_count'] > 0:
                 print(f"\n  Gradient Norms:")
-                print(f"    Mean (last 100):    {gs['recent_mean']:.4f}")
-                print(f"    Max (last 100):     {gs['recent_max']:.4f}")
+                if gs['recent_finite_count']:
+                    print(f"    Mean (last 100):    {gs['recent_mean']:.4f}")
+                    print(f"    Max (last 100):     {gs['recent_finite_max']:.4f}")
+                else:
+                    print("    Mean/Max:           Unavailable (no finite observations)")
+                if gs['recent_nonfinite_count']:
+                    print(f"    Nonfinite (last 100): {gs['recent_nonfinite_count']} "
+                          "(statistics use finite observations only)")
 
             # GPU
             gpu_s = self.gpu_mem_allocated_mb.summary(10)
