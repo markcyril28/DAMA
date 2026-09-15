@@ -1,5 +1,7 @@
 """Safety contracts for publishing locally built Cython extensions."""
 
+import errno
+from functools import partial
 from mmap import ACCESS_READ, mmap
 import os
 from pathlib import Path
@@ -68,6 +70,34 @@ def test_build_recipe_ignores_external_distutils_configuration(
     assert "build_ext" not in distribution.command_options
 
 
+def test_build_recipe_ignores_local_pyproject_extension_overrides(
+    build_recipe: tuple[dict, dict], tmp_path: Path,
+) -> None:
+    """TOML must not append an untracked replacement for a certified target."""
+    _, captured = build_recipe
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="dama-local-override"\nversion="0.1"\n'
+        '[tool.setuptools]\n'
+        'ext-modules=[{name="dama.ai.ml._fast_score",'
+        'sources=["alternate_score.c"],'
+        'define-macros=[["DAMA_AMBIENT_OVERRIDE","1"]]}]\n',
+        encoding="utf-8",
+    )
+    expected_extensions = list(captured["ext_modules"])
+    distribution = captured["distclass"]({
+        "src_root": str(tmp_path),
+        "ext_modules": list(expected_extensions),
+    })
+
+    distribution.parse_config_files()
+
+    assert distribution.ext_modules == expected_extensions
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/maps").is_file(),
+    reason="Mapped-target detection requires Linux /proc process maps.",
+)
 def test_inplace_build_detects_a_mapped_target(
     build_recipe: tuple[dict, dict], tmp_path: Path,
 ) -> None:
@@ -95,6 +125,10 @@ def test_inplace_build_detects_a_mapped_target(
     assert owner == (os.getpid(), target)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows does not allow replacement of an open mapped file.",
+)
 def test_atomic_inplace_copy_hides_partial_binary_and_preserves_reader(
     build_recipe: tuple[dict, dict], tmp_path: Path,
 ) -> None:
@@ -126,9 +160,33 @@ def test_atomic_inplace_copy_hides_partial_binary_and_preserves_reader(
     assert not list(tmp_path.glob(".active.so.*.tmp"))
 
 
+def test_atomic_inplace_copy_publishes_completed_binary(
+    build_recipe: tuple[dict, dict], tmp_path: Path,
+) -> None:
+    """Exercise native file flushing on every platform without live mappings."""
+    _, captured = build_recipe
+    command = captured["cmdclass"]["build_ext"](Distribution())
+    command.initialize_options()
+    command.inplace = True
+    command.dry_run = False
+    command.force = True
+    command.verbose = 0
+    suffix = ".pyd" if os.name == "nt" else ".so"
+    source = tmp_path / f"built{suffix}"
+    target = tmp_path / f"active{suffix}"
+    source.write_bytes(b"new completed extension")
+    target.write_bytes(b"old extension")
+
+    assert command.copy_file(source, target) == (target, True)
+
+    assert target.read_bytes() == source.read_bytes()
+    assert not list(tmp_path.glob(f".{target.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("cleanup_failure", (False, True))
 def test_atomic_inplace_copy_failure_keeps_previous_binary(
     build_recipe: tuple[dict, dict], monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    tmp_path: Path, cleanup_failure: bool,
 ) -> None:
     namespace, captured = build_recipe
     command = captured["cmdclass"]["build_ext"](Distribution())
@@ -145,9 +203,93 @@ def test_atomic_inplace_copy_failure_keeps_previous_binary(
     def fail_replace(_source: Path, _target: Path) -> None:
         raise OSError("synthetic replace failure")
 
+    def fail_unlink(_path: Path, **_kwargs) -> None:
+        raise OSError("synthetic cleanup failure")
+
     monkeypatch.setattr(namespace["os"], "replace", fail_replace)
+    if cleanup_failure:
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
     with pytest.raises(OSError, match="synthetic replace failure"):
         command.copy_file(source, target)
 
     assert target.read_bytes() == b"old"
+    assert bool(list(tmp_path.glob(".active.so.*.tmp"))) is cleanup_failure
+
+
+def test_atomic_inplace_copy_cleans_temporary_after_initial_close_failure(
+    build_recipe: tuple[dict, dict], monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed first close must clean its name without retrying the fd."""
+    namespace, captured = build_recipe
+    command = captured["cmdclass"]["build_ext"](Distribution())
+    command.initialize_options()
+    command.inplace = True
+    command.dry_run = False
+    source = tmp_path / "built.so"
+    target = tmp_path / "active.so"
+    source.write_bytes(b"new")
+    target.write_bytes(b"old")
+    real_close = os.close
+    close_failure = OSError("initial temporary close failed")
+    closed = []
+
+    def fail_close(fd):
+        closed.append(fd)
+        real_close(fd)
+        raise close_failure
+
+    monkeypatch.setattr(namespace["os"], "close", fail_close)
+
+    with pytest.raises(OSError) as observed:
+        command.copy_file(source, target)
+
+    assert observed.value is close_failure
+    assert len(closed) == 1
+    assert target.read_bytes() == b"old"
     assert not list(tmp_path.glob(".active.so.*.tmp"))
+
+
+def test_atomic_inplace_copy_flushes_windows_binary_through_writable_handle(
+    build_recipe: tuple[dict, dict], monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Windows os.fsync uses FlushFileBuffers, which rejects read-only handles."""
+    fcntl = pytest.importorskip("fcntl")
+    namespace, captured = build_recipe
+    command = captured["cmdclass"]["build_ext"](Distribution())
+    command.initialize_options()
+    command.inplace = True
+    command.dry_run = False
+    command.force = True
+    command.verbose = 0
+    source = tmp_path / "built.pyd"
+    target = tmp_path / "active.pyd"
+    probe = tmp_path / "probe.bin"
+    source.write_bytes(b"new")
+    target.write_bytes(b"old")
+    probe.write_bytes(b"probe")
+    real_fsync = os.fsync
+    flushed_access_modes = []
+
+    def windows_fsync(fd: int) -> None:
+        access_mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+        flushed_access_modes.append(access_mode)
+        if access_mode == os.O_RDONLY:
+            raise OSError(errno.EBADF, "FlushFileBuffers needs GENERIC_WRITE")
+        real_fsync(fd)
+
+    fsync_file = namespace["_fsync_file"]
+    monkeypatch.setattr(namespace["os"], "fsync", windows_fsync)
+    # The POSIX read-only flush is exactly what failed on Windows.
+    with pytest.raises(OSError, match="GENERIC_WRITE"):
+        fsync_file(probe, windows=False)
+
+    monkeypatch.setitem(
+        type(command).copy_file.__globals__, "_fsync_file",
+        partial(fsync_file, windows=True))
+    assert command.copy_file(source, target) == (target, True)
+
+    assert target.read_bytes() == b"new"
+    assert os.O_RDWR in flushed_access_modes
+    assert not list(tmp_path.glob(".active.pyd.*.tmp"))
