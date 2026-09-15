@@ -568,7 +568,10 @@ def test_failed_ledger_shard_append_preserves_prior_records(
             return self
 
         def __exit__(self, exc_type, exc, traceback):
-            return self.handle.__exit__(exc_type, exc, traceback)
+            return self.close()
+
+        def close(self):
+            return self.handle.close()
 
         def write(self, payload):
             self.handle.write(memoryview(payload)[:19])
@@ -1131,7 +1134,6 @@ def test_streamed_ledger_merge_cleans_partial_file_after_write_failure(
 ) -> None:
     """A failed atomic rewrite preserves the ledger without pinning disk."""
     path = tmp_path / "keys.txt.gz"
-    temporary = path.with_suffix(path.suffix + ".tmp")
     original = {"0" * 64}
     corpus._merge_state_keys_file(path, original)
     before = path.read_bytes()
@@ -1151,13 +1153,15 @@ def test_streamed_ledger_merge_cleans_partial_file_after_write_failure(
             raise OSError(28, "simulated disk full")
 
         def __exit__(self, exc_type, exc, traceback):
-            return self._handle.__exit__(exc_type, exc, traceback)
+            return self.close()
+
+        def close(self):
+            return self._handle.close()
 
     def fail_temporary_write(target, *args, **kwargs):
         handle = real_open(target, *args, **kwargs)
         mode = args[0] if args else kwargs.get("mode", "rb")
-        target_name = getattr(target, "name", target)
-        if Path(target_name) == temporary and "w" in mode:
+        if "w" in mode:
             return FailingWriter(handle)
         return handle
 
@@ -1167,7 +1171,7 @@ def test_streamed_ledger_merge_cleans_partial_file_after_write_failure(
 
     assert path.read_bytes() == before
     assert corpus._read_state_keys(path) == original
-    assert not temporary.exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_streamed_ledger_merge_batches_text_writes(
