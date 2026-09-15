@@ -2649,50 +2649,61 @@ class Trainer:
         ckpts = self._rollback_checkpoint_candidates("model_step_*.pt")
         print(f"  Dead-epoch rollback triggered ({reason}).")
         if self.config.recovery_enforced:
+            # Bound retries by the initial numbered files plus the external
+            # anchor, even if another writer keeps publishing vanishing picks.
+            for _attempt in range(len(ckpts) + 1):
+                last_ckpt = None
+                try:
+                    last_ckpt = str(self._verified_recovery_rollback_checkpoint())
+                    print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
+                    _call_under_model_state_lock(
+                        getattr(self, '_model_state_lock', None),
+                        self._load_checkpoint,
+                        last_ckpt,
+                    )
+                    if self.scaler is not None:
+                        self.scaler = GradScaler(init_scale=2**10)
+                        print(
+                            "  GradScaler reset to conservative "
+                            f"scale={self.scaler.get_scale():.0f}")
+                    return
+                except FileNotFoundError as exc:
+                    if last_ckpt is None:
+                        print(
+                            f"  [warn] Rollback verification input unavailable ({exc}); "
+                            "retrying verified recovery selection")
+                        continue
+                    if Path(last_ckpt).exists():
+                        # Missing auxiliary state is a load failure, not pruning.
+                        raise
+                    # Reselect through the complete recovery gate: the approved
+                    # anchor can live outside checkpoint_dir, and future steps
+                    # must remain ineligible even after a pruning race.
+                    print(f"  [warn] Verified rollback pick vanished ({exc}); "
+                          f"retrying verified recovery selection")
+            else:
+                raise RuntimeError(
+                    "No verified checkpoint remains available within the "
+                    "recovery retry limit; fresh-weight reset is forbidden")
+        for candidate in reversed(ckpts):
+            if not candidate.is_file():
+                continue
+            last_ckpt = str(candidate)
+            print(f"  Rolling back to checkpoint: {last_ckpt}")
             try:
-                last_ckpt = str(self._verified_recovery_rollback_checkpoint())
-                print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
                 _call_under_model_state_lock(
                     getattr(self, '_model_state_lock', None),
                     self._load_checkpoint,
                     last_ckpt,
                 )
-                if self.scaler is not None:
-                    self.scaler = GradScaler(init_scale=2**10)
-                    print(
-                        "  GradScaler reset to conservative "
-                        f"scale={self.scaler.get_scale():.0f}")
-                return
             except FileNotFoundError as exc:
-                # The verified pick was pruned between selection and load;
-                # fall through to whatever files remain on disk.
-                print(f"  [warn] Verified rollback pick vanished ({exc}); "
-                      f"falling back to remaining checkpoints")
-        baseline_sha256 = str(
-            getattr(self.config, 'recovery_baseline_sha256', '') or '')
-        policy_stage = getattr(self.config, 'policy_stage', None)
-        for candidate in reversed(ckpts):
-            if not candidate.is_file():
+                # Retention can win after is_file(), including while rollback
+                # waits for the model-state lock.
+                if candidate.exists():
+                    raise
+                print(f"  [warn] Rollback pick vanished ({exc}); "
+                      f"trying remaining checkpoints")
                 continue
-            if self.config.recovery_enforced and not (
-                baseline_sha256
-                and policy_stage is not None
-                and recovery_checkpoint_continues_lineage(
-                    candidate, baseline_sha256, policy_stage)
-            ):
-                # Same invariant as the startup gate and the verified resolver:
-                # a file without the pinned lineage stamp must never become a
-                # rollback point, even as a prune-race fallback.
-                print(f"  [warn] Skipping unstamped rollback candidate "
-                      f"{candidate.name} (recovery lineage enforced)")
-                continue
-            last_ckpt = str(candidate)
-            print(f"  Rolling back to checkpoint: {last_ckpt}")
-            _call_under_model_state_lock(
-                getattr(self, '_model_state_lock', None),
-                self._load_checkpoint,
-                last_ckpt,
-            )
             # Reset GradScaler with conservative scale to prevent
             # re-triggering the same overflow.  Default init_scale=65536
             # is too aggressive for trained models — use 1024 (same as
@@ -2701,13 +2712,12 @@ class Trainer:
                 self.scaler = GradScaler(init_scale=2**10)
                 print(f"  GradScaler reset to conservative scale={self.scaler.get_scale():.0f}")
             return
-        if not self.config.recovery_enforced:
-            print("  No checkpoints found — resetting model from scratch")
-            _call_under_model_state_lock(
-                getattr(self, '_model_state_lock', None),
-                self._reset_model_state,
-                "No checkpoint for recovery",
-            )
+        print("  No checkpoints found — resetting model from scratch")
+        _call_under_model_state_lock(
+            getattr(self, '_model_state_lock', None),
+            self._reset_model_state,
+            "No checkpoint for recovery",
+        )
 
     def _seed_stats_file(self) -> None:
         """Copy ``paths.seed_stats_from`` into a not-yet-existing stats file.
