@@ -95,10 +95,9 @@ def main() -> None:
     source_root = Path(__file__).resolve().parent
     script = source_root / "scripts" / "setup_cython.py"
     arguments = sys.argv[1:]
-    if "build_ext" not in arguments:
-        _run_setup(source_root, script, arguments)
-        return
-
+    # The recipe runs cythonize even for metadata and sdist commands, and
+    # `build` invokes build_ext indirectly. Every invocation can therefore
+    # touch shared C sources or build output and needs the same lock.
     from scripts.ensure_cython_extensions import (
         cython_build_lock,
         parent_holds_cython_build_lock,
