@@ -46,6 +46,8 @@ from typing import (
 )
 
 from .move_encoder import ENCODING_VERSION
+# Admission writers can overlap checkpoint tensorizers that fork workers.
+from .fork_writers import fork_safe_mkstemp
 from .replay import ReplayEntry, _json_loads as _replay_json_loads
 from . import run_status
 
@@ -1323,33 +1325,46 @@ def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
     run_status._write_json_atomic(path, value)
 
 
+def _open_nonblocking(name: str, flags: int) -> int:
+    # Pointer names and their targets can be FIFOs. Callers check the opened
+    # descriptor before reading, without waiting for a pipe writer first.
+    return os.open(name, flags | getattr(os, "O_NONBLOCK", 0))
+
+
 def _write_text_atomic(path: Path, value: str) -> None:
     """Atomically publish a small text control file and its directory entry."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temp_name)
+    temporary = None
     try:
-        raw_handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
-        fd = -1
-        with raw_handle as handle:
-            handle.write(value)
-            handle.flush()
-            os.fsync(handle.fileno())
+        with fork_safe_mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent,
+        ) as (fd, temp_name):
+            temporary = Path(temp_name)
+            # Partial stream construction must not release our descriptor for
+            # another thread to reuse before the error reaches cleanup.
+            handle = os.fdopen(
+                fd, "w", encoding="utf-8", newline="\n", closefd=False,
+            )
+            try:
+                handle.write(value)
+                handle.flush()
+                os.fsync(handle.fileno())
+            except BaseException:
+                # Preserve an interrupted write even if buffered close fails.
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+                raise
+            else:
+                handle.close()
         os.replace(temporary, path)
         run_status._fsync_directory(path.parent)
     finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
         try:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         except OSError:
             # Cleanup is best-effort and must not mask the write, replace, or
             # directory-sync failure that determines the public pointer state.
@@ -1372,46 +1387,50 @@ def _write_jsonl_atomic(
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temp_name)
+    temporary = None
     try:
-        raw_handle = os.fdopen(fd, "wb")
-        fd = -1
-        with raw_handle as handle:
-            last_byte = b""
-            if append_existing:
+        with fork_safe_mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent,
+        ) as (fd, temp_name):
+            temporary = Path(temp_name)
+            # Keep raw ownership even if a partially constructed stream closes.
+            handle = os.fdopen(fd, "wb", closefd=False)
+            try:
+                last_byte = b""
+                if append_existing:
+                    try:
+                        with path.open("rb") as source:
+                            while True:
+                                chunk = source.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                handle.write(chunk)
+                                last_byte = chunk[-1:]
+                    except FileNotFoundError:
+                        pass
+                if last_byte and last_byte != b"\n":
+                    handle.write(b"\n")
+                for row in rows:
+                    handle.write(json.dumps(
+                        row, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8"))
+                    handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            except BaseException:
+                # Cleanup must not hide an earlier row/serialization failure.
                 try:
-                    with path.open("rb") as source:
-                        while True:
-                            chunk = source.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            handle.write(chunk)
-                            last_byte = chunk[-1:]
-                except FileNotFoundError:
+                    handle.close()
+                except OSError:
                     pass
-            if last_byte and last_byte != b"\n":
-                handle.write(b"\n")
-            for row in rows:
-                handle.write(json.dumps(
-                    row, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8"))
-                handle.write(b"\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+                raise
+            else:
+                handle.close()
         os.replace(temporary, path)
     finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
         try:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         except OSError:
             # Cleanup is best-effort and must not mask the write or replace
             # failure that kept the previous ledger authoritative.
@@ -1427,31 +1446,54 @@ def _write_state_keys(path: Path, state_keys: Iterable[str]) -> None:
     # flush + fsync, then one atomic os.replace.  A mid-write failure leaves
     # the previous key file untouched instead of truncating it in place.
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temp_name = None
     try:
-        # Wrap the mkstemp fd instead of letting gzip.open(path-name) open a
-        # second handle: the reserved fd must be consumed here or it leaks
-        # (one per growth/admission cycle until process exit).
-        with os.fdopen(fd, "wb") as raw_handle:
-            with gzip.open(
-                raw_handle,
-                "wt",
-                encoding="ascii",
-                newline="\n",
-                compresslevel=_SNAPSHOT_STATE_KEYS_GZIP_COMPRESSLEVEL,
-            ) as handle:
-                for key in sorted(state_keys):
-                    handle.write(key)
-                    handle.write("\n")
-                handle.flush()
-            # The gzip CRC/size trailer is appended on close(), so fsync only
-            # afterwards: the committed file must be durable in full.
-            raw_handle.flush()
-            os.fsync(raw_handle.fileno())
+        with fork_safe_mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent,
+        ) as (fd, temp_name):
+            # Own the raw descriptor even if stream construction partially
+            # succeeds before raising. A wrapper must not close it early and
+            # let another thread reuse the number before our cleanup.
+            raw_handle = os.fdopen(fd, "wb", closefd=False)
+            try:
+                handle = gzip.open(
+                    raw_handle,
+                    "wt",
+                    encoding="ascii",
+                    newline="\n",
+                    compresslevel=_SNAPSHOT_STATE_KEYS_GZIP_COMPRESSLEVEL,
+                )
+                try:
+                    for key in sorted(state_keys):
+                        handle.write(key)
+                        handle.write("\n")
+                    handle.flush()
+                except BaseException:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                    raise
+                else:
+                    handle.close()
+                # The gzip CRC/size trailer is appended on close(), so fsync
+                # only afterwards: the committed file must be durable in full.
+                raw_handle.flush()
+                os.fsync(raw_handle.fileno())
+            except BaseException:
+                # Both gzip finalization and the raw buffer can fail on close.
+                try:
+                    raw_handle.close()
+                except OSError:
+                    pass
+                raise
+            else:
+                raw_handle.close()
         os.replace(temp_name, path)
-    except Exception:
+    except BaseException:
         try:
-            os.unlink(temp_name)
+            if temp_name is not None:
+                os.unlink(temp_name)
         except OSError:
             pass
         raise
@@ -1523,7 +1565,7 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     additions = sorted(set(new_keys))
     if not additions:
         return 0
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = None
     added = 0
     existing = _iter_state_keys(path) if path.is_file() else iter(())
     pending = next(existing, None)
@@ -1533,37 +1575,58 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
         # replaced. Snapshot key files already use this durability contract;
         # the all-time ledger is at least as important because it prevents
         # trained states from entering future validation hold-outs.
-        with temporary.open("wb") as raw_handle:
-            with gzip.open(
-                raw_handle,
-                "wt",
-                encoding="ascii",
-                newline="\n",
-                compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
-            ) as handle:
-                index = 0
-                write_batch: List[str] = []
-                while pending is not None or index < len(additions):
-                    if pending is not None and (
-                        index >= len(additions) or pending <= additions[index]
-                    ):
-                        write_batch.append(pending)
-                        if index < len(additions) and pending == additions[index]:
+        with fork_safe_mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent,
+        ) as (fd, temporary):
+            raw_handle = os.fdopen(fd, "wb", closefd=False)
+            try:
+                handle = gzip.open(
+                    raw_handle,
+                    "wt",
+                    encoding="ascii",
+                    newline="\n",
+                    compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
+                )
+                try:
+                    index = 0
+                    write_batch: List[str] = []
+                    while pending is not None or index < len(additions):
+                        if pending is not None and (
+                            index >= len(additions) or pending <= additions[index]
+                        ):
+                            write_batch.append(pending)
+                            if index < len(additions) and pending == additions[index]:
+                                index += 1
+                            pending = next(existing, None)
+                        else:
+                            write_batch.append(additions[index])
+                            added += 1
                             index += 1
-                        pending = next(existing, None)
-                    else:
-                        write_batch.append(additions[index])
-                        added += 1
-                        index += 1
-                    if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+                        if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+                            handle.write("\n".join(write_batch))
+                            handle.write("\n")
+                            write_batch.clear()
+                    if write_batch:
                         handle.write("\n".join(write_batch))
                         handle.write("\n")
-                        write_batch.clear()
-                if write_batch:
-                    handle.write("\n".join(write_batch))
-                    handle.write("\n")
-            raw_handle.flush()
-            os.fsync(raw_handle.fileno())
+                except BaseException:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                    raise
+                else:
+                    handle.close()
+                raw_handle.flush()
+                os.fsync(raw_handle.fileno())
+            except BaseException:
+                try:
+                    raw_handle.close()
+                except OSError:
+                    pass
+                raise
+            else:
+                raw_handle.close()
         os.replace(temporary, path)
     except BaseException:
         # Output failure can leave the input generator suspended at a yield.
@@ -1582,7 +1645,8 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
         # the volume reported zero bytes free and later replay closes raised EIO.
         # Cleanup is best-effort so it never masks the original write failure.
         try:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
         except OSError:
             pass
         raise
@@ -2452,7 +2516,16 @@ class CorpusSnapshotManager:
         """
 
         try:
-            relative = self.current_pointer.read_text(encoding="utf-8").strip()
+            with open(
+                self.current_pointer, "r", encoding="utf-8",
+                opener=_open_nonblocking,
+            ) as handle:
+                if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise RuntimeError(
+                        "Corpus snapshot pointer is not a regular file: "
+                        f"{self.current_pointer}"
+                    )
+                relative = handle.read().strip()
         except FileNotFoundError:
             relative = ""
         if relative:
@@ -2466,7 +2539,14 @@ class CorpusSnapshotManager:
 
         json_pointer = self.snapshot_root / "current.json"
         try:
-            with json_pointer.open("r", encoding="utf-8") as handle:
+            with open(
+                json_pointer, "r", encoding="utf-8", opener=_open_nonblocking,
+            ) as handle:
+                if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise RuntimeError(
+                        "Corpus snapshot pointer is not a regular file: "
+                        f"{json_pointer}"
+                    )
                 record = json.load(handle)
         except FileNotFoundError:
             return None, None
@@ -2519,13 +2599,20 @@ class CorpusSnapshotManager:
 
         if path is None:
             return None, None
+
         try:
-            with path.open("r", encoding="utf-8") as handle:
+            with open(path, "r", encoding="utf-8", opener=_open_nonblocking) as handle:
                 if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
                     return None, None
                 manifest = json.load(handle)
         except (FileNotFoundError, IsADirectoryError):
             return None, None
+        except PermissionError:
+            # Windows uses EACCES for directory opens. Keep real manifest
+            # permission failures visible while allowing redundant recovery.
+            if path.is_dir():
+                return None, None
+            raise
         if (
             expected_fingerprint is not None
             and (
@@ -3126,18 +3213,31 @@ class CorpusSnapshotManager:
             header_bytes = json.dumps(
                 header, sort_keys=True, separators=(",", ":")
             ).encode("ascii")
-            fd, temp_name = tempfile.mkstemp(
+            with fork_safe_mkstemp(
                 prefix=sidecar_path.name + ".",
                 suffix=".tmp",
                 dir=sidecar_path.parent,
-            )
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(_LEDGER_FINGERPRINT_SIDECAR_MAGIC)
-                handle.write(header_bytes)
-                handle.write(b"\n")
-                values.tofile(handle)
-                handle.flush()
-                os.fsync(handle.fileno())
+            ) as (fd, temp_name):
+                # Keep raw descriptor ownership even if stream construction
+                # partially succeeds before failing. Its cleanup must not
+                # close a descriptor that another thread could then reuse.
+                handle = os.fdopen(fd, "wb", closefd=False)
+                try:
+                    handle.write(_LEDGER_FINGERPRINT_SIDECAR_MAGIC)
+                    handle.write(header_bytes)
+                    handle.write(b"\n")
+                    values.tofile(handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                except BaseException:
+                    # An interruption must not turn into a fail-open OSError.
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                    raise
+                else:
+                    handle.close()
             os.replace(temp_name, sidecar_path)
             if commit_directory:
                 run_status._fsync_directory(sidecar_path.parent)
