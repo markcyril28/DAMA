@@ -1,5 +1,7 @@
 """Build Cython extensions for performance-critical encoding functions."""
 
+from contextlib import redirect_stdout
+from io import StringIO
 import os
 import platform
 from pathlib import Path
@@ -23,6 +25,13 @@ class HermeticBuildDistribution(Distribution):
         # output-changing build_ext options behind an otherwise canonical
         # command line, outside the content manifest's source contract.
         return []
+
+    def parse_config_files(self, filenames=None, ignore_option_errors=False):
+        # setuptools discovers pyproject.toml separately from INI files.
+        # Its ext-modules table can append duplicate names that replace our
+        # certified targets with sources outside the build manifest.
+        return super().parse_config_files(
+            filenames=[], ignore_option_errors=ignore_option_errors)
 
 
 def _mapped_inplace_extension_owner(
@@ -75,15 +84,37 @@ def _mapped_inplace_extension_owner(
     return None
 
 
+def _build_command_flag_requested(
+    arguments: list[str], command: str, name: str,
+) -> bool:
+    """Read an explicit command flag with setuptools' command-line parser."""
+    if command not in arguments:
+        return False
+    distribution = HermeticBuildDistribution({
+        "script_args": arguments,
+        "cmdclass": {"build_ext": build_ext},
+    })
+    # Parsing merges repeated command sections and consumes option values,
+    # including values that look like command names or clustered short flags.
+    # Leave any help output to the real setup() call below.
+    with redirect_stdout(StringIO()):
+        distribution.parse_command_line()
+    options = distribution.command_options.get(command, {})
+    return bool(options.get(name, (None, False))[1])
+
+
+def _build_ext_flag_requested(arguments: list[str], name: str) -> bool:
+    """Read build_ext's own flags before setuptools finalizes inheritance."""
+    return _build_command_flag_requested(arguments, "build_ext", name)
+
+
 def _refuse_mapped_inplace_build(
     extensions: list[Extension], argv: list[str] | None = None,
     source_root: Path | None = None,
 ) -> None:
     """Fail before compiling when a requested in-place target is live."""
     arguments = sys.argv[1:] if argv is None else argv
-    inplace_requested = any(
-        argument in ("--inplace", "-i") for argument in arguments)
-    if "build_ext" not in arguments or not inplace_requested:
+    if not _build_ext_flag_requested(arguments, "inplace"):
         return
     owner = _mapped_inplace_extension_owner(extensions, source_root=source_root)
     if owner is None:
@@ -132,9 +163,11 @@ class AtomicBuildExt(build_ext):
         self.announce(f"atomically copying {source} -> {target}", level=level)
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-        os.close(fd)
         temporary = Path(temporary_name)
         try:
+            # close() can report an error after releasing the descriptor.
+            # Clean its temporary name on failure, but never retry the fd.
+            os.close(fd)
             shutil.copyfile(source, temporary)
             source_stat = source.stat()
             if preserve_times:
@@ -160,7 +193,11 @@ class AtomicBuildExt(build_ext):
                 # directory. The same-directory replacement is still atomic.
                 pass
         except BaseException:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # Keep the copy/publication failure as the diagnostic.
+                pass
             raise
         return outfile, True
 
@@ -229,8 +266,12 @@ _refuse_mapped_inplace_build(extensions)
 # regenerate that C.  Keep both layers coupled: the readiness guard uses a
 # forced build after a content mismatch, including preserved-mtime ``.pyx``
 # changes that Cython's timestamp check cannot see on its own.
-_force_cython = any(
-    argument in ("--force", "-f") for argument in sys.argv[1:]
+# build_ext also inherits force from build, whose grouped flags must force
+# regeneration even when build_ext is invoked indirectly. Parsed options keep
+# values such as ``--include-dirs -f`` from becoming force requests.
+_force_cython = (
+    _build_ext_flag_requested(sys.argv[1:], "force")
+    or _build_command_flag_requested(sys.argv[1:], "build", "force")
 )
 
 ext_modules = cythonize(
