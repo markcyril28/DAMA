@@ -29,6 +29,8 @@ HEALTHY_SUMMARY = {
     "total_count": 2, "recent_finite_count": 2, "recent_nonfinite_count": 0,
     "recent_mean": 1000.0, "recent_min": 900.0, "recent_max": 1100.0,
 }
+NAN = float("nan")
+INF = float("inf")
 
 
 def _outputs(report):
@@ -79,7 +81,7 @@ def _memory_evidence(recommendations):
             if rec.get("recommendation", "").startswith(NONFINITE_RECOMMENDATION)]
 
 
-def _assert_evidence_recommendation(recommendations):
+def _assert_evidence_instead_of_advice(recommendations):
     assert _batch_size_advice(recommendations) == []
     (evidence,) = _memory_evidence(recommendations)
     assert evidence["category"] == "Performance"
@@ -90,10 +92,10 @@ def _assert_evidence_recommendation(recommendations):
 # Python min/max keep a NaN only when it is the oldest sample, so both orders
 # must be detected through the recorded counts rather than the extrema.
 MIXED_WINDOWS = {
-    "nan_first": [float("nan"), 512.0],
-    "nan_last": [512.0, float("nan")],
-    "positive_infinity": [512.0, float("inf")],
-    "negative_infinity": [-float("inf"), 512.0],
+    "nan_first": [NAN, 512.0],
+    "nan_last": [512.0, NAN],
+    "positive_infinity": [512.0, INF],
+    "negative_infinity": [-INF, 512.0],
 }
 
 
@@ -103,75 +105,59 @@ def test_mixed_allocation_window_withholds_batch_size_advice(tmp_path, source, s
     system, recommendations, markdown = _outputs(
         _persisted_report(tmp_path, source, samples))
 
-    # Finite descriptive values stay visible but do not authorize tuning.
-    assert system["gpu_mem_mean_mb"] == 512.0
-    assert system["gpu_mem_utilization"] == pytest.approx(0.064)
-    assert system["gpu_mem_recent_finite_count"] == 1
-    assert system["gpu_mem_recent_nonfinite_count"] == 1
-    assert system["gpu_mem_has_nonfinite"] is True
-    _assert_evidence_recommendation(recommendations)
+    _assert_evidence_instead_of_advice(recommendations)
     assert ("GPU allocated-memory evidence: 1 recorded nonfinite observations in the "
             "recent window. Allocation-based batch-size advice is unavailable.") in markdown
     assert "GPU VRAM utilization is only" not in markdown
+    # Finite descriptive values stay visible but do not authorize tuning.
+    assert system["gpu_mem_mean_mb"] == 512.0
+    assert system["gpu_mem_utilization"] == pytest.approx(0.064)
 
 
 @pytest.mark.parametrize("source", ["terminal", "incremental"])
 def test_invalid_only_allocation_window_reports_its_evidence(tmp_path, source):
-    system, recommendations, markdown = _outputs(_persisted_report(
-        tmp_path, source, [float("nan"), float("inf")]))
+    system, recommendations, markdown = _outputs(
+        _persisted_report(tmp_path, source, [NAN, INF]))
+    _assert_evidence_instead_of_advice(recommendations)
+    assert f"{EVIDENCE_PREFIX}2 recorded nonfinite observations" in markdown
     assert system.get("gpu_mem_mean_mb") is None
     assert system.get("gpu_mem_utilization") is None
-    assert system["gpu_mem_recent_finite_count"] == 0
-    assert system["gpu_mem_recent_nonfinite_count"] == 2
-    assert system["gpu_mem_has_nonfinite"] is True
-    _assert_evidence_recommendation(recommendations)
-    assert f"{EVIDENCE_PREFIX}2 recorded nonfinite observations" in markdown
-
-
-@pytest.mark.parametrize("source", ["terminal", "incremental"])
-def test_healthy_low_allocation_keeps_batch_size_advice(tmp_path, source):
-    system, recommendations, markdown = _outputs(
-        _persisted_report(tmp_path, source, [500.0, 524.0]))
-    assert system["gpu_mem_recent_finite_count"] == 2
-    assert system["gpu_mem_recent_nonfinite_count"] == 0
-    assert system["gpu_mem_has_nonfinite"] is False
-    assert _memory_evidence(recommendations) == []
-    (advice,) = _batch_size_advice(recommendations)
-    assert advice["recommendation"].startswith("GPU VRAM utilization is only 6%.")
-    assert EVIDENCE_PREFIX not in markdown
-
-
-def test_invalid_sample_leaving_recent_window_restores_advice(tmp_path):
-    # Terminal memory summaries span the last 100 samples.
-    system, recommendations, markdown = _outputs(_persisted_report(
-        tmp_path, "terminal", [float("nan")] + [512.0] * 100))
-    assert system["gpu_mem_recent_finite_count"] == 100
-    assert system["gpu_mem_recent_nonfinite_count"] == 0
-    assert system["gpu_mem_has_nonfinite"] is False
-    assert len(_batch_size_advice(recommendations)) == 1
-    assert EVIDENCE_PREFIX not in markdown
 
 
 def test_invalid_sample_at_recent_window_edge_withholds_advice(tmp_path):
-    system, recommendations, _ = _outputs(_persisted_report(
-        tmp_path, "terminal", [float("nan")] + [512.0] * 99))
-    assert system["gpu_mem_recent_nonfinite_count"] == 1
-    _assert_evidence_recommendation(recommendations)
+    # Terminal memory summaries span the last 100 samples.
+    _, recommendations, _ = _outputs(
+        _persisted_report(tmp_path, "terminal", [NAN] + [512.0] * 99))
+    _assert_evidence_instead_of_advice(recommendations)
 
 
-@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+@pytest.mark.parametrize("invalid", [NAN, INF])
 def test_legacy_nonfinite_extrema_without_counts_withhold_advice(invalid):
     system, recommendations, markdown = _outputs(_summary_report({
         "total_count": 2, "recent_mean": 1000.0,
         "recent_min": 1000.0, "recent_max": invalid,
     }))
+    _assert_evidence_instead_of_advice(recommendations)
+    assert (f"{EVIDENCE_PREFIX}nonfinite summary statistics "
+            "(observation count unavailable) in the recent window.") in markdown
     assert system["gpu_mem_utilization"] == pytest.approx(0.125)
     assert system["gpu_mem_recent_finite_count"] is None
     assert system["gpu_mem_recent_nonfinite_count"] is None
-    assert system["gpu_mem_has_nonfinite"] is True
-    _assert_evidence_recommendation(recommendations)
-    assert (f"{EVIDENCE_PREFIX}nonfinite summary statistics "
-            "(observation count unavailable) in the recent window.") in markdown
+
+
+@pytest.mark.parametrize("source", ["terminal", "incremental"])
+@pytest.mark.parametrize("samples, finite, nonfinite, flagged", [
+    ([500.0, 524.0], 2, 0, False),
+    ([512.0, NAN], 1, 1, True),
+    ([NAN, INF], 0, 2, True),
+    ([NAN] + [512.0] * 100, 100, 0, False),
+], ids=["healthy", "mixed", "invalid_only", "invalid_left_window"])
+def test_recent_allocation_counts_reach_system_analysis(
+        tmp_path, source, samples, finite, nonfinite, flagged):
+    system, _, _ = _outputs(_persisted_report(tmp_path, source, samples))
+    assert system["gpu_mem_recent_finite_count"] == finite
+    assert system["gpu_mem_recent_nonfinite_count"] == nonfinite
+    assert system["gpu_mem_has_nonfinite"] is flagged
 
 
 @pytest.mark.parametrize("count", [True, -1, 1.5, "1"])
@@ -186,8 +172,7 @@ def test_malformed_recent_counts_are_not_reported_as_counts(count):
 @pytest.mark.parametrize("hint", [LOW_HINT, HIGH_HINT], ids=["low", "high"])
 @pytest.mark.parametrize("summary, vram_gb", [
     ({**HEALTHY_SUMMARY, "recent_finite_count": 1, "recent_nonfinite_count": 1}, 8.0),
-    ({"total_count": 2, "recent_mean": 1000.0,
-      "recent_min": float("nan"), "recent_max": 1000.0}, 8.0),
+    ({"total_count": 2, "recent_mean": 1000.0, "recent_min": NAN, "recent_max": 1000.0}, 8.0),
     ({"total_count": 2, "recent_mean": -1.0, "recent_min": -1.0, "recent_max": -1.0}, 8.0),
     (HEALTHY_SUMMARY, None),
 ], ids=["counted_nonfinite", "legacy_nonfinite_extrema", "negative_mean", "unknown_capacity"])
@@ -198,9 +183,28 @@ def test_collector_memory_hint_is_withheld_without_valid_evidence(summary, vram_
     assert hint["hint"] not in markdown
 
 
+# Guards against over-suppression: valid evidence keeps existing advice.
+
+@pytest.mark.parametrize("source", ["terminal", "incremental"])
+def test_healthy_low_allocation_keeps_batch_size_advice(tmp_path, source):
+    _, recommendations, markdown = _outputs(
+        _persisted_report(tmp_path, source, [500.0, 524.0]))
+    assert _memory_evidence(recommendations) == []
+    (advice,) = _batch_size_advice(recommendations)
+    assert advice["recommendation"].startswith("GPU VRAM utilization is only 6%.")
+    assert EVIDENCE_PREFIX not in markdown
+
+
+def test_invalid_sample_leaving_recent_window_restores_advice(tmp_path):
+    _, recommendations, markdown = _outputs(
+        _persisted_report(tmp_path, "terminal", [NAN] + [512.0] * 100))
+    assert _memory_evidence(recommendations) == []
+    assert len(_batch_size_advice(recommendations)) == 1
+    assert EVIDENCE_PREFIX not in markdown
+
+
 @pytest.mark.parametrize("hint", [LOW_HINT, HIGH_HINT], ids=["low", "high"])
 def test_collector_memory_hint_is_kept_with_valid_evidence(hint):
-    system, _, markdown = _outputs(_summary_report(HEALTHY_SUMMARY, hints=[hint]))
-    assert system["gpu_mem_has_nonfinite"] is False
+    _, _, markdown = _outputs(_summary_report(HEALTHY_SUMMARY, hints=[hint]))
     assert hint["hint"] in markdown
     assert WITHHELD_HINT not in markdown
