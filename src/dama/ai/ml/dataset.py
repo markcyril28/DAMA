@@ -340,9 +340,13 @@ def _preprocess_pool_init():
     encoders) can never sweep an inherited CUDA tensor whose destructor would
     call cudaSetDevice in a fork that never initialized CUDA
     (cudaErrorInitializationError -> std::terminate -> dead worker).  Mirrors the
-    self-play fix in selfplay._selfplay_worker_init; GC stays active for the
-    worker's OWN allocations (no leak).  Harmless no-op on the spawn path (a
-    spawned worker inherits no CUDA state).
+    self-play fix in selfplay._selfplay_worker_init.  GC normally stays active
+    for the worker's OWN allocations (no leak); the exception is a pool forked
+    from inside corpus.paused_cyclic_gc() (the train-window parse loop), whose
+    child inherits a disabled collector for its short lifetime.  That is
+    strictly safer for the frozen inherited tensors, and reference counting
+    still frees the acyclic per-chunk arrays (Journal Pass 552).  Harmless
+    no-op on the spawn path (a spawned worker inherits no CUDA state).
     """
     gc.freeze()
 
