@@ -60,8 +60,12 @@ def _drop_registered_fds_in_fork_child() -> None:
 def _finish_fork_in_child() -> None:
     try:
         _drop_registered_fds_in_fork_child()
-    finally:
         _fork_writer_lifecycle_lock.release()
+    except BaseException:
+        # CPython ignores exceptions from at-fork callbacks and reports them
+        # to stderr. Never let failed detachment run worker code with an open
+        # parent writer, or block its release on a full diagnostic pipe.
+        _abort_fork_child()
 
 
 if hasattr(os, "register_at_fork"):
@@ -103,11 +107,11 @@ def fork_safe_mkstemp(**kwargs: Any) -> Iterator[tuple[int, str]]:
             # No filename has reached the caller yet, so clean it here too.
             try:
                 os.close(descriptor)
-            except OSError:
+            except BaseException:
                 pass
             try:
                 os.unlink(name)
-            except OSError:
+            except BaseException:
                 pass
             raise
     body_failed = True
@@ -118,7 +122,7 @@ def fork_safe_mkstemp(**kwargs: Any) -> Iterator[tuple[int, str]]:
         with _fork_writer_lifecycle_lock:
             try:
                 os.close(descriptor)
-            except OSError:
+            except BaseException:
                 # Preserve construction/write errors over secondary cleanup.
                 if not body_failed:
                     raise
@@ -139,11 +143,11 @@ def fork_safe_temporary_file(**kwargs: Any) -> Iterator[Any]:
             # registration error and remove the name even with delete=False.
             try:
                 temporary.close()
-            except OSError:
+            except BaseException:
                 pass
             try:
                 os.unlink(temporary.name)
-            except OSError:
+            except BaseException:
                 pass
             raise
     body_failed = True
@@ -156,7 +160,7 @@ def fork_safe_temporary_file(**kwargs: Any) -> Iterator[Any]:
         with _fork_writer_lifecycle_lock:
             try:
                 temporary.close()
-            except OSError:
+            except BaseException:
                 # A buffered close can fail after a write/interruption did.
                 # Preserve that first failure, but refuse a failed healthy close.
                 if not body_failed:
