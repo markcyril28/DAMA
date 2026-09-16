@@ -14,6 +14,8 @@ from __future__ import annotations
 from array import array
 from collections import Counter, defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import bisect
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,6 +46,8 @@ from typing import (
     Set,
     Tuple,
 )
+
+import numpy as np
 
 from .move_encoder import ENCODING_VERSION
 # Admission writers can overlap checkpoint tensorizers that fork workers.
@@ -1525,18 +1529,173 @@ def _read_state_keys(path: Path) -> Set[str]:
 # gzip requests small compressed chunks even while streaming a large ledger.
 # Bound raw read-ahead so those requests do not each cross the DrvFS boundary.
 _STATE_KEYS_READ_BUFFER_BYTES = 4 * 1024 * 1024
+# Canonical keys are 64 lowercase hexadecimal characters plus a newline. Verified
+# ledger text can therefore merge as fixed-width numpy records, instead of
+# yielding every existing row through Python on each admission rewrite.
+_CANONICAL_STATE_KEY_CHARS = 64
+_CANONICAL_STATE_KEY_RECORD_BYTES = _CANONICAL_STATE_KEY_CHARS + 1
+_CANONICAL_STATE_KEY_DIGITS = b"0123456789abcdef"
+_CANONICAL_STATE_KEY_RECORD_DTYPE = np.dtype(f"S{_CANONICAL_STATE_KEY_RECORD_BYTES}")
+# About 4 MiB of decompressed rows per block bounds transient merge buffers.
+_TRAINED_LEDGER_MERGE_BLOCK_RECORDS = 64 * 1024
+
+
+@contextmanager
+def _open_state_key_stream(path: Path, *, binary: bool) -> Iterator[Any]:
+    """Close both source layers while preserving the first actual failure."""
+
+    raw_handle = path.open("rb", buffering=_STATE_KEYS_READ_BUFFER_BYTES)
+    handle = None
+    read_error = None
+    try:
+        handle = gzip.open(
+            raw_handle, "rb" if binary else "rt",
+            **({} if binary else {"encoding": "ascii"}),
+        )
+        yield handle
+    except BaseException as error:
+        read_error = error
+        raise
+    finally:
+        cleanup_error = None
+        for stream in (handle, raw_handle):
+            if stream is not None:
+                try:
+                    stream.close()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+        # Closing a suspended reader injects GeneratorExit. A real teardown
+        # failure must still reach the caller, especially before row fallback.
+        # Construction/read failures instead retain their original identity.
+        if cleanup_error is not None and (
+            read_error is None or isinstance(read_error, GeneratorExit)
+        ):
+            raise cleanup_error
 
 
 def _iter_state_keys(path: Path) -> Iterator[str]:
     """Stream a sorted key file without materialising the whole set."""
-    with (
-        path.open("rb", buffering=_STATE_KEYS_READ_BUFFER_BYTES) as raw_handle,
-        gzip.open(raw_handle, "rt", encoding="ascii") as handle,
-    ):
+    with _open_state_key_stream(path, binary=False) as handle:
         for line in handle:
             key = line.strip()
             if key:
                 yield key
+
+
+def _iter_state_key_blocks(path: Path, block_bytes: int) -> Iterator[bytes]:
+    """Stream decompressed key-file bytes in fixed-size blocks."""
+    with _open_state_key_stream(path, binary=True) as handle:
+        while True:
+            block = handle.read(block_bytes)
+            if not block:
+                return
+            yield block
+
+
+class _NonCanonicalStateKeys(Exception):
+    """Key text needs the row-wise union's stripping and ordering rules."""
+
+
+def _canonical_state_key_records(block: bytes) -> np.ndarray:
+    """Return verified, non-decreasing fixed-width records from key text.
+
+    The row-wise union decodes ASCII, strips each line and skips blank lines.
+    Exactly 64 lowercase hexadecimal characters before every newline make all
+    three transformations identities, so these records compare and merge
+    exactly like the row-wise strings.
+    """
+
+    count, remainder = divmod(len(block), _CANONICAL_STATE_KEY_RECORD_BYTES)
+    newlines = b"\n" * count
+    if (
+        remainder
+        or not count
+        or block[_CANONICAL_STATE_KEY_CHARS::_CANONICAL_STATE_KEY_RECORD_BYTES]
+        != newlines
+        # Deleting every digit must leave exactly the newlines checked above.
+        or block.translate(None, _CANONICAL_STATE_KEY_DIGITS) != newlines
+    ):
+        raise _NonCanonicalStateKeys
+    records = np.frombuffer(block, dtype=_CANONICAL_STATE_KEY_RECORD_DTYPE)
+    if count > 1 and not (records[1:] >= records[:-1]).all():
+        raise _NonCanonicalStateKeys
+    return records
+
+
+def _encode_canonical_state_keys(keys: Sequence[str]) -> bytes:
+    """Encode sorted keys as newline records, requiring canonical keys."""
+
+    if any(len(key) != _CANONICAL_STATE_KEY_CHARS for key in keys):
+        raise _NonCanonicalStateKeys
+    text = "\n".join(keys) + "\n"
+    if not text.isascii():
+        raise _NonCanonicalStateKeys
+    block = text.encode("ascii")
+    _canonical_state_key_records(block)
+    return block
+
+
+def _are_canonical_state_keys(keys: Sequence[str]) -> bool:
+    """Whether sorted additions can use the fixed-width ledger union."""
+
+    try:
+        for start in range(0, len(keys), _TRAINED_LEDGER_MERGE_BLOCK_RECORDS):
+            _encode_canonical_state_keys(
+                keys[start:start + _TRAINED_LEDGER_MERGE_BLOCK_RECORDS])
+    except _NonCanonicalStateKeys:
+        return False
+    return True
+
+
+def _write_canonical_state_key_union(
+    handle: Any,
+    existing: Iterator[bytes],
+    pending: Optional[bytes],
+    additions: Sequence[str],
+) -> int:
+    """Write verified existing blocks with sorted additions inserted.
+
+    An addition equal to an existing row is dropped at its first occurrence,
+    while existing duplicate rows remain, matching the row-wise union.
+    """
+
+    added = 0
+    index = 0
+    previous = None
+    while pending is not None:
+        records = _canonical_state_key_records(pending)
+        # searchsorted matches the row-wise stream merge only if order also
+        # holds across block boundaries.
+        if previous is not None and records[0] < previous:
+            raise _NonCanonicalStateKeys
+        previous = records[-1]
+        stop = bisect.bisect_right(
+            additions,
+            previous[:_CANONICAL_STATE_KEY_CHARS].decode("ascii"),
+            index,
+        )
+        if stop > index:
+            insertions = np.frombuffer(
+                _encode_canonical_state_keys(additions[index:stop]),
+                dtype=_CANONICAL_STATE_KEY_RECORD_DTYPE,
+            )
+            # Every insertion sorts no later than this block's final row, so
+            # each left position names an existing record in the block.
+            positions = np.searchsorted(records, insertions, side="left")
+            fresh = records[positions] != insertions
+            fresh_count = int(np.count_nonzero(fresh))
+            if fresh_count:
+                pending = np.insert(
+                    records, positions[fresh], insertions[fresh]).tobytes()
+                added += fresh_count
+            index = stop
+        handle.write(pending)
+        pending = next(existing, None)
+    for start in range(index, len(additions), _TRAINED_LEDGER_MERGE_BLOCK_RECORDS):
+        handle.write(_encode_canonical_state_keys(
+            additions[start:start + _TRAINED_LEDGER_MERGE_BLOCK_RECORDS]))
+    return added + len(additions) - index
 
 
 def _state_key_fingerprint(key: str) -> int:
@@ -1559,15 +1718,74 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
 
     Reading the existing file into a set to take the union would reintroduce
     the whole-set memory cost this representation exists to avoid, so the two
-    sorted streams are merged directly into a replacement file.
+    sorted streams are merged directly into a replacement file. Canonical
+    ledgers merge verified fixed-width blocks; any other key text keeps the
+    row-wise union.
     """
 
     additions = sorted(set(new_keys))
     if not additions:
         return 0
-    temporary = None
+    if _are_canonical_state_keys(additions):
+        try:
+            return _rewrite_state_key_union(path, additions, canonical=True)
+        except _NonCanonicalStateKeys:
+            # Legacy or edited key text needs row stripping, blank-row skipping
+            # or its own row order. The block attempt published nothing and
+            # closed its reader, so restart with the exact row-wise union.
+            pass
+    return _rewrite_state_key_union(path, additions, canonical=False)
+
+
+def _write_row_state_key_union(
+    handle: Any,
+    existing: Iterator[str],
+    pending: Optional[str],
+    additions: Sequence[str],
+) -> int:
+    """Stream-merge stripped key rows with sorted additions."""
+
     added = 0
-    existing = _iter_state_keys(path) if path.is_file() else iter(())
+    index = 0
+    write_batch: List[str] = []
+    while pending is not None or index < len(additions):
+        if pending is not None and (
+            index >= len(additions) or pending <= additions[index]
+        ):
+            write_batch.append(pending)
+            if index < len(additions) and pending == additions[index]:
+                index += 1
+            pending = next(existing, None)
+        else:
+            write_batch.append(additions[index])
+            added += 1
+            index += 1
+        if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
+            handle.write("\n".join(write_batch))
+            handle.write("\n")
+            write_batch.clear()
+    if write_batch:
+        handle.write("\n".join(write_batch))
+        handle.write("\n")
+    return added
+
+
+def _rewrite_state_key_union(
+    path: Path, additions: Sequence[str], *, canonical: bool,
+) -> int:
+    """Atomically replace ``path`` with its union with sorted ``additions``."""
+
+    temporary = None
+    noncanonical_error = None
+    if not path.is_file():
+        existing = iter(())
+    elif canonical:
+        existing = _iter_state_key_blocks(
+            path,
+            _TRAINED_LEDGER_MERGE_BLOCK_RECORDS * _CANONICAL_STATE_KEY_RECORD_BYTES,
+        )
+    else:
+        existing = _iter_state_keys(path)
     pending = next(existing, None)
     try:
         # Keep the raw descriptor open across gzip finalization so the CRC and
@@ -1582,53 +1800,49 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
             try:
                 handle = gzip.open(
                     raw_handle,
-                    "wt",
-                    encoding="ascii",
-                    newline="\n",
+                    "wb" if canonical else "wt",
                     compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
+                    **({} if canonical else {"encoding": "ascii", "newline": "\n"}),
                 )
                 try:
-                    index = 0
-                    write_batch: List[str] = []
-                    while pending is not None or index < len(additions):
-                        if pending is not None and (
-                            index >= len(additions) or pending <= additions[index]
-                        ):
-                            write_batch.append(pending)
-                            if index < len(additions) and pending == additions[index]:
-                                index += 1
-                            pending = next(existing, None)
-                        else:
-                            write_batch.append(additions[index])
-                            added += 1
-                            index += 1
-                        if len(write_batch) >= _TRAINED_LEDGER_WRITE_BATCH_KEYS:
-                            handle.write("\n".join(write_batch))
-                            handle.write("\n")
-                            write_batch.clear()
-                    if write_batch:
-                        handle.write("\n".join(write_batch))
-                        handle.write("\n")
+                    if canonical:
+                        try:
+                            added = _write_canonical_state_key_union(
+                                handle, existing, pending, additions)
+                        except _NonCanonicalStateKeys as exc:
+                            # Finish stream and descriptor teardown normally.
+                            # A retry signal must not hide an actual close
+                            # failure as secondary to an already-failed write.
+                            noncanonical_error = exc
+                    else:
+                        added = _write_row_state_key_union(
+                            handle, existing, pending, additions)
                 except BaseException:
                     try:
                         handle.close()
-                    except OSError:
+                    except BaseException:
+                        # A resource failure or interruption during teardown
+                        # must not replace the original failed write.
                         pass
                     raise
                 else:
                     handle.close()
-                raw_handle.flush()
-                os.fsync(raw_handle.fileno())
+                if noncanonical_error is None:
+                    raw_handle.flush()
+                    os.fsync(raw_handle.fileno())
             except BaseException:
                 try:
                     raw_handle.close()
-                except OSError:
+                except BaseException:
                     pass
                 raise
             else:
                 raw_handle.close()
+        if noncanonical_error is not None:
+            raise noncanonical_error
         os.replace(temporary, path)
-    except BaseException:
+    except BaseException as error:
+        cleanup_error = None
         # Output failure can leave the input generator suspended at a yield.
         # Close it now so a retained traceback cannot pin its descriptor and
         # read buffer across retries. Normal merges exhaust and close it.
@@ -1636,9 +1850,8 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
             close_existing = getattr(existing, "close", None)
             if close_existing is not None:
                 close_existing()
-        except BaseException:
-            # Cleanup must not replace the original failure or interruption.
-            pass
+        except BaseException as exc:
+            cleanup_error = exc
         # The canonical ledger is still authoritative until os.replace().  A
         # failed gzip write used to strand its partial sibling indefinitely;
         # one production capacity-exhaustion incident left a partial file while
@@ -1647,8 +1860,13 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
         try:
             if temporary is not None:
                 Path(temporary).unlink(missing_ok=True)
-        except OSError:
-            pass
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        # A format mismatch is recoverable only when abandoning its output
+        # succeeds. A real primary failure still takes precedence over cleanup.
+        if isinstance(error, _NonCanonicalStateKeys) and cleanup_error is not None:
+            raise cleanup_error from error
         raise
     return added
 
