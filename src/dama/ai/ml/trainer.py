@@ -2026,13 +2026,18 @@ class Trainer:
         except Exception:
             return None
 
+    def _training_time_limit_reached(self) -> bool:
+        """Check duration without turning it into an operator STOP request."""
+        stop_time = getattr(self.config, 'stop_time', None)
+        return stop_time is not None and datetime.now() >= stop_time
+
     def _check_thermal_and_rest(self) -> None:
         """If thermal protection is enabled, check temps and sleep if too hot.
 
         Called periodically from the training loop. Uses wall-clock gating
         so we don't shell out to nvidia-smi on every batch.
         """
-        if not self.config.thermal_enabled:
+        if not self.config.thermal_enabled or self._training_time_limit_reached():
             return
 
         now = time.time()
@@ -2070,6 +2075,10 @@ class Trainer:
                 self._service_control_queue()
             if self._stopped:
                 print("Thermal rest interrupted by stop request.")
+                sys.stdout.flush()
+                return
+            if self._training_time_limit_reached():
+                print("Thermal rest ended at the training time limit.")
                 sys.stdout.flush()
                 return
             remaining = end_time - time.time()
@@ -4337,6 +4346,14 @@ class Trainer:
             daemon=True,
         )
         self._acceptance_thread.start()
+
+    def _finish_checkpoint_acceptance(self) -> None:
+        """Drain already queued acceptance work before normal termination."""
+        if self._acceptance_thread is not None and not self._stopped:
+            print("Waiting for queued promoted-checkpoint acceptance evaluations...")
+            self._acceptance_queue.join()
+            self._acceptance_queue.put(None)
+            self._acceptance_thread.join(timeout=5)
 
     def _finalize_checkpoint_acceptance_report(
         self,
@@ -6623,10 +6640,15 @@ class Trainer:
     # Background self-play: overlap CPU game generation with GPU training
     # ------------------------------------------------------------------
 
+    def _background_selfplay_shutdown_requested(self) -> bool:
+        """Observe expiry even while the foreground is finishing native work."""
+        return (self._stopped or self._bg_selfplay_stop_event.is_set()
+                or self._training_time_limit_reached())
+
     def _wait_for_selfplay_disk_headroom(self) -> bool:
         """Wait until persistent self-play and corpus writes have headroom.
 
-        Returns false when shutdown is requested while waiting. The check runs
+        Returns false on shutdown or duration expiry. The check runs
         both before generation and before snapshot admission: the former avoids
         spending a complete CPU cycle on a replay shard that cannot close, and
         the latter keeps a concurrent drop in free space away from the much
@@ -6636,16 +6658,12 @@ class Trainer:
             getattr(self.config, 'selfplay_min_free_disk_gb', 0.0) or 0.0
         )
         if minimum_gb <= 0:
-            return not (
-                self._stopped or self._bg_selfplay_stop_event.is_set()
-            )
+            return not self._background_selfplay_shutdown_requested()
 
         required_bytes = int(minimum_gb * _GIB)
         replay_dir = Path(self.config.replay_dir)
         waiting = False
-        while not (
-            self._stopped or self._bg_selfplay_stop_event.is_set()
-        ):
+        while not self._background_selfplay_shutdown_requested():
             try:
                 free_bytes = int(shutil.disk_usage(replay_dir).free)
                 measurement_error = None
@@ -6653,6 +6671,10 @@ class Trainer:
                 free_bytes = None
                 measurement_error = exc
 
+            # A filesystem query can itself outlive the session. Do not
+            # authorize another write phase just because space is available.
+            if self._background_selfplay_shutdown_requested():
+                return False
             if free_bytes is not None and free_bytes >= required_bytes:
                 if waiting:
                     print(
@@ -6696,8 +6718,7 @@ class Trainer:
             return  # already running
         self._bg_selfplay_stop_event.clear()
 
-        def _shutdown_requested() -> bool:
-            return self._stopped or self._bg_selfplay_stop_event.is_set()
+        _shutdown_requested = self._background_selfplay_shutdown_requested
 
         def _worker():
             if self._snapshot_manager is not None:
@@ -7643,17 +7664,17 @@ class Trainer:
         def _wait_for_training_controls() -> bool:
             if _service_control is not None:
                 _service_control()
-            if self._stopped:
+            if self._stopped or self._training_time_limit_reached():
                 return False
             if _thermal_enabled:
                 self._check_thermal_and_rest()
             while self._paused:
                 if _service_control is not None:
                     _service_control()
+                if self._stopped or self._training_time_limit_reached():
+                    return False
                 time.sleep(0.1)
-                if self._stopped:
-                    break
-            return not self._stopped
+            return not (self._stopped or self._training_time_limit_reached())
 
         _pending_loss = _pending_raw_loss = None
         _pending_scores = _pending_move_counts = None
@@ -7976,8 +7997,8 @@ class Trainer:
                 break
 
         # Natural exhaustion still owns the last successful microbatches,
-        # even when trailing batches failed a sanity check. Explicit STOP
-        # discards pending work, matching the per-batch cancellation contract.
+        # even when trailing batches failed a sanity check. STOP or duration
+        # expiry discards pending work, matching per-batch cancellation.
         if _micro_step and _wait_for_training_controls():
             _finish_optimizer_step(
                 _pending_loss, _pending_raw_loss, _pending_scores,
@@ -8444,6 +8465,25 @@ class Trainer:
 
     def _run_training(self) -> None:
         """Run the full training loop."""
+        def _startup_shutdown_requested() -> bool:
+            # Startup phases can be long even before the first epoch. Finish
+            # the active phase, then stop before dispatching another one.
+            self._service_control_queue()
+            if self._stopped:
+                print("Stop requested during startup; exiting before training")
+                return True
+            if self._training_time_limit_reached():
+                print("Time limit reached during startup; exiting before training")
+                # Construction may have recovered durable acceptance tasks.
+                # Preserve their normal finalization before the run marker
+                # records expiry, even when no training batch has started.
+                self._finish_checkpoint_acceptance()
+                return True
+            return False
+
+        if _startup_shutdown_requested():
+            return
+
         print("\n" + "=" * 50)
         print("Filipino Dama - ML Training")
         print("=" * 50)
@@ -8476,10 +8516,16 @@ class Trainer:
         # Generate initial self-play data if needed. Snapshot recovery needs at
         # least two repaired files so one whole file can be frozen for
         # validation while at least one remains for training.
+        if _startup_shutdown_requested():
+            return
         if self._snapshot_manager is not None:
             eligible_files, rejected_files = (
                 self._snapshot_manager.eligible_replay_files())
+            if _startup_shutdown_requested():
+                return
             eligible_metrics, _ = analyze_replay_files(eligible_files)
+            if _startup_shutdown_requested():
+                return
             entry_count = int(eligible_metrics.get('records', 0))
             if rejected_files:
                 print(
@@ -8488,6 +8534,8 @@ class Trainer:
                 )
             minimum_entries = self.config.batch_size * 10
             while len(eligible_files) < 2 or entry_count < minimum_entries:
+                if _startup_shutdown_requested():
+                    return
                 print(
                     "\nInsufficient repaired snapshot data "
                     f"({len(eligible_files)} files, {entry_count} entries)"
@@ -8495,32 +8543,37 @@ class Trainer:
                 before_files = len(eligible_files)
                 before_entries = entry_count
                 self.run_selfplay(self.config.selfplay_games)
+                if _startup_shutdown_requested():
+                    return
                 eligible_files, _ = self._snapshot_manager.eligible_replay_files()
+                if _startup_shutdown_requested():
+                    return
                 eligible_metrics, _ = analyze_replay_files(eligible_files)
+                if _startup_shutdown_requested():
+                    return
                 entry_count = int(eligible_metrics.get('records', 0))
                 if (len(eligible_files) <= before_files and
                         entry_count <= before_entries):
                     raise RuntimeError(
                         "Self-play produced no eligible repaired replay data"
                     )
-                self._service_control_queue()
-                if self._stopped:
-                    break
         else:
             entry_count = self.replay_buffer.count_entries()
+        if _startup_shutdown_requested():
+            return
         if (self._snapshot_manager is None and
                 entry_count < self.config.batch_size * 10):
             print(f"\nInsufficient training data ({entry_count} entries)")
             self.run_selfplay(self.config.selfplay_games)
 
-        self._service_control_queue()
-        if self._stopped:
-            print("Stop requested during startup; exiting before training")
+        if _startup_shutdown_requested():
             return
 
         # Prepare data
         print("\nPreparing training data...")
         self._ensure_frozen_teacher_suite()
+        if _startup_shutdown_requested():
+            return
         train_entries, validation_entries = self._prepare_training_split()
         preloaded_dataset = self._preloaded_snapshot_dataset
         preloaded_cache_metadata = self._preloaded_snapshot_cache_metadata
@@ -8535,6 +8588,8 @@ class Trainer:
         self._preloaded_snapshot_cache_checked = False
         self._preloaded_validation_dataset = None
         self._preloaded_validation_cache_metadata = None
+        if _startup_shutdown_requested():
+            return
         self._set_validation_entries(
             validation_entries,
             preloaded_dataset=preloaded_validation_dataset,
@@ -8546,6 +8601,8 @@ class Trainer:
         # Validation now owns the cache. This startup local must not keep
         # its tensors alive after a later snapshot replaces validation.
         preloaded_validation_dataset = None
+        if _startup_shutdown_requested():
+            return
         train_entry_count = (
             len(preloaded_dataset)
             if preloaded_dataset is not None else len(train_entries)
@@ -8575,6 +8632,8 @@ class Trainer:
             print("Warning: ignored malformed cached side-weight metadata")
             train_balance = None
 
+        if _startup_shutdown_requested():
+            return
         if self.config.clear_replay_after_load:
             deleted = self.replay_buffer.clear_files()
             if deleted:
@@ -8585,6 +8644,8 @@ class Trainer:
             return
 
         # Create dataloader
+        if _startup_shutdown_requested():
+            return
         effective_workers = self.config.dataloader_workers
         
         print(f"Creating DataLoader with {effective_workers} workers...")
@@ -8672,9 +8733,7 @@ class Trainer:
         print(f"DataLoader ready with {len(dataloader)} batches{_path_label}.")
         sys.stdout.flush()
 
-        self._service_control_queue()
-        if self._stopped:
-            print("Stop requested during startup; exiting before training")
+        if _startup_shutdown_requested():
             return
 
         # Training loop
@@ -8773,6 +8832,8 @@ class Trainer:
         # Start continuous background self-play immediately so CPU is never idle.
         # Full game count (not half) — GPU epochs are ~100x faster than self-play,
         # so generating more data per cycle improves data freshness.
+        if _startup_shutdown_requested():
+            return
         if _simultaneous:
             self._start_background_selfplay(self.config.selfplay_games)
 
@@ -8782,7 +8843,7 @@ class Trainer:
                 break
 
             # Check if stop time has been reached
-            if self.config.stop_time and datetime.now() >= self.config.stop_time:
+            if self._training_time_limit_reached():
                 print(f"\nStop time reached ({self.config.stop_time.strftime('%Y-%m-%d %H:%M')}). Saving and exiting...")
                 break
 
@@ -8792,9 +8853,9 @@ class Trainer:
             self.stats.epochs_completed = self.epoch
             self._record_epoch_loss(loss)
             self._save_progress_report_if_due()
-            # Skip dataloader refresh / async-test startup when stopping:
-            # they only add wind-down latency after a Stop request.
-            if self._stopped:
+            # A deadline can expire inside an epoch or a control wait. Begin
+            # finalization before recovery, data refresh or new evaluations.
+            if self._stopped or self._training_time_limit_reached():
                 break
             # Throttle epoch prints: with ~245 epochs per 60s self-play cycle,
             # per-epoch prints add ~735ms of terminal I/O overhead on WSL2
@@ -8873,8 +8934,10 @@ class Trainer:
                         # Respect pause commands while waiting
                         while self._paused and not self._stopped:
                             self._service_control_queue()
+                            if self._stopped or self._training_time_limit_reached():
+                                break
                             time.sleep(0.1)
-                        if self._stopped:
+                        if self._stopped or self._training_time_limit_reached():
                             break
                         # If background thread died, resume training on stale data
                         # rather than spinning forever.
@@ -8908,7 +8971,7 @@ class Trainer:
                         # 2s timeout for stop/pause/thermal checks.
                         self._data_ready_event.wait(timeout=2.0)
                         # Check stop conditions while waiting
-                        if self.config.stop_time and datetime.now() >= self.config.stop_time:
+                        if self._training_time_limit_reached():
                             break
                     # Wait loop exited — record how long the GPU sat idle so the
                     # session report's summary.gpu_idle_wait_* aggregates it.
@@ -8992,6 +9055,10 @@ class Trainer:
                     self._use_padded = True
                     _gpu_resident = getattr(dataloader, 'on_gpu', False)
 
+            # A data/GUI wait may have reached the deadline after the epoch.
+            if self._stopped or self._training_time_limit_reached():
+                break
+
             # Collect completed async test (non-blocking)
             _collect_async_test()
 
@@ -9021,11 +9088,7 @@ class Trainer:
         # Final checkpoint
         self._save_checkpoint(loss)
         self._wait_for_checkpoint_writer()
-        if self._acceptance_thread is not None and not self._stopped:
-            print("Waiting for queued promoted-checkpoint acceptance evaluations...")
-            self._acceptance_queue.join()
-            self._acceptance_queue.put(None)
-            self._acceptance_thread.join(timeout=5)
+        self._finish_checkpoint_acceptance()
 
         # Final test vs algorithm (synchronous — training is done).
         # Skipped when training was explicitly stopped: a Stop request from
