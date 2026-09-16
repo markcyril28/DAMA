@@ -19,6 +19,7 @@ import bisect
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import gc
 import gzip
 import hashlib
 import json
@@ -862,6 +863,63 @@ def audit_policy_replay_file(
         return _audit_policy_replay_file_uncached(path, allowed_opening_plies)
     return _audit_policy_replay_file_for_identity(
         path, allowed_opening_plies, identity)
+
+
+# Parsing a replay window materializes millions of small container objects
+# (entry dicts, legal-move lists, ``ReplayEntry`` instances) that stay alive
+# until tensorization.  CPython's cyclic collector schedules a full collection
+# whenever the long-lived object count has grown by a quarter, and every full
+# pass walks each live container, so per-shard parse time grows with the
+# entries already held.  A 22-shard chunk of the c174k window parsed in 26.3 s
+# and 26.7 s with the collector enabled against 9.5 s and 10.9 s with it
+# paused, with identical entries (Journal Pass 552).  Replay entries hold no
+# reference cycles, so reference counting still frees every temporary at once;
+# only the cyclic pass is deferred until the window is parsed.
+_cyclic_gc_pause_lock = threading.Lock()
+_cyclic_gc_pause_depth = 0
+_cyclic_gc_pause_restore = False
+
+
+def _reset_cyclic_gc_pause_state() -> None:
+    """Drop pause bookkeeping inherited mid-hold: its holder is not in the child."""
+    global _cyclic_gc_pause_lock, _cyclic_gc_pause_depth, _cyclic_gc_pause_restore
+    _cyclic_gc_pause_lock = threading.Lock()
+    _cyclic_gc_pause_depth = 0
+    _cyclic_gc_pause_restore = False
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_cyclic_gc_pause_state)
+
+
+@contextmanager
+def paused_cyclic_gc() -> Iterator[None]:
+    """Pause CPython's cyclic collector while a replay window is parsed.
+
+    Re-entrant across nested loaders and overlapping threads: the collector is
+    disabled on the outermost entry only if it was enabled there, and it is
+    re-enabled only when the last active pause exits.  A collector that was
+    already disabled on entry stays disabled.  A forked child inherits the
+    parent's collector state and resets this bookkeeping; the preprocessing
+    pools freeze inherited objects in their initializer anyway, and a paused
+    collector in a short-lived worker is strictly safer for the inherited CUDA
+    tensors that freeze protects.
+    """
+    global _cyclic_gc_pause_depth, _cyclic_gc_pause_restore
+    with _cyclic_gc_pause_lock:
+        if _cyclic_gc_pause_depth == 0:
+            _cyclic_gc_pause_restore = gc.isenabled()
+            if _cyclic_gc_pause_restore:
+                gc.disable()
+        _cyclic_gc_pause_depth += 1
+    try:
+        yield
+    finally:
+        with _cyclic_gc_pause_lock:
+            _cyclic_gc_pause_depth -= 1
+            if _cyclic_gc_pause_depth == 0 and _cyclic_gc_pause_restore:
+                _cyclic_gc_pause_restore = False
+                gc.enable()
 
 
 def _iter_entry_dicts(path: Path) -> Iterator[dict]:
@@ -4695,19 +4753,21 @@ class CorpusSnapshotManager:
         validation_entries: List[ReplayEntry] = []
         leaked_validation_states: Set[str] = set()
         leaked_validation_entries = 0
-        for record in context.validation_manifest["files"]:
-            file_path = context.validation_path.parent / _read_relpath(
-                record["path"])
-            for entry_dict in _iter_entry_dicts(file_path):
-                key = canonical_state_key(entry_dict["state"])
-                # The key stays in ``validation_keys`` either way, so a state
-                # dropped here is never quietly handed back to training.
-                context.validation_keys.add(key)
-                if _state_key_fingerprint(key) in context.historically_trained:
-                    leaked_validation_states.add(key)
-                    leaked_validation_entries += 1
-                    continue
-                validation_entries.append(ReplayEntry.from_dict(entry_dict))
+        with paused_cyclic_gc():
+            for record in context.validation_manifest["files"]:
+                file_path = context.validation_path.parent / _read_relpath(
+                    record["path"])
+                for entry_dict in _iter_entry_dicts(file_path):
+                    key = canonical_state_key(entry_dict["state"])
+                    # The key stays in ``validation_keys`` either way, so a
+                    # state dropped here is never quietly handed back to
+                    # training.
+                    context.validation_keys.add(key)
+                    if _state_key_fingerprint(key) in context.historically_trained:
+                        leaked_validation_states.add(key)
+                        leaked_validation_entries += 1
+                        continue
+                    validation_entries.append(ReplayEntry.from_dict(entry_dict))
         context.manifest["validation_leakage"] = {
             "ledger_enabled": self.trained_ledger_enabled,
             "all_time_trained_state_count": len(context.historically_trained),
@@ -4770,9 +4830,10 @@ class CorpusSnapshotManager:
         """Materialize the train entries after cross-split deduplication."""
 
         train_entries: List[ReplayEntry] = []
-        for record in context.manifest["files"]:
-            train_entries.extend(
-                self.load_train_file_entries(context, record))
+        with paused_cyclic_gc():
+            for record in context.manifest["files"]:
+                train_entries.extend(
+                    self.load_train_file_entries(context, record))
 
         indices = self.train_cap_sample_indices(
             len(train_entries), context.max_train_entries)
