@@ -144,6 +144,75 @@ _SELFPLAY_DISK_HEADROOM_POLL_SECONDS = 30.0
 _GIB = 1024 ** 3
 
 
+def _diagnostic_print(*args, **kwargs) -> None:
+    """Print progress without letting a dead console abort training work.
+
+    A closed console pipe raised BrokenPipeError from the shutdown diagnostic
+    in ``_stop_background_selfplay`` on 2026-09-15, which skipped the producer
+    join, the final checkpoint, the acceptance drain and the statistics export
+    and cost 1,616 optimizer steps (step 435,616 against a step-434,000
+    checkpoint; Journal Pass 551 incident, repaired in Pass 553).
+
+    A broken pipe is permanent, so guarding one call would only move the
+    failure to the next print.  Retire both streams to the null device on the
+    first broken pipe, leaving unguarded diagnostics downstream harmless.
+    Other console errors are swallowed per write, matching the existing
+    convention in ``stats_collector`` (``except (OSError, ValueError)``).
+    """
+
+    broken = kwargs.get('file') or sys.stdout
+    try:
+        print(*args, **kwargs)
+        return
+    except BrokenPipeError:
+        pass
+    except (OSError, ValueError):
+        return
+    _retire_unwritable_console(broken)
+
+
+def _retire_unwritable_console(broken) -> None:
+    """Point the failed stream at the null device after a permanent failure.
+
+    Only the stream that actually raised is retired: the launchers merge
+    stderr into stdout, but a caller that kept them separate must not lose a
+    still-writable stderr to a dead stdout.
+
+    KNOWN GAP (not auto-fixed, Journal Pass 553): under the launchers'
+    ``2>&1 | tee`` the shell dup2s fd 1 onto fd 2, so both descriptors die
+    together while remaining distinct Python objects, and stderr stays broken
+    here. That is cosmetic today because trainer.py writes nothing to stderr
+    explicitly (``grep -n 'file=sys.stderr'`` is empty) and CPython's
+    excepthook swallows its own write failures. Detecting the shared pipe
+    would need ``os.fstat`` device/inode comparison, which is too fragile to
+    add on a failure path; route any new shutdown-path stderr write through
+    ``_diagnostic_print(..., file=sys.stderr)`` instead.
+    """
+
+    try:
+        null_stream = open(os.devnull, 'w')
+    except OSError:
+        return
+    replaced = False
+    for name in ('stdout', 'stderr'):
+        if getattr(sys, name, None) is broken:
+            setattr(sys, name, null_stream)
+            replaced = True
+    if not replaced:
+        null_stream.close()
+        return
+    # The buffered data is unreachable, and closing now keeps the interpreter
+    # from retrying that flush at shutdown. Dropping it must not raise here.
+    # This is only safe because CPython builds the std streams with
+    # closefd=False, so fd 1 stays occupied and no later open() can reuse the
+    # number a copied stream might still flush into (the hazard
+    # fork_writers._drop_registered_fds_in_fork_child handles with dup2).
+    try:
+        broken.close()
+    except (OSError, ValueError):
+        pass
+
+
 def _fsync_directory(path: Path) -> None:
     """Persist a completed rename on platforms that expose directory fds."""
 
@@ -3798,6 +3867,15 @@ class Trainer:
                 if decision.admitted or settings_match:
                     break
 
+                # Repairing the contract costs one whole self-play cycle per
+                # iteration until admission passes, so this loop is exactly
+                # the unbounded startup work a session deadline has to bound.
+                # Stop before dispatching another cycle, matching the replay
+                # bootstrap loop in _run_training (Journal Pass 553).
+                self._service_control_queue()
+                if self._stopped or self._training_time_limit_reached():
+                    return [], []
+
                 eligible_before, _ = (
                     self._snapshot_manager.eligible_replay_files()
                 )
@@ -3816,8 +3894,11 @@ class Trainer:
                         f"Replay: pruned {pruned} old file(s) while preparing "
                         "the new data contract"
                     )
+                # Expiry during the cycle is observed here too: the caller
+                # rechecks immediately, and an empty split leaves the active
+                # dataloader untouched in alternate mode.
                 self._service_control_queue()
-                if self._stopped:
+                if self._stopped or self._training_time_limit_reached():
                     return [], []
 
                 eligible_after, _ = (
@@ -4357,7 +4438,8 @@ class Trainer:
     def _finish_checkpoint_acceptance(self) -> None:
         """Drain already queued acceptance work before normal termination."""
         if self._acceptance_thread is not None and not self._stopped:
-            print("Waiting for queued promoted-checkpoint acceptance evaluations...")
+            _diagnostic_print(
+                "Waiting for queued promoted-checkpoint acceptance evaluations...")
             self._acceptance_queue.join()
             self._acceptance_queue.put(None)
             self._acceptance_thread.join(timeout=5)
@@ -7065,7 +7147,7 @@ class Trainer:
         self._data_ready_event.set()
         thread = self._bg_selfplay_thread
         if thread is not None and thread.is_alive():
-            print("Waiting for background self-play to finish...")
+            _diagnostic_print("Waiting for background self-play to finish...")
             thread.join()
 
     def _collect_background_selfplay(self):
@@ -8464,11 +8546,12 @@ class Trainer:
                     traceback_text=traceback_text,
                     context={'step': int(self.step), 'epoch': int(self.epoch)},
                 )
-                print(f"Trainer terminal reason recorded: {reason}"
-                      + (f" ({detail})" if detail else ""))
-                sys.stdout.flush()
+                _diagnostic_print(f"Trainer terminal reason recorded: {reason}"
+                                  + (f" ({detail})" if detail else ""),
+                                  flush=True)
             except (OSError, ValueError) as exc:
-                print(f"Warning: could not record terminal reason: {exc}")
+                _diagnostic_print(
+                    f"Warning: could not record terminal reason: {exc}")
 
     def _run_training(self) -> None:
         """Run the full training loop."""
@@ -9083,7 +9166,7 @@ class Trainer:
 
         # Collect any in-flight async test before exit
         if _async_test_thread is not None and _async_test_thread.is_alive():
-            print("Waiting for async test to complete...")
+            _diagnostic_print("Waiting for async test to complete...")
             _async_test_thread.join(timeout=30)
         _collect_async_test()
 
@@ -9092,7 +9175,12 @@ class Trainer:
         if _simultaneous:
             self._stop_background_selfplay()
 
-        # Final checkpoint
+        # Final checkpoint.
+        # KNOWN GAP (not auto-fixed, Journal Pass 553): _save_checkpoint's own
+        # progress prints are unguarded, so a console pipe that dies inside it
+        # still aborts the write. _diagnostic_print() covers the diagnostics
+        # that were observed to fail (the producer join banner above), not
+        # every print reachable during finalization.
         self._save_checkpoint(loss)
         self._wait_for_checkpoint_writer()
         self._finish_checkpoint_acceptance()
@@ -9103,10 +9191,10 @@ class Trainer:
         if (self.config.test_vs_algo and not self.config.test_promoted_only
                 and not self._stopped):
             try:
-                print("\nRunning final model evaluation...")
+                _diagnostic_print("\nRunning final model evaluation...")
                 self.run_test_vs_algo(num_games=self.config.test_games * 2)
             except Exception as e:
-                print(f"Final test failed: {e}")
+                _diagnostic_print(f"Final test failed: {e}")
 
         elapsed = time.time() - start_time
         print(f"\nTraining complete!")
