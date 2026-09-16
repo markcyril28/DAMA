@@ -106,6 +106,7 @@ from .corpus import (
     _SnapshotSplitContext,
     analyze_replay_files,
     canonical_state_key,
+    paused_cyclic_gc,
     replay_file_sha256,
 )
 from .teacher_validation import (
@@ -3579,25 +3580,31 @@ class Trainer:
             # Only the tensors need to survive while the next shards parse.
             miss_entries.clear()
 
-        for record in miss_records:
-            if should_abort is not None and should_abort():
-                return None
-            entries = manager.load_train_file_entries(context, record)
-            miss_counts.append(len(entries))
-            miss_offsets.append((
-                len(miss_tensors), len(miss_entries),
-                len(miss_entries) + len(entries),
-            ))
-            miss_entries.extend(entries)
-            entries = None
-            if len(miss_entries) >= _TRAIN_WINDOW_PARSE_CHUNK_ENTRIES:
+        # Each parse chunk keeps up to a quarter-million entries alive as
+        # small containers, and CPython's cyclic collector re-walks all of
+        # them on every full collection it schedules while the chunk grows.
+        # Pause it for the parse and encode loop only; the assembly below
+        # runs with the collector restored (Journal Pass 552).
+        with paused_cyclic_gc():
+            for record in miss_records:
                 if should_abort is not None and should_abort():
                     return None
+                entries = manager.load_train_file_entries(context, record)
+                miss_counts.append(len(entries))
+                miss_offsets.append((
+                    len(miss_tensors), len(miss_entries),
+                    len(miss_entries) + len(entries),
+                ))
+                miss_entries.extend(entries)
+                entries = None
+                if len(miss_entries) >= _TRAIN_WINDOW_PARSE_CHUNK_ENTRIES:
+                    if should_abort is not None and should_abort():
+                        return None
+                    encode_misses()
+            if should_abort is not None and should_abort():
+                return None
+            if miss_entries:
                 encode_misses()
-        if should_abort is not None and should_abort():
-            return None
-        if miss_entries:
-            encode_misses()
         miss_entries = None
         if should_abort is not None and should_abort():
             return None
