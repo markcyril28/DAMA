@@ -758,6 +758,118 @@ def load_jsonl_logs(logs_dir: str = "logs") -> list[dict]:
     return test_entries
 
 
+WIN_RATE_TESTER_KIND = 'win_rate_tester'
+# The stamp test_ml_vs_algo_win_rate.sh writes into every record it appends
+# (its shared_provenance block), and the file name it writes them to. Both are
+# the read side of that script's output contract: keep them in step with it.
+WIN_RATE_TESTER_STAMP = 'test_ml_vs_algo_win_rate.sh'
+WIN_RATE_TESTER_RESULTS_NAME = 'results.jsonl'
+DEFAULT_TEST_STATS_DIRNAME = 'test_stats'
+
+
+def load_test_stats_results(test_stats_dir: str | Path = "models/test_stats") -> list[dict]:
+    """Load win-rate tester results stored under models/test_stats.
+
+    test_ml_vs_algo_win_rate.sh writes one record per (model, difficulty) to
+    <test_stats>/<namespace>/win_rate_tester/results.jsonl -- appending, or
+    rewriting the file in place when its OVERWRITE_PREVIOUS is set. Those runs
+    are the only ML-vs-algorithm measurements taken between the trainer's own
+    periodic tests, so each (file, difficulty) becomes its own dashboard series
+    rather than being folded into the training run's line.
+
+    Only records carrying that script's stamp are plotted, because the series
+    label claims the measurement came from it. A record whose step could not be
+    resolved has no place on a step axis and is skipped. Invalid steps or win
+    rates are skipped before they reach either renderer. Repeat measurements of
+    one step in one series keep the newest timestamp, so a rewritten file and
+    an appended one plot the same point.
+    """
+    root = Path(test_stats_dir)
+    if not root.is_dir():
+        return []
+
+    entries: dict[tuple[str, int], dict] = {}
+    skipped_unknown_step = 0
+    skipped_invalid_metrics = 0
+    for results_file in sorted(root.rglob(WIN_RATE_TESTER_RESULTS_NAME)):
+        try:
+            lines = results_file.read_text(encoding='utf-8').splitlines()
+        except Exception as e:  # noqa: BLE001 - a bad file must not kill the report
+            print(f"Warning: Could not read {results_file}: {e}")
+            continue
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            # Only this tester's own records. Another writer's results.jsonl
+            # under test_stats is a different measurement and must not be
+            # labelled as one of its runs.
+            if record.get('tester') != WIN_RATE_TESTER_STAMP:
+                continue
+            # Random-opponent records measure a different opponent entirely,
+            # and the panel is "ML Model vs Algorithm".
+            if record.get('opponent_type') == 'random':
+                continue
+            if record.get('step_known') is False:
+                skipped_unknown_step += 1
+                continue
+            step = record.get('step')
+            numeric_step = (_as_finite_float(step)
+                            if isinstance(step, (int, float)) and not isinstance(step, bool)
+                            else None)
+            rates = {name: _as_finite_float(record.get(name)) for name in (
+                'ml_win_rate', 'ml_as_p1_win_rate', 'ml_as_p2_win_rate')}
+            invalid_step = (numeric_step is None or numeric_step < 0
+                            or not numeric_step.is_integer())
+            invalid_rates = any(
+                isinstance(record.get(name), bool) or rate is None or not 0 <= rate <= 1
+                for name, rate in rates.items())
+            if invalid_step or invalid_rates:
+                skipped_invalid_metrics += 1
+                continue
+
+            difficulty = record.get('algo_difficulty') or 'algorithm'
+            namespace = record.get('namespace')
+            try:
+                relative = results_file.relative_to(root).as_posix()
+            except ValueError:
+                relative = results_file.name
+            source_file = f"{relative}#{difficulty}"
+            tagged = dict(record)
+            tagged['step'] = int(step)
+            # Both renderers multiply these values by 100. Preserve accepted
+            # numeric strings as numbers, not repeated strings in Plotly data.
+            tagged.update(rates)
+            tagged['source_file'] = source_file
+            tagged['run'] = f"Tester {difficulty}" + (f" [{namespace}]" if namespace else "")
+            tagged['source_kind'] = WIN_RATE_TESTER_KIND
+
+            key = (source_file, tagged['step'])
+            previous = entries.get(key)
+            if previous is None or str(tagged.get('timestamp') or '') >= str(previous.get('timestamp') or ''):
+                entries[key] = tagged
+
+    if skipped_unknown_step:
+        print(f"  Skipped {skipped_unknown_step} tester result(s) with no resolved training step")
+    if skipped_invalid_metrics:
+        print(f"Warning: Skipped {skipped_invalid_metrics} tester result(s) with invalid step or win rates")
+    return [entries[key] for key in sorted(entries, key=lambda item: (item[1], item[0]))]
+
+
+def _is_tester_entry(entry) -> bool:
+    """True for a record produced by the standalone win-rate tester."""
+    return (isinstance(entry, dict)
+            and (entry.get('source_kind') == WIN_RATE_TESTER_KIND
+                 or entry.get('tester') == WIN_RATE_TESTER_STAMP))
+
+
 def _tag_log_entries(log_entries: list[dict], stats: dict) -> list[dict]:
     """Tag external JSONL entries with the current report source when absent."""
     source_file = stats.get('current_source_file') or 'logs'
@@ -771,12 +883,14 @@ def _tag_log_entries(log_entries: list[dict], stats: dict) -> list[dict]:
     return tagged
 
 
-def merge_test_history(stats: dict, log_entries: list[dict]) -> list[dict]:
-    """Merge test history from stats file and log files, removing duplicates.
+def merge_test_history(stats: dict, log_entries: list[dict],
+                       test_stats_entries: list[dict] | None = None) -> list[dict]:
+    """Merge test history from stats file, log files and the win-rate tester.
 
     Args:
         stats: Training statistics dictionary (with test_history)
         log_entries: Test entries from JSONL log files
+        test_stats_entries: Tester entries from load_test_stats_results()
 
     Returns:
         Combined and deduplicated test history, sorted by step
@@ -793,6 +907,13 @@ def merge_test_history(stats: dict, log_entries: list[dict]) -> list[dict]:
         step = entry.get('step')
         if step is not None:
             combined[(entry.get('source_file', 'logs'), step, idx)] = entry
+
+    # Add standalone win-rate tester runs; load_test_stats_results() already
+    # tagged one source per (results file, difficulty) and deduplicated steps.
+    for idx, entry in enumerate(test_stats_entries or []):
+        step = entry.get('step')
+        if step is not None:
+            combined[(entry.get('source_file', 'test_stats'), step, idx)] = entry
 
     # Sort by step and return as list
     return [entry for _, entry in sorted(
@@ -996,27 +1117,66 @@ def _recovery_summary_metrics(stats: dict, test_history: list[dict]) -> dict:
     }
 
 
+def _tester_summary_lines(test_history: list[dict]) -> list[str]:
+    """Latest standalone win-rate tester result per series, newest series last."""
+    latest_by_source: dict[str, dict] = {}
+    for entry in test_history:
+        if not _is_tester_entry(entry):
+            continue
+        source = entry.get('source_file') or entry.get('run') or 'tester'
+        previous = latest_by_source.get(source)
+        if previous is None or (
+                (entry.get('step') or 0), str(entry.get('timestamp') or '')
+        ) >= ((previous.get('step') or 0), str(previous.get('timestamp') or '')):
+            latest_by_source[source] = entry
+    if not latest_by_source:
+        return []
+
+    lines = ["", "<b>Manual Win-Rate Tests</b>", "====================="]
+    for entry in sorted(latest_by_source.values(),
+                        key=lambda item: (item.get('run') or '', item.get('step') or 0)):
+        win_rate = (_as_finite_float(entry.get('ml_win_rate')) or 0.0) * 100
+        lines.append(f"{entry.get('run', 'Tester')}:")
+        lines.append(
+            f"  step {int(entry.get('step') or 0):,}  {win_rate:.1f}%  "
+            f"({entry.get('ml_wins', 0)}W/{entry.get('draws', 0)}D/"
+            f"{entry.get('algo_wins', 0)}L of {entry.get('total_games', 0)})"
+        )
+    return lines
+
+
 def _build_summary_text(stats: dict, test_history: list[dict], steps, win_rates) -> str:
-    """Build the monospace summary block (uses <br> for Plotly line breaks)."""
-    total_games = sum(t['total_games'] for t in test_history)
-    total_ml_wins = sum(t['ml_wins'] for t in test_history)
-    total_algo_wins = sum(t['algo_wins'] for t in test_history)
-    total_draws = sum(t['draws'] for t in test_history)
+    """Build the monospace summary block (uses <br> for Plotly line breaks).
+
+    The cumulative, best and latest lines describe the training run's own
+    periodic tests. Standalone tester runs are measurements of a hand-picked
+    checkpoint, sometimes at a difficulty the run never tests, so they get
+    their own block instead of redefining those numbers.
+    """
+    training_tests = [t for t in test_history if not _is_tester_entry(t)]
+    training_steps = [t['step'] for t in training_tests if t.get('step') is not None]
+    training_win_rates = [(_as_finite_float(t.get('ml_win_rate')) or 0.0) * 100
+                          for t in training_tests if t.get('step') is not None]
+
+    total_games = sum(t['total_games'] for t in training_tests)
+    total_ml_wins = sum(t['ml_wins'] for t in training_tests)
+    total_algo_wins = sum(t['algo_wins'] for t in training_tests)
+    total_draws = sum(t['draws'] for t in training_tests)
     overall_win_rate = (total_ml_wins / total_games * 100) if total_games > 0 else 0
     algo_win_rate = (total_algo_wins / total_games * 100) if total_games > 0 else 0
 
-    best_win_rate = max(win_rates) if win_rates else 0
-    best_step = steps[win_rates.index(best_win_rate)] if win_rates else 0
-    latest_win_rate = win_rates[-1] if win_rates else 0
+    best_win_rate = max(training_win_rates) if training_win_rates else 0
+    best_step = training_steps[training_win_rates.index(best_win_rate)] if training_win_rates else 0
+    latest_win_rate = training_win_rates[-1] if training_win_rates else 0
 
-    # Use max step from test history if it's higher than stats
+    # Only the training run's own tests can extend its recorded progress.
     total_steps_from_stats = stats.get('total_steps')
-    max_step_from_tests = max(steps) if steps else 0
+    max_step_from_tests = max(training_steps) if training_steps else 0
     total_steps = max(total_steps_from_stats or 0, max_step_from_tests)
     total_steps_str = f"{total_steps:,}" if total_steps > 0 else 'N/A'
     epochs = stats.get('epochs_completed')
     epochs_str = f"{epochs:,}" if isinstance(epochs, (int, float)) else 'N/A'
-    recovery_metrics = _recovery_summary_metrics(stats, test_history)
+    recovery_metrics = _recovery_summary_metrics(stats, training_tests)
     start_time = stats.get('start_time', 'N/A')
     start_time_str = start_time[:19] if isinstance(start_time, str) and len(start_time) >= 19 else str(start_time)
     end_time = stats.get('end_time', 'N/A')
@@ -1048,12 +1208,15 @@ def _build_summary_text(stats: dict, test_history: list[dict], steps, win_rates)
         "",
         f"Best Win Rate:         {best_win_rate:.1f}% (at step {best_step:,})",
         f"Latest Win Rate:       {latest_win_rate:.1f}%",
+    ]
+    lines.extend(_tester_summary_lines(test_history))
+    lines.extend([
         "",
         "<b>Training Period</b>",
         "===============",
         f"Start: {start_time_str}",
         f"End:   {end_time_str}",
-    ]
+    ])
     return "<br>".join(lines)
 
 
@@ -1082,7 +1245,7 @@ def _as_finite_float(value) -> float | None:
     """Return a finite float, or None for missing/non-numeric metric values."""
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) else None
 
@@ -1281,7 +1444,8 @@ def _stats_for_source(stats: dict, source_file: str) -> dict:
 def _fig_overall(test_history: list[dict]) -> go.Figure:
     """Overall ML win-rate vs the algorithm, with a polynomial trend line."""
     fig = go.Figure()
-    palette = ['royalblue', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna']
+    palette = ['royalblue', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna',
+               'darkturquoise', 'hotpink', 'olive', 'slategray']
     for group_idx, (source_file, run_label, entries) in enumerate(
             _group_history_by_source(test_history)):
         steps = [t['step'] for t in entries]
@@ -1317,8 +1481,10 @@ def _fig_overall(test_history: list[dict]) -> go.Figure:
 def _fig_position(test_history: list[dict]) -> go.Figure:
     """Win rate split by which side the ML model played (Player 1 vs Player 2)."""
     fig = go.Figure()
-    p1_palette = ['green', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna']
-    p2_palette = ['magenta', 'firebrick', 'teal', 'goldenrod', 'slateblue', 'gray']
+    p1_palette = ['green', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna',
+                  'darkturquoise', 'hotpink', 'olive', 'slategray']
+    p2_palette = ['magenta', 'firebrick', 'teal', 'goldenrod', 'slateblue', 'gray',
+                  'darkgreen', 'indigo', 'chocolate', 'steelblue']
     for group_idx, (source_file, run_label, entries) in enumerate(
             _group_history_by_source(test_history)):
         steps = [t['step'] for t in entries]
@@ -1352,7 +1518,8 @@ def _fig_loss(stats: dict) -> go.Figure:
     trace_x_gpu_hours = []
     loss_history = stats.get('loss_history', [])
     current_source_file = stats.get('current_source_file')
-    palette = ['royalblue', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna']
+    palette = ['royalblue', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna',
+               'darkturquoise', 'hotpink', 'olive', 'slategray']
     if loss_history:
         for group_idx, (source_file, run_label, entries) in enumerate(
                 _group_history_by_source(loss_history)):
@@ -1559,16 +1726,34 @@ def plot_win_rate(stats: dict, test_history: list[dict], output_path: str = "mod
     return [fig for _, _, fig in panels]
 
 
+def _resolve_test_stats_dir(stats_path: Path, test_stats_dir: str | Path | None,
+                            include_test_stats: bool) -> Path | None:
+    """Where to look for win-rate tester results, or None when disabled.
+
+    The default sits beside the stats file (models/test_stats), so the
+    trainer's own report refreshes pick up tester runs without being told.
+    """
+    if not include_test_stats:
+        return None
+    if test_stats_dir is not None:
+        return Path(test_stats_dir)
+    return stats_path.parent / DEFAULT_TEST_STATS_DIRNAME
+
+
 def write_progress_report(stats_path: str | Path,
                           logs_dir: str | Path | None = None,
-                          output_path: str | Path = "models/training_progress.html") -> Path:
+                          output_path: str | Path = "models/training_progress.html",
+                          test_stats_dir: str | Path | None = None,
+                          include_test_stats: bool = True) -> Path:
     """Regenerate the interactive HTML report from the latest stats/log files."""
     stats_path = Path(stats_path)
     stats, _stats_paths = load_stats_bundle(stats_path)
 
     logs_path = Path(logs_dir) if logs_dir is not None else stats_path.parent.parent / "logs"
     log_entries = load_jsonl_logs(str(logs_path)) if logs_path.exists() else []
-    test_history = merge_test_history(stats, log_entries)
+    tester_dir = _resolve_test_stats_dir(stats_path, test_stats_dir, include_test_stats)
+    tester_entries = load_test_stats_results(tester_dir) if tester_dir is not None else []
+    test_history = merge_test_history(stats, log_entries, tester_entries)
 
     plot_win_rate(stats, test_history, str(output_path), show=False)
     return Path(output_path)
@@ -1584,14 +1769,18 @@ def write_progress_outputs(stats_path: str | Path,
                            logs_dir: str | Path | None = None,
                            html_output_path: str | Path = "models/training_progress.html",
                            image_output_path: str | Path | None = None,
-                           dpi: int = DEFAULT_DPI) -> dict[str, Path]:
+                           dpi: int = DEFAULT_DPI,
+                           test_stats_dir: str | Path | None = None,
+                           include_test_stats: bool = True) -> dict[str, Path]:
     """Regenerate both the interactive HTML report and the static PNG snapshot."""
     stats_path = Path(stats_path)
     stats, _stats_paths = load_stats_bundle(stats_path)
 
     logs_path = Path(logs_dir) if logs_dir is not None else stats_path.parent.parent / "logs"
     log_entries = load_jsonl_logs(str(logs_path)) if logs_path.exists() else []
-    test_history = merge_test_history(stats, log_entries)
+    tester_dir = _resolve_test_stats_dir(stats_path, test_stats_dir, include_test_stats)
+    tester_entries = load_test_stats_results(tester_dir) if tester_dir is not None else []
+    test_history = merge_test_history(stats, log_entries, tester_entries)
 
     html_output = Path(html_output_path)
     image_output = Path(image_output_path) if image_output_path is not None else _companion_png_path(html_output)
@@ -1623,46 +1812,69 @@ def plot_win_rate_static(stats: dict, test_history: list[dict],
     matplotlib.use('Agg')  # headless; we open the saved PNG ourselves
     import matplotlib.pyplot as plt
 
-    # Extract data
+    # Extract data (per-series values are read inside the plotting loops below)
     steps = [t['step'] for t in test_history]
     win_rates = [t['ml_win_rate'] * 100 for t in test_history]  # Convert to percentage
-    p1_win_rates = [t['ml_as_p1_win_rate'] * 100 for t in test_history]
-    p2_win_rates = [t['ml_as_p2_win_rate'] * 100 for t in test_history]
 
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=FIGURE_SIZE)
     fig.suptitle('Filipino Micro ML Model Training Progress', fontsize=16, fontweight='bold')
 
+    # Each run source (training runs, and each standalone tester difficulty)
+    # gets its own line, as the interactive figures do. Drawing one line over
+    # the merged history would join measurements of different models and
+    # opponents into a single curve and fit one trend through the mixture.
+    history_groups = _group_history_by_source(test_history)
+    # Ten entries: a wrap would give two runs the same colour in one panel.
+    static_palette = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple',
+                      'tab:brown', 'tab:pink', 'tab:gray', 'tab:olive', 'tab:cyan']
+    p1_palette = ['green', 'darkorange', 'seagreen', 'crimson', 'mediumpurple', 'sienna',
+                  'darkturquoise', 'hotpink', 'olive', 'slategray']
+    p2_palette = ['magenta', 'firebrick', 'teal', 'goldenrod', 'slateblue', 'gray',
+                  'darkgreen', 'indigo', 'chocolate', 'steelblue']
+
     # Plot 1: Overall Win Rate
     ax1 = axes[0, 0]
-    ax1.plot(steps, win_rates, 'b-o', linewidth=2, markersize=6, label='ML Win Rate')
     ax1.axhline(y=50, color='r', linestyle='--', alpha=0.7, label='50% (Equal)')
-    ax1.fill_between(steps, win_rates, alpha=0.3)
+    for group_idx, (_source_file, run_label, entries) in enumerate(history_groups):
+        group_steps = [t['step'] for t in entries]
+        group_win_rates = [t['ml_win_rate'] * 100 for t in entries]
+        color = static_palette[group_idx % len(static_palette)]
+        ax1.plot(group_steps, group_win_rates, marker='o', color=color,
+                 linewidth=2, markersize=5, label=f'{run_label} ML Win Rate')
+        if group_idx == 0:
+            ax1.fill_between(group_steps, group_win_rates, alpha=0.3, color=color)
+        if len(group_steps) > 2:
+            z = np.polyfit(group_steps, group_win_rates, TREND_LINE_DEGREE)
+            p = np.poly1d(z)
+            x_smooth = np.linspace(min(group_steps), max(group_steps), 100)
+            # Unlabelled: a dashed line in the series colour reads as that
+            # series' trend, and one legend entry per run is already a lot.
+            ax1.plot(x_smooth, np.clip(p(x_smooth), 0, 100), '--', color=color,
+                     alpha=0.7)
     ax1.set_xlabel('Training Steps', fontsize=11)
     ax1.set_ylabel('Win Rate (%)', fontsize=11)
     ax1.set_title('ML Model vs Algorithm - Overall Win Rate', fontsize=12)
     ax1.set_ylim(0, 100)
     ax1.grid(True, alpha=0.3)
-
-    # Add trend line
-    if len(steps) > 2:
-        z = np.polyfit(steps, win_rates, TREND_LINE_DEGREE)
-        p = np.poly1d(z)
-        x_smooth = np.linspace(min(steps), max(steps), 100)
-        ax1.plot(x_smooth, np.clip(p(x_smooth), 0, 100), 'g--', alpha=0.7, label='Trend')
-
-    ax1.legend(loc='upper left')
+    ax1.legend(loc='upper left', fontsize=6, ncol=2, framealpha=0.6)
 
     # Plot 2: Win Rate by Player Position
     ax2 = axes[0, 1]
-    ax2.plot(steps, p1_win_rates, 'g-s', linewidth=2, markersize=5, label='ML as Player 1 (White)')
-    ax2.plot(steps, p2_win_rates, 'm-^', linewidth=2, markersize=5, label='ML as Player 2 (Black)')
     ax2.axhline(y=50, color='r', linestyle='--', alpha=0.7)
+    for group_idx, (_source_file, run_label, entries) in enumerate(history_groups):
+        group_steps = [t['step'] for t in entries]
+        ax2.plot(group_steps, [t['ml_as_p1_win_rate'] * 100 for t in entries],
+                 marker='s', color=p1_palette[group_idx % len(p1_palette)],
+                 linewidth=2, markersize=4, label=f'{run_label} P1 (White)')
+        ax2.plot(group_steps, [t['ml_as_p2_win_rate'] * 100 for t in entries],
+                 marker='^', color=p2_palette[group_idx % len(p2_palette)],
+                 linewidth=2, markersize=4, label=f'{run_label} P2 (Black)')
     ax2.set_xlabel('Training Steps', fontsize=11)
     ax2.set_ylabel('Win Rate (%)', fontsize=11)
     ax2.set_title('Win Rate by Player Position', fontsize=12)
     ax2.set_ylim(0, 100)
-    ax2.legend(loc='upper left')
+    ax2.legend(loc='upper left', fontsize=6, ncol=2, framealpha=0.6)
     ax2.grid(True, alpha=0.3)
 
     # Plot 3: Loss History
@@ -1745,6 +1957,11 @@ def main():
                        help='Path to training_stats.json file')
     parser.add_argument('--logs', type=str, default=None,
                        help='Path to logs directory containing train_*.jsonl files')
+    parser.add_argument('--test-stats', type=str, default=None,
+                       help='Directory holding win-rate tester results.jsonl files '
+                            '(default: models/test_stats beside the stats file)')
+    parser.add_argument('--no-test-stats', action='store_true',
+                       help='Ignore win-rate tester results from test_ml_vs_algo_win_rate.sh')
     parser.add_argument('--output', type=str, default=None,
                        help='Output path (default: models/training_progress.html; in default mode a companion .png is also written)')
     parser.add_argument('--static', action='store_true',
@@ -1799,10 +2016,20 @@ def main():
         log_entries = load_jsonl_logs(str(logs_dir))
         print(f"  Found {len(log_entries)} test entries in log files")
 
+    # Load standalone win-rate tester results (test_ml_vs_algo_win_rate.sh)
+    tester_dir = _resolve_test_stats_dir(
+        stats_path, args.test_stats, not args.no_test_stats)
+    tester_entries = []
+    if tester_dir is not None and tester_dir.is_dir():
+        print(f"Loading win-rate tester results from: {tester_dir}")
+        tester_entries = load_test_stats_results(tester_dir)
+        print(f"  Found {len(tester_entries)} tester entries")
+
     # Merge test history
-    test_history = merge_test_history(stats, log_entries)
+    test_history = merge_test_history(stats, log_entries, tester_entries)
     stats_count = len(stats.get('test_history', []))
-    print(f"  Combined {stats_count} from stats and {len(log_entries)} from logs -> {len(test_history)} unique entries (deduplicated by step)")
+    print(f"  Combined {stats_count} from stats, {len(log_entries)} from logs and "
+          f"{len(tester_entries)} from test_stats -> {len(test_history)} unique entries (deduplicated by step)")
 
     if args.static:
         print("Generating static training progress plot (matplotlib PNG)...")
@@ -1817,6 +2044,8 @@ def main():
             html_output_path=output_path,
             image_output_path=image_output,
             dpi=args.dpi,
+            test_stats_dir=args.test_stats,
+            include_test_stats=not args.no_test_stats,
         )
         if not args.no_show:
             open_file(str(outputs['html']))
