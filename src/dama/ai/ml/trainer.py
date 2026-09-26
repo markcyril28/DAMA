@@ -154,8 +154,8 @@ def _diagnostic_print(*args, **kwargs) -> None:
     checkpoint; Journal Pass 551 incident, repaired in Pass 553).
 
     A broken pipe is permanent, so guarding one call would only move the
-    failure to the next print.  Retire both streams to the null device on the
-    first broken pipe, leaving unguarded diagnostics downstream harmless.
+    failure to the next print. Retire the failed stream to the null device on
+    its first broken pipe, leaving its downstream diagnostics harmless.
     Other console errors are swallowed per write, matching the existing
     convention in ``stats_collector`` (``except (OSError, ValueError)``).
     """
@@ -181,12 +181,13 @@ def _retire_unwritable_console(broken) -> None:
     KNOWN GAP (not auto-fixed, Journal Pass 553): under the launchers'
     ``2>&1 | tee`` the shell dup2s fd 1 onto fd 2, so both descriptors die
     together while remaining distinct Python objects, and stderr stays broken
-    here. That is cosmetic today because trainer.py writes nothing to stderr
-    explicitly (``grep -n 'file=sys.stderr'`` is empty) and CPython's
-    excepthook swallows its own write failures. Detecting the shared pipe
-    would need ``os.fstat`` device/inode comparison, which is too fragile to
-    add on a failure path; route any new shutdown-path stderr write through
-    ``_diagnostic_print(..., file=sys.stderr)`` instead.
+    here. Every explicit stderr write in trainer.py (the checkpoint writer's
+    and the self-play producer's tracebacks, Journal Pass 557) therefore goes
+    through ``_diagnostic_print(..., file=sys.stderr)``, which retires stderr
+    on its own first failure, and CPython's excepthook swallows its own write
+    failures. Detecting the shared pipe would need ``os.fstat`` device/inode
+    comparison, which is too fragile to add on a failure path; route any new
+    stderr write through that guard as well.
     """
 
     try:
@@ -2746,7 +2747,11 @@ class Trainer:
         ``_load_checkpoint``.
         """
         ckpts = self._rollback_checkpoint_candidates("model_step_*.pt")
-        print(f"  Dead-epoch rollback triggered ({reason}).")
+        # Guarded like the loop that calls this: rollback loads a checkpoint
+        # from disk (seconds), so a console that dies during that window would
+        # make a bare print here the first dead-pipe write and raise out of the
+        # training loop before the final checkpoint (Journal Pass 558).
+        _diagnostic_print(f"  Dead-epoch rollback triggered ({reason}).")
         if self.config.recovery_enforced:
             # Bound retries by the initial numbered files plus the external
             # anchor, even if another writer keeps publishing vanishing picks.
@@ -2754,7 +2759,7 @@ class Trainer:
                 last_ckpt = None
                 try:
                     last_ckpt = str(self._verified_recovery_rollback_checkpoint())
-                    print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
+                    _diagnostic_print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
                     _call_under_model_state_lock(
                         getattr(self, '_model_state_lock', None),
                         self._load_checkpoint,
@@ -2762,13 +2767,13 @@ class Trainer:
                     )
                     if self.scaler is not None:
                         self.scaler = GradScaler(init_scale=2**10)
-                        print(
+                        _diagnostic_print(
                             "  GradScaler reset to conservative "
                             f"scale={self.scaler.get_scale():.0f}")
                     return
                 except FileNotFoundError as exc:
                     if last_ckpt is None:
-                        print(
+                        _diagnostic_print(
                             f"  [warn] Rollback verification input unavailable ({exc}); "
                             "retrying verified recovery selection")
                         continue
@@ -2778,8 +2783,8 @@ class Trainer:
                     # Reselect through the complete recovery gate: the approved
                     # anchor can live outside checkpoint_dir, and future steps
                     # must remain ineligible even after a pruning race.
-                    print(f"  [warn] Verified rollback pick vanished ({exc}); "
-                          f"retrying verified recovery selection")
+                    _diagnostic_print(f"  [warn] Verified rollback pick vanished ({exc}); "
+                                      f"retrying verified recovery selection")
             else:
                 raise RuntimeError(
                     "No verified checkpoint remains available within the "
@@ -2788,7 +2793,7 @@ class Trainer:
             if not candidate.is_file():
                 continue
             last_ckpt = str(candidate)
-            print(f"  Rolling back to checkpoint: {last_ckpt}")
+            _diagnostic_print(f"  Rolling back to checkpoint: {last_ckpt}")
             try:
                 _call_under_model_state_lock(
                     getattr(self, '_model_state_lock', None),
@@ -2800,8 +2805,8 @@ class Trainer:
                 # waits for the model-state lock.
                 if candidate.exists():
                     raise
-                print(f"  [warn] Rollback pick vanished ({exc}); "
-                      f"trying remaining checkpoints")
+                _diagnostic_print(f"  [warn] Rollback pick vanished ({exc}); "
+                                  f"trying remaining checkpoints")
                 continue
             # Reset GradScaler with conservative scale to prevent
             # re-triggering the same overflow.  Default init_scale=65536
@@ -2809,9 +2814,9 @@ class Trainer:
             # the resume-without-scaler-state path).
             if self.scaler is not None:
                 self.scaler = GradScaler(init_scale=2**10)
-                print(f"  GradScaler reset to conservative scale={self.scaler.get_scale():.0f}")
+                _diagnostic_print(f"  GradScaler reset to conservative scale={self.scaler.get_scale():.0f}")
             return
-        print("  No checkpoints found — resetting model from scratch")
+        _diagnostic_print("  No checkpoints found — resetting model from scratch")
         _call_under_model_state_lock(
             getattr(self, '_model_state_lock', None),
             self._reset_model_state,
@@ -2995,7 +3000,7 @@ class Trainer:
                 os.replace(_tmp_path, stats_path)
                 _fsync_directory(stats_path.parent)
             except Exception as e:
-                print(f"Warning: Failed to save stats: {e}")
+                _diagnostic_print(f"Warning: Failed to save stats: {e}")
                 # Clean up temp file on failure
                 if _tmp_path is not None:
                     try:
@@ -3038,7 +3043,7 @@ class Trainer:
                 html_output_path=html_output_path,
             )
         except Exception as e:
-            print(f"Warning: Failed to update training progress artifacts: {e}")
+            _diagnostic_print(f"Warning: Failed to update training progress artifacts: {e}")
 
     def _snapshot_stats(self) -> dict:
         """Take a consistent snapshot of training stats for background I/O.
@@ -3982,8 +3987,10 @@ class Trainer:
                 if (type(manager) is CorpusSnapshotManager
                         and type(split_context) is _SnapshotSplitContext):
                     # Validation, leakage accounting and cache identities are
-                    # complete. Retire startup's full-ledger copy before train
+                    # complete. Drop the context's ledger reference before train
                     # loading, preserving external aliases and custom contracts.
+                    # The built-in manager shares one immutable index (Journal
+                    # Pass 556), so no full-ledger copy remains to retire.
                     split_context = replace(
                         split_context, historically_trained=set())
                 manifest = split_context.manifest
@@ -4299,7 +4306,7 @@ class Trainer:
             'teacher_forced_move_fraction': float(
                 result['forced_move_fraction']),
         })
-        print(
+        _diagnostic_print(
             f"Frozen-suite teacher agreement: {agreement:.2%} "
             f"({result['correct_states']}/{result['total_states']}), "
             f"promotion={decision.promoted} ({decision.reason})"
@@ -4383,7 +4390,7 @@ class Trainer:
         terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
             output_dir, task)
         if terminal is not None:
-            print(
+            _diagnostic_print(
                 f"Acceptance task {task_id} already has terminal report: {terminal}")
             return False
 
@@ -4407,7 +4414,7 @@ class Trainer:
                 self._acceptance_task_ids.discard(task_id)
                 raise
 
-        print(f"Queued acceptance protocol for promoted step {task['step']}")
+        _diagnostic_print(f"Queued acceptance protocol for promoted step {task['step']}")
         return True
 
     def _ensure_checkpoint_acceptance_worker(self) -> None:
@@ -4494,7 +4501,7 @@ class Trainer:
         self.stats.acceptance_history.insert(insert_at, report)
         self._save_stats(_raise_on_error=True)
         state = 'PASSED' if report['passed'] else 'FAILED'
-        print(
+        _diagnostic_print(
             f"Acceptance {state} for step {task['step']}: "
             f"{durable_report}"
         )
@@ -4550,7 +4557,7 @@ class Trainer:
                 checkpoint_acceptance_tasks.load_completed_acceptance_report(
                     output_dir, task))
             if durable_success is not None:
-                print(
+                _diagnostic_print(
                     f"Acceptance finalization error for step {task['step']}: "
                     f"{exc}. Pending task retained for startup recovery."
                 )
@@ -4560,7 +4567,7 @@ class Trainer:
                     checkpoint_acceptance_tasks.write_acceptance_failure_report(
                         output_dir, task, exc))
             except Exception as report_exc:
-                print(
+                _diagnostic_print(
                     f"Acceptance evaluation error for step {task['step']}: {exc}. "
                     f"Failure report could not be written: {report_exc}"
                 )
@@ -4578,13 +4585,13 @@ class Trainer:
                 self._finalize_checkpoint_acceptance_report(
                     task, failure, failure_path)
             except Exception as stats_exc:
-                print(
+                _diagnostic_print(
                     f"Acceptance failure finalization error for step "
                     f"{task['step']}: {stats_exc}. Pending task retained for "
                     f"startup recovery."
                 )
                 return
-            print(
+            _diagnostic_print(
                 f"Acceptance evaluation error for step {task['step']}: {exc}. "
                 f"Failure report: {failure_path}"
             )
@@ -4595,7 +4602,7 @@ class Trainer:
                     checkpoint_acceptance_tasks.remove_pending_acceptance_task(
                         output_dir, task)
                 except OSError as cleanup_exc:
-                    print(
+                    _diagnostic_print(
                         f"Pending acceptance task cleanup failed for "
                         f"{task['task_id']}: {cleanup_exc}"
                     )
@@ -5556,7 +5563,7 @@ class Trainer:
                     continue
                 path.unlink()
             except OSError as exc:
-                print(f"  [warn] Could not prune checkpoint {path.name}: {exc}")
+                _diagnostic_print(f"  [warn] Could not prune checkpoint {path.name}: {exc}")
                 continue
             removed.append(path.name)
         if removed:
@@ -5567,11 +5574,32 @@ class Trainer:
             _fsync_directory(directory)
         live_count = len(candidates) - len(removed)
         if live_count > keep_count and skipped_protected > 0:
-            print(
+            # One cheap disk_usage() query (only on a protection overage, not on
+            # every prune) turns the pinned count into a runway signal: unbounded
+            # promoted-checkpoint pinning only matters against the real free space
+            # and the self-play floor it will eventually cross. A per-file byte sum
+            # is deliberately avoided here: it is one stat() per pinned checkpoint
+            # on drvfs, the metadata cost the corpus caches exist to remove. See
+            # Journal Pass 559.
+            minimum_gb = float(
+                getattr(self.config, 'selfplay_min_free_disk_gb', 0.0) or 0.0
+            )
+            try:
+                free_gb = shutil.disk_usage(directory).free / _GIB
+            except OSError:
+                headroom = ""
+            else:
+                headroom = " Disk: {:.1f} GiB free{}".format(
+                    free_gb,
+                    " vs {:.1f} GiB self-play floor.".format(minimum_gb)
+                    if minimum_gb > 0 else ".",
+                )
+            _diagnostic_print(
                 f"  [warn] {live_count} checkpoints are live but "
                 f"max_retained_checkpoints is {keep_count}: promoted, "
                 f"best-agreement and resume protection pins "
                 f"{skipped_protected} file(s). Retention cannot reclaim them."
+                f"{headroom}"
             )
         return removed
 
@@ -5637,16 +5665,16 @@ class Trainer:
                     checkpoint_path)
                 self._save_stats()
             except Exception as exc:  # never block on measurement
-                print(f"  [warn] Collision-path measurement skipped: {exc}")
+                _diagnostic_print(f"  [warn] Collision-path measurement skipped: {exc}")
             _val_text = (
                 f", val_loss={collision_val_loss:.4f}"
                 if collision_val_loss is not None else ""
             )
-            print(
+            _diagnostic_print(
                 f"Verified existing checkpoint; it will remain unchanged: "
                 f"{checkpoint_path}"
             )
-            print(
+            _diagnostic_print(
                 f"  Measured without writing (step {self.step}"
                 f"{_val_text}); promotion registry not modified"
                 if collision_selection is not None else
@@ -5855,7 +5883,7 @@ class Trainer:
                         f"{checkpoint_path}"
                     )
                 numbered_rewrite_attempted = True
-                print(
+                _diagnostic_print(
                     f"  [warn] Numbered checkpoint disappeared after "
                     f"publication; rewriting once: {checkpoint_path}"
                 )
@@ -5935,7 +5963,7 @@ class Trainer:
                 stage = 'checkpoint retention'
                 pruned = self._prune_old_checkpoints(checkpoint_path)
                 if pruned:
-                    print(
+                    _diagnostic_print(
                         f"  Retention: pruned {len(pruned)} checkpoint(s) "
                         f"(keeping newest {self.config.max_retained_checkpoints}"
                         f", plus promoted and resumed)"
@@ -5957,7 +5985,7 @@ class Trainer:
                         save_time_sec=time.perf_counter() - write_started,
                         file_size_mb=ckpt_size,
                     )
-                print(f"Checkpoint saved: {checkpoint_path}")
+                _diagnostic_print(f"Checkpoint saved: {checkpoint_path}")
                 # Notify the GUI so the panel can log the checkpoint and
                 # refresh its stats view (no-op when training headless).
                 self._put_status({
@@ -5973,8 +6001,9 @@ class Trainer:
                 # Keep only a compact exception, not the worker exception's
                 # traceback, which can retain the full checkpoint tensor graph.
                 self._checkpoint_write_error = RuntimeError(message)
-                print(message)
-                traceback.print_exc()
+                _diagnostic_print(message)
+                _diagnostic_print(
+                    traceback.format_exc(), file=sys.stderr, end='')
 
         self._checkpoint_write_error = None
         self._checkpoint_thread = threading.Thread(target=_write_checkpoint, daemon=True)
@@ -6408,6 +6437,20 @@ class Trainer:
 
         # --- Open one replay file for the entire self-play cycle ---
         if not skip_replay:
+            # Only this method writes replay entries, and a complete cycle
+            # closes its file before returning. A writer still open here
+            # belongs to a cycle whose exception escaped the discard below,
+            # such as a failed console write in an error handler, and
+            # start_new_file() would publish it: possibly partial, and under
+            # the generation id this cycle reuses, because the hidden staging
+            # shard is invisible to the durable id scan (Journal Pass 557).
+            discard_unclosed = getattr(
+                self.replay_buffer, 'discard_unclosed_file', None)
+            stale_file = discard_unclosed() if callable(discard_unclosed) else None
+            if stale_file is not None:
+                _diagnostic_print(
+                    "  [warn] Discarded replay file left open by an "
+                    f"interrupted self-play cycle: {stale_file.name}")
             self.replay_buffer.start_new_file()
 
         side_balance_totals = {
@@ -6600,6 +6643,12 @@ class Trainer:
                     except Exception as e:
                         print(f"Self-play sequential re-run error ({task_type}): {e}")
         except Exception as e:
+            # KNOWN GAP (not auto-fixed, Journal Pass 557): this and the four
+            # other handler prints in this pool block are bare. A dead-pipe
+            # write in one re-raises past the BaseException discard below and
+            # abandons the cycle; the cycle-start discard_unclosed_file() call
+            # keeps that shard out of the corpus. Guarding them would let such
+            # a cycle complete instead.
             print(f"Unified pool failed ({e}), falling back to sequential")
             # Retry every still-owed batch in-process.  A partial retry is not
             # admissible: the completion gate below quarantines the whole
@@ -6854,12 +6903,20 @@ class Trainer:
                             take_replay_stats()
                             if callable(take_replay_stats) else None
                         )
+                        # Time the admission call so a live run can separate the
+                        # O(all-time-ledger) work it does on an admit (canonical
+                        # ledger merge + sidecar + retention) from the O(window)
+                        # split prep below. Journal Pass 560 measured the summed
+                        # per-admission overhead (~162 s mean, growing) but could
+                        # not attribute it; this is the missing instrument.
+                        _admit_start = time.monotonic()
                         decision = self._snapshot_manager.consider_snapshot(
                             teacher_settings=teacher,
                             noise_settings=noise,
                             generation_settings=generation,
                             replay_file_stats_handoff=replay_file_stats_handoff,
                         )
+                        _admit_sec = time.monotonic() - _admit_start
                         # Admission is already durable. If STOP arrived while
                         # the manager was auditing or publishing it, leave the
                         # snapshot for the next launch instead of making the
@@ -6881,6 +6938,19 @@ class Trainer:
                         if pending_snapshot_path is None:
                             continue
 
+                        # Split-prep clocks. _verify_sec is prepare_split's
+                        # integrity work (manifest + lineage + per-shard SHA-256
+                        # re-hash of the ~88 stored shards, drvfs I/O); the
+                        # remainder is the O(window) parse + tensorize. Both are
+                        # separate levers from consider_snapshot's O(all-time
+                        # ledger) work, which Pass 560 could not attribute. On a
+                        # Pass 445 retry the ledger work happened on an earlier
+                        # cycle, so _admit_sec then reflects only this cycle's
+                        # cheap reject (no "Trained ledger: +N" line). _verify_sec
+                        # stays 0 on the legacy load_split path, which does verify
+                        # and load together.
+                        _prep_start = time.monotonic()
+                        _verify_sec = 0.0
                         manager = self._snapshot_manager
                         dataset = None
                         train_entries = None
@@ -6897,6 +6967,7 @@ class Trainer:
                                 pending_snapshot_path,
                                 max_train_entries=self.config.replay_max_entries,
                             )
+                            _verify_sec = time.monotonic() - _prep_start
                             # Verification can outlive STOP. Do not begin a
                             # new materialization phase without a consumer.
                             if _shutdown_requested():
@@ -6910,10 +6981,12 @@ class Trainer:
                                     and type(split_context) is _SnapshotSplitContext):
                                 # Validation and its leakage accounting are
                                 # complete. Training uses only the exclusions,
-                                # so retire this producer's full-ledger copy
+                                # so drop this context's ledger reference
                                 # before allocating train tensors. Replace the
                                 # context to preserve any external aliases;
                                 # custom managers retain their own contracts.
+                                # The built-in index is shared, not copied
+                                # (Journal Pass 556).
                                 split_context = replace(
                                     split_context, historically_trained=set())
                             per_file_split = all(
@@ -6962,15 +7035,35 @@ class Trainer:
                             self._bg_validation_identity = validation_identity
                         pending_snapshot_path = None
                         self._data_ready_event.set()
+                        _prep_sec = time.monotonic() - _prep_start
+                        _load_sec = max(0.0, _prep_sec - _verify_sec)
                         print(
                             f"  Corpus snapshot {manifest['version']} ready: "
                             f"{manifest['metrics']['fresh_unique_state_rate']:.1%} "
                             "fresh canonical states"
                         )
+                        # Per-admission phase split, so a post-Pass-556 live run
+                        # can decide which lever is behind Pass 560's ~27% GPU
+                        # idle: consider_snapshot (O(all-time ledger) merge +
+                        # sidecar + retention), verify (prepare_split's per-shard
+                        # SHA-256 re-hash, drvfs I/O) or load+tensorize (O(window)
+                        # parse). Guarded because the producer shares the
+                        # dead-console path (Pass 557); fires only on an admission
+                        # (rare path, like the Pass 559 retention warning).
+                        _diagnostic_print(
+                            "  Admission timing: consider_snapshot "
+                            f"{_admit_sec:.1f}s, verify {_verify_sec:.1f}s, "
+                            f"load+tensorize {_load_sec:.1f}s"
+                        )
                     except Exception as exc:
                         import traceback
-                        print(f"Background snapshot self-play error: {exc}")
-                        traceback.print_exc()
+                        # A bare print here re-raised a dead console's
+                        # BrokenPipeError and ended the producer, leaving the
+                        # main loop on its standing snapshot (Journal Pass 557).
+                        _diagnostic_print(
+                            f"Background snapshot self-play error: {exc}")
+                        _diagnostic_print(
+                            traceback.format_exc(), file=sys.stderr, end='')
                         if not _shutdown_requested():
                             self._bg_selfplay_stop_event.wait(timeout=2.0)
                     finally:
@@ -7126,8 +7219,11 @@ class Trainer:
 
                 except Exception as e:
                     import traceback
-                    print(f"Background self-play error: {e}")
-                    traceback.print_exc()
+                    # Guarded like the snapshot branch: a dead console must
+                    # not turn this handler into the thread's exit.
+                    _diagnostic_print(f"Background self-play error: {e}")
+                    _diagnostic_print(
+                        traceback.format_exc(), file=sys.stderr, end='')
                     # Don't crash the loop — sleep briefly and retry
                     if not _shutdown_requested():
                         self._bg_selfplay_stop_event.wait(timeout=2.0)
@@ -7406,8 +7502,9 @@ class Trainer:
         wr = test_result.get('ml_win_rate', 0)
         p1wr = test_result.get('ml_as_p1_win_rate', 0)
         p2wr = test_result.get('ml_as_p2_win_rate', 0)
-        print(f"  [async test @ step {at_step}] ML Win Rate: {wr*100:.1f}%"
-              f"  (P1: {p1wr*100:.1f}%, P2: {p2wr*100:.1f}%)")
+        _diagnostic_print(
+            f"  [async test @ step {at_step}] ML Win Rate: {wr*100:.1f}%"
+            f"  (P1: {p1wr*100:.1f}%, P2: {p2wr*100:.1f}%)")
 
         self._log({'type': 'test_vs_algo', **test_record})
         self._save_stats()
@@ -7621,7 +7718,7 @@ class Trainer:
                     details = 'Non-finite gradients; optimizer update skipped'
                     if _clip_norm_tensor is not None:
                         details += f'; grad_norm={_clip_norm_tensor.item()!r}'
-                    print(f"  Warning: {details}")
+                    _diagnostic_print(f"  Warning: {details}")
                     if _stats_collector:
                         _stats_collector.record_non_finite_event(
                             self.step, 'grad_scaler', details)
@@ -7674,7 +7771,7 @@ class Trainer:
                 _raw_loss_val = _raw_loss.item()
                 if not math.isfinite(_raw_loss_val):
                     if self._repair_batchnorm_stats():
-                        print("  Repaired corrupted BatchNorm running stats (NaN/Inf loss detected)")
+                        _diagnostic_print("  Repaired corrupted BatchNorm running stats (NaN/Inf loss detected)")
                     if _stats_collector:
                         _stats_collector.record_non_finite_event(
                             _step, 'nan_to_num',
@@ -7746,7 +7843,7 @@ class Trainer:
             # Avoids extra CUDA syncs from a separate hardcoded interval.
             if _loss_val is not None and _is_stats_step:
                 self._update_process_title(_step, _loss_val)
-                print(f"  Step {_step}, Loss: {_loss_val:.4f}")
+                _diagnostic_print(f"  Step {_step}, Loss: {_loss_val:.4f}")
 
             return _step >= _train_steps
 
@@ -7790,8 +7887,9 @@ class Trainer:
                     _step_start = time.perf_counter()
                     _step_samples = 0
             if first_batch:
-                print(f"  First batch loaded. Processing {total_batches} batches...")
-                sys.stdout.flush()
+                _diagnostic_print(
+                    f"  First batch loaded. Processing {total_batches} batches...",
+                    flush=True)
 
             if not _wait_for_training_controls():
                 break
@@ -7826,7 +7924,7 @@ class Trainer:
             _do_sanity = (self.step % _sanity_interval == 0)
             if _do_sanity:
                 if not torch.isfinite(boards).all() or not torch.isfinite(move_features).all():
-                    print("  Warning: non-finite inputs detected; skipping batch")
+                    _diagnostic_print("  Warning: non-finite inputs detected; skipping batch")
                     if _stats_collector:
                         _stats_collector.record_non_finite_event(
                             self.step, 'input_data', 'Non-finite board or move features')
@@ -7872,9 +7970,9 @@ class Trainer:
 
                 # Score-level NaN check at sanity interval only (expensive array-wide check)
                 if _do_sanity and torch.isnan(_current_scores).any():
-                    print("  Warning: NaN scores detected; skipping batch")
+                    _diagnostic_print("  Warning: NaN scores detected; skipping batch")
                     if self._repair_batchnorm_stats():
-                        print("  Repaired corrupted BatchNorm running stats")
+                        _diagnostic_print("  Repaired corrupted BatchNorm running stats")
                     if _stats_collector:
                         _stats_collector.record_non_finite_event(
                             self.step, 'compiled_fwd_loss', 'NaN scores')
@@ -7915,9 +8013,8 @@ class Trainer:
                     if "device kernel image is invalid" in str(_compile_err) and first_batch:
                         # torch.compile generated incompatible CUDA kernels —
                         # unwrap to eager model and retry this batch
-                        print(f"torch.compile runtime failure: {_compile_err}")
-                        print("Falling back to eager mode for remaining training...")
-                        sys.stdout.flush()
+                        _diagnostic_print(f"torch.compile runtime failure: {_compile_err}")
+                        _diagnostic_print("Falling back to eager mode for remaining training...", flush=True)
                         _orig = getattr(_model, '_orig_mod', None)
                         if _orig is not None:
                             self.model = _orig
@@ -7953,9 +8050,9 @@ class Trainer:
                     else:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
-                        print("  Warning: non-finite scores detected; skipping batch")
+                        _diagnostic_print("  Warning: non-finite scores detected; skipping batch")
                         if self._repair_batchnorm_stats():
-                            print("  Repaired corrupted BatchNorm running stats")
+                            _diagnostic_print("  Repaired corrupted BatchNorm running stats")
                         if _stats_collector:
                             _stats_collector.record_non_finite_event(
                                 self.step, 'model_scores', 'Non-finite output scores')
@@ -8020,9 +8117,9 @@ class Trainer:
                     else:
                         _bad = not torch.isfinite(scores).all()
                     if _bad:
-                        print("  Warning: non-finite scores detected; skipping batch")
+                        _diagnostic_print("  Warning: non-finite scores detected; skipping batch")
                         if self._repair_batchnorm_stats():
-                            print("  Repaired corrupted BatchNorm running stats")
+                            _diagnostic_print("  Repaired corrupted BatchNorm running stats")
                         if _stats_collector:
                             _stats_collector.record_non_finite_event(
                                 self.step, 'model_scores', 'Non-finite output scores (FP32)')
@@ -8122,9 +8219,10 @@ class Trainer:
         # with small per-cycle batch counts). Reads LR from scheduler if present.
         _hb_lr = (_scheduler.get_last_lr()[0]
                   if _scheduler is not None else _cfg.learning_rate)
-        print(f"  [epoch end] step={self.step} loss={_avg_loss:.4f} "
-              f"lr={_hb_lr:.2e} batches={num_batches} time={epoch_time:.1f}s")
-        sys.stdout.flush()
+        _diagnostic_print(
+            f"  [epoch end] step={self.step} loss={_avg_loss:.4f} "
+            f"lr={_hb_lr:.2e} batches={num_batches} time={epoch_time:.1f}s",
+            flush=True)
 
         return _avg_loss
 
@@ -8897,14 +8995,14 @@ class Trainer:
                     _async_test_result[0] = self._run_test_cpu_only(
                         _test_path_str, _n_games, _diff, _max_mv, _n_wk)
                 except Exception as e:
-                    print(f"  [async test] error: {e}")
+                    _diagnostic_print(f"  [async test] error: {e}")
                 finally:
                     self._cleanup_runtime_model_file(_test_path_str)
                     self._cleanup_runtime_models_dir()
 
             _async_test_thread = threading.Thread(target=_worker, daemon=True)
             _async_test_thread.start()
-            print(f"  [async test] started ({_n_games} games vs {_diff})")
+            _diagnostic_print(f"  [async test] started ({_n_games} games vs {_diff})")
 
         def _collect_async_test():
             nonlocal _async_test_thread
@@ -8934,7 +9032,7 @@ class Trainer:
 
             # Check if stop time has been reached
             if self._training_time_limit_reached():
-                print(f"\nStop time reached ({self.config.stop_time.strftime('%Y-%m-%d %H:%M')}). Saving and exiting...")
+                _diagnostic_print(f"\nStop time reached ({self.config.stop_time.strftime('%Y-%m-%d %H:%M')}). Saving and exiting...")
                 break
 
             loss = self.train_epoch(dataloader, use_scoring=self._should_use_scoring(),
@@ -8952,12 +9050,21 @@ class Trainer:
             # (~3ms per print call with stdout flush).  Print every 50 epochs
             # to give periodic progress while keeping overhead at ~15 prints/cycle.
             if self.epoch % 50 == 0 or self.epoch == 1:
+                # This and the loop's other steady-state diagnostics (data
+                # refresh, dead epochs, async tests, alternate self-play) now
+                # go through _diagnostic_print, so a dead console retires the
+                # stream instead of ending training before its final
+                # checkpoint (the Pass 553 incident's failure mode, extended
+                # here in Journal Pass 558). REMAINING LIMITATION: a dead
+                # producer is still noticed only at _max_stale and never
+                # restarted; that is a supervision gap, not a console one.
                 scoring_label = "scoring" if self._should_use_scoring_for_epoch(self.epoch) else "no-scoring"
                 current_lr = (self.scheduler.get_last_lr()[0]
                               if self.scheduler is not None
                               else self.config.learning_rate)
-                print(f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
-                      f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
+                _diagnostic_print(
+                    f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
+                    f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
 
             # --- Dead-epoch recovery: detect & recover from stuck non-finite state ---
             # Successful backward calls can still end in rejected AMP updates.
@@ -8970,20 +9077,20 @@ class Trainer:
             if getattr(self, '_last_epoch_batches', -1) == 0 or _unusable_scale:
                 _consecutive_dead_epochs += 1
                 if _consecutive_dead_epochs >= _DEAD_EPOCH_RECOVERY_THRESHOLD:
-                    print(f"\n{'='*60}")
-                    print(f"WARNING: {_consecutive_dead_epochs} consecutive epochs with "
-                          f"unusable training progress.")
+                    _diagnostic_print(f"\n{'='*60}")
+                    _diagnostic_print(
+                        f"WARNING: {_consecutive_dead_epochs} consecutive epochs with "
+                        f"unusable training progress.")
                     if _unusable_scale:
-                        print(f"  Cause: GradScaler scale is unusable ({_epoch_scale!r})")
+                        _diagnostic_print(f"  Cause: GradScaler scale is unusable ({_epoch_scale!r})")
                     elif self._has_non_finite_tensors():
-                        print("  Cause: model weights contain NaN/Inf")
+                        _diagnostic_print("  Cause: model weights contain NaN/Inf")
                     else:
-                        print("  Cause: FP16 overflow (weights finite in FP32, "
-                              "but intermediate values overflow float16)")
+                        _diagnostic_print("  Cause: FP16 overflow (weights finite in FP32, "
+                                          "but intermediate values overflow float16)")
                     self._rollback_after_dead_epoch(
                         reason=f"{_consecutive_dead_epochs} consecutive dead epochs")
-                    print(f"{'='*60}\n")
-                    sys.stdout.flush()
+                    _diagnostic_print(f"{'='*60}\n", flush=True)
                     _consecutive_dead_epochs = 0
             else:
                 _consecutive_dead_epochs = 0
@@ -9000,8 +9107,8 @@ class Trainer:
                     _desc = (f"{len(bg_dataset)} entries"
                              if bg_dataset is not None
                              else f"+{len(bg_incremental)} incremental")
-                    print(f"Background self-play complete — refreshing DataLoader "
-                          f"({_desc})...")
+                    _diagnostic_print(f"Background self-play complete — refreshing DataLoader "
+                                      f"({_desc})...")
                     dataloader, _gpu_resident = self._refresh_dataloader(
                         dataloader, bg_dataset, bg_incremental, effective_workers)
                     # The loader owns CPU fallback data or has copied it to
@@ -9033,8 +9140,9 @@ class Trainer:
                         # rather than spinning forever.
                         if (self._bg_selfplay_thread is not None
                                 and not self._bg_selfplay_thread.is_alive()):
-                            print("Warning: background self-play thread died "
-                                  "— resuming training on existing data")
+                            _diagnostic_print(
+                                "Warning: background self-play thread died "
+                                "— resuming training on existing data")
                             _stale_epochs = 0
                             break
                         # Clear event BEFORE checking for data so that any
@@ -9049,8 +9157,8 @@ class Trainer:
                             _desc = (f"{len(bg_dataset)} entries"
                                      if bg_dataset is not None
                                      else f"+{len(bg_incremental)} incremental")
-                            print(f"Fresh data arrived after {_stale_epochs} stale epochs "
-                                  f"— refreshing ({_desc})...")
+                            _diagnostic_print(f"Fresh data arrived after {_stale_epochs} stale epochs "
+                                              f"— refreshing ({_desc})...")
                             dataloader, _gpu_resident = self._refresh_dataloader(
                                 dataloader, bg_dataset, bg_incremental, effective_workers)
                             # Match the non-waiting refresh ownership boundary.
@@ -9063,22 +9171,23 @@ class Trainer:
                         # Check stop conditions while waiting
                         if self._training_time_limit_reached():
                             break
-                    # Wait loop exited — record how long the GPU sat idle so the
+                    # Wait loop exited. Record how long the GPU sat idle so the
                     # session report's summary.gpu_idle_wait_* aggregates it.
+                    # This branch DOES fire on local: the 2026-09-20 c174k run
+                    # (PID 612672) recorded 98 waits, 27.1% of the session (per-
+                    # admission overhead decomposition in Journal Pass 560).
                     # CAVEAT: this elapsed span includes any GUI-pause time spent
                     # in the inner _paused loop above, so a PAUSE during this
-                    # branch would over-count starvation. Harmless in practice —
-                    # the branch fires only when self-play falls behind
-                    # (_stale_epochs >= _max_stale), which never happens on local
-                    # (self-play over-produces) and the server runs headless (no
-                    # PAUSE). Revisit (subtract paused time) only if _max_stale is
-                    # ever lowered for a GUI run.
+                    # branch would over-count starvation. Harmless on headless
+                    # local_train.sh, where _paused is never set here (thermal
+                    # cooldown runs in the batch loop, not this wait); correct for
+                    # paused time only if _max_stale>0 is ever run under the GUI.
                     if self.stats_collector is not None:
                         self.stats_collector.record_gpu_idle_wait(
                             time.monotonic() - _wait_start, _wait_stale)
             else:
                 # Alternate mode: generate data synchronously, then rebuild dataloader
-                print("Running self-play (alternate mode)...")
+                _diagnostic_print("Running self-play (alternate mode)...")
                 self.run_selfplay(self.config.selfplay_games)
                 train_entries, validation_entries = self._prepare_training_split(
                     use_train_cache=False)
@@ -9088,7 +9197,7 @@ class Trainer:
                 self._pending_validation_reuse_identity = None
                 train_balance = self._balance_side_sample_weights(train_entries)
                 if train_balance is not None:
-                    print(
+                    _diagnostic_print(
                         "Training side weight balance: "
                         f"P1 {train_balance['p1_weight_before']:.1f} to "
                         f"{train_balance['p1_weight_after']:.1f}, "
@@ -9098,7 +9207,7 @@ class Trainer:
                 if self.config.clear_replay_after_load:
                     deleted = self.replay_buffer.clear_files()
                     if deleted:
-                        print(f"Cleared {deleted} replay files after loading")
+                        _diagnostic_print(f"Cleared {deleted} replay files after loading")
                 if train_entries:
                     if self.config.policy_stage == 'enhanced':
                         dataloader = create_enhanced_dataloader(
@@ -9162,7 +9271,7 @@ class Trainer:
                     _start_async_test()
                     last_test_step = self.step
                 except Exception as e:
-                    print(f"  [async test] failed to start: {e}")
+                    _diagnostic_print(f"  [async test] failed to start: {e}")
 
         # Collect any in-flight async test before exit
         if _async_test_thread is not None and _async_test_thread.is_alive():
@@ -9175,12 +9284,8 @@ class Trainer:
         if _simultaneous:
             self._stop_background_selfplay()
 
-        # Final checkpoint.
-        # KNOWN GAP (not auto-fixed, Journal Pass 553): _save_checkpoint's own
-        # progress prints are unguarded, so a console pipe that dies inside it
-        # still aborts the write. _diagnostic_print() covers the diagnostics
-        # that were observed to fail (the producer join banner above), not
-        # every print reachable during finalization.
+        # Checkpoint diagnostics are best-effort, including retention and
+        # acceptance publication, so a closed console cannot reject the save.
         self._save_checkpoint(loss)
         self._wait_for_checkpoint_writer()
         self._finish_checkpoint_acceptance()
@@ -9197,16 +9302,16 @@ class Trainer:
                 _diagnostic_print(f"Final test failed: {e}")
 
         elapsed = time.time() - start_time
-        print(f"\nTraining complete!")
-        print(f"  Total steps: {self.step}")
-        print(f"  Epochs: {self.epoch}")
-        print(f"  Time: {elapsed:.1f}s")
-        print(f"  Final model: {self.config.latest_path}")
+        _diagnostic_print("\nTraining complete!")
+        _diagnostic_print(f"  Total steps: {self.step}")
+        _diagnostic_print(f"  Epochs: {self.epoch}")
+        _diagnostic_print(f"  Time: {elapsed:.1f}s")
+        _diagnostic_print(f"  Final model: {self.config.latest_path}")
         
         # Print test summary
         if self.stats.test_history:
             latest_test = self.stats.test_history[-1]
-            print(f"  Final ML Win Rate: {latest_test.get('ml_win_rate', 0)*100:.1f}%")
+            _diagnostic_print(f"  Final ML Win Rate: {latest_test.get('ml_win_rate', 0)*100:.1f}%")
 
         # Export comprehensive statistics
         if self.stats_collector:
@@ -9214,11 +9319,11 @@ class Trainer:
                 self.stats_collector.set_training_end_step(self.step)
                 self.stats_collector.print_session_summary()
                 exports = self.stats_collector.export_all()
-                print(f"\n  Statistics exported to: {self.config.stats_output_dir}/")
+                _diagnostic_print(f"\n  Statistics exported to: {self.config.stats_output_dir}/")
                 for name, path in exports.items():
-                    print(f"    {name}: {path}")
+                    _diagnostic_print(f"    {name}: {path}")
             except Exception as e:
-                print(f"  Warning: Failed to export statistics: {e}")
+                _diagnostic_print(f"  Warning: Failed to export statistics: {e}")
 
     def pause(self) -> None:
         """Pause training."""
