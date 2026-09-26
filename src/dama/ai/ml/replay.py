@@ -632,6 +632,18 @@ class ReplayBuffer:
         """Close the buffer."""
         self._close_current()
 
+    def discard_unclosed_file(self) -> Optional[Path]:
+        """Remove a replay file whose writer was never closed, if any.
+
+        Only an open writer marks an interrupted cycle: ``start_new_file()``
+        would otherwise publish it as though it were complete.  A closed file,
+        including one whose post-close bookkeeping raised after publication,
+        is left untouched.  Returns the discarded path or ``None``.
+        """
+        if self._current_writer is None:
+            return None
+        return self.discard_current_file()
+
     def discard_current_file(self) -> Optional[Path]:
         """Close and remove the currently open replay file.
 
