@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import gc
 import gzip
 import hashlib
+import io
 import json
 import operator
 import os
@@ -34,6 +35,7 @@ import stat as stat_module
 import sys
 import tempfile
 import threading
+import time
 from time import perf_counter_ns
 from typing import (
     AbstractSet,
@@ -49,6 +51,7 @@ from typing import (
     Set,
     Tuple,
 )
+import zlib
 
 import numpy as np
 
@@ -148,6 +151,28 @@ _TRAINED_LEDGER_GZIP_COMPRESSLEVEL = 1
 # Each key occupies 65 ASCII bytes including its newline. Buffer about 1 MiB
 # before crossing TextIOWrapper and gzip, while retaining streaming memory use.
 _TRAINED_LEDGER_WRITE_BATCH_KEYS = 16 * 1024
+# Single-threaded level-1 deflate cost about 48 s of every admission's ledger
+# rewrite at 86M keys (5.6 GB of key text), as much as reading and inflating
+# the old file. Block deflate on a few threads overlaps it with that work;
+# more threads only add contention for the trainer (Journal Pass 567).
+_TRAINED_LEDGER_DEFLATE_WORKERS = 4
+# Reading and inflating the old ledger was then the largest serial stage of the
+# rewrite (about 48 s at 86M keys). Two helper threads, one reading the file
+# and one inflating it, each run at most this many 4 MiB chunks ahead of their
+# consumer, bounding the extra memory (Journal Pass 568).
+_TRAINED_LEDGER_READ_AHEAD_BLOCKS = 4
+# A process killed while replacing a ledger file strands its mkstemp temporary,
+# which no reader opens and no writer reuses.  The canonical gzip rewrite alone
+# can strand up to the whole ledger (a run killed 25 s into one merge left
+# 374 MB for nine days).  Only the namespace's snapshot manager writes this
+# directory, and a live writer keeps modifying its temporary until the rename,
+# so a writer-named regular file untouched for an hour is an orphan.  mkstemp
+# inserts eight characters from [a-z0-9_] between "<target>." and ".tmp".
+_TRAINED_LEDGER_TEMPORARY_NAME = re.compile(
+    r"(?:trained_shards\.jsonl|trained_state_keys\.txt\.gz"
+    r"|trained_state_fingerprints\.v1\.bin|seed\.json)\.[a-z0-9_]{8}\.tmp"
+)
+_STALE_LEDGER_TEMPORARY_SECONDS = 3600.0
 # A live snapshot manager repeatedly needs exactly two immutable key sets:
 # the active training snapshot and the append-only validation manifest.  Keep
 # only those two decompressed members process-local.  A larger bound spends
@@ -1627,22 +1652,39 @@ _STATE_KEYS_READ_BUFFER_BYTES = 4 * 1024 * 1024
 # yielding every existing row through Python on each admission rewrite.
 _CANONICAL_STATE_KEY_CHARS = 64
 _CANONICAL_STATE_KEY_RECORD_BYTES = _CANONICAL_STATE_KEY_CHARS + 1
-_CANONICAL_STATE_KEY_DIGITS = b"0123456789abcdef"
 _CANONICAL_STATE_KEY_RECORD_DTYPE = np.dtype(f"S{_CANONICAL_STATE_KEY_RECORD_BYTES}")
 # About 4 MiB of decompressed rows per block bounds transient merge buffers.
 _TRAINED_LEDGER_MERGE_BLOCK_RECORDS = 64 * 1024
 
 
 @contextmanager
-def _open_state_key_stream(path: Path, *, binary: bool) -> Iterator[Any]:
-    """Close both source layers while preserving the first actual failure."""
+def _open_state_key_stream(
+    path: Path, *, binary: bool, read_ahead: bool = False,
+) -> Iterator[Any]:
+    """Close every source layer while preserving the first actual failure.
+
+    With ``read_ahead``, a helper thread reads compressed chunks from disk
+    ahead of the gzip reader (Journal Pass 568).
+    """
 
     raw_handle = path.open("rb", buffering=_STATE_KEYS_READ_BUFFER_BYTES)
+    prefetched = None
     handle = None
     read_error = None
     try:
+        source = raw_handle
+        if read_ahead:
+            prefetched = io.BufferedReader(
+                _ChunkReader(_ReadAheadBlocks(
+                    _iter_raw_chunks(raw_handle, _STATE_KEYS_READ_BUFFER_BYTES),
+                    _TRAINED_LEDGER_READ_AHEAD_BLOCKS,
+                    name="ledger-raw-read-ahead",
+                )),
+                buffer_size=_STATE_KEYS_READ_BUFFER_BYTES,
+            )
+            source = prefetched
         handle = gzip.open(
-            raw_handle, "rb" if binary else "rt",
+            source, "rb" if binary else "rt",
             **({} if binary else {"encoding": "ascii"}),
         )
         yield handle
@@ -1651,7 +1693,8 @@ def _open_state_key_stream(path: Path, *, binary: bool) -> Iterator[Any]:
         raise
     finally:
         cleanup_error = None
-        for stream in (handle, raw_handle):
+        # The read-ahead layer stops its thread without closing raw_handle.
+        for stream in (handle, prefetched, raw_handle):
             if stream is not None:
                 try:
                     stream.close()
@@ -1676,14 +1719,252 @@ def _iter_state_keys(path: Path) -> Iterator[str]:
                 yield key
 
 
-def _iter_state_key_blocks(path: Path, block_bytes: int) -> Iterator[bytes]:
+def _iter_state_key_blocks(
+    path: Path, block_bytes: int, *, read_ahead: bool = False,
+) -> Iterator[bytes]:
     """Stream decompressed key-file bytes in fixed-size blocks."""
-    with _open_state_key_stream(path, binary=True) as handle:
+    with _open_state_key_stream(path, binary=True, read_ahead=read_ahead) as handle:
         while True:
             block = handle.read(block_bytes)
             if not block:
                 return
             yield block
+
+
+def _iter_raw_chunks(handle: Any, chunk_bytes: int) -> Iterator[bytes]:
+    """Yield successive reads of at most ``chunk_bytes`` until end of file."""
+    while True:
+        chunk = handle.read(chunk_bytes)
+        if not chunk:
+            return
+        yield chunk
+
+
+class _ChunkReader(io.RawIOBase):
+    """Read-only raw stream over an iterator of byte chunks.
+
+    ``close()`` closes the iterator and raises its teardown failure.
+    """
+
+    def __init__(self, chunks: Iterator[bytes]) -> None:
+        super().__init__()
+        self._chunks = chunks
+        self._chunk = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        while not len(self._chunk):
+            chunk = next(self._chunks, None)
+            if chunk is None:
+                return 0
+            self._chunk = memoryview(chunk)
+        size = min(len(buffer), len(self._chunk))
+        buffer[:size] = self._chunk[:size]
+        self._chunk = self._chunk[size:]
+        return size
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self._chunk = memoryview(b"")
+        try:
+            close = getattr(self._chunks, "close", None)
+            if close is not None:
+                close()
+        finally:
+            super().close()
+
+
+def _usable_cpu_count() -> int:
+    """CPUs this process may run on (its affinity set where available)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+class _ReadAheadFailure:
+    """A source exception carried to the consumer in stream order."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+class _ReadAheadBlocks:
+    """Iterate a block source on a helper thread, a bounded number of blocks ahead.
+
+    Reading and inflating the old ledger is the largest serial stage left in
+    the canonical rewrite after Journal Pass 567. File reads and zlib inflate
+    release the GIL, so a helper thread overlaps them with the merge, CRC-32,
+    deflate hand-off and output write. Blocks, exhaustion and source
+    exceptions reach the consumer in source order, so a read failure keeps
+    its identity and surfaces where a direct read would have raised it.
+
+    ``close()`` acts like closing the source generator: the helper stops
+    between blocks and closes the source, and a teardown failure is raised
+    from ``close()``. A source failure the consumer never reached is raised
+    there as well, so an abandoned read cannot pass for a clean teardown
+    before the row-wise fallback. If no thread can start, iteration stays on
+    the calling thread.
+    """
+
+    _END = object()
+    _NO_RESULT = object()
+    # The consumer rechecks the helper this often while waiting for a block.
+    _POLL_SECONDS = 1.0
+
+    def __init__(
+        self, source: Iterator[bytes], depth: int, *, name: str = "ledger-read-ahead",
+    ) -> None:
+        self._source = source
+        self._depth = max(1, int(depth))
+        self._name = name
+        self._condition = threading.Condition()
+        self._items: collections.deque = collections.deque()
+        self._thread: Optional[threading.Thread] = None
+        self._direct = False
+        self._closing = False
+        self._finished = False
+        # Set once the source was closed: by the helper when it stopped for
+        # ``close()``, or by the consumer after the helper died.
+        self._source_closed = False
+        self._teardown_error: Optional[BaseException] = None
+
+    def __iter__(self) -> "_ReadAheadBlocks":
+        return self
+
+    def _offer(self, item: Any) -> bool:
+        """Queue ``item`` once there is room; False once closing began."""
+        with self._condition:
+            while len(self._items) >= self._depth and not self._closing:
+                self._condition.wait()
+            if self._closing:
+                return False
+            self._items.append(item)
+            self._condition.notify_all()
+            return True
+
+    def _run(self) -> None:
+        source = self._source
+        while True:
+            try:
+                item: Any = next(source)
+            except StopIteration:
+                item = self._END
+            except BaseException as error:
+                item = _ReadAheadFailure(error)
+            if not self._offer(item):
+                break
+            if item is self._END or isinstance(item, _ReadAheadFailure):
+                return
+        # Closing: the consumer will never receive ``item``.
+        if isinstance(item, _ReadAheadFailure):
+            # A failed source already finished and closed its streams.
+            self._teardown_error = item.error
+        else:
+            try:
+                close = getattr(source, "close", None)
+                if close is not None:
+                    close()
+            except BaseException as error:
+                self._teardown_error = error
+        self._source_closed = True
+
+    def _start(self) -> None:
+        thread = threading.Thread(target=self._run, name=self._name, daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            # No thread available: read on the calling thread instead.
+            self._direct = True
+            return
+        self._thread = thread
+
+    def __next__(self) -> bytes:
+        if self._finished:
+            raise StopIteration
+        if self._thread is None and not self._direct:
+            self._start()
+        thread = self._thread
+        if thread is None:
+            return next(self._source)
+        with self._condition:
+            while not self._items and thread.is_alive():
+                self._condition.wait(self._POLL_SECONDS)
+            item = self._items.popleft() if self._items else self._NO_RESULT
+            self._condition.notify_all()
+        if item is self._NO_RESULT:
+            # The helper died without a result. Its source is idle, and a
+            # caller that fails before close() must not keep it open.
+            self._finished = True
+            self._source_closed = True
+            try:
+                close = getattr(self._source, "close", None)
+                if close is not None:
+                    close()
+            except BaseException:
+                # The helper's death is the primary failure.
+                pass
+            raise RuntimeError("ledger read-ahead thread stopped without a result")
+        if item is self._END:
+            self._finished = True
+            raise StopIteration
+        if isinstance(item, _ReadAheadFailure):
+            self._finished = True
+            raise item.error
+        return item
+
+    def close(self) -> None:
+        """Stop reading ahead and close the source, raising its teardown failure."""
+        self._finished = True
+        thread = self._thread
+        if thread is None:
+            close = getattr(self._source, "close", None)
+            if close is not None:
+                close()
+            return
+        undelivered = None
+        with self._condition:
+            self._closing = True
+            for item in self._items:
+                if isinstance(item, _ReadAheadFailure):
+                    undelivered = item.error
+            self._items.clear()
+            self._condition.notify_all()
+        # An interrupted join leaves the helper to close the source itself.
+        thread.join()
+        error, self._teardown_error = self._teardown_error, None
+        if undelivered is not None:
+            # The failed source already finished and closed its streams.
+            raise undelivered
+        if error is not None:
+            raise error
+        if not self._source_closed:
+            # The helper queued the end of the stream or died; either way
+            # the source is idle, so close it here.
+            self._source_closed = True
+            close = getattr(self._source, "close", None)
+            if close is not None:
+                close()
+
+
+def _state_key_block_reader(path: Path, block_bytes: int) -> Iterator[bytes]:
+    """Canonical ledger blocks, read and inflated ahead on helper threads.
+
+    One thread reads compressed chunks from disk and another inflates them,
+    so the DrvFS read, the inflate and the merge thread's work overlap
+    (Journal Pass 568). With one usable CPU, everything stays on the caller.
+    """
+    if _usable_cpu_count() < 2:
+        return _iter_state_key_blocks(path, block_bytes)
+    return _ReadAheadBlocks(
+        _iter_state_key_blocks(path, block_bytes, read_ahead=True),
+        _TRAINED_LEDGER_READ_AHEAD_BLOCKS,
+    )
 
 
 class _NonCanonicalStateKeys(Exception):
@@ -1700,14 +1981,20 @@ def _canonical_state_key_records(block: bytes) -> np.ndarray:
     """
 
     count, remainder = divmod(len(block), _CANONICAL_STATE_KEY_RECORD_BYTES)
-    newlines = b"\n" * count
+    if remainder or not count:
+        raise _NonCanonicalStateKeys
+    # NumPy releases the GIL on these passes; bytes.translate held it for
+    # about 3 ms per 4 MiB block, stalling the read-ahead thread's inflate
+    # (Journal Pass 568). uint8 subtraction wraps, so each comparison selects
+    # exactly one digit range.
+    octets = np.frombuffer(block, dtype=np.uint8)
+    digits = np.subtract(octets, ord("0"), dtype=np.uint8) < 10
+    digits |= np.subtract(octets, ord("a"), dtype=np.uint8) < 6
     if (
-        remainder
-        or not count
-        or block[_CANONICAL_STATE_KEY_CHARS::_CANONICAL_STATE_KEY_RECORD_BYTES]
-        != newlines
-        # Deleting every digit must leave exactly the newlines checked above.
-        or block.translate(None, _CANONICAL_STATE_KEY_DIGITS) != newlines
+        not (octets[_CANONICAL_STATE_KEY_CHARS::_CANONICAL_STATE_KEY_RECORD_BYTES]
+             == ord("\n")).all()
+        # With every row's final byte a newline, the rest must all be digits.
+        or np.count_nonzero(digits) != _CANONICAL_STATE_KEY_CHARS * count
     ):
         raise _NonCanonicalStateKeys
     records = np.frombuffer(block, dtype=_CANONICAL_STATE_KEY_RECORD_DTYPE)
@@ -1739,6 +2026,29 @@ def _are_canonical_state_keys(keys: Sequence[str]) -> bool:
     except _NonCanonicalStateKeys:
         return False
     return True
+
+
+def _insert_state_key_records(
+    block: bytes, positions: np.ndarray, insertions: np.ndarray,
+) -> bytes:
+    """Return ``block`` with each insertion placed before the row at its position.
+
+    Positions must be non-decreasing; equal positions keep insertion order,
+    as ``np.insert`` does. One join of zero-copy slices replaced
+    ``np.insert(...).tobytes()``: about 0.5 ms instead of 2.7 ms per 4 MiB
+    block, and a far shorter hold on the GIL (Journal Pass 568).
+    """
+
+    view = memoryview(block)
+    pieces: List[Any] = []
+    start = 0
+    for position, record in zip(positions.tolist(), insertions.tolist()):
+        offset = position * _CANONICAL_STATE_KEY_RECORD_BYTES
+        pieces.append(view[start:offset])
+        pieces.append(record)
+        start = offset
+    pieces.append(view[start:])
+    return b"".join(pieces)
 
 
 def _write_canonical_state_key_union(
@@ -1779,8 +2089,8 @@ def _write_canonical_state_key_union(
             fresh = records[positions] != insertions
             fresh_count = int(np.count_nonzero(fresh))
             if fresh_count:
-                pending = np.insert(
-                    records, positions[fresh], insertions[fresh]).tobytes()
+                pending = _insert_state_key_records(
+                    pending, positions[fresh], insertions[fresh])
                 added += fresh_count
             index = stop
         handle.write(pending)
@@ -1964,9 +2274,144 @@ def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     row-wise union.
     """
 
+    return _merge_state_keys_file_with_digest(path, new_keys)[0]
+
+
+@dataclass(frozen=True)
+class _LedgerSourceDigest:
+    """SHA-256 of a rewritten key file, bound to the identity it was published as."""
+
+    identity: _ReplayFileIdentity
+    sha256: str
+
+
+class _Sha256Writer:
+    """Forward writes to ``raw`` and hash exactly the bytes it accepted."""
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._digest = hashlib.sha256()
+
+    def write(self, data: Any) -> int:
+        # A blocking BufferedWriter accepts every byte or raises, so hashing
+        # after the call covers exactly what reaches the file.
+        written = self._raw.write(data)
+        self._digest.update(data)
+        return written
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+_ZLIB_COMPRESS_TYPE = type(zlib.compressobj())
+
+
+class _ParallelDeflate:
+    """Stand-in for a ``GzipFile``'s deflater that compresses on worker threads.
+
+    Each ``compress()`` call becomes an independent raw-deflate segment that
+    ends in a sync flush, so the segments concatenate into one valid deflate
+    stream (pigz's technique) and the file stays a single standard gzip
+    member. ``GzipFile`` still writes the header, CRC-32 and size. zlib
+    releases the GIL while deflating. Output keeps submission order, and at
+    most ``2 * workers`` segments are in flight. Each segment restarts the
+    deflate window, so callers should write large blocks.
+    """
+
+    def __init__(self, level: int, workers: int) -> None:
+        self._level = level
+        self._workers = workers
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._pending: collections.deque = collections.deque()
+        self._finished = False
+
+    def _segment(self, data: bytes) -> bytes:
+        deflater = zlib.compressobj(self._level, zlib.DEFLATED, -zlib.MAX_WBITS)
+        return deflater.compress(data) + deflater.flush(zlib.Z_SYNC_FLUSH)
+
+    def compress(self, data: Any) -> bytes:
+        if self._finished:
+            raise ValueError("compress() after the deflate stream was finished")
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._workers, thread_name_prefix="ledger-deflate")
+        # GzipFile passes bytes, a bytearray or a memoryview; a segment must
+        # own immutable input while it waits for a worker.
+        self._pending.append(self._executor.submit(self._segment, bytes(data)))
+        output = []
+        while self._pending and (
+            len(self._pending) > 2 * self._workers or self._pending[0].done()
+        ):
+            output.append(self._pending.popleft().result())
+        return b"".join(output)
+
+    def flush(self, mode: int = zlib.Z_FINISH) -> bytes:
+        # Every segment already ends byte-aligned, so returning them all
+        # satisfies any flush mode; only Z_FINISH needs the final block.
+        try:
+            output = []
+            while self._pending:
+                output.append(self._pending.popleft().result())
+            if mode == zlib.Z_FINISH:
+                output.append(zlib.compressobj(
+                    self._level, zlib.DEFLATED, -zlib.MAX_WBITS,
+                ).flush(zlib.Z_FINISH))
+        finally:
+            if mode == zlib.Z_FINISH:
+                self.close()
+        return b"".join(output)
+
+    def close(self) -> None:
+        """Stop the workers; unfinished segments are discarded."""
+        self._finished = True
+        pending, self._pending = self._pending, collections.deque()
+        for future in pending:
+            future.cancel()
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _parallelize_gzip_deflate(handle: Any, level: int) -> Optional[_ParallelDeflate]:
+    """Give a writable ``GzipFile`` the threaded deflater, if it can use one.
+
+    ``GzipFile.compress`` is private, but CPython 3.11 through 3.13 route every
+    write and the final flush through it; ``test_ledger_parallel_deflate.py``
+    pins that on the running interpreter. Returns ``None`` (the handle keeps
+    zlib's serial deflater) when fewer than two CPUs are available or the
+    handle is not an unused ``GzipFile``.
+    """
+
+    workers = min(_TRAINED_LEDGER_DEFLATE_WORKERS, _usable_cpu_count())
+    if (
+        workers < 2
+        or not isinstance(handle, gzip.GzipFile)
+        or not isinstance(getattr(handle, "compress", None), _ZLIB_COMPRESS_TYPE)
+        or handle.size
+    ):
+        return None
+    deflate = _ParallelDeflate(level, workers)
+    handle.compress = deflate
+    return deflate
+
+
+def _merge_state_keys_file_with_digest(
+    path: Path, new_keys: Iterable[str],
+) -> Tuple[int, Optional[_LedgerSourceDigest]]:
+    """Like :func:`_merge_state_keys_file`, plus the replacement's digest.
+
+    The digest is computed from the compressed bytes as they are written, so
+    the ledger sidecar need not read the multi-gigabyte file back (Journal
+    Pass 566). It is ``None`` when nothing was rewritten or when the published
+    name cannot be proven to be the inode that was hashed.
+    """
+
     additions = sorted(set(new_keys))
     if not additions:
-        return 0
+        return 0, None
     if _are_canonical_state_keys(additions):
         try:
             return _rewrite_state_key_union(path, additions, canonical=True)
@@ -2013,15 +2458,19 @@ def _write_row_state_key_union(
 
 def _rewrite_state_key_union(
     path: Path, additions: Sequence[str], *, canonical: bool,
-) -> int:
-    """Atomically replace ``path`` with its union with sorted ``additions``."""
+) -> Tuple[int, Optional[_LedgerSourceDigest]]:
+    """Atomically replace ``path`` with its union with sorted ``additions``.
+
+    Return the added count and the replacement's write-time digest.
+    """
 
     temporary = None
     noncanonical_error = None
+    written_stat = None
     if not path.is_file():
         existing = iter(())
     elif canonical:
-        existing = _iter_state_key_blocks(
+        existing = _state_key_block_reader(
             path,
             _TRAINED_LEDGER_MERGE_BLOCK_RECORDS * _CANONICAL_STATE_KEY_RECORD_BYTES,
         )
@@ -2038,13 +2487,19 @@ def _rewrite_state_key_union(
             prefix=path.name + ".", suffix=".tmp", dir=path.parent,
         ) as (fd, temporary):
             raw_handle = os.fdopen(fd, "wb", closefd=False)
+            hashing_handle = _Sha256Writer(raw_handle)
+            deflate = None
             try:
                 handle = gzip.open(
-                    raw_handle,
+                    hashing_handle,
                     "wb" if canonical else "wt",
                     compresslevel=_TRAINED_LEDGER_GZIP_COMPRESSLEVEL,
                     **({} if canonical else {"encoding": "ascii", "newline": "\n"}),
                 )
+                if canonical:
+                    # handle.close() finishes the stream and stops its workers.
+                    deflate = _parallelize_gzip_deflate(
+                        handle, _TRAINED_LEDGER_GZIP_COMPRESSLEVEL)
                 try:
                     if canonical:
                         try:
@@ -2071,7 +2526,15 @@ def _rewrite_state_key_union(
                 if noncanonical_error is None:
                     raw_handle.flush()
                     os.fsync(raw_handle.fileno())
+                    written_stat = os.fstat(raw_handle.fileno())
             except BaseException:
+                try:
+                    # Normally already stopped by handle.close(); a failed or
+                    # skipped close must not leave deflate workers behind.
+                    if deflate is not None:
+                        deflate.close()
+                except BaseException:
+                    pass
                 try:
                     raw_handle.close()
                 except BaseException:
@@ -2109,7 +2572,15 @@ def _rewrite_state_key_union(
         if isinstance(error, _NonCanonicalStateKeys) and cleanup_error is not None:
             raise cleanup_error from error
         raise
-    return added
+    # Bind the digest only if the published name still reports the synced
+    # inode; otherwise the sidecar falls back to re-hashing the file.
+    try:
+        published = _replay_file_identity(path)
+    except OSError:
+        return added, None
+    if published != _replay_file_identity_from_stat(path, written_stat):
+        return added, None
+    return added, _LedgerSourceDigest(published, hashing_handle.hexdigest())
 
 
 def _store_shard(
@@ -3633,6 +4104,7 @@ class CorpusSnapshotManager:
         fingerprints: Iterable[int],
         *,
         commit_directory: bool = True,
+        source_digest: Optional[_LedgerSourceDigest] = None,
     ) -> None:
         """Best-effort atomically persist a verified compact ledger index.
 
@@ -3641,6 +4113,11 @@ class CorpusSnapshotManager:
         passes ``commit_directory=False`` because its shared ledger commit
         orders every authoritative replacement and this derived cache before
         snapshot activation.
+
+        Admission also passes the digest its canonical rewrite computed while
+        writing. It is used only while the source still has the identity that
+        rewrite published; otherwise the source is re-hashed. Sidecar loads
+        always re-hash the source (Journal Pass 566).
         """
 
         # Source verification may fail before optional payload publication.
@@ -3662,7 +4139,12 @@ class CorpusSnapshotManager:
                 "version": _LEDGER_FINGERPRINT_SIDECAR_VERSION,
                 "byteorder": "little",
                 "source_identity": self._ledger_source_identity(source_identity),
-                "source_sha256": _sha256_file_uncached(source_path),
+                "source_sha256": (
+                    source_digest.sha256
+                    if source_digest is not None
+                    and source_digest.identity == source_identity
+                    else _sha256_file_uncached(source_path)
+                ),
                 "fingerprint_count": len(values),
                 "payload_sha256": hashlib.sha256(values).hexdigest(),
             }
@@ -3805,9 +4287,61 @@ class CorpusSnapshotManager:
     def _ensure_trained_ledger(self) -> None:
         if not self.trained_ledger_enabled:
             return
+        # Every ledger access that can write passes here first, so the sweep
+        # never sees a temporary created later by the same call.
+        self._reclaim_stale_ledger_temporaries()
         if self._ledger_seed_path.is_file():
             return
         self._seed_trained_ledger()
+
+    def _reclaim_stale_ledger_temporaries(self) -> None:
+        """Remove temporaries that a killed ledger writer left behind.
+
+        Only exact ledger-writer names that are regular files and have not been
+        modified for ``_STALE_LEDGER_TEMPORARY_SECONDS`` qualify.  Nothing reads
+        such a name, so removal cannot change the ledger.  This is best-effort
+        garbage collection: no failure here may fail the ledger operation that
+        follows, including a dead console reporting the reclaimed space.
+        """
+        try:
+            now = time.time()
+            with os.scandir(self.trained_ledger_dir) as entries:
+                candidates = [
+                    entry for entry in entries
+                    if _TRAINED_LEDGER_TEMPORARY_NAME.fullmatch(entry.name)
+                ]
+        except OSError:
+            # Absent before the first admission, or unreadable: nothing to do.
+            return
+        reclaimed_files = 0
+        reclaimed_bytes = 0
+        for entry in candidates:
+            try:
+                info = entry.stat(follow_symlinks=False)
+                if (not stat_module.S_ISREG(info.st_mode)
+                        or now - info.st_mtime
+                        < _STALE_LEDGER_TEMPORARY_SECONDS):
+                    continue
+                os.unlink(entry.path)
+            except OSError:
+                continue
+            reclaimed_files += 1
+            reclaimed_bytes += info.st_size
+        if not reclaimed_files:
+            return
+        try:
+            run_status._fsync_directory(self.trained_ledger_dir)
+        except OSError:
+            # A lost unlink only restores garbage that the next call removes.
+            pass
+        try:
+            print(
+                f"  Trained ledger: reclaimed {reclaimed_files} stale temporary "
+                f"file(s) left by an interrupted writer "
+                f"({reclaimed_bytes / 2**20:,.1f} MiB)"
+            )
+        except (OSError, ValueError):
+            pass
 
     def _load_trained_ledger(self) -> Tuple[Set[str], AbstractSet[int]]:
         """Return (shard names, state fingerprints) known to have been trained.
@@ -3952,7 +4486,7 @@ class CorpusSnapshotManager:
         # Even a zero-addition rewrite can replace the compressed source.
         # Retire the previous proof before mutation, including failed attempts.
         self._trained_ledger_source_sha256 = None
-        added_states = _merge_state_keys_file(
+        added_states, source_digest = _merge_state_keys_file_with_digest(
             self._ledger_state_keys_path, state_keys)
         # Publish a new index. Contexts prepared from the previous one keep
         # their unchanged view, which is what made their copies unnecessary.
@@ -3960,9 +4494,12 @@ class CorpusSnapshotManager:
             known_fingerprints).union_fingerprints(
                 _state_key_fingerprint(key) for key in state_keys)
         if added_states:
+            # The write-time digest spares reading the whole canonical ledger
+            # back from disk, about 20-30 s at 3.15 GB on DrvFS.
             self._write_ledger_fingerprint_sidecar(
                 known_fingerprints,
                 commit_directory=False,
+                source_digest=source_digest,
             )
         try:
             # CURRENT is committed in the snapshot root, not in ledger/.  The
