@@ -1115,9 +1115,10 @@ def newest_verified_recovery_continuation(
 # tensors instead of clearing or rebuilding them.
 _VALIDATION_TENSORS_CURRENT = object()
 
-# Free-RAM floor that must remain after the producer retains the assembled
-# train window's CPU tensors between admissions for per-shard reuse. Below it
-# the cache is dropped and the next admission takes the full parse path.
+# Free-RAM floor for retaining the assembled train window's CPU tensors between
+# admissions for per-shard reuse. Once the replaced window is released, free
+# RAM must still exceed this floor by one more window (Journal Pass 569).
+# Below it the cache is dropped and the next admission takes the full parse path.
 _TRAIN_WINDOW_CACHE_MIN_FREE_GB = 4.0
 # Tensorize at shard boundaries so parsing does not retain a whole window's
 # Python object graph beside the old cache and forked preprocessing workers.
@@ -3743,10 +3744,26 @@ class Trainer:
 
         retain = params is not None
         if retain:
-            window_bytes = sum(
-                getattr(window_dataset, field).element_size()
-                * getattr(window_dataset, field).nelement()
-                for field in fields
+            def tensor_bytes(dataset):
+                return sum(
+                    getattr(dataset, field).element_size()
+                    * getattr(dataset, field).nelement()
+                    for field in fields
+                )
+
+            window_bytes = tensor_bytes(window_dataset)
+            # Free RAM is read with the new window already resident while the
+            # previous window, released at publication below, is still held.
+            # Credit that release: counting it refused every other warm
+            # retention once RAM tightened, forcing full-window re-parses
+            # (Journal Pass 569). Use the attribute, not the local cache, which
+            # is dropped on a params/filter mismatch while still resident.
+            previous = getattr(self, "_train_tensor_window", None)
+            previous_dataset = (
+                previous.get("dataset") if isinstance(previous, Mapping) else None
+            )
+            previous_bytes = (
+                tensor_bytes(previous_dataset) if previous_dataset is not None else 0
             )
             try:
                 import psutil
@@ -3755,9 +3772,17 @@ class Trainer:
                 available = None
             retain = (
                 available is not None
-                and (available - window_bytes)
+                and (available + previous_bytes - window_bytes)
                 >= _TRAIN_WINDOW_CACHE_MIN_FREE_GB * (1024 ** 3)
             )
+            if not retain and available is not None:
+                _diagnostic_print(
+                    f"  Train window: not retaining {len(window_dataset)} row(s) "
+                    f"for reuse: {(available + previous_bytes) / 1024 ** 3:.2f} GiB "
+                    f"free after release, below the "
+                    f"{_TRAIN_WINDOW_CACHE_MIN_FREE_GB:.1f} GiB floor plus "
+                    f"{window_bytes / 1024 ** 3:.2f} GiB window margin"
+                )
         if should_abort is not None and should_abort():
             return None
         next_cache = None
