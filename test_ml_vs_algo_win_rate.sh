@@ -49,7 +49,8 @@ TEST_ALL_MODELS=true            # true = test every model_step_*.pt in MODEL_DIR
 MODEL_DIR=""                     # Where TEST_ALL_MODELS looks (empty = the config's paths.checkpoint_dir)
 SKIP_ALREADY_TESTED=true         # true = skip a step already recorded in RESULTS_FILE for the same
                                  # difficulty, game count and opening suite, so an interrupted
-                                 # sweep resumes. false = measure every model again.
+                                 # sweep resumes. Cached rows still count in the report and gate.
+                                 # false = measure every model again.
 OVERWRITE_PREVIOUS=false         # true = drop the earlier records for each (step, difficulty) this
                                  # run measures, so RESULTS_FILE keeps one result per point on the
                                  # dashboard instead of a growing history. Turns re-testing on, so
@@ -413,8 +414,8 @@ print(-1 if step is None else step, digest.hexdigest().upper())
 # weights, and that replacement must be measured again.
 declare -A ALREADY_TESTED=()
 if [[ "$SKIP_ALREADY_TESTED" == true && -f "$RESULTS_FILE" ]]; then
-    while IFS= read -r _key; do
-        [[ -n "$_key" ]] && ALREADY_TESTED["$_key"]=1
+    while IFS=$'\t' read -r _key _cached_record; do
+        [[ -n "$_key" ]] && ALREADY_TESTED["$_key"]="$_cached_record"
     done < <(
         RESULTS_FILE="$RESULTS_FILE" EXPECT_GAMES="$NUM_GAMES" \
         EXPECT_SEED="$OPENING_SEED" EXPECT_PLIES="$OPENING_PLIES" \
@@ -435,6 +436,10 @@ with open(os.environ["RESULTS_FILE"], "r", encoding="utf-8") as handle:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("tester") != "test_ml_vs_algo_win_rate.sh" or record.get("opponent_type") != "algorithm":
+            continue
         if record.get("total_games") != expect_games:
             continue
         if record.get("opening_seed") != expect_seed:
@@ -447,7 +452,7 @@ with open(os.environ["RESULTS_FILE"], "r", encoding="utf-8") as handle:
             continue
         sha256, difficulty = record.get("model_sha256"), record.get("algo_difficulty")
         if sha256 and difficulty:
-            print(f"{sha256}|{difficulty}")
+            print(f"{sha256}|{difficulty}\t{json.dumps(record, separators=(chr(44), chr(58)))}")
 ' 2>/dev/null
     )
 fi
@@ -487,6 +492,7 @@ if [[ -f "$_status_file" ]] && grep -q '"status": *"running"' "$_status_file"; t
     fi
 fi
 
+_evaluate_models() {
 MODEL_INDEX=0
 EVALUATED=0
 SKIPPED=0
@@ -514,6 +520,9 @@ for MODEL_FILE in "${MODEL_FILES[@]}"; do
         if [[ -n "${ALREADY_TESTED["$MODEL_SHA256|$difficulty"]:-}" ]]; then
             log "SKIP: $_model_name vs $difficulty already measured at these settings"
             SKIPPED=$(( SKIPPED + 1 ))
+            printf '%s\t%s\t%s\t%s\n' \
+                "$MODEL_FILE" "$MODEL_SHA256" "$STEP_KNOWN" \
+                "${ALREADY_TESTED["$MODEL_SHA256|$difficulty"]}" >> "$RECORDS_FILE"
             continue
         fi
         log "EVAL: ${_progress}vs $difficulty algorithm - $NUM_GAMES games"
@@ -541,9 +550,16 @@ for MODEL_FILE in "${MODEL_FILES[@]}"; do
         fi
         # Tab-separated provenance per record: a sweep tests many models, and
         # compact JSON never contains a literal tab.
-        printf '%s\t%s\t%s\t%s\n' \
+        _record_line="$(printf '%s\t%s\t%s\t%s' \
             "$MODEL_FILE" "$MODEL_SHA256" "$STEP_KNOWN" \
-            "$(printf '%s\n' "$json_line" | tail -n 1)" >> "$RECORDS_FILE"
+            "$(printf '%s\n' "$json_line" | tail -n 1)")"
+        # Publish each completed measurement before starting the next one, so
+        # failure or interruption preserves the work that resume can reuse.
+        if ! _process_records save "$_record_line"; then
+            log "ERROR: could not save evaluation of $_model_name vs $difficulty"
+            return 2
+        fi
+        printf '%s\n' "$_record_line" >> "$RECORDS_FILE"
         EVALUATED=$(( EVALUATED + 1 ))
         log "DONE: vs $difficulty in $(( SECONDS - _started ))s"
     done
@@ -556,18 +572,21 @@ done
 if (( EVALUATED == 0 )); then
     log "Nothing to evaluate: $SKIPPED measurement(s) already recorded at these settings."
     log "Set SKIP_ALREADY_TESTED=false to measure them again."
-    exit 0
 fi
-(( SKIPPED == 0 )) || log "Skipped $SKIPPED already-measured model/difficulty pair(s)."
+(( SKIPPED == 0 )) || log "Report and gate include $SKIPPED cached model/difficulty pair(s)."
+return 0
+}
 
 # ========================== REPORT ===========================================
 
-set +e
+_process_records() {
+REPORT_MODE="$1" EVALUATION_RECORD="${2:-}" \
 RECORDS_FILE="$RECORDS_FILE" RESULTS_FILE="$RESULTS_FILE" RUN_ID="$RUN_ID" \
 CONFIG_FILE="$CONFIG_FILE" PROJECT_DIR="$PROJECT_DIR" OUTPUT_NAMESPACE="$OUTPUT_NAMESPACE" \
 MAX_MOVES="$MAX_MOVES" MIN_WIN_RATE="$MIN_WIN_RATE" STATS_DIR="$STATS_DIR" \
 OVERWRITE_PREVIOUS="$OVERWRITE_PREVIOUS" \
     "${PYTHON_CMD[@]}" - <<'PY'
+import io
 import json
 import os
 import sys
@@ -593,7 +612,9 @@ shared_provenance = {
 }
 
 records = []
-with open(env["RECORDS_FILE"], "r", encoding="utf-8") as handle:
+input_records = (io.StringIO(env["EVALUATION_RECORD"]) if env["REPORT_MODE"] == "save"
+                 else open(env["RECORDS_FILE"], "r", encoding="utf-8"))
+with input_records as handle:
     for line in handle:
         line = line.rstrip("\n")
         if not line:
@@ -631,47 +652,51 @@ def result_key(record):
     return ("sha256", record.get("model_sha256"), difficulty)
 
 
-results_path = env["RESULTS_FILE"]
 superseded = 0
-if env["OVERWRITE_PREVIOUS"] == "true" and os.path.exists(results_path):
-    replaced_keys = {result_key(record) for record in records}
-    kept = []
-    with open(results_path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                existing = json.loads(line)
-            except json.JSONDecodeError:
-                kept.append(line)  # never discard what cannot be understood
-                continue
-            if result_key(existing) in replaced_keys:
-                superseded += 1
-                continue
-            kept.append(line)
+if env["REPORT_MODE"] == "save":
+    results_path = env["RESULTS_FILE"]
+    if env["OVERWRITE_PREVIOUS"] == "true" and os.path.exists(results_path):
+        replaced_keys = {result_key(record) for record in records}
+        kept = []
+        with open(results_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    existing = json.loads(line)
+                except json.JSONDecodeError:
+                    kept.append(line)  # never discard what cannot be understood
+                    continue
+                if result_key(existing) in replaced_keys:
+                    superseded += 1
+                    continue
+                kept.append(line)
 
-    # Rewrite through a temporary in the same directory: a partially written
-    # results file would lose measurements this run did not take.
-    directory = os.path.dirname(results_path) or "."
-    descriptor, temporary = tempfile.mkstemp(dir=directory, suffix=".tmp")
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            for line in kept:
-                handle.write(line + "\n")
+        # Rewrite through a temporary in the same directory: a partially written
+        # results file would lose measurements this run did not take.
+        directory = os.path.dirname(results_path) or "."
+        descriptor, temporary = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                for line in kept:
+                    handle.write(line + "\n")
+                for record in records:
+                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, results_path)
+        except BaseException:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+    else:
+        with open(results_path, "a", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, results_path)
-    except BaseException:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-        raise
-else:
-    with open(results_path, "a", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    if superseded:
+        print(f"Replaced {superseded} earlier result(s).", file=sys.stderr)
+    sys.exit(0)
 
 models = {}
 for record in records:
@@ -770,6 +795,11 @@ if env["MIN_WIN_RATE"]:
 print(rule)
 sys.exit(exit_code)
 PY
+}
+
+_evaluate_models
+set +e
+_process_records report
 _status=$?
 set -e
 exit "$_status"
