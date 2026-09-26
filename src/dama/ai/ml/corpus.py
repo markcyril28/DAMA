@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from array import array
 from collections import Counter, defaultdict, OrderedDict
+import collections.abc
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import bisect
@@ -23,6 +24,7 @@ import gc
 import gzip
 import hashlib
 import json
+import operator
 import os
 from pathlib import Path
 import random
@@ -315,7 +317,7 @@ class _SnapshotSplitContext:
     validation_path: Path
     validation_manifest: dict
     validation_keys: Set[str]
-    historically_trained: Set[int]
+    historically_trained: AbstractSet[int]
     max_train_entries: int
     # The verified key set of the immutable validation manifest alone, without
     # the external frozen-suite exclusions folded into ``validation_keys``.
@@ -1771,6 +1773,154 @@ def _state_key_fingerprint(key: str) -> int:
     return int(key[:16], 16)
 
 
+_FINGERPRINT_MAX = (1 << 64) - 1
+_FINGERPRINT_ITER_CHUNK = 64 * 1024
+
+
+class _TrainedLedgerFingerprints(collections.abc.Set):
+    """Immutable sorted membership index of all-time ledger fingerprints.
+
+    A Python ``set`` of 64-bit ints costs roughly 80-90 bytes per key in int
+    objects plus a hash table that doubles as it grows, and every split
+    preparation copied that table again.  At 86M keys the ledger alone held
+    several GB of the trainer's 24 GB host (Journal Pass 556).  One strictly
+    increasing ``uint64`` array holds the same membership at 8 bytes per key
+    and is exactly the sidecar payload on little-endian hosts.
+
+    The array is read-only and never mutated.  Admission publishes a new
+    index through :meth:`union_fingerprints`, so a split context may keep the
+    index it was prepared with, without a copy.  Every needle is converted to
+    ``uint64`` before searching: a signed ``int64`` needle against this
+    unsigned array promotes both sides to ``float64`` and loses the low bits
+    of fingerprints above 2**53.
+    """
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: np.ndarray) -> None:
+        # Constructors below pass a private, strictly increasing uint64 array.
+        values.flags.writeable = False
+        self._values = values
+
+    @classmethod
+    def empty(cls) -> "_TrainedLedgerFingerprints":
+        return cls(np.empty(0, dtype=np.uint64))
+
+    @classmethod
+    def from_array(cls, values: np.ndarray) -> "_TrainedLedgerFingerprints":
+        """Index a private native ``uint64`` array, sorting and deduplicating."""
+
+        if values.dtype != np.dtype(np.uint64) or values.ndim != 1:
+            raise TypeError("ledger fingerprints must be a 1-D uint64 array")
+        if values.size > 1 and not bool(np.all(values[1:] > values[:-1])):
+            values = np.unique(values)
+        return cls(values)
+
+    @classmethod
+    def from_iterable(
+        cls, fingerprints: Iterable[int],
+    ) -> "_TrainedLedgerFingerprints":
+        """Return ``fingerprints`` itself if already indexed, else index it."""
+
+        if isinstance(fingerprints, cls):
+            return fingerprints
+        count = len(fingerprints) if isinstance(
+            fingerprints, collections.abc.Sized) else -1
+        return cls.from_array(
+            np.fromiter(fingerprints, dtype=np.uint64, count=count))
+
+    @classmethod
+    def from_verified_payload(
+        cls, payload: bytes,
+    ) -> Optional["_TrainedLedgerFingerprints"]:
+        """Index a digest-verified sidecar payload, or ``None`` on duplicates.
+
+        Sorted payloads are used in place, without a copy.  Sidecars written
+        before Pass 556 stored set-iteration order; those are sorted once into
+        a private array, after which the caller's payload may be released.
+        """
+
+        values = np.frombuffer(payload, dtype="<u8")
+        if values.dtype != np.dtype(np.uint64):
+            values = values.astype(np.uint64)
+        if values.size > 1 and not bool(np.all(values[1:] > values[:-1])):
+            values = np.sort(values)
+            # The source-key representation is a set, so duplicate binary
+            # values mean a malformed sidecar rather than a valid cache hit.
+            if bool(np.any(values[1:] == values[:-1])):
+                return None
+        return cls(values)
+
+    @classmethod
+    def _from_iterable(cls, iterable: Iterable[Any]) -> FrozenSet[Any]:
+        # Mixin operators (``&``, ``|``, ``-``) serve small comparisons only.
+        # Their results need no sorted index, so never route them through
+        # ``__init__``; production code uses ``union_fingerprints``.
+        return frozenset(iterable)
+
+    def little_endian_values(self) -> np.ndarray:
+        """The index as the little-endian sidecar payload array."""
+
+        return self._values.astype("<u8", copy=False)
+
+    def __len__(self) -> int:
+        return int(self._values.size)
+
+    def __iter__(self) -> Iterator[int]:
+        values = self._values
+        for start in range(0, values.size, _FINGERPRINT_ITER_CHUNK):
+            yield from values[start:start + _FINGERPRINT_ITER_CHUNK].tolist()
+
+    def __contains__(self, value: object) -> bool:
+        try:
+            integer = operator.index(value)
+        except TypeError:
+            return False
+        if integer < 0 or integer > _FINGERPRINT_MAX:
+            return False
+        needle = np.uint64(integer)
+        values = self._values
+        position = int(values.searchsorted(needle))
+        return position < values.size and bool(values[position] == needle)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(<{len(self)} fingerprints>)"
+
+    def contains_many(self, needles: np.ndarray) -> np.ndarray:
+        """Vectorized membership of a ``uint64`` needle array."""
+
+        if needles.dtype != np.dtype(np.uint64):
+            raise TypeError("fingerprint needles must be uint64")
+        values = self._values
+        if values.size == 0:
+            return np.zeros(needles.shape, dtype=bool)
+        positions = values.searchsorted(needles)
+        np.minimum(positions, values.size - 1, out=positions)
+        return values[positions] == needles
+
+    def union_fingerprints(
+        self, fingerprints: Iterable[int],
+    ) -> "_TrainedLedgerFingerprints":
+        """Return a new index that also holds ``fingerprints``.
+
+        ``self`` is left unchanged for every holder of this index.  One sorted
+        insertion copies the existing array once instead of re-sorting it.
+        """
+
+        additions = np.unique(np.fromiter(fingerprints, dtype=np.uint64))
+        values = self._values
+        if additions.size == 0:
+            return self
+        if values.size == 0:
+            return type(self)(additions)
+        positions = values.searchsorted(additions)
+        fresh = values[np.minimum(positions, values.size - 1)] != additions
+        if not bool(fresh.any()):
+            return self
+        return type(self)(
+            np.insert(values, positions[fresh], additions[fresh]))
+
+
 def _merge_state_keys_file(path: Path, new_keys: Iterable[str]) -> int:
     """Union ``new_keys`` into a sorted key file, streaming; return added count.
 
@@ -2141,7 +2291,8 @@ class CorpusSnapshotManager:
         self.trained_ledger_seed_roots = tuple(
             Path(value) for value in trained_ledger_seed_roots)
         self._lineage_base_cache: Optional[Tuple[Path, dict, Set[str]]] = None
-        self._trained_ledger_cache: Optional[Tuple[Set[str], Set[int]]] = None
+        self._trained_ledger_cache: Optional[
+            Tuple[Set[str], AbstractSet[int]]] = None
         # Immutable manifest key files otherwise get decompressed, parsed and
         # fingerprinted again after every self-play cycle.  Entries are keyed
         # by the same stat identity as the replay caches, so a replacement or
@@ -3350,7 +3501,9 @@ class CorpusSnapshotManager:
             "st_mtime_ns": identity.st_mtime_ns,
         }
 
-    def _load_ledger_fingerprint_sidecar(self) -> Optional[Set[int]]:
+    def _load_ledger_fingerprint_sidecar(
+        self,
+    ) -> Optional[_TrainedLedgerFingerprints]:
         """Load a verified binary ledger index, or return ``None`` on a miss.
 
         The sidecar is strictly an acceleration of the canonical gzip ledger,
@@ -3361,6 +3514,9 @@ class CorpusSnapshotManager:
         the established gzip parser.
         """
 
+        # A failed verification must not leave an earlier ledger proof usable
+        # as the source key of a derived validation tensor cache.
+        self._trained_ledger_source_sha256 = None
         source_path = self._ledger_state_keys_path
         sidecar_path = self._ledger_fingerprints_path
         if not source_path.is_file() or not sidecar_path.is_file():
@@ -3420,19 +3576,13 @@ class CorpusSnapshotManager:
                 return None
             if len(payload) != count * _LEDGER_FINGERPRINT_BYTES:
                 return None
-            values = array("Q")
-            if values.itemsize != _LEDGER_FINGERPRINT_BYTES:
-                return None
-            values.frombytes(payload)
-            # The array owns a copy. Retire the verified byte buffer before
-            # allocating the much larger membership set and its resize storage.
+            # A sorted payload becomes the index's own storage.  A legacy
+            # set-order payload is sorted into a private array instead, and
+            # the verified byte buffer is released with this local name.
+            fingerprints = _TrainedLedgerFingerprints.from_verified_payload(
+                payload)
             del payload
-            if sys.byteorder != "little":
-                values.byteswap()
-            fingerprints = set(values)
-            # The source-key representation is a set, so duplicate binary
-            # values mean a malformed sidecar rather than a valid cache hit.
-            if len(fingerprints) != count:
+            if fingerprints is None or len(fingerprints) != count:
                 return None
             self._trained_ledger_source_sha256 = source_sha256
             return fingerprints
@@ -3447,7 +3597,7 @@ class CorpusSnapshotManager:
 
     def _write_ledger_fingerprint_sidecar(
         self,
-        fingerprints: Set[int],
+        fingerprints: Iterable[int],
         *,
         commit_directory: bool = True,
     ) -> None:
@@ -3460,6 +3610,9 @@ class CorpusSnapshotManager:
         snapshot activation.
         """
 
+        # Source verification may fail before optional payload publication.
+        # Only a newly verified digest may authorize derived tensor reuse.
+        self._trained_ledger_source_sha256 = None
         source_path = self._ledger_state_keys_path
         sidecar_path = self._ledger_fingerprints_path
         if not source_path.is_file():
@@ -3467,11 +3620,11 @@ class CorpusSnapshotManager:
         temp_name: Optional[str] = None
         try:
             source_identity = _replay_file_identity(source_path)
-            values = array("Q", fingerprints)
+            # The sorted index is the payload; no per-write array is built.
+            values = _TrainedLedgerFingerprints.from_iterable(
+                fingerprints).little_endian_values()
             if values.itemsize != _LEDGER_FINGERPRINT_BYTES:
-                raise RuntimeError("unexpected unsigned-long-long item size")
-            if sys.byteorder != "little":
-                values.byteswap()
+                raise RuntimeError("unexpected fingerprint item size")
             header = {
                 "version": _LEDGER_FINGERPRINT_SIDECAR_VERSION,
                 "byteorder": "little",
@@ -3497,12 +3650,17 @@ class CorpusSnapshotManager:
                 # Keep raw descriptor ownership even if stream construction
                 # partially succeeds before failing. Its cleanup must not
                 # close a descriptor that another thread could then reuse.
-                handle = os.fdopen(fd, "wb", closefd=False)
+                # array.tofile emits 64 KiB writes. Coalesce them on mounts
+                # with expensive small writes, while keeping staging bounded.
+                handle = os.fdopen(
+                    fd, "wb", buffering=1024 * 1024, closefd=False)
                 try:
                     handle.write(_LEDGER_FINGERPRINT_SIDECAR_MAGIC)
                     handle.write(header_bytes)
                     handle.write(b"\n")
-                    values.tofile(handle)
+                    # Through the registered wrapper, never ndarray.tofile:
+                    # that dups the descriptor outside the fork registry.
+                    handle.write(memoryview(values).cast("B"))
                     handle.flush()
                     os.fsync(handle.fileno())
                 except BaseException:
@@ -3587,6 +3745,7 @@ class CorpusSnapshotManager:
                 for name in sorted(shard_records)
             ),
         )
+        self._trained_ledger_source_sha256 = None
         self._ledger_state_keys_path.unlink(missing_ok=True)
         _merge_state_keys_file(self._ledger_state_keys_path, state_keys)
         _write_json_atomic(self._ledger_seed_path, {
@@ -3617,12 +3776,13 @@ class CorpusSnapshotManager:
             return
         self._seed_trained_ledger()
 
-    def _load_trained_ledger(self) -> Tuple[Set[str], Set[int]]:
+    def _load_trained_ledger(self) -> Tuple[Set[str], AbstractSet[int]]:
         """Return (shard names, state fingerprints) known to have been trained.
 
         States are held as 64-bit fingerprints rather than full keys; see
         :func:`_state_key_fingerprint` for why, and for why the failure
-        direction is safe.
+        direction is safe.  An enabled ledger returns the immutable
+        :class:`_TrainedLedgerFingerprints` index.
         """
         if not self.trained_ledger_enabled:
             return set(), set()
@@ -3657,10 +3817,14 @@ class CorpusSnapshotManager:
                     names.add(name)
         fingerprints = self._load_ledger_fingerprint_sidecar()
         if fingerprints is None:
-            fingerprints = set()
+            fingerprints = _TrainedLedgerFingerprints.empty()
             if self._ledger_state_keys_path.is_file():
+                collected = array("Q")
                 for key in _iter_state_keys(self._ledger_state_keys_path):
-                    fingerprints.add(_state_key_fingerprint(key))
+                    collected.append(_state_key_fingerprint(key))
+                fingerprints = _TrainedLedgerFingerprints.from_array(
+                    np.frombuffer(collected, dtype=np.uint64))
+                del collected
                 self._write_ledger_fingerprint_sidecar(fingerprints)
         else:
             print(
@@ -3673,9 +3837,14 @@ class CorpusSnapshotManager:
     def trained_ledger_shard_names(self) -> Set[str]:
         return set(self._load_trained_ledger()[0])
 
-    def trained_ledger_state_fingerprints(self) -> Set[int]:
-        """Membership set used to reject historically trained hold-out states."""
-        return set(self._load_trained_ledger()[1])
+    def trained_ledger_state_fingerprints(self) -> AbstractSet[int]:
+        """Membership index used to reject historically trained hold-out states.
+
+        Admission publishes a new index rather than mutating this one, so a
+        split context can hold it for a whole preparation without the full
+        copy every admission used to allocate (Journal Pass 556).
+        """
+        return self._load_trained_ledger()[1]
 
     def trained_ledger_source_sha256(self) -> Optional[str]:
         """Return the digest of the canonical ledger verified for this split.
@@ -3747,10 +3916,16 @@ class CorpusSnapshotManager:
                 append_existing=True,
             )
             known_names.update(new_names)
+        # Even a zero-addition rewrite can replace the compressed source.
+        # Retire the previous proof before mutation, including failed attempts.
+        self._trained_ledger_source_sha256 = None
         added_states = _merge_state_keys_file(
             self._ledger_state_keys_path, state_keys)
-        known_fingerprints |= {
-            _state_key_fingerprint(key) for key in state_keys}
+        # Publish a new index. Contexts prepared from the previous one keep
+        # their unchanged view, which is what made their copies unnecessary.
+        known_fingerprints = _TrainedLedgerFingerprints.from_iterable(
+            known_fingerprints).union_fingerprints(
+                _state_key_fingerprint(key) for key in state_keys)
         if added_states:
             self._write_ledger_fingerprint_sidecar(
                 known_fingerprints,
@@ -3764,7 +3939,7 @@ class CorpusSnapshotManager:
             # no additions so a retry can finish a previously failed commit.
             run_status._fsync_directory(self.trained_ledger_dir)
         except OSError:
-            # Both sets returned by _load_trained_ledger may have been mutated
+            # The shard-name set returned by _load_trained_ledger was mutated
             # above.  Reload the visible on-disk transaction before a retry so
             # it neither duplicates shard rows nor trusts uncommitted memory.
             self._trained_ledger_cache = None
@@ -4738,10 +4913,17 @@ class CorpusSnapshotManager:
         """
 
         historically_trained = context.historically_trained
+        stored_keys = context.stored_validation_keys
+        if isinstance(historically_trained, _TrainedLedgerFingerprints):
+            # Explicit uint64 needles; see the index's float64 warning.
+            needles = np.fromiter(
+                map(_state_key_fingerprint, stored_keys),
+                dtype=np.uint64, count=len(stored_keys))
+            return frozenset(
+                needles[historically_trained.contains_many(needles)].tolist())
         return frozenset(
             fingerprint
-            for fingerprint in map(
-                _state_key_fingerprint, context.stored_validation_keys)
+            for fingerprint in map(_state_key_fingerprint, stored_keys)
             if fingerprint in historically_trained
         )
 
