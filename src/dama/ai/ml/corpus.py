@@ -207,8 +207,33 @@ _REPLAY_IDENTITY_MAP_MAX = max(_REPLAY_FILE_CACHE_MAX, _REPLAY_DIGEST_CACHE_MAX)
 _REPLAY_CACHE_LOCK = threading.RLock()
 _REPLAY_ANALYSIS_CACHE: "OrderedDict[tuple, _ReplayFileAnalysis]" = OrderedDict()
 _REPLAY_HASH_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
+# The hash cache above is keyed by the full identity, whose first field is the
+# resolved path, so the SAME inode reached through two names misses.  Snapshot
+# admission hardlinks each live replay shard into ``snapshot_vN/files/`` (drvfs
+# preserves dev+inode+size+mtime_ns across the link), so ``consider_snapshot``
+# hashes the shard under its ``replay_*/`` path and ``_verify_manifest_integrity``
+# then re-reads the identical bytes under the ``files/`` path.  Key a second
+# cache by the physical identity alone (dev, ino, size, mtime_ns == identity[1:])
+# so the second name reuses the digest instead of re-reading it from the slow
+# volume.  A changed file gets a new mtime_ns (and usually size), hence a new
+# key, so this stays fail-closed for write-once shards (Journal Pass 562).
+_REPLAY_PHYSICAL_HASH_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
 _REPLAY_AUDIT_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 _REPLAY_LATEST_IDENTITY: Dict[str, tuple] = {}
+
+
+def _store_replay_file_digest(identity_key: tuple, digest: str) -> None:
+    """Record a shard digest under both its full-identity and physical keys.
+
+    The caller must hold ``_REPLAY_CACHE_LOCK``.  ``identity_key[1:]`` drops the
+    resolved path, leaving ``(st_dev, st_ino, st_size, st_mtime_ns)`` shared by
+    every hardlink to the same inode.
+    """
+
+    _cache_touch(_REPLAY_HASH_CACHE, identity_key, digest, _REPLAY_DIGEST_CACHE_MAX)
+    _cache_touch(
+        _REPLAY_PHYSICAL_HASH_CACHE, identity_key[1:], digest,
+        _REPLAY_DIGEST_CACHE_MAX)
 
 
 @dataclass(frozen=True)
@@ -565,6 +590,7 @@ def _clear_replay_file_cache() -> None:
     with _REPLAY_CACHE_LOCK:
         _REPLAY_ANALYSIS_CACHE.clear()
         _REPLAY_HASH_CACHE.clear()
+        _REPLAY_PHYSICAL_HASH_CACHE.clear()
         _REPLAY_AUDIT_CACHE.clear()
         _REPLAY_LATEST_IDENTITY.clear()
     with _METADATA_STAT_STRATEGY_LOCK:
@@ -674,11 +700,24 @@ def _replay_file_sha256_for_identity(
 
     path = Path(path)
     identity_key = _cache_prepare_identity(identity)
+    physical_key = identity_key[1:]
     with _REPLAY_CACHE_LOCK:
         cached = _REPLAY_HASH_CACHE.get(identity_key)
         if cached is not None:
             _REPLAY_HASH_CACHE.move_to_end(identity_key)
+            # Seed the physical cache so a hardlinked copy reached through a
+            # different path (the snapshot ``files/`` name) reuses this digest.
+            _cache_touch(
+                _REPLAY_PHYSICAL_HASH_CACHE, physical_key, cached,
+                _REPLAY_DIGEST_CACHE_MAX)
             return cached
+        physical = _REPLAY_PHYSICAL_HASH_CACHE.get(physical_key)
+        if physical is not None:
+            _REPLAY_PHYSICAL_HASH_CACHE.move_to_end(physical_key)
+            _cache_touch(
+                _REPLAY_HASH_CACHE, identity_key, physical,
+                _REPLAY_DIGEST_CACHE_MAX)
+            return physical
 
     digest = _sha256_file_uncached(path)
     try:
@@ -687,9 +726,7 @@ def _replay_file_sha256_for_identity(
         unchanged = False
     if unchanged:
         with _REPLAY_CACHE_LOCK:
-            _cache_touch(
-                _REPLAY_HASH_CACHE, identity_key, digest,
-                _REPLAY_DIGEST_CACHE_MAX)
+            _store_replay_file_digest(identity_key, digest)
     return digest
 
 
@@ -844,9 +881,7 @@ def _audit_policy_replay_file_for_identity(
                 _REPLAY_DIGEST_CACHE_MAX)
             if analysis is not None and analysis.malformed_records == 0:
                 _cache_touch(_REPLAY_ANALYSIS_CACHE, identity_key, analysis)
-                _cache_touch(
-                    _REPLAY_HASH_CACHE, identity_key, analysis.sha256,
-                    _REPLAY_DIGEST_CACHE_MAX)
+                _store_replay_file_digest(identity_key, analysis.sha256)
     return result
 
 
@@ -1195,9 +1230,7 @@ def _cached_replay_file_analysis_for_identity(
     if unchanged and analysis.malformed_records == 0:
         with _REPLAY_CACHE_LOCK:
             _cache_touch(_REPLAY_ANALYSIS_CACHE, identity_key, analysis)
-            _cache_touch(
-                _REPLAY_HASH_CACHE, identity_key, analysis.sha256,
-                _REPLAY_DIGEST_CACHE_MAX)
+            _store_replay_file_digest(identity_key, analysis.sha256)
     return analysis
 
 
