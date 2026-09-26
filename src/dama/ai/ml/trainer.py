@@ -6939,16 +6939,21 @@ class Trainer:
                             continue
 
                         # Split-prep clocks. _verify_sec is prepare_split's
-                        # integrity work (manifest + lineage + per-shard SHA-256
-                        # re-hash of the ~88 stored shards, drvfs I/O); the
-                        # remainder is the O(window) parse + tensorize. Both are
-                        # separate levers from consider_snapshot's O(all-time
-                        # ledger) work, which Pass 560 could not attribute. On a
-                        # Pass 445 retry the ledger work happened on an earlier
-                        # cycle, so _admit_sec then reflects only this cycle's
-                        # cheap reject (no "Trained ledger: +N" line). _verify_sec
-                        # stays 0 on the legacy load_split path, which does verify
-                        # and load together.
+                        # integrity work (manifest + lineage + shard-integrity
+                        # check); its per-shard SHA-256 is identity-cached
+                        # (_REPLAY_HASH_CACHE keyed by dev/inode/size/mtime), so
+                        # on the c174k producer it hashes only the newly rotated
+                        # train shards (the "parsing N shard(s)" set) while reused
+                        # hardlinked shards and the stable hold-out hit the cache.
+                        # The remainder is the O(window) parse + tensorize. Both
+                        # are separate levers from consider_snapshot, which on an
+                        # admit contains the O(all-time-ledger) merge plus the
+                        # snapshot install; Pass 560 could not attribute the
+                        # summed overhead. On a Pass 445 retry the ledger work
+                        # happened on an earlier cycle, so _admit_sec then
+                        # reflects only this cycle's cheap reject (no "Trained
+                        # ledger: +N" line). _verify_sec stays 0 on the legacy
+                        # load_split path, which does verify and load together.
                         _prep_start = time.monotonic()
                         _verify_sec = 0.0
                         manager = self._snapshot_manager
@@ -7044,12 +7049,14 @@ class Trainer:
                         )
                         # Per-admission phase split, so a post-Pass-556 live run
                         # can decide which lever is behind Pass 560's ~27% GPU
-                        # idle: consider_snapshot (O(all-time ledger) merge +
-                        # sidecar + retention), verify (prepare_split's per-shard
-                        # SHA-256 re-hash, drvfs I/O) or load+tensorize (O(window)
-                        # parse). Guarded because the producer shares the
-                        # dead-console path (Pass 557); fires only on an admission
-                        # (rare path, like the Pass 559 retention warning).
+                        # idle: consider_snapshot (O(all-time-ledger) merge +
+                        # sidecar + retention + snapshot install), verify
+                        # (prepare_split's integrity check; hashes only newly
+                        # rotated shards, the rest identity-cached) or
+                        # load+tensorize (O(window) parse). Guarded because the
+                        # producer shares the dead-console path (Pass 557); fires
+                        # only on an admission (rare path, like the Pass 559
+                        # retention warning).
                         _diagnostic_print(
                             "  Admission timing: consider_snapshot "
                             f"{_admit_sec:.1f}s, verify {_verify_sec:.1f}s, "
