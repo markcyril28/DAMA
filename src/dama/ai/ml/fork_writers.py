@@ -1,4 +1,4 @@
-"""Keep temporary writers out of concurrently forked worker processes.
+"""Keep temporary and append writers out of concurrently forked workers.
 
 DrvFS can hide an atomically replaced public name while a fork child retains
 its writer. Serialize open/register and close/unregister against fork, then
@@ -124,6 +124,41 @@ def fork_safe_mkstemp(**kwargs: Any) -> Iterator[tuple[int, str]]:
                 os.close(descriptor)
             except BaseException:
                 # Preserve construction/write errors over secondary cleanup.
+                if not body_failed:
+                    raise
+            finally:
+                _FORK_CHILD_DROPPED_FDS.discard(descriptor)
+
+
+@contextmanager
+def fork_safe_open(path: Any, flags: int, mode: int = 0o666) -> Iterator[int]:
+    """Own a raw descriptor for an in-place writer through close.
+
+    Append-only streams write their public file directly instead of a
+    temporary. Open/register and close/unregister are serialized against fork
+    as in ``fork_safe_mkstemp``; nothing is unlinked because the caller owns
+    the public name. A failed raw close must not be retried.
+    """
+    with _fork_writer_lifecycle_lock:
+        descriptor = os.open(path, flags, mode)
+        try:
+            _FORK_CHILD_DROPPED_FDS.add(descriptor)
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+            raise
+    body_failed = True
+    try:
+        yield descriptor
+        body_failed = False
+    finally:
+        with _fork_writer_lifecycle_lock:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                # Preserve write/rollback errors over secondary cleanup.
                 if not body_failed:
                     raise
             finally:
