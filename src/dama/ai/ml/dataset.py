@@ -1,6 +1,7 @@
 """Dataset for training the move scorer model."""
 
 import hashlib
+import io
 import json
 import gc
 import gzip
@@ -9,6 +10,7 @@ import time
 import os
 import random
 import threading
+import zlib
 from numbers import Real
 import psutil
 from concurrent.futures import ProcessPoolExecutor
@@ -40,6 +42,74 @@ def _is_gzip_tensor_cache(path: Path) -> bool:
 
     with path.open('rb') as raw_file:
         return raw_file.read(len(_TENSOR_CACHE_GZIP_MAGIC)) == _TENSOR_CACHE_GZIP_MAGIC
+
+
+# zlib's gzip wrapper: inflate parses the member header and verifies the
+# trailer's CRC-32 and length itself.
+_TENSOR_CACHE_GZIP_WBITS = 16 + zlib.MAX_WBITS
+# Compressed bytes per inflate call, and the most output one call may return.
+# Small output chunks keep the transient zlib buffers from growing the heap:
+# 8 MiB chunks left 10.3 MiB of anonymous memory behind, 256 KiB none (Journal
+# Pass 581), and every retained GiB costs each self-play fork (Pass 580).
+_TENSOR_CACHE_INFLATE_INPUT_BYTES = 16 * 1024
+_TENSOR_CACHE_INFLATE_OUTPUT_BYTES = 256 * 1024
+# Deflate cannot expand more than 1032:1, so a larger trailer size is corrupt.
+_TENSOR_CACHE_MAX_INFLATE_RATIO = 1032
+
+
+def _inflate_gzip_tensor_cache(path: Path) -> Optional[io.BytesIO]:
+    """Read a single-member gzip tensor cache into memory in one pass.
+
+    ``torch.load`` seeks through its input for the zip central directory and
+    every record, and a ``GzipFile`` seeks backwards only by decompressing
+    again from the first byte: the 1.6 GB c174k cache took about 240 s to load
+    that way, against about 3 s to inflate once and load from memory (Journal
+    Pass 581).  The payload goes into one buffer of the size the gzip trailer
+    records, so the transient cost is one copy of it, freed when the caller
+    closes the returned stream.
+
+    Returns ``None`` unless the file is exactly one complete gzip member whose
+    CRC-32 and recorded size verify.  Concatenated members, zero padding,
+    trailing bytes, a truncated or corrupt stream, or a payload of 4 GiB or
+    more (the trailer keeps the size modulo 2**32) go back to the gzip
+    module's reader, which still decides what those files load or raise.
+    """
+    with path.open('rb') as raw_file:
+        compressed = raw_file.read()
+    expected_size = int.from_bytes(compressed[-4:], 'little')
+    if (
+        expected_size <= 0
+        or expected_size > len(compressed) * _TENSOR_CACHE_MAX_INFLATE_RATIO
+    ):
+        return None
+    stream = io.BytesIO(bytes(expected_size))
+    decompressor = zlib.decompressobj(wbits=_TENSOR_CACHE_GZIP_WBITS)
+    consumed = 0
+    written = 0
+    with memoryview(compressed) as source, stream.getbuffer() as target:
+        try:
+            while consumed < len(source) and not decompressor.eof:
+                piece = source[consumed:consumed + _TENSOR_CACHE_INFLATE_INPUT_BYTES]
+                consumed += len(piece)
+                while piece:
+                    chunk = decompressor.decompress(
+                        piece, _TENSOR_CACHE_INFLATE_OUTPUT_BYTES)
+                    end = written + len(chunk)
+                    if end > expected_size:
+                        return None
+                    target[written:end] = chunk
+                    written = end
+                    piece = decompressor.unconsumed_tail
+        except zlib.error:
+            return None
+    if (
+        not decompressor.eof
+        or decompressor.unused_data
+        or consumed != len(compressed)
+        or written != expected_size
+    ):
+        return None
+    return stream
 
 
 # Try to import Cython-accelerated encoding functions (~6-7x faster).
@@ -330,6 +400,39 @@ def _entry_signature(entries: List[Any], max_samples: int = 64) -> str:
     return h.hexdigest()
 
 
+def _remove_openmp_registration() -> None:
+    """Remove this process's OpenMP runtime registration file, if any.
+
+    With NumPy imported before torch (the trainer's order) the Intel/LLVM
+    OpenMP runtime of every forked worker that runs torch registers
+    ``/dev/shm/__KMP_REGISTERED_LIB_<pid>_<uid>``. Pool workers leave through
+    ``os._exit``, which skips the runtime's own unregistration, so each one
+    leaked a 4 KiB tmpfs file until the VM restarted: about 12 per self-play
+    cycle, some 86,000 in a 48 h session (Journal Pass 575).
+    """
+    getuid = getattr(os, 'getuid', None)
+    if getuid is None:
+        return
+    try:
+        os.unlink(f'/dev/shm/__KMP_REGISTERED_LIB_{os.getpid()}_{getuid()}')
+    except OSError:
+        pass
+
+
+def _remove_openmp_registration_at_exit() -> None:
+    """Have this pool worker remove its OpenMP registration when it exits.
+
+    ``multiprocessing`` runs such finalizers in ``_exit_function`` when a
+    worker leaves normally, just before ``os._exit``; a worker that is
+    terminated instead still leaks its file.
+    """
+    try:
+        from multiprocessing import util as mp_util
+        mp_util.Finalize(None, _remove_openmp_registration, exitpriority=0)
+    except Exception:
+        pass
+
+
 def _preprocess_pool_init():
     """Per-worker initializer for the forked preprocessing pools below.
 
@@ -349,6 +452,7 @@ def _preprocess_pool_init():
     no-op on the spawn path (a spawned worker inherits no CUDA state).
     """
     gc.freeze()
+    _remove_openmp_registration_at_exit()
 
 
 def _preprocess_chunk(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1282,9 +1386,18 @@ class CachedTensorDataset(Dataset):
         """
         cache_path = Path(path)
         if _is_gzip_tensor_cache(cache_path):
-            with gzip.open(cache_path, 'rb') as compressed_file:
-                data = torch.load(
-                    compressed_file, weights_only=True, map_location='cpu')
+            # A GzipFile restarts decompression on every backward seek, so it
+            # is only the fallback for files the one-pass read declines
+            # (Journal Pass 581).
+            payload = _inflate_gzip_tensor_cache(cache_path)
+            if payload is not None:
+                with payload:
+                    data = torch.load(
+                        payload, weights_only=True, map_location='cpu')
+            else:
+                with gzip.open(cache_path, 'rb') as compressed_file:
+                    data = torch.load(
+                        compressed_file, weights_only=True, map_location='cpu')
         else:
             # Existing caches predate compression and remain valid inputs.
             data = torch.load(cache_path, weights_only=True, map_location='cpu')
