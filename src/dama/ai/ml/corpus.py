@@ -170,9 +170,22 @@ _TRAINED_LEDGER_READ_AHEAD_BLOCKS = 4
 # inserts eight characters from [a-z0-9_] between "<target>." and ".tmp".
 _TRAINED_LEDGER_TEMPORARY_NAME = re.compile(
     r"(?:trained_shards\.jsonl|trained_state_keys\.txt\.gz"
+    r"|trained_state_keys\.pending\.txt\.gz"
     r"|trained_state_fingerprints\.v1\.bin|seed\.json)\.[a-z0-9_]{8}\.tmp"
 )
 _STALE_LEDGER_TEMPORARY_SECONDS = 3600.0
+# Rewriting the whole canonical ledger for every admission is O(all-time
+# states): at 86M states each admission read 3.15 GB and wrote 3.16 GB plus a
+# 0.69 GB sidecar to record about 156,000 new states. From this many all-time
+# states on, an admission unions its keys into a small canonical pending file
+# instead, and the base ledger and its sidecar are rewritten only when pending
+# outgrows its bound. Smaller ledgers keep the one-file layout (Journal Pass 583).
+_TRAINED_LEDGER_TWO_LEVEL_MIN_STATES = 8_000_000
+# About 20 admissions of new states plus the first window's overlap with the
+# base. A fold holds pending as 65-byte records, about 0.3 GB at the bound.
+_TRAINED_LEDGER_PENDING_MAX_STATES = 4_000_000
+# Domain separation for the digest of a base ledger plus its pending file.
+_TWO_LEVEL_LEDGER_DIGEST_DOMAIN = "dama-trained-ledger-two-level-v1"
 # A live snapshot manager repeatedly needs exactly two immutable key sets:
 # the active training snapshot and the append-only validation manifest.  Keep
 # only those two decompressed members process-local.  A larger bound spends
@@ -290,6 +303,14 @@ class _FastStatResult:
     st_ino: int
     st_size: int
     st_mtime_ns: int
+
+    @property
+    def st_mtime(self) -> float:
+        # os.stat_result computes this float as sec + nsec * 1e-9 in C. The
+        # same two IEEE operations reproduce it bit for bit, which replay
+        # rotation order and its parsed-file cache comparison rely on.
+        seconds, nanoseconds = divmod(self.st_mtime_ns, 1_000_000_000)
+        return seconds + nanoseconds * 1e-9
 
 
 @dataclass(frozen=True)
@@ -936,7 +957,9 @@ def audit_policy_replay_file(
 # and 26.7 s with the collector enabled against 9.5 s and 10.9 s with it
 # paused, with identical entries (Journal Pass 552).  Replay entries hold no
 # reference cycles, so reference counting still frees every temporary at once;
-# only the cyclic pass is deferred until the window is parsed.
+# only the cyclic pass is deferred until the window is parsed.  The trainer
+# pauses it the same way while a self-play pool delivers result rows (Journal
+# Pass 577).
 _cyclic_gc_pause_lock = threading.Lock()
 _cyclic_gc_pause_depth = 0
 _cyclic_gc_pause_restore = False
@@ -956,7 +979,7 @@ if hasattr(os, "register_at_fork"):
 
 @contextmanager
 def paused_cyclic_gc() -> Iterator[None]:
-    """Pause CPython's cyclic collector while a replay window is parsed.
+    """Pause CPython's cyclic collector while replay rows are held in bulk.
 
     Re-entrant across nested loaders and overlapping threads: the collector is
     disabled on the outermost entry only if it was enabled there, and it is
@@ -2250,7 +2273,14 @@ class _TrainedLedgerFingerprints(collections.abc.Set):
         insertion copies the existing array once instead of re-sorting it.
         """
 
-        additions = np.unique(np.fromiter(fingerprints, dtype=np.uint64))
+        if (
+            isinstance(fingerprints, np.ndarray)
+            and fingerprints.dtype == np.dtype(np.uint64)
+        ):
+            # Pending-ledger loads pass millions of parsed fingerprints.
+            additions = np.unique(fingerprints)
+        else:
+            additions = np.unique(np.fromiter(fingerprints, dtype=np.uint64))
         values = self._values
         if additions.size == 0:
             return self
@@ -2419,6 +2449,125 @@ def _merge_state_keys_file_with_digest(
             # Legacy or edited key text needs row stripping, blank-row skipping
             # or its own row order. The block attempt published nothing and
             # closed its reader, so restart with the exact row-wise union.
+            pass
+    return _rewrite_state_key_union(path, additions, canonical=False)
+
+
+def _combined_ledger_digest(
+    base_sha256: Optional[str],
+    pending_sha256: Optional[str],
+    *,
+    pending_present: bool,
+) -> Optional[str]:
+    """Source digest of a base ledger plus its pending file (Journal Pass 583).
+
+    Without a pending file this is the base digest itself, so a one-file
+    ledger keeps exactly the identity it always had. An unverified half
+    leaves the whole unverified.
+    """
+
+    if not pending_present:
+        return base_sha256
+    if base_sha256 is None or pending_sha256 is None:
+        return None
+    return hashlib.sha256(
+        f"{_TWO_LEVEL_LEDGER_DIGEST_DOMAIN}\n{base_sha256}\n{pending_sha256}\n"
+        .encode("ascii")
+    ).hexdigest()
+
+
+class _CanonicalKeyRecords(collections.abc.Sequence):
+    """Strictly increasing canonical key records, read as ``str`` keys.
+
+    A fold of the pending ledger holds a few million keys; as 65-byte records
+    they take about half the memory of Python strings. Only the slices the
+    union asks for are decoded.
+    """
+
+    __slots__ = ("_records",)
+
+    def __init__(self, records: np.ndarray) -> None:
+        self._records = records
+
+    def __len__(self) -> int:
+        return int(self._records.size)
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return [
+                record[:_CANONICAL_STATE_KEY_CHARS].decode("ascii")
+                for record in self._records[index].tolist()
+            ]
+        return bytes(
+            self._records[index][:_CANONICAL_STATE_KEY_CHARS]).decode("ascii")
+
+
+def _read_canonical_key_records(path: Path) -> Optional[np.ndarray]:
+    """Read a canonical single-member key file as strictly increasing records.
+
+    The records buffer is sized from the gzip trailer, so the file is held
+    once. Returns ``None`` for any other layout or for key text the
+    fixed-width union would not reproduce exactly; the caller then uses the
+    row-wise keys instead.
+    """
+
+    with path.open("rb") as raw_handle:
+        size = os.fstat(raw_handle.fileno()).st_size
+        if size < 18:
+            return None
+        raw_handle.seek(size - 4)
+        expected = int.from_bytes(raw_handle.read(4), "little")
+    count, remainder = divmod(expected, _CANONICAL_STATE_KEY_RECORD_BYTES)
+    if remainder:
+        return None
+    records = np.empty(count, dtype=_CANONICAL_STATE_KEY_RECORD_DTYPE)
+    view = memoryview(records.view(np.uint8))
+    filled = 0
+    chunk = _TRAINED_LEDGER_MERGE_BLOCK_RECORDS * _CANONICAL_STATE_KEY_RECORD_BYTES
+    with _open_state_key_stream(path, binary=True) as handle:
+        while filled < expected:
+            read = handle.readinto(view[filled:filled + chunk])
+            if not read:
+                break
+            filled += read
+        trailing = handle.read(1)
+    if filled != expected or trailing:
+        # Another member, or an uncompressed size the 32-bit trailer wrapped.
+        return None
+    previous = None
+    for start in range(0, count, _TRAINED_LEDGER_MERGE_BLOCK_RECORDS):
+        stop = min(count, start + _TRAINED_LEDGER_MERGE_BLOCK_RECORDS)
+        try:
+            block = _canonical_state_key_records(view[
+                start * _CANONICAL_STATE_KEY_RECORD_BYTES:
+                stop * _CANONICAL_STATE_KEY_RECORD_BYTES])
+        except _NonCanonicalStateKeys:
+            return None
+        if previous is not None and block[0] < previous:
+            return None
+        previous = block[-1]
+    del view
+    if count > 1 and not bool((records[1:] > records[:-1]).all()):
+        # A canonical union never writes duplicates; tolerate them anyway.
+        records = np.unique(records)
+    return records
+
+
+def _merge_sorted_state_keys_with_digest(
+    path: Path, additions: Sequence[str], *, canonical: bool,
+) -> Tuple[int, Optional[_LedgerSourceDigest]]:
+    """Union sorted, duplicate-free ``additions`` into a key file.
+
+    :func:`_merge_state_keys_file_with_digest` for additions that are already
+    sorted and unique, so they need not be materialized as a set.
+    """
+
+    if not len(additions):
+        return 0, None
+    if canonical:
+        try:
+            return _rewrite_state_key_union(path, additions, canonical=True)
+        except _NonCanonicalStateKeys:
             pass
     return _rewrite_state_key_union(path, additions, canonical=False)
 
@@ -2821,6 +2970,11 @@ class CorpusSnapshotManager:
         # Consumers use this as a source identity for derived caches, never as
         # a substitute for the ledger's own verification.
         self._trained_ledger_source_sha256: Optional[str] = None
+        # Two-level ledger halves behind that digest (Journal Pass 583): the
+        # verified base file, and the pending file's digest and row count.
+        self._trained_ledger_base_sha256: Optional[str] = None
+        self._trained_ledger_pending_sha256: Optional[str] = None
+        self._trained_ledger_pending_states = 0
 
     def set_external_validation_state_keys(self, state_keys: Iterable[str]) -> None:
         """Exclude a frozen external validation suite from every train snapshot."""
@@ -3985,6 +4139,16 @@ class CorpusSnapshotManager:
         return self.trained_ledger_dir / "trained_state_keys.txt.gz"
 
     @property
+    def _ledger_pending_state_keys_path(self) -> Path:
+        """Canonical keys admitted since the base ledger was last rewritten.
+
+        Same sorted canonical gzip format as the base; it may repeat base
+        keys. The ledger is the union of both files (Journal Pass 583).
+        """
+
+        return self.trained_ledger_dir / "trained_state_keys.pending.txt.gz"
+
+    @property
     def _ledger_fingerprints_path(self) -> Path:
         """Path for the optional, source-verified fingerprint sidecar."""
 
@@ -4021,6 +4185,7 @@ class CorpusSnapshotManager:
         # A failed verification must not leave an earlier ledger proof usable
         # as the source key of a derived validation tensor cache.
         self._trained_ledger_source_sha256 = None
+        self._trained_ledger_base_sha256 = None
         source_path = self._ledger_state_keys_path
         sidecar_path = self._ledger_fingerprints_path
         if not source_path.is_file() or not sidecar_path.is_file():
@@ -4088,7 +4253,8 @@ class CorpusSnapshotManager:
             del payload
             if fingerprints is None or len(fingerprints) != count:
                 return None
-            self._trained_ledger_source_sha256 = source_sha256
+            self._trained_ledger_base_sha256 = source_sha256
+            self._refresh_trained_ledger_digest()
             return fingerprints
         except (
             OSError,
@@ -4123,6 +4289,7 @@ class CorpusSnapshotManager:
         # Source verification may fail before optional payload publication.
         # Only a newly verified digest may authorize derived tensor reuse.
         self._trained_ledger_source_sha256 = None
+        self._trained_ledger_base_sha256 = None
         source_path = self._ledger_state_keys_path
         sidecar_path = self._ledger_fingerprints_path
         if not source_path.is_file():
@@ -4153,7 +4320,8 @@ class CorpusSnapshotManager:
             # The source digest was calculated from an unchanged canonical
             # ledger.  Preserve it for any derived cache assembled later in
             # this manager's verified split preparation.
-            self._trained_ledger_source_sha256 = header["source_sha256"]
+            self._trained_ledger_base_sha256 = header["source_sha256"]
+            self._refresh_trained_ledger_digest()
             header_bytes = json.dumps(
                 header, sort_keys=True, separators=(",", ":")
             ).encode("ascii")
@@ -4261,7 +4429,12 @@ class CorpusSnapshotManager:
             ),
         )
         self._trained_ledger_source_sha256 = None
+        self._trained_ledger_base_sha256 = None
         self._ledger_state_keys_path.unlink(missing_ok=True)
+        # A reseed replaces the whole ledger, pending additions included.
+        self._ledger_pending_state_keys_path.unlink(missing_ok=True)
+        self._trained_ledger_pending_sha256 = None
+        self._trained_ledger_pending_states = 0
         _merge_state_keys_file(self._ledger_state_keys_path, state_keys)
         _write_json_atomic(self._ledger_seed_path, {
             "schema_version": TRAINED_LEDGER_SCHEMA_VERSION,
@@ -4398,8 +4571,45 @@ class CorpusSnapshotManager:
                 "Loaded trained-ledger fingerprint sidecar "
                 f"({len(fingerprints):,} states)."
             )
+        # The sidecar and the cold rebuild both describe the base file only.
+        fingerprints = self._union_pending_trained_ledger(fingerprints)
         self._trained_ledger_cache = (names, fingerprints)
         return self._trained_ledger_cache
+
+    def _union_pending_trained_ledger(
+        self, fingerprints: _TrainedLedgerFingerprints,
+    ) -> _TrainedLedgerFingerprints:
+        """Add the pending file's states to a base index (Journal Pass 583).
+
+        The pending file is hashed before it is parsed and must keep the same
+        identity afterwards, as the sidecar load requires of the base, so the
+        combined digest names exactly the bytes that were parsed. A corrupt
+        pending file raises: it holds trained states, so the load fails closed.
+        """
+
+        self._trained_ledger_pending_sha256 = None
+        self._trained_ledger_pending_states = 0
+        pending_path = self._ledger_pending_state_keys_path
+        if not pending_path.is_file():
+            return fingerprints
+        identity = _replay_file_identity(pending_path)
+        pending_sha256: Optional[str] = _sha256_file_uncached(pending_path)
+        collected = array("Q")
+        for key in _iter_state_keys(pending_path):
+            collected.append(_state_key_fingerprint(key))
+        if _replay_file_identity(pending_path) != identity:
+            pending_sha256 = None
+        self._trained_ledger_pending_states = len(collected)
+        self._trained_ledger_pending_sha256 = pending_sha256
+        self._refresh_trained_ledger_digest()
+        union = fingerprints.union_fingerprints(
+            np.frombuffer(collected, dtype=np.uint64))
+        print(
+            "Loaded trained-ledger pending additions "
+            f"({len(collected):,} states; {len(union):,} all-time)."
+        )
+        del collected
+        return union
 
     def trained_ledger_shard_names(self) -> Set[str]:
         return set(self._load_trained_ledger()[0])
@@ -4420,6 +4630,8 @@ class CorpusSnapshotManager:
         ledger load path.  This method deliberately triggers that same path,
         so an unavailable or unverifiable ledger returns ``None`` instead of
         letting a derived cache claim a source identity it did not verify.
+        With a pending file it is a domain-separated digest of both files'
+        digests; without one, the base file's own SHA-256 (Journal Pass 583).
         """
 
         self._load_trained_ledger()
@@ -4434,9 +4646,13 @@ class CorpusSnapshotManager:
         if not self.trained_ledger_enabled:
             return set()
         self._ensure_trained_ledger()
-        if not self._ledger_state_keys_path.is_file():
-            return set()
-        return _read_state_keys(self._ledger_state_keys_path)
+        keys: Set[str] = set()
+        if self._ledger_state_keys_path.is_file():
+            keys = _read_state_keys(self._ledger_state_keys_path)
+        # The ledger is the union of the base and its pending file.
+        if self._ledger_pending_state_keys_path.is_file():
+            keys |= _read_state_keys(self._ledger_pending_state_keys_path)
+        return keys
 
     def _record_trained_ledger(
         self,
@@ -4451,6 +4667,8 @@ class CorpusSnapshotManager:
         shard that no admission used. Shard rows are retained append-only through
         atomic replacement; the state set is rewritten as the union, which is the
         only representation that stays answerable in one read after pruning.
+        From ``_TRAINED_LEDGER_TWO_LEVEL_MIN_STATES`` on, that union is split
+        into the base file plus a bounded pending file (Journal Pass 583).
         """
         if not self.trained_ledger_enabled:
             return
@@ -4486,21 +4704,30 @@ class CorpusSnapshotManager:
         # Even a zero-addition rewrite can replace the compressed source.
         # Retire the previous proof before mutation, including failed attempts.
         self._trained_ledger_source_sha256 = None
-        added_states, source_digest = _merge_state_keys_file_with_digest(
-            self._ledger_state_keys_path, state_keys)
-        # Publish a new index. Contexts prepared from the previous one keep
-        # their unchanged view, which is what made their copies unnecessary.
-        known_fingerprints = _TrainedLedgerFingerprints.from_iterable(
-            known_fingerprints).union_fingerprints(
-                _state_key_fingerprint(key) for key in state_keys)
-        if added_states:
-            # The write-time digest spares reading the whole canonical ledger
-            # back from disk, about 20-30 s at 3.15 GB on DrvFS.
-            self._write_ledger_fingerprint_sidecar(
-                known_fingerprints,
-                commit_directory=False,
-                source_digest=source_digest,
-            )
+        if (
+            len(known_fingerprints) < _TRAINED_LEDGER_TWO_LEVEL_MIN_STATES
+            and not self._ledger_pending_state_keys_path.is_file()
+        ):
+            self._trained_ledger_base_sha256 = None
+            added_states, source_digest = _merge_state_keys_file_with_digest(
+                self._ledger_state_keys_path, state_keys)
+            # Publish a new index. Contexts prepared from the previous one keep
+            # their unchanged view, which is what made their copies unnecessary.
+            known_fingerprints = _TrainedLedgerFingerprints.from_iterable(
+                known_fingerprints).union_fingerprints(
+                    _state_key_fingerprint(key) for key in state_keys)
+            if added_states:
+                # The write-time digest spares reading the whole canonical
+                # ledger back from disk, about 20-30 s at 3.15 GB on DrvFS.
+                self._write_ledger_fingerprint_sidecar(
+                    known_fingerprints,
+                    commit_directory=False,
+                    source_digest=source_digest,
+                )
+        else:
+            known_fingerprints, added_states = (
+                self._record_two_level_trained_ledger(
+                    known_fingerprints, state_keys))
         try:
             # CURRENT is committed in the snapshot root, not in ledger/.  The
             # authoritative shard and state-key replacements must therefore
@@ -4514,6 +4741,7 @@ class CorpusSnapshotManager:
             # it neither duplicates shard rows nor trusts uncommitted memory.
             self._trained_ledger_cache = None
             self._trained_ledger_source_sha256 = None
+            self._trained_ledger_base_sha256 = None
             raise
         self._trained_ledger_cache = (known_names, known_fingerprints)
         if new_rows or added_states:
@@ -4522,6 +4750,141 @@ class CorpusSnapshotManager:
                 f"+{added_states} canonical state(s) "
                 f"({len(known_names)} shard(s) all-time)"
             )
+
+    def _record_two_level_trained_ledger(
+        self,
+        known_fingerprints: AbstractSet[int],
+        state_keys: Set[str],
+    ) -> Tuple[_TrainedLedgerFingerprints, int]:
+        """Union one admission into the pending file; fold it in when due.
+
+        Returns the new membership index and the all-time states it added,
+        counted against the index because the pending merge cannot see the
+        base. The base ledger and its sidecar stay untouched until pending
+        holds more than ``_TRAINED_LEDGER_PENDING_MAX_STATES`` rows or the
+        ledger is below the two-level size. The caller still commits the
+        ledger directory before snapshot activation (Journal Pass 583).
+        """
+
+        pending_path = self._ledger_pending_state_keys_path
+        added_pending, pending_digest = _merge_state_keys_file_with_digest(
+            pending_path, state_keys)
+        try:
+            if state_keys:
+                self._trained_ledger_pending_sha256 = (
+                    pending_digest.sha256 if pending_digest is not None
+                    else self._stable_file_sha256(pending_path))
+                self._trained_ledger_pending_states += added_pending
+            known_index = _TrainedLedgerFingerprints.from_iterable(
+                known_fingerprints)
+            new_index = known_index.union_fingerprints(
+                _state_key_fingerprint(key) for key in state_keys)
+            if pending_path.is_file() and (
+                self._trained_ledger_pending_states
+                > _TRAINED_LEDGER_PENDING_MAX_STATES
+                or len(new_index) < _TRAINED_LEDGER_TWO_LEVEL_MIN_STATES
+            ):
+                folded = self._trained_ledger_pending_states
+                self._fold_pending_trained_ledger(new_index)
+                print(
+                    f"  Trained ledger: folded {folded:,} pending state(s) "
+                    f"into the base ledger ({len(new_index):,} all-time)"
+                )
+            self._refresh_trained_ledger_digest()
+        except BaseException:
+            # The pending file already holds this admission's states, which
+            # the cached index lacks. A later, different admission must not
+            # fold from that index and stamp a sidecar that describes less
+            # than the base holds, so reload the visible ledger first.
+            self._trained_ledger_cache = None
+            self._trained_ledger_source_sha256 = None
+            self._trained_ledger_base_sha256 = None
+            self._trained_ledger_pending_sha256 = None
+            raise
+        return new_index, len(new_index) - len(known_index)
+
+    def _fold_pending_trained_ledger(
+        self, fingerprints: _TrainedLedgerFingerprints,
+    ) -> None:
+        """Rewrite the base as its union with the pending file, then retire it.
+
+        ``fingerprints`` must index exactly that union. Order: base
+        replacement, base sidecar, ledger-directory commit, pending unlink.
+        Until the unlink every state is in the base, the pending file or both,
+        and loads union them, so a crash at any step loses nothing; the commit
+        keeps a durable unlink from outliving a lost base replacement.
+        """
+
+        base_path = self._ledger_state_keys_path
+        pending_path = self._ledger_pending_state_keys_path
+        records = _read_canonical_key_records(pending_path)
+        additions: Sequence[str] = (
+            _CanonicalKeyRecords(records) if records is not None
+            else sorted(_read_state_keys(pending_path)))
+        if len(additions):
+            self._trained_ledger_source_sha256 = None
+            self._trained_ledger_base_sha256 = None
+            _, base_digest = _merge_sorted_state_keys_with_digest(
+                base_path, additions, canonical=records is not None)
+            del additions, records
+            # A fold always replaces the base, even when every pending state
+            # was already there, so its sidecar is rewritten unconditionally.
+            self._write_ledger_fingerprint_sidecar(
+                fingerprints,
+                commit_directory=False,
+                source_digest=base_digest,
+            )
+            try:
+                run_status._fsync_directory(self.trained_ledger_dir)
+            except OSError:
+                # Reload the visible transaction before any retry.
+                self._trained_ledger_cache = None
+                self._trained_ledger_source_sha256 = None
+                self._trained_ledger_base_sha256 = None
+                raise
+        else:
+            del additions, records
+        try:
+            pending_path.unlink()
+        except OSError as exc:
+            # Every pending state is already in the base; the next fold
+            # retries the unlink, and loads meanwhile union the duplicates.
+            try:
+                print(
+                    "[warn] Could not remove the folded pending trained "
+                    f"ledger: {exc}"
+                )
+            except (OSError, ValueError):
+                pass
+            return
+        self._trained_ledger_pending_sha256 = None
+        self._trained_ledger_pending_states = 0
+
+    def _refresh_trained_ledger_digest(self) -> None:
+        """Publish the base digest combined with any pending file's digest.
+
+        Every writer of either half publishes through here, so a pending file
+        can never be hidden behind the base file's digest alone.
+        """
+
+        self._trained_ledger_source_sha256 = _combined_ledger_digest(
+            self._trained_ledger_base_sha256,
+            self._trained_ledger_pending_sha256,
+            pending_present=self._ledger_pending_state_keys_path.is_file(),
+        )
+
+    @staticmethod
+    def _stable_file_sha256(path: Path) -> Optional[str]:
+        """SHA-256 of ``path``, or ``None`` if its identity changed meanwhile."""
+
+        try:
+            identity = _replay_file_identity(path)
+            digest = _sha256_file_uncached(path)
+            if _replay_file_identity(path) != identity:
+                return None
+            return digest
+        except OSError:
+            return None
 
     @staticmethod
     def _realized_split_share(
