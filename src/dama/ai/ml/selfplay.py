@@ -62,7 +62,11 @@ try:
 except ImportError:
     _HAS_FAST_ENCODE = False
 
-from .dataset import _encode_board_fast, _encode_moves_fast
+from .dataset import (
+    _encode_board_fast,
+    _encode_moves_fast,
+    _remove_openmp_registration_at_exit,
+)
 
 
 def _selfplay_worker_init(seed: int = 0):
@@ -84,9 +88,14 @@ def _selfplay_worker_init(seed: int = 0):
     freeze() leaves normal GC active for the worker's OWN allocations, so it
     cannot leak; it also avoids GC traversal of inherited pages (fewer COW
     faults, aligning with the Pass 70 copy-on-write goal).
+
+    The worker also removes its OpenMP runtime registration file when it
+    exits normally; otherwise each worker leaked one into /dev/shm (Journal
+    Pass 575).
     """
     random.seed(int(seed) & 0xFFFFFFFF)
     gc.freeze()
+    _remove_openmp_registration_at_exit()
 
 # [Pass 70] Fork-inherited model for self-play workers.
 # On Linux (fork start method), parent sets this global before creating the
