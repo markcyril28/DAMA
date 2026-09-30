@@ -880,7 +880,6 @@ class ReplayBuffer:
         strict mode to preserve its fail-closed behavior for inaccessible
         directories or shard identities.
         """
-        records = []
         try:
             directory = os.scandir(self.replay_dir)
         except FileNotFoundError:
@@ -890,19 +889,25 @@ class ReplayBuffer:
                 raise
             return []
         with directory:
-            for entry in directory:
-                name = entry.name
-                if not (name.startswith('replay_') and name.endswith('.jsonl')):
-                    continue
-                try:
-                    stat = entry.stat()
-                except OSError:
-                    if strict:
-                        raise
-                    # A shard rotated between enumeration and stat is not
-                    # part of this point-in-time telemetry view.
-                    continue
-                records.append((Path(entry.path), stat))
+            entries = [
+                entry for entry in directory
+                if entry.name.startswith('replay_')
+                and entry.name.endswith('.jsonl')
+            ]
+        # The same following stats as one DirEntry.stat() per shard, in one
+        # adaptive batch: native threads on a slow mount, where 61 serial
+        # DrvFS stats cost 0.05-0.15 s of every cycle's telemetry (Journal
+        # Pass 579), serial on a fast one. Deferred: corpus imports this module.
+        from .corpus import _directory_entry_stats
+        records = []
+        for entry, stat, error in _directory_entry_stats(entries):
+            if error is not None:
+                if strict:
+                    raise error
+                # A shard rotated between enumeration and stat is not
+                # part of this point-in-time telemetry view.
+                continue
+            records.append((Path(entry.path), stat))
         return records
 
     @staticmethod
