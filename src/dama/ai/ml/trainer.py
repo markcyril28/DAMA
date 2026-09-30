@@ -9,6 +9,7 @@ import random
 import math
 import re
 import argparse
+import fnmatch
 import hashlib
 import hmac
 import io
@@ -19,7 +20,7 @@ import traceback
 import warnings
 import numpy as np
 from collections import deque
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import platform
 import threading
 import multiprocessing as mp
@@ -37,6 +38,36 @@ if platform.system() != 'Windows':
         mp.set_start_method('fork', force=False)
     except RuntimeError:
         pass  # Already set
+
+
+def _transparent_hugepage_mode(
+    path: str = '/sys/kernel/mm/transparent_hugepage/enabled',
+) -> Optional[str]:
+    """Return the kernel's selected THP mode, or None when unavailable."""
+    try:
+        with open(path, encoding='ascii') as handle:
+            text = handle.read()
+    except (OSError, ValueError):
+        return None
+    start = text.find('[')
+    end = text.find(']', start + 1)
+    if start < 0 or end < 0:
+        return None
+    return text[start + 1:end].strip() or None
+
+
+# Each self-play cycle forks cpu_workers children, and fork copies one page
+# table entry per 4 KiB page of this process's anonymous memory, about 76 ms
+# per GiB for a 12-worker pool. After a session's first admission the producer
+# retains the assembled train window (torch.cat output, about 1.5 GiB on
+# c174k). Backed by huge pages, it cut offline pool startup 0.34 -> 0.20 s and
+# the cycle period 6.7%. With THP_MEM_ALLOC_ENABLE set, torch advises CPU
+# allocations of at least 2 MiB for transparent huge pages. It reads the
+# variable once, so it is set here, before the import; setdefault keeps an
+# operator's explicit value, including 0 (Journal Pass 580).
+if (platform.system() == 'Linux'
+        and _transparent_hugepage_mode() in ('always', 'madvise')):
+    os.environ.setdefault('THP_MEM_ALLOC_ENABLE', '1')
 
 import torch
 import torch.nn as nn
@@ -104,6 +135,7 @@ from .fork_writers import (
 from .corpus import (
     CorpusSnapshotManager,
     _SnapshotSplitContext,
+    _directory_entry_stats,
     analyze_replay_files,
     canonical_state_key,
     paused_cyclic_gc,
@@ -142,6 +174,10 @@ _ALGORITHM_OPENING_SCHEDULE = "cycle_rotated_v1"
 # wakes this wait immediately through ``_bg_selfplay_stop_event``.
 _SELFPLAY_DISK_HEADROOM_POLL_SECONDS = 30.0
 _GIB = 1024 ** 3
+
+# Cycle-id allocation stats the replay window through corpus's adaptive batch
+# only where DirEntry.stat() fills st_ino and st_dev (Journal Pass 579).
+_POSIX_METADATA_BATCH = os.name == 'posix'
 
 
 def _diagnostic_print(*args, **kwargs) -> None:
@@ -522,6 +558,260 @@ def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
                 manager_thread.join(timeout=remaining)
             except (RuntimeError, OSError, ValueError):
                 pass
+
+
+# Seconds this process has spent inside cyclic-GC collections, by generation.
+# A full collection holds the GIL for its whole walk; before Pass 556 each one
+# also walked the trainer's multi-GB set-ledger table. The collection count
+# (Pass 572) cannot tell a 5 ms pass from a 3 s one, so the samplers below
+# also read this clock (Journal Pass 575). It starts on first use in the
+# trainer process only, and a forked child drops it before any worker code
+# runs, so self-play workers' time-limited searches never pay for it.
+_GC_PAUSE_SECONDS = [0.0, 0.0, 0.0]
+_GC_PAUSE_STARTED = [None]
+_GC_PAUSE_CLOCK = time.perf_counter
+
+
+def _gc_pause_callback(phase, info):
+    # CPython reports a callback exception as unraisable, so this stays a
+    # few bytecodes that cannot fail.
+    if phase == 'start':
+        _GC_PAUSE_STARTED[0] = _GC_PAUSE_CLOCK()
+        return
+    started = _GC_PAUSE_STARTED[0]
+    if started is not None:
+        _GC_PAUSE_STARTED[0] = None
+        _GC_PAUSE_SECONDS[info['generation']] += _GC_PAUSE_CLOCK() - started
+
+
+def _gc_pause_totals() -> Optional[tuple]:
+    """Start the collection clock if needed; return (all, full) seconds.
+
+    The producer and checkpoint-writer threads may both start it. A racing
+    duplicate registration cannot double count: the first ``stop`` clears
+    the shared start, so the second copy adds nothing.
+    """
+    try:
+        if _gc_pause_callback not in gc.callbacks:
+            gc.callbacks.append(_gc_pause_callback)
+    except Exception:
+        return None
+    return sum(_GC_PAUSE_SECONDS), _GC_PAUSE_SECONDS[2]
+
+
+def _drop_gc_pause_clock_in_child() -> None:
+    try:
+        while _gc_pause_callback in gc.callbacks:
+            gc.callbacks.remove(_gc_pause_callback)
+        _GC_PAUSE_STARTED[0] = None
+    except BaseException:
+        # A child that kept the clock would only pay microseconds per
+        # collection; an escaping exception would be reported on stderr.
+        pass
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_drop_gc_pause_clock_in_child)
+
+
+def _selfplay_resource_sample() -> dict:
+    """Read raw process and host CPU counters for self-play phase telemetry.
+
+    Best effort and cheap (two ``getrusage`` calls, one ``gc.get_stats()``,
+    the collection clock and one ``/proc/stat`` line). Hosts without
+    ``resource`` or ``/proc`` (native Windows) return only what they have,
+    and the matching delta fields are then omitted.
+    """
+    sample = {}
+    try:
+        import resource
+        children = resource.getrusage(resource.RUSAGE_CHILDREN)
+        own = resource.getrusage(resource.RUSAGE_SELF)
+        sample['child_cpu'] = children.ru_utime + children.ru_stime
+        sample['child_minflt'] = children.ru_minflt
+        sample['child_majflt'] = children.ru_majflt
+        sample['self_cpu'] = own.ru_utime + own.ru_stime
+        # Whole-process counters (every trainer thread). Each fork
+        # write-protects the trainer's pages, so its own later writes fault;
+        # voluntary switches count blocking waits (GIL, locks, I/O) and
+        # involuntary ones count preemption (Journal Pass 572).
+        sample['self_minflt'] = own.ru_minflt
+        sample['self_majflt'] = own.ru_majflt
+        sample['self_nvcsw'] = own.ru_nvcsw
+        sample['self_nivcsw'] = own.ru_nivcsw
+    except Exception:
+        pass
+    try:
+        # Cumulative full (oldest-generation) collections. A full pass visits
+        # every tracked object and holds the GIL, stalling all trainer
+        # threads; its writes also re-copy pages still shared with workers.
+        sample['gc_gen2_collections'] = int(gc.get_stats()[2]['collections'])
+    except Exception:
+        pass
+    pause = _gc_pause_totals()
+    if pause is not None:
+        sample['gc_pause_sec'], sample['gc_full_pause_sec'] = pause
+    try:
+        with open('/proc/stat', 'rb') as handle:
+            fields = handle.readline().split()
+        if len(fields) >= 9 and fields[0] == b'cpu':
+            # user nice system idle iowait irq softirq steal (guest time is
+            # already included in user and nice).
+            values = [int(value) for value in fields[1:9]]
+            sample['host_cpu_total'] = sum(values)
+            sample['host_cpu_idle'] = values[3]
+            sample['host_cpu_iowait'] = values[4]
+            sample['host_cpu_steal'] = values[7]
+    except Exception:
+        pass
+    return sample
+
+
+def _selfplay_resource_delta(before: dict, after: dict) -> dict:
+    """Convert two ``_selfplay_resource_sample`` readings into record fields.
+
+    ``RUSAGE_CHILDREN`` counts only children reaped inside the window: for a
+    self-play cycle, the pool's workers joined at shutdown, plus any other
+    trainer child reaped meanwhile (for example a frozen-suite preprocessing
+    fork from the checkpoint thread), so one spike need not be pool work. The host
+    percentages cover every guest CPU, so they separate a pool that is busy
+    computing from one whose CPUs sit idle while the cycle waits. The
+    ``parent_*`` fault, switch and collection counts cover every trainer
+    thread in the window, including the training loop, not the producer alone.
+    """
+    fields = {}
+    if 'child_cpu' in before and 'child_cpu' in after:
+        fields['child_cpu_sec'] = round(after['child_cpu'] - before['child_cpu'], 3)
+        fields['child_minflt'] = int(after['child_minflt'] - before['child_minflt'])
+        fields['child_majflt'] = int(after['child_majflt'] - before['child_majflt'])
+        fields['parent_cpu_sec'] = round(after['self_cpu'] - before['self_cpu'], 3)
+    if 'self_minflt' in before and 'self_minflt' in after:
+        fields['parent_minflt'] = int(after['self_minflt'] - before['self_minflt'])
+        fields['parent_majflt'] = int(after['self_majflt'] - before['self_majflt'])
+        fields['parent_nvcsw'] = int(after['self_nvcsw'] - before['self_nvcsw'])
+        fields['parent_nivcsw'] = int(after['self_nivcsw'] - before['self_nivcsw'])
+    if 'gc_gen2_collections' in before and 'gc_gen2_collections' in after:
+        fields['parent_gc_gen2_collections'] = int(
+            after['gc_gen2_collections'] - before['gc_gen2_collections'])
+    if 'gc_pause_sec' in before and 'gc_pause_sec' in after:
+        # Wall time inside collections of any trainer thread, and the part
+        # spent in full ones; every thread waits for the GIL meanwhile.
+        fields['parent_gc_pause_sec'] = round(
+            after['gc_pause_sec'] - before['gc_pause_sec'], 4)
+        fields['parent_gc_full_pause_sec'] = round(
+            after['gc_full_pause_sec'] - before['gc_full_pause_sec'], 4)
+    if 'host_cpu_total' in before and 'host_cpu_total' in after:
+        total = after['host_cpu_total'] - before['host_cpu_total']
+        if total > 0:
+            idle = after['host_cpu_idle'] - before['host_cpu_idle']
+            iowait = after['host_cpu_iowait'] - before['host_cpu_iowait']
+            steal = after['host_cpu_steal'] - before['host_cpu_steal']
+            fields['host_cpu_busy_pct'] = round(
+                100.0 * (total - idle - iowait - steal) / total, 1)
+            fields['host_cpu_iowait_pct'] = round(100.0 * iowait / total, 1)
+            fields['host_cpu_steal_pct'] = round(100.0 * steal / total, 1)
+    return fields
+
+
+def _thread_resource_sample() -> dict:
+    """Read the calling thread's CPU, fault and context-switch counters.
+
+    ``RUSAGE_THREAD`` is Linux-only; other hosts (native Windows) keep just
+    the process-wide full-collection count and collection clock, and the
+    matching delta fields are then omitted. Two ``getrusage``-sized reads,
+    cheap enough per save.
+    """
+    sample = {}
+    try:
+        import resource
+        own = resource.getrusage(resource.RUSAGE_THREAD)
+        sample['thread_user'] = own.ru_utime
+        sample['thread_sys'] = own.ru_stime
+        sample['thread_minflt'] = own.ru_minflt
+        sample['thread_majflt'] = own.ru_majflt
+        sample['thread_nvcsw'] = own.ru_nvcsw
+        sample['thread_nivcsw'] = own.ru_nivcsw
+    except Exception:
+        pass
+    try:
+        sample['gc_gen2_collections'] = int(gc.get_stats()[2]['collections'])
+    except Exception:
+        pass
+    pause = _gc_pause_totals()
+    if pause is not None:
+        sample['gc_pause_sec'], sample['gc_full_pause_sec'] = pause
+    return sample
+
+
+def _checkpoint_writer_resource_delta(before: dict, after: dict) -> dict:
+    """Checkpoint-record fields from two writer-thread samples.
+
+    Fixed writer work took 10-18 s with no live self-play pool at any session
+    age, but a median 28 s early and 74 s late beside one, with or without a
+    concurrent training epoch (2026-09-18; Journal Pass 574). The thread's own
+    counters split that extra wall time: waiting for the GIL, a lock or I/O
+    adds voluntary switches without CPU, preemption adds involuntary
+    switches, and copy-on-write faults on pages still shared with forked
+    workers add minor faults and system time. The full-collection count and
+    the collection seconds are process-wide: any thread's collection in the
+    window holds the GIL.
+    """
+    fields = {}
+    if 'thread_user' in before and 'thread_user' in after:
+        fields['save_thread_cpu_sec'] = round(
+            (after['thread_user'] + after['thread_sys'])
+            - (before['thread_user'] + before['thread_sys']), 3)
+        fields['save_thread_sys_sec'] = round(
+            after['thread_sys'] - before['thread_sys'], 3)
+        for key in ('minflt', 'majflt', 'nvcsw', 'nivcsw'):
+            fields[f'save_thread_{key}'] = int(
+                after[f'thread_{key}'] - before[f'thread_{key}'])
+    if 'gc_gen2_collections' in before and 'gc_gen2_collections' in after:
+        fields['save_gc_gen2_collections'] = int(
+            after['gc_gen2_collections'] - before['gc_gen2_collections'])
+    if 'gc_pause_sec' in before and 'gc_pause_sec' in after:
+        fields['save_gc_pause_sec'] = round(
+            after['gc_pause_sec'] - before['gc_pause_sec'], 4)
+        fields['save_gc_full_pause_sec'] = round(
+            after['gc_full_pause_sec'] - before['gc_full_pause_sec'], 4)
+    return fields
+
+
+def _process_rss_gb() -> Optional[float]:
+    """Resident set size of this process in GB from ``/proc``, else None."""
+    try:
+        with open('/proc/self/statm', 'rb') as handle:
+            resident_pages = int(handle.read().split()[1])
+        return round(resident_pages * os.sysconf('SC_PAGE_SIZE') / 1e9, 3)
+    except Exception:
+        return None
+
+
+def _process_handle_counts(
+    status_path: str = '/proc/self/status',
+    fd_dir: str = '/proc/self/fd',
+) -> dict:
+    """Native thread and open-descriptor counts of this process from ``/proc``.
+
+    Taken once per cycle after the pool and replay file are closed, so steady
+    growth across a session points at a leaked thread or descriptor rather
+    than at the pool's own. Hosts without ``/proc`` omit the fields.
+    """
+    counts = {}
+    try:
+        with open(status_path, 'rb') as handle:
+            for line in handle:
+                if line.startswith(b'Threads:'):
+                    counts['parent_threads'] = int(line.split()[1])
+                    break
+    except Exception:
+        pass
+    try:
+        # The listing holds its own directory descriptor while it reads.
+        counts['parent_fds'] = max(0, len(os.listdir(fd_dir)) - 1)
+    except Exception:
+        pass
+    return counts
 
 
 def _consume_and_release_selfplay_batch(
@@ -1073,6 +1363,53 @@ def _checkpoint_step_number(path: Path) -> int:
         return int(path.stem.rsplit('_', 1)[-1])
     except ValueError:
         return -1
+
+
+class _CheckpointPathKeys:
+    """``Path.resolve()`` for checkpoint retention without a walk per file.
+
+    Retention compares resolved paths, and ``resolve()`` lstat()s every path
+    component and then stats the result, about 6 ms per path on the nearly
+    full DrvFS project volume. Resolving every promoted registry row twice and
+    every numbered checkpoint once cost a median 5.3 s per checkpoint save at
+    296 promotions, and each promotion adds three more calls. This resolves
+    each distinct parent directory once and scans the checkpoint directory
+    once: a present, non-symlink entry of that directory keys as
+    ``resolved_parent / name``, exactly what ``resolve()`` returns for it.
+    Anything the scan cannot vouch for (another directory, a missing or
+    symlinked name, a failed resolve or scan) calls ``resolve()`` itself, so
+    its result and exceptions are unchanged. See Journal Pass 574.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self._resolved_parents = {}
+        self._resolved_dir = None
+        self._plain_names = frozenset()
+        try:
+            resolved_dir = Path(directory).resolve()
+            with os.scandir(resolved_dir) as entries:
+                # d_type answers is_symlink() without a stat on Linux,
+                # DrvFS included.
+                plain_names = frozenset(
+                    entry.name for entry in entries if not entry.is_symlink())
+        except (OSError, RuntimeError):
+            return
+        self._resolved_dir = resolved_dir
+        self._plain_names = plain_names
+
+    def resolve(self, path: Path) -> Path:
+        if self._resolved_dir is not None and path.name in self._plain_names:
+            parent = path.parent
+            resolved_parent = self._resolved_parents.get(parent)
+            if resolved_parent is None:
+                try:
+                    resolved_parent = parent.resolve()
+                except (OSError, RuntimeError):
+                    resolved_parent = False
+                self._resolved_parents[parent] = resolved_parent
+            if resolved_parent == self._resolved_dir:
+                return resolved_parent / path.name
+        return path.resolve()
 
 
 def newest_verified_recovery_continuation(
@@ -3302,6 +3639,20 @@ class Trainer:
         return digest.hexdigest()
 
     @staticmethod
+    def _validation_leak_fingerprints_digest(fingerprints: Iterable[int]) -> str:
+        """Return an order-free digest of the ledger subset filtering a hold-out.
+
+        Fingerprints are unsigned 64-bit, so they are hashed as sorted
+        little-endian uint64 bytes rather than through a text form.
+        """
+
+        ordered = np.array(
+            sorted(int(value) for value in fingerprints), dtype=np.uint64)
+        digest = hashlib.sha256(b"dama-validation-leak-fingerprints-v1\n")
+        digest.update(ordered.astype("<u8", copy=False).tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
     def _manifest_cache_digest(manifest: Mapping[str, Any]) -> str:
         """Return the exact manifest identity used by a derived tensor cache."""
 
@@ -3346,13 +3697,22 @@ class Trainer:
             return None
         return normalized
 
-    def _validation_tensor_cache_metadata(self, context) -> Optional[dict]:
+    def _validation_tensor_cache_metadata(
+        self, context, leak_fingerprints=None,
+    ) -> Optional[dict]:
         """Return a complete source key for the immutable held-out tensors.
 
         ``prepare_split`` verifies every validation shard, the canonical state
         set, frozen-suite exclusions, and the canonical trained ledger before
         this helper is reached.  The cache can therefore eliminate only the
         repeat JSON/materialization and tensorization work on a warm relaunch.
+
+        The retained entries are a pure function of the verified validation
+        manifest and the ledger fingerprints among its stored keys (see
+        ``validation_leak_fingerprints``), so the key digests that subset
+        rather than the whole ledger, which changes at every admission.  A
+        verified ledger digest is still required.  Callers that already hold
+        the subset for the same context may pass it to avoid a second pass.
         """
 
         cache_file = getattr(
@@ -3376,14 +3736,24 @@ class Trainer:
             return None
         if not isinstance(validation_manifest, Mapping):
             return None
+        if not getattr(context, "stored_validation_keys", None):
+            return None
+        if leak_fingerprints is None:
+            leak_getter = getattr(manager, "validation_leak_fingerprints", None)
+            if not callable(leak_getter):
+                return None
+            leak_fingerprints = leak_getter(context)
+            if leak_fingerprints is None:
+                return None
         return {
             "cache_version": 3,
-            "validation_tensor_cache_version": 1,
+            "validation_tensor_cache_version": 2,
             "validation_manifest_sha256": self._manifest_cache_digest(
                 validation_manifest),
             "validation_exclusion_keys_sha256": self._snapshot_cache_key_digest(
                 validation_keys),
-            "trained_ledger_source_sha256": ledger_digest,
+            "validation_leak_fingerprints_sha256": (
+                self._validation_leak_fingerprints_digest(leak_fingerprints)),
             "max_moves_per_sample": int(self.config.max_moves_per_sample),
             "encoding_version": ENCODING_VERSION,
             "policy_stage": "policy_only",
@@ -3986,10 +4356,17 @@ class Trainer:
                 # Recorded after the startup tensors are published, so the
                 # first mid-run admission with an unchanged hold-out can skip
                 # its redundant validation re-parse and re-tensorization.
-                self._pending_validation_reuse_identity = (
-                    self._validation_reuse_identity(split_context))
+                reuse_identity = self._validation_reuse_identity(split_context)
+                self._pending_validation_reuse_identity = reuse_identity
+                # The persisted key digests the same leak subset, so compute
+                # it once per startup instead of walking the hold-out twice.
                 validation_cache_metadata = (
-                    self._validation_tensor_cache_metadata(split_context))
+                    self._validation_tensor_cache_metadata(
+                        split_context,
+                        leak_fingerprints=(
+                            reuse_identity.get("leak_fingerprints")
+                            if isinstance(reuse_identity, Mapping) else None),
+                    ))
                 cached_validation = (
                     self._load_matching_validation_tensor_cache(
                         validation_cache_metadata)
@@ -3999,7 +4376,21 @@ class Trainer:
                     validation_dataset, validation_leakage = cached_validation
                     # The cache is only accepted after prepare_split's source
                     # verification.  Restore the accounting the materializer
-                    # would have attached to the activated manifest.
+                    # would have attached to the activated manifest.  The key
+                    # pins only the removed/retained counts; the ledger has
+                    # usually grown since the save, so take its size and state
+                    # from the live context, as the mid-run reuse path does.
+                    validation_leakage = dict(validation_leakage)
+                    ledger_enabled = getattr(
+                        manager, "trained_ledger_enabled", None)
+                    if isinstance(ledger_enabled, bool):
+                        validation_leakage["ledger_enabled"] = ledger_enabled
+                    # No local may hold the ledger: it is released below.
+                    try:
+                        validation_leakage["all_time_trained_state_count"] = (
+                            len(split_context.historically_trained))
+                    except (AttributeError, TypeError):
+                        pass
                     split_context.manifest["validation_leakage"] = (
                         validation_leakage)
                     self._preloaded_validation_dataset = validation_dataset
@@ -4971,7 +5362,11 @@ class Trainer:
     @staticmethod
     def _generation_cycle_file_identity(path: Path) -> tuple:
         """Return the identity used to invalidate a replay-cycle cache entry."""
-        stat = path.stat()
+        return Trainer._generation_cycle_identity_from_stat(path, path.stat())
+
+    @staticmethod
+    def _generation_cycle_identity_from_stat(path: Path, stat) -> tuple:
+        """Build that identity from one already-completed following stat."""
         return (
             str(path),
             int(stat.st_dev),
@@ -5130,7 +5525,27 @@ class Trainer:
             return -1
 
         try:
-            replay_files = sorted(replay_dir.glob('replay_*.jsonl'))
+            # Canonicalize keys so equivalent relative/absolute config paths
+            # do not create duplicate cache entries. Every shard is a direct
+            # child, so resolving the directory once gives each regular file
+            # the key resolve() would; per-shard resolve() lstat()ed every
+            # path component, 0.37-0.58 s of each cycle's allocation on DrvFS
+            # (Journal Pass 573). A symlinked shard keys by its own name.
+            resolved_dir = replay_dir.resolve()
+            # os.scandir, not Path.glob: on Python 3.11 glob swallows a
+            # PermissionError and reported an unlistable directory as empty,
+            # which silently reused cycle id 0 (Journal Pass 579).
+            with os.scandir(resolved_dir) as directory:
+                replay_entries = sorted(
+                    (entry for entry in directory
+                     if fnmatch.fnmatch(entry.name, 'replay_*.jsonl')),
+                    key=lambda entry: entry.name,
+                )
+        except FileNotFoundError:
+            # Removed after the is_dir() check: no durable shard remains,
+            # the same answer as a missing directory above.
+            cache.clear()
+            return -1
         except OSError as exc:
             raise RuntimeError(
                 f"Cannot enumerate replay files for generation-cycle allocation: "
@@ -5139,31 +5554,49 @@ class Trainer:
 
         sidecar_loaded = self._load_generation_cycle_sidecar(replay_dir)
 
-        # Canonicalize keys so equivalent relative/absolute config paths do
-        # not create duplicate cache entries.  A file disappearing before its
-        # identity is read is simply evicted on this pass.
+        # The same following stats as a per-shard Path.stat() loop, in one
+        # adaptive batch: native threads on a slow mount (61 serial DrvFS
+        # stats were 0.13-0.27 s of every cycle's allocation, Journal Pass
+        # 579), serial on a fast one. Every helper thread joins before this
+        # returns, so no metadata thread outlives it into a pool fork.
+        # Windows keeps the per-path stat: its DirEntry.stat() leaves st_ino
+        # and st_dev zero, which would weaken the cache identity.
+        if _POSIX_METADATA_BATCH:
+            entry_stats = _directory_entry_stats(replay_entries)
+        else:
+            entry_stats = []
+            for dir_entry in replay_entries:
+                try:
+                    entry_stats.append((
+                        dir_entry, (resolved_dir / dir_entry.name).stat(),
+                        None))
+                except OSError as exc:
+                    entry_stats.append((dir_entry, None, exc))
+
+        # A file disappearing before its identity is read is simply evicted
+        # on this pass.
         current_paths = set()
         highest = -1
         sidecar_entries: Dict[str, tuple] = {}
-        for replay_path in replay_files:
-            try:
-                replay_path = replay_path.resolve()
-                identity = self._generation_cycle_file_identity(replay_path)
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
+        for dir_entry, stat_result, stat_error in entry_stats:
+            replay_path = resolved_dir / dir_entry.name
+            if stat_error is not None:
+                if isinstance(stat_error, FileNotFoundError):
+                    continue
                 raise RuntimeError(
                     f"Cannot stat replay file for generation-cycle allocation: "
-                    f"{replay_path}: {exc}"
-                ) from exc
+                    f"{replay_path}: {stat_error}"
+                ) from stat_error
+            identity = self._generation_cycle_identity_from_stat(
+                replay_path, stat_result)
             current_paths.add(replay_path)
             cached = cache.get(replay_path)
             if cached is not None and cached[0] == identity:
                 file_highest = int(cached[1])
             else:
                 # identity[3]/[4] are this file's size/mtime_ns from the
-                # already-guarded _generation_cycle_file_identity stat; reuse
-                # them instead of a second stat() that could race a deletion.
+                # already-guarded batch stat above; reuse them instead of a
+                # second stat() that could race a deletion.
                 _, _, _, size, mtime_ns = identity
                 persisted = sidecar_loaded.get(replay_path.name)
                 file_highest = None
@@ -5450,7 +5883,7 @@ class Trainer:
                 f"durable promotion record: {checkpoint_path}"
             )
 
-    def _protected_checkpoint_paths(self) -> set:
+    def _protected_checkpoint_paths(self, path_keys=None) -> set:
         """Checkpoints retention must never delete, whatever their age.
 
         Audit Suggestion 10.  Three classes, all of them artifacts something
@@ -5484,6 +5917,8 @@ class Trainer:
             return None
 
         directory = Path(self.config.checkpoint_dir)
+        if path_keys is None:
+            path_keys = _CheckpointPathKeys(directory)
 
         def _protect(raw_path) -> None:
             if not raw_path:
@@ -5494,7 +5929,7 @@ class Trainer:
             # not depend on the working directory a session was launched from.
             for form in (candidate, directory / candidate.name):
                 try:
-                    protected.add(form.resolve())
+                    protected.add(path_keys.resolve(form))
                 except OSError:
                     continue
 
@@ -5559,7 +5994,10 @@ class Trainer:
         directory = Path(self.config.checkpoint_dir)
         if not directory.is_dir():
             return []
-        protected = self._protected_checkpoint_paths()
+        # One directory resolve and scan key every registry row and candidate
+        # below instead of one DrvFS resolve() walk each (Journal Pass 574).
+        path_keys = _CheckpointPathKeys(directory)
+        protected = self._protected_checkpoint_paths(path_keys)
         if protected is None:
             return []
         try:
@@ -5583,7 +6021,7 @@ class Trainer:
             if len(candidates) - len(removed) <= keep_count:
                 break
             try:
-                if path.resolve() in protected:
+                if path_keys.resolve(path) in protected:
                     skipped_protected += 1
                     continue
                 path.unlink()
@@ -5848,6 +6286,7 @@ class Trainer:
             # its statistics, retention, promotion and acceptance task writes.
             # Main-thread validation and CPU snapshot copies are not save I/O time.
             write_started = time.perf_counter()
+            resource_started = _thread_resource_sample()
             stage = 'checkpoint serialization'
             numbered_rewrite_attempted = False
 
@@ -6009,6 +6448,8 @@ class Trainer:
                         step=_step, loss=loss, path=str(checkpoint_path),
                         save_time_sec=time.perf_counter() - write_started,
                         file_size_mb=ckpt_size,
+                        resource_fields=_checkpoint_writer_resource_delta(
+                            resource_started, _thread_resource_sample()),
                     )
                 _diagnostic_print(f"Checkpoint saved: {checkpoint_path}")
                 # Notify the GUI so the panel can log the checkpoint and
@@ -6128,6 +6569,7 @@ class Trainer:
         skip_replay: bool = False,
         preprocess_inline: bool = False,
         return_behavior_step: bool = False,
+        after_submit=None,
     ) -> int | tuple[int, int]:
         """Run self-play to generate training data.
 
@@ -6145,6 +6587,14 @@ class Trainer:
                 completion-delivery loop.  Eliminates the separate from_dicts()
                 preprocessing phase after self-play.  Result stored in
                 self._last_selfplay_preprocessed (a CachedTensorDataset).
+            after_submit: Optional callable run once, in this thread, after
+                every batch is submitted to the worker pool and before any
+                result is delivered, so a caller can overlap work with
+                generation. It may return a callable, which is called after
+                the pool is torn down and before the cycle's shard is
+                published, sequentially re-run, discarded or returned.
+                An ``Exception`` from the hook is reported and does not cost
+                the cycle; the hook is not called when the pool cannot start.
 
         Returns:
             Total number of training entries generated, or a tuple of
@@ -6350,6 +6800,12 @@ class Trainer:
         # The loadable payload is always serialized for provenance, but is
         # persisted only when fork inheritance is unavailable.
         import dama.ai.ml.selfplay as _sp_mod
+        # Phase telemetry (Journal Pass 570): long sessions lose about half
+        # their cycles per hour while system CPU use falls, so each cycle
+        # records where its wall time goes and whether the pool computed or
+        # waited. Timing never changes generated data.
+        phase_timing = {}
+        _capture_start = time.monotonic()
         if all_ml_tasks:
             runtime_arch = getattr(self.model, 'arch_params', {
                 'embedding_size': self.config.model_embedding,
@@ -6421,6 +6877,9 @@ class Trainer:
                     persist_to_disk=True,
                 )
                 del runtime_checkpoint, fallback_state
+        # Lock wait behind the training step, device copy, hash and fold.
+        phase_timing['model_capture_sec'] = round(
+            time.monotonic() - _capture_start, 3)
 
         # --- Batch tasks for the unified pool ---
         effective_workers = (
@@ -6499,6 +6958,7 @@ class Trainer:
         # all three paths stay in sync.
         def _consume_batch(entries_data, batch_game_count):
             nonlocal entries, completed_total
+            _consume_start = time.monotonic()
             # Worker output is a raw dict pipeline, so retain provenance in
             # the durable JSONL without changing ReplayEntry's legacy schema.
             # The parser intentionally ignores these additive metadata keys.
@@ -6541,6 +7001,11 @@ class Trainer:
                 callback(completed_total, grand_total)
             if completed_total % 100 == 0 or completed_total == grand_total:
                 print(f"  Games: {completed_total}/{grand_total}")
+            # Producer-thread work per delivered batch (annotation, replay
+            # write, preprocessing), which competes with training for the GIL.
+            phase_timing['consume_sec'] = round(
+                phase_timing.get('consume_sec', 0.0)
+                + time.monotonic() - _consume_start, 3)
 
         def _selfplay_shutdown_requested():
             """Keep operator and duration stops responsive between results."""
@@ -6561,12 +7026,22 @@ class Trainer:
         unfinished = {}  # future → (task_type, batch_game_count, batch)
 
         executor = None
+        overlap_wait = None
+        phase_timing['setup_sec'] = round(time.time() - _selfplay_start, 3)
+        _pool_start = time.monotonic()
+        _pool_resources = _selfplay_resource_sample()
         try:
             executor = ProcessPoolExecutor(
                 max_workers=effective_workers,
                 initializer=_selfplay_worker_init,
                 initargs=(opening_seed_base,),
             )
+            # Unpickled result rows stay alive until their batch is consumed,
+            # so a cycle's ~15,000 rows survived young collections and forced
+            # three or four full collections per cycle, each freezing every
+            # trainer thread. Reference counting frees consumed rows anyway
+            # (Journal Pass 577).
+            delivery_gc_pause = ExitStack()
             try:
                 # future → (task_type, num_games_in_batch, batch)
                 future_meta = {}
@@ -6576,6 +7051,24 @@ class Trainer:
                 for batch in algo_batches:
                     f = executor.submit(_play_games_batch_worker_algo, batch)
                     future_meta[f] = ('algo', len(batch), batch)
+                # A fork pool starts every worker at the first submit, so
+                # this includes forking the trainer once per worker.
+                phase_timing['pool_submit_sec'] = round(
+                    time.monotonic() - _pool_start, 3)
+                # Every worker is now forked and busy. The background producer
+                # starts its check of the previous cycle's corpus candidate
+                # here instead of with every worker idle (Journal Pass 578).
+                # The hook may return a wait callable, joined below once the
+                # pool is gone and before this cycle's shard is published.
+                if after_submit is not None:
+                    try:
+                        overlap_wait = after_submit()
+                    except Exception as exc:
+                        _diagnostic_print(
+                            f"  [warn] Self-play overlap hook failed: {exc}")
+                # A fork pool never forks a replacement worker, so pausing
+                # only now leaves every worker's inherited collector as is.
+                delivery_gc_pause.enter_context(paused_cyclic_gc())
                 unfinished = dict(future_meta)
 
                 # as_completed() blocks until some Future finishes, so the old
@@ -6609,6 +7102,11 @@ class Trainer:
                         continue
                     pending_results.remove(future)
                     task_type, batch_game_count, batch = future_meta[future]
+                    # Receipt time per arm: the later arm is the cycle's
+                    # critical path; a gap after it is parent-side work.
+                    _received = round(time.monotonic() - _pool_start, 3)
+                    phase_timing.setdefault('first_result_sec', _received)
+                    phase_timing[f'{task_type}_last_result_sec'] = _received
                     try:
                         entries_data = future.result()
                         if not _selfplay_batch_result_is_complete(
@@ -6633,6 +7131,7 @@ class Trainer:
                     except Exception as e:
                         print(f"Self-play error ({task_type}): {e}")
             finally:
+                delivery_gc_pause.close()
                 # Once an operator or duration stop is visible, no pending
                 # worker result remains useful: an incomplete cycle will be
                 # quarantined below, while an already complete one has all of
@@ -6640,11 +7139,29 @@ class Trainer:
                 # terminal status is not held hostage by a stalled native
                 # search. Ordinary completion and broken-pool recovery retain
                 # the grace period.
-                shutdown_timeout = (
-                    0.0 if _selfplay_shutdown_requested() else 5.0
-                )
-                _shutdown_selfplay_executor(
-                    executor, timeout=shutdown_timeout)
+                try:
+                    shutdown_timeout = (
+                        0.0 if _selfplay_shutdown_requested() else 5.0
+                    )
+                    _shutdown_start = time.monotonic()
+                    _shutdown_selfplay_executor(
+                        executor, timeout=shutdown_timeout)
+                    phase_timing['shutdown_sec'] = round(
+                        time.monotonic() - _shutdown_start, 3)
+                    phase_timing.update(_selfplay_resource_delta(
+                        _pool_resources, _selfplay_resource_sample()))
+                finally:
+                    # The overlapped work ends before any sequential re-run,
+                    # the shard publication, or a return or raise. A long
+                    # admission is waited for here with the workers already
+                    # gone, not held behind an idle pool.
+                    if overlap_wait is not None:
+                        _wait_start = time.monotonic()
+                        try:
+                            overlap_wait()
+                        finally:
+                            phase_timing['overlap_wait_sec'] = round(
+                                time.monotonic() - _wait_start, 3)
 
             # Pool torn down. Re-run any batches the broken pool never
             # delivered, in-process (single process = less memory pressure
@@ -6723,7 +7240,10 @@ class Trainer:
                 f"completed {completed_total}/{grand_total} games"
             )
         if not skip_replay:
+            _close_start = time.monotonic()
             self.replay_buffer.close()
+            # File sync, public link and directory sync on the project volume.
+            phase_timing['close_sec'] = round(time.monotonic() - _close_start, 3)
         self.stats.generation_cycles_completed = cycle_id + 1
         if side_balance_totals['batches'] > 0:
             print(
@@ -6762,7 +7282,18 @@ class Trainer:
 
         # Record self-play stats
         if self.stats_collector:
-            _selfplay_elapsed = time.time() - _selfplay_start
+            # The wait for the previous window's overlapped check belongs to
+            # that admission, which never counted as generation time; its
+            # own field keeps it visible (Journal Pass 578).
+            _selfplay_elapsed = max(
+                0.0,
+                time.time() - _selfplay_start
+                - phase_timing.get('overlap_wait_sec', 0.0),
+            )
+            _rss_gb = _process_rss_gb()
+            if _rss_gb is not None:
+                phase_timing['parent_rss_gb'] = _rss_gb
+            phase_timing.update(_process_handle_counts())
             self.stats_collector.record_selfplay_epoch(
                 step=self.step,
                 epoch=self.epoch,
@@ -6772,6 +7303,7 @@ class Trainer:
                 result_distribution=selfplay_results,
                 game_lengths=selfplay_lengths,
                 game_length_basis='recorded_post_opening_plies',
+                phase_timing=phase_timing,
             )
 
             # Record replay buffer state (skip when replay I/O was bypassed —
@@ -6861,6 +7393,26 @@ class Trainer:
             )
         return False
 
+    def _selfplay_disk_headroom_available(self) -> bool:
+        """Report the self-play storage floor once, without waiting.
+
+        The overlapped corpus check runs beside a live pool, which must not be
+        parked behind the 30-second headroom poll. A short or unmeasurable
+        volume returns false, and the caller defers to the sequential path,
+        which waits with no pool alive.
+        """
+        minimum_gb = float(
+            getattr(self.config, 'selfplay_min_free_disk_gb', 0.0) or 0.0
+        )
+        if minimum_gb <= 0:
+            return True
+        try:
+            free_bytes = int(
+                shutil.disk_usage(Path(self.config.replay_dir)).free)
+        except OSError:
+            return False
+        return free_bytes >= int(minimum_gb * _GIB)
+
     def _start_background_selfplay(self, num_games: int) -> None:
         """Launch continuous self-play + data preparation in a background thread.
 
@@ -6886,6 +7438,14 @@ class Trainer:
         def _worker():
             if self._snapshot_manager is not None:
                 pending_snapshot_path = None
+                # Each cycle's corpus candidate is checked while the next
+                # cycle's pool generates, instead of with every worker idle
+                # between cycles (Journal Pass 578). The deferral starts only
+                # after the real run_selfplay has called its hook, so a
+                # replacement that never calls it keeps the sequential order.
+                # Split preparation always runs with no pool alive.
+                overlap_supported = False
+                deferred_candidate = None
                 while not _shutdown_requested():
                     try:
                         while self._paused and not _shutdown_requested():
@@ -6895,13 +7455,111 @@ class Trainer:
                         if not self._wait_for_selfplay_disk_headroom():
                             break
 
-                        _, selfplay_behavior_step = self.run_selfplay(
-                            num_games,
-                            return_behavior_step=True,
-                            collect_dicts=False,
-                            skip_replay=False,
-                            preprocess_inline=False,
-                        )
+                        _admit_sec = 0.0
+                        candidate = deferred_candidate
+                        deferred_candidate = None
+                        overlap = {}
+
+                        def _check_deferred_candidate(
+                            candidate=candidate, overlap=overlap,
+                        ):
+                            """Start the previous window's check; return its join.
+
+                            run_selfplay calls this once its workers are
+                            forked and joins the returned callable after the
+                            pool is torn down, before it publishes, discards
+                            or returns this cycle's shard. The check therefore
+                            never overlaps a replay-directory change, and a
+                            long admission does not hold idle workers.
+                            """
+                            overlap['called'] = True
+                            if candidate is None:
+                                return None
+                            # A stop or a short volume leaves the candidate to
+                            # the sequential path after this cycle, which can
+                            # wait with no pool alive.
+                            if (_shutdown_requested()
+                                    or not self._selfplay_disk_headroom_available()):
+                                return None
+                            teacher, noise, generation, handoff = candidate
+
+                            def _check():
+                                started = time.monotonic()
+                                try:
+                                    decision = (
+                                        self._snapshot_manager.consider_snapshot(
+                                            teacher_settings=teacher,
+                                            noise_settings=noise,
+                                            generation_settings=generation,
+                                            replay_file_stats_handoff=handoff,
+                                        ))
+                                except Exception as exc:
+                                    # A local import: the producer's handler
+                                    # below imports traceback into its own
+                                    # scope, which would leave this closure's
+                                    # free variable unbound.
+                                    import traceback
+                                    overlap['error'] = True
+                                    _diagnostic_print(
+                                        "Background snapshot self-play error: "
+                                        f"{exc}")
+                                    _diagnostic_print(
+                                        traceback.format_exc(),
+                                        file=sys.stderr, end='')
+                                    return
+                                finally:
+                                    overlap['admit_sec'] = (
+                                        time.monotonic() - started)
+                                overlap['decision'] = decision
+                                if not decision.admitted:
+                                    _diagnostic_print(
+                                        "  Corpus candidate not activated: "
+                                        f"{decision.reason}"
+                                    )
+
+                            check_thread = threading.Thread(
+                                target=_check,
+                                name='corpus-candidate-check',
+                                daemon=True,
+                            )
+                            overlap['thread'] = check_thread
+                            check_thread.start()
+                            return check_thread.join
+
+                        try:
+                            _, selfplay_behavior_step = self.run_selfplay(
+                                num_games,
+                                return_behavior_step=True,
+                                collect_dicts=False,
+                                skip_replay=False,
+                                preprocess_inline=False,
+                                after_submit=_check_deferred_candidate,
+                            )
+                        finally:
+                            # run_selfplay joins the check; this covers a
+                            # replacement that returns without doing so.
+                            check_thread = overlap.get('thread')
+                            if check_thread is not None:
+                                check_thread.join()
+                            # An admission is durable once consider_snapshot
+                            # returns, even if this cycle then stops or fails.
+                            overlap_decision = overlap.get('decision')
+                            if (overlap_decision is not None
+                                    and overlap_decision.admitted):
+                                pending_snapshot_path = (
+                                    overlap_decision.manifest_path)
+                        if overlap.get('called'):
+                            overlap_supported = True
+                        if overlap.get('error'):
+                            # The check reported its failure. Back off as the
+                            # handler below does and consider the extended
+                            # window after the next cycle instead.
+                            if not _shutdown_requested():
+                                self._bg_selfplay_stop_event.wait(timeout=2.0)
+                            continue
+                        candidate_checked = 'decision' in overlap
+                        if candidate_checked:
+                            _admit_sec = overlap['admit_sec']
                         pruned = self.replay_buffer.cleanup_old_files()
                         if pruned:
                             print(
@@ -6928,40 +7586,58 @@ class Trainer:
                             take_replay_stats()
                             if callable(take_replay_stats) else None
                         )
-                        # Time the admission call so a live run can separate the
-                        # O(all-time-ledger) work it does on an admit (canonical
-                        # ledger merge + sidecar + retention) from the O(window)
-                        # split prep below. Journal Pass 560 measured the summed
-                        # per-admission overhead (~162 s mean, growing) but could
-                        # not attribute it; this is the missing instrument.
-                        _admit_start = time.monotonic()
-                        decision = self._snapshot_manager.consider_snapshot(
-                            teacher_settings=teacher,
-                            noise_settings=noise,
-                            generation_settings=generation,
-                            replay_file_stats_handoff=replay_file_stats_handoff,
-                        )
-                        _admit_sec = time.monotonic() - _admit_start
-                        # Admission is already durable. If STOP arrived while
-                        # the manager was auditing or publishing it, leave the
-                        # snapshot for the next launch instead of making the
-                        # terminal join wait for a full split load and tensor
-                        # rebuild that no consumer can activate.
-                        if _shutdown_requested():
-                            break
-                        if decision.admitted:
-                            # Admission advances the durable freshness reference
-                            # before parsing/tensorization can fail. Retain only
-                            # its path until the dataset handoff succeeds, so a
-                            # later rejected cycle can retry the verified load.
-                            pending_snapshot_path = decision.manifest_path
-                        else:
-                            print(
-                                "  Corpus candidate not activated: "
-                                f"{decision.reason}"
+                        if overlap_supported and (
+                                candidate is None or candidate_checked):
+                            # Check this window during the next cycle's pool.
+                            # A candidate the hook could not check is covered
+                            # by the sequential check below instead: this
+                            # cycle's shard extends the same window.
+                            deferred_candidate = (
+                                teacher, noise, generation,
+                                replay_file_stats_handoff,
                             )
+                        else:
+                            # Time the admission call so a live run can separate
+                            # the O(all-time-ledger) work it does on an admit
+                            # (canonical ledger merge + sidecar + retention)
+                            # from the O(window) split prep below. Journal Pass
+                            # 560 measured the summed per-admission overhead
+                            # (~162 s mean, growing) but could not attribute it;
+                            # this is the missing instrument.
+                            _admit_start = time.monotonic()
+                            decision = self._snapshot_manager.consider_snapshot(
+                                teacher_settings=teacher,
+                                noise_settings=noise,
+                                generation_settings=generation,
+                                replay_file_stats_handoff=replay_file_stats_handoff,
+                            )
+                            _admit_sec = time.monotonic() - _admit_start
+                            # Admission is already durable. If STOP arrived
+                            # while the manager was auditing or publishing it,
+                            # leave the snapshot for the next launch instead of
+                            # making the terminal join wait for a full split
+                            # load and tensor rebuild that no consumer can
+                            # activate.
+                            if _shutdown_requested():
+                                break
+                            if decision.admitted:
+                                # Admission advances the durable freshness
+                                # reference before parsing/tensorization can
+                                # fail. Retain only its path until the dataset
+                                # handoff succeeds, so a later rejected cycle
+                                # can retry the verified load.
+                                pending_snapshot_path = decision.manifest_path
+                            else:
+                                print(
+                                    "  Corpus candidate not activated: "
+                                    f"{decision.reason}"
+                                )
                         if pending_snapshot_path is None:
                             continue
+                        # The same stop rule for an admission the previous
+                        # cycle's hook made during this cycle's pool.
+                        if _shutdown_requested():
+                            break
 
                         # Split-prep clocks. _verify_sec is prepare_split's
                         # integrity work (manifest + lineage + shard-integrity
