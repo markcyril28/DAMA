@@ -23,6 +23,8 @@ Usage:
 
 import os
 import csv
+import errno
+import io
 import json
 import math
 import time
@@ -43,8 +45,32 @@ except ImportError:
 
 import torch
 
-from .fork_writers import fork_safe_mkstemp
+from .fork_writers import fork_safe_mkstemp, fork_safe_open
 from .run_status import _fsync_directory
+
+
+# Per-cycle self-play phase and resource fields recorded by the trainer
+# (Journal Pass 570). Receipt times are seconds from pool start; child fields
+# cover the pool's workers reaped at shutdown plus any other trainer child
+# reaped in that window; host percentages cover every CPU over the pool
+# window. Absent fields were unavailable on the host.
+SELFPLAY_PHASE_FIELDS = (
+    'setup_sec', 'model_capture_sec', 'pool_submit_sec', 'first_result_sec',
+    'ml_last_result_sec', 'algo_last_result_sec', 'consume_sec',
+    'shutdown_sec', 'close_sec', 'child_cpu_sec', 'child_minflt',
+    'child_majflt', 'parent_cpu_sec', 'host_cpu_busy_pct',
+    'host_cpu_iowait_pct', 'host_cpu_steal_pct', 'parent_rss_gb',
+    # Parent-side faults, blocking and preemption, full collections, and
+    # thread/descriptor counts (Journal Pass 572).
+    'parent_minflt', 'parent_majflt', 'parent_nvcsw', 'parent_nivcsw',
+    'parent_gc_gen2_collections', 'parent_threads', 'parent_fds',
+    # Seconds inside the trainer's own collections, all and full ones, over
+    # the same window (Journal Pass 575).
+    'parent_gc_pause_sec', 'parent_gc_full_pause_sec',
+    # Seconds this cycle waited, after its pool was gone, for the previous
+    # cycle's overlapped corpus check to finish (Journal Pass 578).
+    'overlap_wait_sec',
+)
 
 
 # ---------------------------------------------------------------------------
@@ -106,27 +132,57 @@ def _atomic_text_writer(
                 pass
 
 
-def _append_jsonl_atomic(path: Path, row: Dict[str, Any]) -> None:
-    """Append one JSONL row without exposing an incomplete public stream."""
-    with _atomic_text_writer(path, newline="\n") as destination:
-        last_character = ""
-        try:
-            with path.open("r", encoding="utf-8", newline="") as source:
-                while True:
-                    chunk = source.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    destination.write(chunk)
-                    last_character = chunk[-1]
-        except FileNotFoundError:
-            pass
+def _write_all(descriptor: int, payload: bytes) -> None:
+    """Write every byte of ``payload``, continuing after short writes."""
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "append wrote no bytes")
+        view = view[written:]
 
-        if last_character and last_character != "\n":
-            raise RuntimeError(
-                f"Incremental statistics stream has an incomplete final row: {path}"
-            )
-        json.dump(row, destination)
-        destination.write("\n")
+
+def _append_jsonl_atomic(path: Path, row: Dict[str, Any]) -> None:
+    """Append one complete JSONL row in time proportional to that row.
+
+    Republishing the whole stream on every flush made each flush O(stream):
+    on the 2026-09-18 c174k session the file reached 222 MB and a flush cost
+    0.27 s at 6 MB but 4.69 s at 208 MB (Journal Pass 571). The row is now
+    serialized in memory, the stream must already end in a newline, and only
+    the row is written and fsynced. A failed append truncates back to the
+    previous length, so this process never keeps or extends a partial row.
+    A host crash mid-append can still leave one torn final row, which the
+    analyzer ignores (Journal Pass 270).
+    """
+    buffer = io.StringIO()
+    json.dump(row, buffer)
+    buffer.write("\n")
+    payload = buffer.getvalue().encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    with fork_safe_open(path, flags) as descriptor:
+        size = os.fstat(descriptor).st_size
+        if size:
+            os.lseek(descriptor, size - 1, os.SEEK_SET)
+            if os.read(descriptor, 1) != b"\n":
+                raise RuntimeError(
+                    f"Incremental statistics stream has an incomplete final row: {path}"
+                )
+        else:
+            # Commit the name before its first row. A failed commit leaves an
+            # empty stream, and the next flush retries it.
+            _fsync_directory(path.parent)
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        except BaseException:
+            try:
+                os.ftruncate(descriptor, size)
+            except BaseException:
+                # Keep the write or interruption error. A partial row that
+                # survives is refused by the next append's newline check.
+                pass
+            raise
 
 
 def _safe_mean(values: list) -> float:
@@ -1025,8 +1081,14 @@ class StatsCollector:
         game_lengths: Optional[List[int]] = None,
         avg_moves_per_position: Optional[float] = None,
         game_length_basis: Optional[str] = None,
+        phase_timing: Optional[Dict[str, float]] = None,
     ) -> None:
-        """Record statistics for a self-play data generation epoch."""
+        """Record statistics for a self-play data generation epoch.
+
+        ``phase_timing`` carries the trainer's per-cycle phase and resource
+        fields (``SELFPLAY_PHASE_FIELDS``); they are stored flat on the record
+        so the self-play CSV can export them as columns.
+        """
         with self._lock:
             record: Dict[str, Any] = {
                 'step': step,
@@ -1058,6 +1120,10 @@ class StatsCollector:
                 }
             if avg_moves_per_position is not None:
                 record['avg_legal_moves_per_position'] = avg_moves_per_position
+            if phase_timing:
+                for key in SELFPLAY_PHASE_FIELDS:
+                    if key in phase_timing:
+                        record[key] = phase_timing[key]
 
             self.selfplay_records.append(record)
             self._maybe_flush()
@@ -1165,17 +1231,26 @@ class StatsCollector:
         path: str,
         save_time_sec: float = 0.0,
         file_size_mb: float = 0.0,
+        resource_fields: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Record checkpoint save event."""
+        """Record checkpoint save event.
+
+        ``resource_fields`` carries the writer thread's CPU, fault, switch
+        and full-collection deltas when the host can measure them (Journal
+        Pass 574); the record keeps them flat beside ``save_time_sec``.
+        """
+        record = {
+            'step': step,
+            'loss': loss,
+            'path': path,
+            'timestamp': datetime.now().isoformat(),
+            'save_time_sec': save_time_sec,
+            'file_size_mb': file_size_mb,
+        }
+        if resource_fields:
+            record.update(resource_fields)
         with self._lock:
-            self.checkpoint_records.append({
-                'step': step,
-                'loss': loss,
-                'path': path,
-                'timestamp': datetime.now().isoformat(),
-                'save_time_sec': save_time_sec,
-                'file_size_mb': file_size_mb,
-            })
+            self.checkpoint_records.append(record)
 
     # ===================================================================
     # Convergence / optimization signals
@@ -1931,6 +2006,7 @@ class StatsCollector:
             fieldnames = [
                 'step', 'epoch', 'timestamp', 'num_games', 'num_entries',
                 'elapsed_sec', 'games_per_sec', 'entries_per_sec',
+                *SELFPLAY_PHASE_FIELDS,
             ]
             with _atomic_text_writer(path, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
