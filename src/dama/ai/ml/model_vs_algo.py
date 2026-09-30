@@ -50,6 +50,12 @@ def _evaluation_worker_init() -> None:
     Evaluation already parallelizes across processes. Spawn and forkserver
     workers do not inherit the trainer's one-thread PyTorch setting and can
     otherwise create a full intra-op pool of their own.
+
+    Forkserver workers also leave through ``os._exit``, which skips the OpenMP
+    runtime's own unregistration, so each one leaked its
+    ``/dev/shm/__KMP_REGISTERED_LIB_<pid>_<uid>`` file: four per acceptance
+    (Journal Pass 576). They now remove it at normal exit, like the self-play
+    and preprocessing workers (Journal Pass 575).
     """
     import torch
 
@@ -60,6 +66,12 @@ def _evaluation_worker_init() -> None:
         # PyTorch permits setting inter-op width only before parallel work.
         # Fresh evaluator workers take the primary path; keep direct reuse safe.
         pass
+    # Only a pool worker owns a registration to clean up. A direct call in the
+    # main process must not schedule removal of that process's live one.
+    if mp.parent_process() is not None:
+        from .dataset import _remove_openmp_registration_at_exit
+
+        _remove_openmp_registration_at_exit()
 
 
 class TestResult(Enum):
