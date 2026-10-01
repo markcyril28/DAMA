@@ -61,3 +61,28 @@ bash run_game.sh
 ```
 
 A window opens with the board. You click a piece to select it, then click the square you want to move it to. From the menus you can choose who plays: you, a friend, the Calculating Opponent, or the Learning Opponent, and adjust settings like difficulty and appearance.
+
+## Running on a Mac (Apple Silicon)
+
+The project also runs on Macs with an Apple chip (M1 or newer). A Mac has no NVIDIA graphics card, so training uses the Mac's own graphics chip through Apple's Metal system (called "MPS") instead. Each main script has a Mac version:
+
+```
+bash setup_conda_mac.sh              # once: creates the 'dama' Python environment and builds the speed-ups
+bash run_game_mac.sh                 # play the game
+bash local_train_mac.sh              # train the Learning Opponent (settings: config/training_config_mac.yaml)
+bash stop_training_mac.sh            # stop training
+bash eval_checkpoints_mac.sh --once  # test the saved models against the Calculating Opponent
+```
+
+Before the first setup you need Miniforge or Miniconda for Apple Silicon (`brew install --cask miniforge`) and Apple's command line tools (`xcode-select --install`), which compile the speed-up modules. The Mac scripts switch to the Python environment by themselves.
+
+What is different on a Mac:
+
+- **Graphics chip:** training runs on the Mac's GPU in a compact number format (bfloat16), which needs macOS 14 or newer; older versions automatically fall back to a similar format (float16). Playing the game and the practice games run on the main processor: the model is small, and for one move at a time that is faster on a Mac than the graphics chip.
+- **Shared memory:** a Mac's processor and graphics chip share one pool of memory. The Mac settings are sized for a 36 GB Mac: training uses a little over 20 GB of it (about 13 GB of that for the graphics chip), so close other memory-hungry apps while it runs.
+- **Separate files:** Mac training saves to `models/checkpoints_mac/`, `models/latest_mac.pt` and `logs/mac/`, so it never mixes with training copied from another computer. To play against it, pick `models/latest_mac.pt` in the game's settings. The model has the same shape as on the other computers, so saved models can be copied between them.
+- **Practice-game workers:** macOS starts them as fresh processes ("spawn") instead of copies of the trainer ("fork"), because copying a process after Apple's graphics libraries have loaded is unsafe. The `DAMA_MP_START_METHOD` setting overrides this when tracking down a problem. These workers exit by themselves when the trainer stops, even if it was force-quit; `stop_training_mac.sh` also ends any it finds left behind.
+- **No overheating pause:** macOS does not let programs read its temperature sensors, so that safety pause is off. The Mac slows itself down when it runs hot.
+- **Rosetta:** if Terminal runs under Rosetta (Apple's Intel translator), the Mac scripts restart themselves in native mode.
+
+`eval_checkpoints_mac.sh` tests the models saved in `models/checkpoints_mac/` and writes the scores to `models/eval_results_mac.jsonl`, with a chart in `models/eval_progress_mac.png`. Without `--once` it keeps watching for new ones. The scripts without `_mac` in their names are for the Linux and Windows computers; on a Mac, use the `_mac` versions.

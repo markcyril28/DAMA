@@ -1,0 +1,1095 @@
+"""Model vs Algorithm self-play testing."""
+
+import json
+import hashlib
+import multiprocessing as mp
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Callable, Tuple, Sequence
+from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from enum import Enum
+import random
+
+from ...types import Move, Player
+from ...game_state import GameState
+from .acceptance import WILSON_95_METHOD, wdl_summary
+from .run_status import _fsync_directory, _write_json_atomic
+
+
+_EVALUATION_FORKSERVER_PRELOAD = (
+    # Initialize NumPy's MKL runtime before PyTorch loads libgomp. Reversing
+    # this order can abort the fresh forkserver on Conda MKL installations.
+    "numpy",
+    "torch",
+    "dama.ai.ml.inference",
+    "dama.ai.ml.dataset",
+    "dama.ai.ml.model_vs_algo",
+)
+
+
+def _evaluation_worker_context():
+    """Return a CUDA-safe evaluator context with shared imports on Linux.
+
+    A forkserver is itself spawned without the trainer's CUDA state. Loading
+    the CPU inference stack once there lets evaluator children inherit those
+    immutable module pages instead of importing PyTorch independently in every
+    worker. Other platforms retain the established spawn path.
+    """
+    if sys.platform.startswith("linux") and "forkserver" in mp.get_all_start_methods():
+        mp.set_forkserver_preload(list(_EVALUATION_FORKSERVER_PRELOAD))
+        return mp.get_context("forkserver")
+    return mp.get_context("spawn")
+
+
+def _evaluation_worker_init() -> None:
+    """Keep each isolated evaluator to one PyTorch compute thread.
+
+    Evaluation already parallelizes across processes. Spawn and forkserver
+    workers do not inherit the trainer's one-thread PyTorch setting and can
+    otherwise create a full intra-op pool of their own.
+
+    Forkserver workers also leave through ``os._exit``, which skips the OpenMP
+    runtime's own unregistration, so each one leaked its
+    ``/dev/shm/__KMP_REGISTERED_LIB_<pid>_<uid>`` file: four per acceptance
+    (Journal Pass 576). They now remove it at normal exit, like the self-play
+    and preprocessing workers (Journal Pass 575).
+    """
+    import torch
+
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch permits setting inter-op width only before parallel work.
+        # Fresh evaluator workers take the primary path; keep direct reuse safe.
+        pass
+    # Only a pool worker owns a registration to clean up. A direct call in the
+    # main process must not schedule removal of that process's live one.
+    if mp.parent_process() is not None:
+        from .dataset import _remove_openmp_registration_at_exit
+
+        _remove_openmp_registration_at_exit()
+        if sys.platform == 'darwin':
+            # Spawned workers on macOS exit by themselves once the parent is
+            # gone, instead of idling on the task pipe indefinitely.
+            from .dataset import _start_parent_death_watchdog
+
+            _start_parent_death_watchdog()
+
+
+class TestResult(Enum):
+    """Result of a single test game."""
+    ML_WIN = "ml_win"
+    ALGO_WIN = "algo_win"
+    DRAW = "draw"
+
+
+@dataclass
+class GameTestRecord:
+    """Record of a single test game."""
+    result: TestResult
+    ml_player: Player
+    winner: Optional[Player]
+    num_moves: int
+    ml_moves: int
+    algo_moves: int
+    game_time_ms: float
+    opponent_type: str = "algorithm"
+    opening_plies: int = 0
+    opening_seed: Optional[int] = None
+    ml_inference_depth: int = 1
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'result': self.result.value,
+            'ml_player': self.ml_player.value,
+            'winner': self.winner.value if self.winner else None,
+            'num_moves': self.num_moves,
+            'ml_moves': self.ml_moves,
+            'algo_moves': self.algo_moves,
+            'game_time_ms': self.game_time_ms,
+            'opponent_type': self.opponent_type,
+            'opening_plies': self.opening_plies,
+            'opening_seed': self.opening_seed,
+            'ml_inference_depth': self.ml_inference_depth,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'GameTestRecord':
+        return cls(
+            result=TestResult(data['result']),
+            ml_player=Player(data['ml_player']),
+            winner=Player(data['winner']) if data['winner'] else None,
+            num_moves=data['num_moves'],
+            ml_moves=data['ml_moves'],
+            algo_moves=data['algo_moves'],
+            game_time_ms=data['game_time_ms'],
+            opponent_type=data.get('opponent_type', 'algorithm'),
+            opening_plies=data.get('opening_plies', 0),
+            opening_seed=data.get('opening_seed'),
+            ml_inference_depth=data.get('ml_inference_depth', 1),
+        )
+
+
+@dataclass
+class TestStatistics:
+    """Statistics from model vs algorithm testing."""
+    total_games: int = 0
+    ml_wins: int = 0
+    algo_wins: int = 0
+    draws: int = 0
+    
+    ml_as_p1_wins: int = 0
+    ml_as_p1_losses: int = 0
+    ml_as_p1_draws: int = 0
+    
+    ml_as_p2_wins: int = 0
+    ml_as_p2_losses: int = 0
+    ml_as_p2_draws: int = 0
+    
+    avg_game_length: float = 0.0
+    avg_game_time_ms: float = 0.0
+    
+    # Model info
+    model_path: str = ""
+    algo_difficulty: str = "medium"
+    opponent_type: str = "algorithm"
+    opening_seed: Optional[int] = None
+    opening_plies: List[int] = field(default_factory=list)
+    opening_suite_id: str = ""
+    opening_suite_size: int = 0
+    ml_inference_depth: int = 1
+    
+    # Timestamp
+    start_time: str = ""
+    end_time: str = ""
+    
+    # Game records
+    games: List[Dict] = field(default_factory=list)
+    
+    @property
+    def ml_win_rate(self) -> float:
+        if self.total_games == 0:
+            return 0.0
+        return self.ml_wins / self.total_games
+    
+    @property
+    def algo_win_rate(self) -> float:
+        if self.total_games == 0:
+            return 0.0
+        return self.algo_wins / self.total_games
+    
+    @property
+    def draw_rate(self) -> float:
+        if self.total_games == 0:
+            return 0.0
+        return self.draws / self.total_games
+    
+    @property
+    def ml_as_p1_games(self) -> int:
+        return self.ml_as_p1_wins + self.ml_as_p1_losses + self.ml_as_p1_draws
+    
+    @property
+    def ml_as_p2_games(self) -> int:
+        return self.ml_as_p2_wins + self.ml_as_p2_losses + self.ml_as_p2_draws
+    
+    @property
+    def ml_as_p1_win_rate(self) -> float:
+        games = self.ml_as_p1_games
+        if games == 0:
+            return 0.0
+        return self.ml_as_p1_wins / games
+    
+    @property
+    def ml_as_p2_win_rate(self) -> float:
+        games = self.ml_as_p2_games
+        if games == 0:
+            return 0.0
+        return self.ml_as_p2_wins / games
+
+    @property
+    def match_score(self) -> float:
+        return wdl_summary(self.ml_wins, self.draws, self.algo_wins)['match_score']
+
+    @property
+    def ml_as_p1_match_score(self) -> float:
+        return wdl_summary(
+            self.ml_as_p1_wins,
+            self.ml_as_p1_draws,
+            self.ml_as_p1_losses,
+        )['match_score']
+
+    @property
+    def ml_as_p2_match_score(self) -> float:
+        return wdl_summary(
+            self.ml_as_p2_wins,
+            self.ml_as_p2_draws,
+            self.ml_as_p2_losses,
+        )['match_score']
+    
+    def to_dict(self) -> Dict[str, Any]:
+        overall = wdl_summary(self.ml_wins, self.draws, self.algo_wins)
+        as_p1 = wdl_summary(
+            self.ml_as_p1_wins,
+            self.ml_as_p1_draws,
+            self.ml_as_p1_losses,
+        )
+        as_p2 = wdl_summary(
+            self.ml_as_p2_wins,
+            self.ml_as_p2_draws,
+            self.ml_as_p2_losses,
+        )
+        return {
+            'total_games': self.total_games,
+            'ml_wins': self.ml_wins,
+            'algo_wins': self.algo_wins,
+            'draws': self.draws,
+            'ml_win_rate': self.ml_win_rate,
+            'algo_win_rate': self.algo_win_rate,
+            'draw_rate': self.draw_rate,
+            'opponent_wins': self.algo_wins,
+            'match_score': overall['match_score'],
+            'match_score_ci_95': overall['match_score_ci_95'],
+            'ci_method': WILSON_95_METHOD,
+            'overall_wdl': overall,
+            'ml_as_p1_wins': self.ml_as_p1_wins,
+            'ml_as_p1_losses': self.ml_as_p1_losses,
+            'ml_as_p1_draws': self.ml_as_p1_draws,
+            'ml_as_p1_win_rate': self.ml_as_p1_win_rate,
+            'ml_as_p1_match_score': as_p1['match_score'],
+            'ml_as_p1_match_score_ci_95': as_p1['match_score_ci_95'],
+            'ml_as_p1_wdl': as_p1,
+            'ml_as_p2_wins': self.ml_as_p2_wins,
+            'ml_as_p2_losses': self.ml_as_p2_losses,
+            'ml_as_p2_draws': self.ml_as_p2_draws,
+            'ml_as_p2_win_rate': self.ml_as_p2_win_rate,
+            'ml_as_p2_match_score': as_p2['match_score'],
+            'ml_as_p2_match_score_ci_95': as_p2['match_score_ci_95'],
+            'ml_as_p2_wdl': as_p2,
+            'avg_game_length': self.avg_game_length,
+            'avg_game_time_ms': self.avg_game_time_ms,
+            'model_path': self.model_path,
+            'algo_difficulty': self.algo_difficulty,
+            'opponent_type': self.opponent_type,
+            'opening_seed': self.opening_seed,
+            'opening_plies': list(self.opening_plies),
+            'opening_suite_id': self.opening_suite_id,
+            'opening_suite_size': self.opening_suite_size,
+            'ml_inference_depth': self.ml_inference_depth,
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'games': self.games,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TestStatistics':
+        stats = cls(
+            total_games=data.get('total_games', 0),
+            ml_wins=data.get('ml_wins', 0),
+            algo_wins=data.get('algo_wins', 0),
+            draws=data.get('draws', 0),
+            ml_as_p1_wins=data.get('ml_as_p1_wins', 0),
+            ml_as_p1_losses=data.get('ml_as_p1_losses', 0),
+            ml_as_p1_draws=data.get('ml_as_p1_draws', 0),
+            ml_as_p2_wins=data.get('ml_as_p2_wins', 0),
+            ml_as_p2_losses=data.get('ml_as_p2_losses', 0),
+            ml_as_p2_draws=data.get('ml_as_p2_draws', 0),
+            avg_game_length=data.get('avg_game_length', 0.0),
+            avg_game_time_ms=data.get('avg_game_time_ms', 0.0),
+            model_path=data.get('model_path', ''),
+            algo_difficulty=data.get('algo_difficulty', 'medium'),
+            opponent_type=data.get('opponent_type', 'algorithm'),
+            opening_seed=data.get('opening_seed'),
+            opening_plies=list(data.get('opening_plies', [])),
+            opening_suite_id=data.get('opening_suite_id', ''),
+            opening_suite_size=data.get('opening_suite_size', 0),
+            ml_inference_depth=data.get('ml_inference_depth', 1),
+            start_time=data.get('start_time', ''),
+            end_time=data.get('end_time', ''),
+            games=data.get('games', []),
+        )
+        return stats
+
+
+def _apply_random_opening(state: GameState, opening: Optional[Tuple[int, int]]) -> GameState:
+    """Play `plies` uniformly random legal moves from `state`.
+
+    [Pass 109] Both test workers used to start every game from
+    GameState.initial(). With a deterministic argmax model that made all
+    `num_games` collapse onto ~2 distinct games (one per colour), so a 50-game
+    test reported a 2-sample measurement as if it were 50. A short random
+    opening makes every game a distinct sample without changing the opponent
+    or the scoring. `opening=None` (or 0 plies) restores the old behaviour.
+    """
+    if not opening:
+        return state
+    plies, seed = opening
+    if plies <= 0:
+        return state
+    rng = random.Random(seed)
+    for _ in range(plies):
+        legal_moves = state.legal_moves()
+        if not legal_moves:
+            break
+        state = state.apply_move(rng.choice(legal_moves))
+    return state
+
+
+def _normalize_opponent_type(opponent_type: str) -> str:
+    normalized = str(opponent_type).strip().lower()
+    if normalized in {'algo', 'algorithmic'}:
+        normalized = 'algorithm'
+    if normalized not in {'algorithm', 'random'}:
+        raise ValueError("opponent_type must be 'algorithm' or 'random'")
+    return normalized
+
+
+def _choose_opponent_move(
+    state: GameState,
+    legal_moves: Sequence[Move],
+    difficulty: str,
+    opponent_type: str,
+    rng: random.Random,
+) -> Optional[Move]:
+    """Choose one opponent move, with true uniform choice for random play."""
+    if not legal_moves:
+        return None
+    if _normalize_opponent_type(opponent_type) == 'random':
+        return rng.choice(legal_moves)
+
+    from ..algorithmic.search import get_best_move
+
+    move = get_best_move(state, difficulty, use_parallel=False)
+    if move in legal_moves:
+        return move
+    if move is not None:
+        matching = [candidate for candidate in legal_moves if candidate.path == move.path]
+        if matching:
+            return matching[0]
+    raise RuntimeError(
+        f"{difficulty} opponent failed to return a legal evaluation move"
+    )
+
+
+def _opening_suite_identity(
+    opening_seed: int,
+    opening_plies: Sequence[int],
+    games_per_side: int,
+) -> str:
+    payload = json.dumps(
+        {
+            'version': 1,
+            'opening_seed': opening_seed,
+            'opening_plies': list(opening_plies),
+            'games_per_side': games_per_side,
+            'paired_across_sides': True,
+        },
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def opening_suite_identity(
+    opening_seed: int,
+    opening_plies: Sequence[int],
+    games_per_side: int,
+) -> str:
+    """Public recomputation of the identity a balanced run stamps on its stats.
+
+    The acceptance gate must derive this itself.  Comparing a report's
+    ``opening_suite_id`` only against the *other* report proves the two runs
+    agreed with each other, not that either used the declared opening suite --
+    so a hand-written pair of records with a matching invented id passed.
+    Normalization is identical to :func:`_build_balanced_game_specs`.
+    """
+    normalized_plies = tuple(int(value) for value in opening_plies) or (0,)
+    if any(value < 0 for value in normalized_plies):
+        raise ValueError("opening plies must be non-negative")
+    return _opening_suite_identity(
+        int(opening_seed), normalized_plies, int(games_per_side))
+
+
+def _build_balanced_game_specs(
+    model_path: str,
+    difficulty: str,
+    opponent_type: str,
+    num_games: int,
+    max_moves: int,
+    opening_plies: Sequence[int],
+    opening_seed: Optional[int],
+    ml_inference_depth: int,
+) -> Tuple[List[tuple], int, str]:
+    """Build paired opening specs with exactly half the games on each side."""
+    if isinstance(num_games, bool) or not isinstance(num_games, int) or num_games <= 0:
+        raise ValueError("num_games must be a positive integer")
+    if num_games % 2 != 0:
+        raise ValueError("num_games must be even for exact side balance")
+    if isinstance(ml_inference_depth, bool) or ml_inference_depth not in (1, 2, 3):
+        raise ValueError("ml_inference_depth must be one of 1, 2, or 3")
+
+    normalized_opponent = _normalize_opponent_type(opponent_type)
+    normalized_plies = tuple(int(value) for value in opening_plies)
+    if not normalized_plies:
+        normalized_plies = (0,)
+    if any(value < 0 for value in normalized_plies):
+        raise ValueError("opening plies must be non-negative")
+
+    base_seed = (
+        int(opening_seed)
+        if opening_seed is not None
+        else random.SystemRandom().randrange(1 << 63)
+    )
+    games_per_side = num_games // 2
+    suite = [
+        (normalized_plies[i % len(normalized_plies)], base_seed + i)
+        for i in range(games_per_side)
+    ]
+    suite_id = _opening_suite_identity(base_seed, normalized_plies, games_per_side)
+
+    specs = []
+    for player in (Player.ONE, Player.TWO):
+        for opening in suite:
+            specs.append((
+                model_path,
+                difficulty,
+                normalized_opponent,
+                player.value,
+                max_moves,
+                opening,
+                ml_inference_depth,
+            ))
+    random.Random(base_seed ^ 0x5A17C9E3).shuffle(specs)
+    return specs, base_seed, suite_id
+
+
+def _play_single_test_game(
+    args: Tuple[str, str, str, int, int, Optional[Tuple[int, int]], int]
+) -> Dict[str, Any]:
+    """
+    Play a single test game between ML model and algorithm.
+
+    Args:
+        args: (model_path, difficulty, opponent_type, ml_player_value,
+              max_moves, opening, ml_inference_depth)
+              where `opening` is an optional (plies, seed) random-opening spec.
+
+    Returns:
+        Game record as dict
+    """
+    (model_path, difficulty, opponent_type, ml_player_value, max_moves,
+     opening, ml_inference_depth) = args
+
+    # Import here to avoid loading in main process
+    from .inference import get_ml_move
+
+    ml_player = Player(ml_player_value)
+
+    state = _apply_random_opening(GameState.initial(), opening)
+    opening_length, game_seed = opening or (0, 0)
+    opponent_rng = random.Random(game_seed ^ 0x4D595DF4D0F33173)
+    move_count = 0
+    ml_moves = 0
+    algo_moves = 0
+
+    start_time = time.perf_counter()
+
+    while move_count < max_moves:
+        legal_moves = state.legal_moves()
+        if not legal_moves:
+            break
+
+        current_player = state.current_player
+
+        if current_player == ml_player:
+            # ML model's turn
+            try:
+                chosen_move = get_ml_move(
+                    state,
+                    model_path,
+                    device='cpu',
+                    depth=ml_inference_depth,
+                )
+                if chosen_move is None:
+                    raise RuntimeError(
+                        "ML inference returned no move for a non-terminal state"
+                    )
+            except Exception as e:
+                raise RuntimeError("ML inference failed during evaluation") from e
+            ml_moves += 1
+        else:
+            chosen_move = _choose_opponent_move(
+                state,
+                legal_moves,
+                difficulty,
+                opponent_type,
+                opponent_rng,
+            )
+            algo_moves += 1
+
+        # Validate move
+        if chosen_move not in legal_moves:
+            # Try to find matching move by path
+            matching = [m for m in legal_moves if m.path == chosen_move.path]
+            if matching:
+                chosen_move = matching[0]
+            else:
+                raise RuntimeError(
+                    "Evaluation policy returned a move outside the legal set"
+                )
+
+        state = state.apply_move(chosen_move)
+        move_count += 1
+
+    game_time_ms = (time.perf_counter() - start_time) * 1000
+
+    # Determine result
+    winner = state.winner()
+
+    if winner is None:
+        result = TestResult.DRAW
+    elif winner == ml_player:
+        result = TestResult.ML_WIN
+    else:
+        result = TestResult.ALGO_WIN
+
+    record = GameTestRecord(
+        result=result,
+        ml_player=ml_player,
+        winner=winner,
+        num_moves=move_count,
+        ml_moves=ml_moves,
+        algo_moves=algo_moves,
+        game_time_ms=game_time_ms,
+        opponent_type=opponent_type,
+        opening_plies=opening_length,
+        opening_seed=game_seed,
+        ml_inference_depth=ml_inference_depth,
+    )
+
+    return record.to_dict()
+
+
+def _play_test_games_batch(
+    args: Tuple[
+        str,
+        str,
+        str,
+        List[int],
+        int,
+        List[Optional[Tuple[int, int]]],
+        int,
+    ]
+) -> List[Dict[str, Any]]:
+    """Play multiple test games interleaved with batched ML inference.
+
+    Same semantics as calling _play_single_test_game N times, but batches
+    ML forward passes across all active games.  ~2-3x faster for ML moves.
+    Algo moves are still sequential (alpha-beta can't be batched).
+
+    Args:
+        args: (model_path, difficulty, opponent_type, ml_player_values,
+              max_moves, openings, ml_inference_depth)
+              ml_player_values is a list of Player int values, one per game.
+              openings is a matching list of (plies, seed) specs (or Nones).
+
+    Returns:
+        List of game record dicts.
+    """
+    import torch
+    import numpy as np
+    from .inference import get_model
+    # [Pass 67] Fast encoding: Cython (~6-7x faster) or Python dict-based (~2x)
+    try:
+        from ._fast_encode import (
+            encode_board_fast_cy as _cy_board,
+            encode_moves_fast_cy as _cy_moves,
+        )
+    except ImportError:
+        _cy_board = None
+        _cy_moves = None
+    from .dataset import _encode_board_fast, _encode_moves_fast
+
+    (model_path, difficulty, opponent_type, ml_player_values, max_moves,
+     openings, ml_inference_depth) = args
+    n = len(ml_player_values)
+    if not openings:
+        openings = [None] * n
+
+    # Depths 2 and 3 traverse a distinct tree for each game. Keep the optimized
+    # batched policy-only path for depth 1 and use the shared single-game path
+    # for value-head search.
+    if ml_inference_depth > 1:
+        return [
+            _play_single_test_game((
+                model_path,
+                difficulty,
+                opponent_type,
+                mpv,
+                max_moves,
+                opening,
+                ml_inference_depth,
+            ))
+            for mpv, opening in zip(ml_player_values, openings)
+        ]
+
+    # Load model once for the entire batch
+    try:
+        model = get_model(model_path, 'cpu')
+    except Exception:
+        # Fall back to sequential
+        results = []
+        for mpv, opening in zip(ml_player_values, openings):
+            results.append(_play_single_test_game(
+                (model_path, difficulty, opponent_type, mpv, max_moves,
+                 opening, ml_inference_depth)))
+        return results
+
+    # Initialize all games
+    games = []
+    for mpv, opening in zip(ml_player_values, openings):
+        opening_length, game_seed = opening or (0, 0)
+        games.append({
+            'state': _apply_random_opening(GameState.initial(), opening),
+            'ml_player': Player(mpv),
+            'opening_plies': opening_length,
+            'opening_seed': game_seed,
+            'opponent_rng': random.Random(game_seed ^ 0x4D595DF4D0F33173),
+            'move_count': 0,
+            'ml_moves': 0,
+            'algo_moves': 0,
+            # Interleaved play shares one wall clock across the whole batch,
+            # so per-game time must be attributed, not read from a start
+            # timestamp: each round's elapsed time is split equally among the
+            # games active in that round, and the shares sum to the batch wall.
+            'active_ms': 0.0,
+        })
+
+    active = list(range(n))
+
+    # [Pass 68] Pre-allocate numpy buffers for ML inference (same pattern as
+    # selfplay.py).  Avoids np.zeros() allocation+zeroing per round.
+    _MAX_M = 32  # matches config max_moves_per_sample
+    _boards_buf = np.zeros((n, 5, 8, 8), dtype=np.float32)
+    _mf_buf = np.zeros((n, _MAX_M, 8), dtype=np.float32)
+    _counts_buf = np.zeros(n, dtype=np.int32)
+
+    while active:
+        round_start = time.perf_counter()
+        ml_requests = []      # (game_idx, legal_moves)
+        algo_requests = []    # (game_idx, legal_moves)
+        immediate = []        # (game_idx, legal_moves, chosen_idx)
+
+        new_active = []
+        for i in active:
+            g = games[i]
+            if g['move_count'] >= max_moves:
+                continue
+            legal_moves = g['state'].legal_moves()
+            if not legal_moves:
+                continue
+            new_active.append(i)
+
+            if len(legal_moves) == 1:
+                immediate.append((i, legal_moves, 0))
+                continue
+
+            if g['state'].current_player == g['ml_player']:
+                ml_requests.append((i, legal_moves))
+            else:
+                algo_requests.append((i, legal_moves))
+
+        active = new_active
+        if not active:
+            break
+
+        # Immediate moves (forced single moves)
+        for game_idx, legal_moves, idx in immediate:
+            g = games[game_idx]
+            if g['state'].current_player == g['ml_player']:
+                g['ml_moves'] += 1
+            else:
+                g['algo_moves'] += 1
+            g['state'] = g['state'].apply_move(legal_moves[idx])
+            g['move_count'] += 1
+
+        # Batched ML inference
+        if ml_requests:
+            batch_sz = len(ml_requests)
+
+            # [Pass 68] Reuse pre-allocated buffers instead of np.zeros() per round.
+            boards = _boards_buf[:batch_sz]
+            all_mf = _mf_buf[:batch_sz]
+            counts = _counts_buf[:batch_sz]
+
+            for j, (game_idx, legal_moves) in enumerate(ml_requests):
+                sd = games[game_idx]['state'].to_compact()
+                md = [m.to_dict() for m in legal_moves]
+                if _cy_board is not None:
+                    _cy_board(sd, boards[j])
+                    counts[j] = _cy_moves(sd, md, all_mf[j])
+                else:
+                    _encode_board_fast(sd, boards[j])
+                    counts[j] = _encode_moves_fast(sd, md, all_mf[j])
+
+            with torch.inference_mode():
+                # Score only the widest live legal-move set in this round.
+                # Padding remains reusable at 32 slots, but evaluating its
+                # unused tail adds MLP work without affecting any valid logit.
+                live_width = int(counts.max())
+                scores = model.forward_padded(
+                    torch.from_numpy(boards),
+                    torch.from_numpy(all_mf[:, :live_width]),
+                    torch.from_numpy(counts),
+                )
+
+            # [Pass 68] Batch argmax + tolist() avoids per-game .item() dispatch.
+            best_indices_list = scores.argmax(dim=1).tolist()
+
+            for j, (game_idx, legal_moves) in enumerate(ml_requests):
+                best_idx = best_indices_list[j]
+                g = games[game_idx]
+                g['ml_moves'] += 1
+                g['state'] = g['state'].apply_move(legal_moves[best_idx])
+                g['move_count'] += 1
+
+        # Sequential opponent moves
+        for game_idx, legal_moves in algo_requests:
+            g = games[game_idx]
+            move = _choose_opponent_move(
+                g['state'],
+                legal_moves,
+                difficulty,
+                opponent_type,
+                g['opponent_rng'],
+            )
+            g['algo_moves'] += 1
+            g['state'] = g['state'].apply_move(move)
+            g['move_count'] += 1
+
+        round_ms = (time.perf_counter() - round_start) * 1000.0
+        share = round_ms / len(active)
+        for i in active:
+            games[i]['active_ms'] += share
+
+    # Build results
+    results = []
+    for g in games:
+        game_time_ms = g['active_ms']
+        winner = g['state'].winner()
+        if winner is None:
+            result = TestResult.DRAW
+        elif winner == g['ml_player']:
+            result = TestResult.ML_WIN
+        else:
+            result = TestResult.ALGO_WIN
+
+        results.append(GameTestRecord(
+            result=result,
+            ml_player=g['ml_player'],
+            winner=winner,
+            num_moves=g['move_count'],
+            ml_moves=g['ml_moves'],
+            algo_moves=g['algo_moves'],
+            game_time_ms=game_time_ms,
+            opponent_type=opponent_type,
+            opening_plies=g['opening_plies'],
+            opening_seed=g['opening_seed'],
+            ml_inference_depth=ml_inference_depth,
+        ).to_dict())
+
+    return results
+
+
+class ModelVsAlgoTester:
+    """
+    Run test games between an ML model and an algorithmic or random opponent.
+    
+    Features:
+    - Run multiple games with ML as both Player 1 and Player 2
+    - Collect statistics on win rates
+    - Save results to file
+    """
+    
+    def __init__(
+        self,
+        model_path: str = "models/latest.pt",
+        algo_difficulty: str = "medium",
+        num_workers: int = 4,
+        max_moves: int = 200,
+        stats_dir: str = "models/test_stats",
+        opening_plies: Sequence[int] = (0,),
+        opening_seed: Optional[int] = 1234,
+        opponent_type: str = "algorithm",
+        ml_inference_depth: int = 1,
+        executor: Optional[ProcessPoolExecutor] = None,
+    ):
+        self.model_path = model_path
+        self.algo_difficulty = algo_difficulty
+        if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers <= 0:
+            raise ValueError("num_workers must be a positive integer")
+        self.num_workers = num_workers
+        self.max_moves = max_moves
+        self.stats_dir = Path(stats_dir)
+        # [Pass 109] Random-opening lengths cycled across games. The default
+        # (0,) reproduces the historical fixed-opening behaviour; anything else
+        # makes each test game a distinct sample (see _apply_random_opening).
+        self.opening_plies = tuple(int(value) for value in opening_plies) or (0,)
+        self.opening_seed = opening_seed
+        self.opponent_type = _normalize_opponent_type(opponent_type)
+        if isinstance(ml_inference_depth, bool) or ml_inference_depth not in (1, 2, 3):
+            raise ValueError("ml_inference_depth must be one of 1, 2, or 3")
+        self.ml_inference_depth = ml_inference_depth
+        # Acceptance evaluates random and easy sequentially against the same
+        # checkpoint.  An injected executor keeps the spawned workers and their
+        # folded CPU-model caches alive across both phases.  Standalone callers
+        # retain the established one-pool-per-run lifecycle.
+        self._executor = executor
+
+        self._running = False
+        self._games_completed = 0
+    
+    def run_tests(
+        self,
+        num_games: int = 100,
+        callback: Optional[Callable[[int, int, TestStatistics], None]] = None,
+    ) -> TestStatistics:
+        """
+        Run test games.
+        
+        Args:
+            num_games: Total number of games to play (half as P1, half as P2)
+            callback: Optional callback(games_completed, total_games, current_stats)
+        
+        Returns:
+            TestStatistics with all results
+        """
+        self._running = True
+        self._games_completed = 0
+        args_list, base_seed, suite_id = _build_balanced_game_specs(
+            model_path=self.model_path,
+            difficulty=self.algo_difficulty,
+            opponent_type=self.opponent_type,
+            num_games=num_games,
+            max_moves=self.max_moves,
+            opening_plies=self.opening_plies,
+            opening_seed=self.opening_seed,
+            ml_inference_depth=self.ml_inference_depth,
+        )
+
+        stats = TestStatistics(
+            model_path=self.model_path,
+            algo_difficulty=self.algo_difficulty,
+            opponent_type=self.opponent_type,
+            opening_seed=base_seed,
+            opening_plies=list(self.opening_plies),
+            opening_suite_id=suite_id,
+            opening_suite_size=num_games // 2,
+            ml_inference_depth=self.ml_inference_depth,
+            start_time=datetime.now().isoformat(),
+        )
+        
+        total_moves = 0
+        total_time_ms = 0.0
+
+        def _ingest_result(record_data: Dict[str, Any]) -> None:
+            """Update stats from a single completed game."""
+            nonlocal total_moves, total_time_ms
+            record = GameTestRecord.from_dict(record_data)
+
+            stats.total_games += 1
+            total_moves += record.num_moves
+            total_time_ms += record.game_time_ms
+
+            if record.result == TestResult.ML_WIN:
+                stats.ml_wins += 1
+                if record.ml_player == Player.ONE:
+                    stats.ml_as_p1_wins += 1
+                else:
+                    stats.ml_as_p2_wins += 1
+            elif record.result == TestResult.ALGO_WIN:
+                stats.algo_wins += 1
+                if record.ml_player == Player.ONE:
+                    stats.ml_as_p1_losses += 1
+                else:
+                    stats.ml_as_p2_losses += 1
+            else:
+                stats.draws += 1
+                if record.ml_player == Player.ONE:
+                    stats.ml_as_p1_draws += 1
+                else:
+                    stats.ml_as_p2_draws += 1
+
+            stats.games.append(record_data)
+            self._games_completed += 1
+
+            stats.avg_game_length = total_moves / stats.total_games
+            stats.avg_game_time_ms = total_time_ms / stats.total_games
+
+            if callback:
+                callback(self._games_completed, num_games, stats)
+
+        # Batch games per worker for interleaved ML inference (~2-3x faster).
+        # Each worker plays multiple games with batched forward passes.
+        _GAMES_PER_BATCH = max(2, num_games // self.num_workers)
+        batches = []
+        for i in range(0, len(args_list), _GAMES_PER_BATCH):
+            chunk = args_list[i:i + _GAMES_PER_BATCH]
+            ml_player_vals = [a[3] for a in chunk]
+            openings = [a[5] for a in chunk]
+            batches.append((
+                self.model_path,
+                self.algo_difficulty,
+                self.opponent_type,
+                ml_player_vals,
+                self.max_moves,
+                openings,
+                self.ml_inference_depth,
+            ))
+
+        def _consume_parallel(executor: ProcessPoolExecutor) -> None:
+            futures = [executor.submit(_play_test_games_batch, batch)
+                       for batch in batches]
+
+            for future in as_completed(futures):
+                if not self._running:
+                    break
+
+                try:
+                    for record_data in future.result():
+                        _ingest_result(record_data)
+                except Exception as e:
+                    print(f"Test batch error: {e}")
+
+        try:
+            if self._executor is not None:
+                _consume_parallel(self._executor)
+            else:
+                # The Linux forkserver is spawned outside the CUDA-owning
+                # trainer and shares preloaded CPU inference imports. Other
+                # platforms use spawn with the same isolation guarantee.
+                worker_ctx = _evaluation_worker_context()
+                with ProcessPoolExecutor(
+                    max_workers=self.num_workers,
+                    mp_context=worker_ctx,
+                    initializer=_evaluation_worker_init,
+                ) as executor:
+                    _consume_parallel(executor)
+
+        except Exception as e:
+            print(f"Parallel testing failed ({e}), falling back to sequential")
+            # The parallel loop may have already ingested some games before
+            # failing; the fallback replays every batch, so reset all
+            # accumulators to avoid double-counting those games.
+            stats = TestStatistics(
+                model_path=self.model_path,
+                algo_difficulty=self.algo_difficulty,
+                opponent_type=self.opponent_type,
+                opening_seed=base_seed,
+                opening_plies=list(self.opening_plies),
+                opening_suite_id=suite_id,
+                opening_suite_size=num_games // 2,
+                ml_inference_depth=self.ml_inference_depth,
+                start_time=stats.start_time,
+            )
+            total_moves = 0
+            total_time_ms = 0.0
+            self._games_completed = 0
+            # Sequential fallback - use batched function directly
+            for batch in batches:
+                if not self._running:
+                    break
+
+                try:
+                    for record_data in _play_test_games_batch(batch):
+                        _ingest_result(record_data)
+                except Exception as e:
+                    print(f"Test batch error: {e}")
+        
+        if stats.total_games != num_games:
+            raise RuntimeError(
+                f"evaluation completed {stats.total_games} of {num_games} games"
+            )
+
+        if stats.ml_as_p1_games != num_games // 2 or stats.ml_as_p2_games != num_games // 2:
+            raise RuntimeError("evaluation did not preserve exact player-side balance")
+
+        stats.end_time = datetime.now().isoformat()
+        
+        # Save stats
+        self._save_stats(stats)
+        
+        return stats
+    
+    def _save_stats(self, stats: TestStatistics) -> str:
+        """Atomically save timestamped and latest test statistics."""
+        self.stats_dir.mkdir(parents=True, exist_ok=True)
+        # Atomic file publication commits names inside this directory, but
+        # that fsync is not recursive. Commit the detail namespace in its
+        # parent first, and retry on every save after an earlier sync failure.
+        _fsync_directory(self.stats_dir.parent)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"test_{timestamp}.json"
+        filepath = self.stats_dir / filename
+
+        payload = stats.to_dict()
+        _write_json_atomic(filepath, payload)
+
+        # Also save as latest
+        latest_path = self.stats_dir / "latest_test.json"
+        _write_json_atomic(latest_path, payload)
+
+        print(f"Test stats saved: {filepath}")
+        return str(filepath)
+    
+    def stop(self) -> None:
+        """Stop running tests."""
+        self._running = False
+    
+    @property
+    def games_completed(self) -> int:
+        return self._games_completed
+
+
+def load_test_stats(stats_file: str = "models/test_stats/latest_test.json") -> Optional[TestStatistics]:
+    """Load test statistics from file."""
+    path = Path(stats_file)
+    if not path.exists():
+        return None
+    
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        return TestStatistics.from_dict(data)
+    except Exception:
+        return None
+
+
+def list_test_results(stats_dir: str = "models/test_stats") -> List[Dict[str, Any]]:
+    """List all available test result files."""
+    path = Path(stats_dir)
+    if not path.exists():
+        return []
+    
+    results = []
+    for f in path.glob("test_*.json"):
+        try:
+            with open(f, 'r') as file:
+                data = json.load(file)
+                results.append({
+                    'path': str(f),
+                    'name': f.name,
+                    'total_games': data.get('total_games', 0),
+                    'ml_win_rate': data.get('ml_win_rate', 0),
+                    'start_time': data.get('start_time', ''),
+                })
+        except Exception:
+            continue
+    
+    # Sort by time
+    results.sort(key=lambda x: x['start_time'], reverse=True)
+    return results

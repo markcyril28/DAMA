@@ -1,5 +1,6 @@
 """ML model inference for move selection."""
 
+import sys
 import time
 import warnings
 import threading
@@ -71,6 +72,13 @@ def get_model(model_path: str, device: Optional[torch.device] = None) -> MoveSco
     if device is None:
         if torch.cuda.is_available():
             device = torch.device('cuda')
+        elif sys.platform == 'darwin':
+            # macOS has no CUDA build to install, and CPU is the intended
+            # inference device there: the model is small and one position per
+            # call is dominated by Metal launch/sync latency on MPS (M4 Max:
+            # ~0.4 ms/move on CPU vs ~1.4-2 ms on MPS), so there is nothing
+            # to warn about.
+            device = torch.device('cpu')
         else:
             warnings.warn(
                 "CUDA not available, falling back to CPU inference. "

@@ -189,7 +189,8 @@ def _extension_layout(
     sources = tuple(
         source_root / relative for relative in _EXTENSION_SOURCES
         if not (
-            platform_system == "Windows" and relative.stem == "_fast_stat"
+            platform_system in ("Windows", "Darwin")
+            and relative.stem == "_fast_stat"
         )
     )
     modules = tuple(

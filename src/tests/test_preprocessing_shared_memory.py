@@ -205,6 +205,10 @@ def test_combined_worker_outputs_release_consumed_source_fields(
         monkeypatch.setattr(mp, "get_start_method", lambda: "spawn")
         monkeypatch.setattr(dataset, "ProcessPoolExecutor", partial(
             ProcessPoolExecutor, mp_context=mp.get_context("spawn")))
+        # The macOS dataset variant runs spawn-sized inputs inline; this test
+        # needs the pool path (absent on other platforms, hence raising=False).
+        monkeypatch.setattr(
+            dataset, "_INLINE_PREPROCESS_UNDER_SPAWN", False, raising=False)
     else:
         _track_segments(monkeypatch, fail_allocation=1)
 

@@ -92,12 +92,19 @@ DEF PLAYER_ONE = 1
 DEF PLAYER_TWO = 2
 
 # ── Move limits ──
-DEF MAX_PATH = 8
-DEF MAX_CAPTURES = 7
+# Every jump removes a distinct opponent piece and a side starts with 12, so a
+# capture chain from any reachable position is at most 12 captures / 13 path
+# squares. Flying kings do reach 8+ jump chains; sizing these for 7 captures
+# smashed the stack (SIGABRT under the macOS stack protector, silent memory
+# corruption elsewhere). _generate_captures_recursive also stops a chain at
+# MAX_CAPTURES, so a hand-built board with more opponent pieces truncates the
+# chain instead of overflowing.
+DEF MAX_CAPTURES = 12
+DEF MAX_PATH = MAX_CAPTURES + 1
 # 128: multi-king positions with forced_capture off can exceed 64 combined
 # capture+simple moves; 64 would silently truncate legal moves. sizeof(CMove)
-# is 140 bytes, so CMoveList is ~18KB; worst-case recursion (max_depth 12
-# plus nested IID plus quiescence, ~30 frames at one CMoveList each) stays
+# is under 140 bytes, so CMoveList is ~18KB; worst-case recursion (max_depth
+# 12 plus nested IID plus quiescence, ~30 frames at one CMoveList each) stays
 # under 1MB, well within the 8MB default Linux thread stack.
 DEF MAX_MOVES = 128
 DEF MAX_PLY = 32
@@ -565,6 +572,13 @@ cdef int _generate_captures_recursive(
     cdef int *dirs_r
     cdef int *dirs_c
     cdef int ndirs
+
+    # This function and _flying_king_capture write path_sq[path_len] and
+    # cap_sq[path_len - 1] with boundscheck off. A full chain can only get
+    # here on a board holding more than MAX_CAPTURES opponent pieces; end it
+    # as a completed capture instead of overrunning.
+    if path_len > MAX_CAPTURES:
+        return 0
 
     # The moving piece cannot change during one capture sequence. Classify it
     # once at the public generator boundary, then carry that value through the
@@ -1913,14 +1927,19 @@ def apply_move_board(bytes board_bytes, int player, dict move_dict) -> tuple:
     # Convert move dict → CMove
     # [Pass 83] Direct key access: cmove_to_dict always includes all three keys.
     path = move_dict['path']
+    captures = move_dict['captures']
     n = len(path)
+    # The CMove arrays are fixed-size and boundscheck is off: reject a move
+    # that could not have come from the move generator rather than write
+    # past them.
+    if n < 2 or n > MAX_PATH or len(captures) > MAX_CAPTURES:
+        raise ValueError("move path/captures do not fit the CMove arrays")
     cmove.path_len = n
     for i in range(n):
         cmove.path_sq[i] = path[i][0] * 8 + path[i][1]
     cmove.from_sq = cmove.path_sq[0]
     cmove.to_sq = cmove.path_sq[n - 1]
 
-    captures = move_dict['captures']
     cmove.num_captures = len(captures)
     for i in range(cmove.num_captures):
         cmove.cap_sq[i] = captures[i][0] * 8 + captures[i][1]

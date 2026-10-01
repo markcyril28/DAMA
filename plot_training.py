@@ -59,6 +59,15 @@ def open_file(output_path: str) -> None:
             raise FileNotFoundError("explorer.exe not found")
         except Exception as e:  # noqa: BLE001 - fall back to the default opener
             print(f"Warning: could not open via Windows browser ({e}); falling back.")
+    elif sys.platform == "darwin":
+        # macOS: `open` hands the file to its default app through Launch
+        # Services (browser for HTML, Preview for PNG), as promised above,
+        # instead of going through webbrowser's AppleScript bridge.
+        try:
+            subprocess.run(["open", str(Path(output_path).resolve())], check=True)
+            return
+        except Exception as e:  # noqa: BLE001 - fall back to the default opener
+            print(f"Warning: could not open via macOS 'open' ({e}); falling back.")
     webbrowser.open(f"file://{Path(output_path).resolve()}")
 
 
@@ -1924,8 +1933,8 @@ def resolve_stats_path(project_dir: Path, explicit: str | None) -> Path:
     With --stats, honor the given path verbatim. Otherwise pick the most
     recently modified non-legacy stats file (training_stats.json,
     training_stats_local.json, training_stats_server.json,
-    training_stats_policy_distillation.json) so the no-arg command tracks
-    whichever run last wrote stats. Fall back to
+    training_stats_policy_distillation.json, training_stats_mac.json) so the
+    no-arg command tracks whichever run last wrote stats. Fall back to
     training_stats_legacy.json only when none of those exist, then to the
     conventional default path so the caller reports a consistent message.
     """
@@ -1938,6 +1947,7 @@ def resolve_stats_path(project_dir: Path, explicit: str | None) -> Path:
         models_dir / "training_stats_local.json",
         models_dir / "training_stats_server.json",
         models_dir / "training_stats_policy_distillation.json",
+        models_dir / "training_stats_mac.json",
     ]
     existing = [p for p in candidates if p.exists()]
     if existing:

@@ -1,0 +1,11333 @@
+"""Training loop for the move scorer model."""
+
+import os
+import signal
+import sys
+import json
+import time
+import random
+import math
+import re
+import argparse
+import hashlib
+import hmac
+import io
+import gc
+import shutil
+import tempfile
+import traceback
+import warnings
+import numpy as np
+from collections import deque
+from contextlib import nullcontext
+import platform
+import threading
+import multiprocessing as mp
+from queue import Empty, Queue
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, Any, Iterable, Mapping
+from dataclasses import dataclass, field, replace
+
+# Set multiprocessing start method before any other multiprocessing imports
+# 'fork' is faster on Linux but can cause issues with CUDA
+# 'spawn' is safer but slower
+#
+# macOS gets 'spawn' (Python's own macOS default since 3.8): forking a process
+# that has already initialised Metal / Accelerate / libdispatch -- which
+# importing torch with MPS does -- can hang or crash the child.  Every pool
+# the trainer creates has a spawn path: self-play workers load the behaviour
+# model from the temp file written each cycle, and dataset preprocessing
+# pickles its inputs whenever the start method is not 'fork'.  Windows only
+# supports spawn and is left untouched.  DAMA_MP_START_METHOD overrides the
+# choice on any OS, for diagnosing a start-method-specific failure.
+_MP_START_METHODS = ('fork', 'spawn', 'forkserver')
+
+
+def _preferred_mp_start_method() -> Optional[str]:
+    override = os.environ.get('DAMA_MP_START_METHOD', '').strip().lower()
+    if override:
+        if override in _MP_START_METHODS and override in mp.get_all_start_methods():
+            return override
+        print(f"[warn] Ignoring DAMA_MP_START_METHOD={override!r}: expected one "
+              f"of {[m for m in _MP_START_METHODS if m in mp.get_all_start_methods()]}")
+    system = platform.system()
+    if system == 'Windows':
+        return None
+    if system == 'Darwin':
+        return 'spawn'
+    return 'fork'
+
+
+_preferred_start_method = _preferred_mp_start_method()
+if _preferred_start_method is not None:
+    try:
+        mp.set_start_method(_preferred_start_method, force=False)
+    except RuntimeError:
+        pass  # Already set
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+
+# Default matmul precision — overridden per config in Trainer.__init__().
+# 'medium' allows aggressive use of TF32 tensor cores on Ampere+ GPUs.
+torch.set_float32_matmul_precision('medium')
+
+# Enable cuDNN autotuning — finds the fastest convolution algorithm for
+# the fixed input shapes (8x8 board, constant batch size with drop_last=True).
+# One-time benchmark cost on first forward pass, then faster for all subsequent.
+torch.backends.cudnn.benchmark = True
+
+# Allow FP16 accumulation in matmuls for faster tensor core throughput.
+# Minimal precision impact for this model's score magnitudes.
+try:
+    torch.backends.cuda.matmul.allow_fp16_reduction = True
+except AttributeError:
+    pass  # Older PyTorch versions
+
+# Configure torch.compile CUDAGraph settings to avoid overhead from dynamic shapes
+# This prevents recording too many graphs for varying input sizes
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+    inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
+    # Silence inductor/dynamo info and warning messages
+    import logging
+    logging.getLogger("torch._inductor.compile_fx").setLevel(logging.ERROR)
+    logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
+    logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+except (ImportError, AttributeError):
+    pass  # Older PyTorch versions may not have this config
+
+# Suppress torch.compile inductor warnings and pynvml deprecation
+warnings.filterwarnings('ignore', message='.*TensorFloat32.*')
+warnings.filterwarnings('ignore', message='.*max_autotune_gemm.*')
+warnings.filterwarnings('ignore', message='.*CUDAGraph.*dynamic shapes.*')
+warnings.filterwarnings('ignore', message='.*skipping cudagraphs.*')
+warnings.filterwarnings('ignore', message='.*pynvml package is deprecated.*')
+
+from .model import MoveScorerNet, create_model, save_model, load_model
+from . import device as ml_device
+from .move_encoder import BOARD_PLANES, ENCODING_VERSION, MOVE_FEATURE_SIZE
+from .replay import ReplayBuffer
+from .selfplay import (
+    allocate_policy_distillation_games,
+    _play_game_worker_algo_vs_algo,
+    _play_games_batch_worker_algo, _play_games_batch_worker_full,
+    _selfplay_worker_init,
+)
+from .dataset import (
+    create_dataloader, create_dataloader_from_dataset, prepare_training_data,
+    CachedTensorDataset, CUDAPrefetcher, FastBatchIterator,
+    load_matching_cached_tensor_dataset,
+)
+from .scoring import compute_reward_weight
+from .stats_collector import StatsCollector
+from .fork_writers import (
+    _FORK_CHILD_DROPPED_FDS,
+    _fork_children_drop_fd,
+    fork_safe_temporary_file,
+)
+from .corpus import (
+    CorpusSnapshotManager,
+    _SnapshotSplitContext,
+    analyze_replay_files,
+    canonical_state_key,
+    paused_cyclic_gc,
+    replay_file_sha256,
+)
+from .teacher_validation import (
+    PromotionDecision,
+    PromotionRegistry,
+    create_frozen_teacher_suite,
+    evaluate_teacher_agreement,
+    load_frozen_teacher_suite,
+)
+from .teacher_targets import (
+    EnhancedBatchIterator,
+    create_enhanced_dataloader,
+    soft_target_cross_entropy,
+)
+from .acceptance import ACCEPTANCE_GAMES_PER_OPPONENT
+from . import run_status
+from . import checkpoint_acceptance as checkpoint_acceptance_tasks
+
+# ``ModelVsAlgoTester`` plays each distinct opening once per player side, so a
+# 100-game acceptance run reports ``opening_suite_size == 50``.  The enhanced
+# stage gate must compare against that per-side count; comparing against the
+# 100-game total rejected every genuinely produced acceptance report and made
+# P5 unreachable even after a valid promotion and acceptance.
+_ACCEPTANCE_OPENING_SUITE_SIZE = ACCEPTANCE_GAMES_PER_OPPONENT // 2
+
+# Rotate the algorithm arm's stratified opening-depth assignment across
+# generation cycles. Each cycle still uses every configured depth equally,
+# while each difficulty/start-side slot sees all depths over four cycles.
+_ALGORITHM_OPENING_SCHEDULE = "cycle_rotated_v1"
+
+# Polling is deliberately infrequent while storage is constrained. The main
+# thread remains responsive through its normal two-second data wait, and STOP
+# wakes this wait immediately through ``_bg_selfplay_stop_event``.
+_SELFPLAY_DISK_HEADROOM_POLL_SECONDS = 30.0
+_GIB = 1024 ** 3
+
+
+def _diagnostic_print(*args, **kwargs) -> None:
+    """Print progress without letting a dead console abort training work.
+
+    A closed console pipe raised BrokenPipeError from the shutdown diagnostic
+    in ``_stop_background_selfplay`` on 2026-09-15, which skipped the producer
+    join, the final checkpoint, the acceptance drain and the statistics export
+    and cost 1,616 optimizer steps (step 435,616 against a step-434,000
+    checkpoint; Journal Pass 551 incident, repaired in Pass 553).
+
+    A broken pipe is permanent, so guarding one call would only move the
+    failure to the next print. Retire the failed stream to the null device on
+    its first broken pipe, leaving its downstream diagnostics harmless.
+    Other console errors are swallowed per write, matching the existing
+    convention in ``stats_collector`` (``except (OSError, ValueError)``).
+    """
+
+    broken = kwargs.get('file') or sys.stdout
+    try:
+        print(*args, **kwargs)
+        return
+    except BrokenPipeError:
+        pass
+    except (OSError, ValueError):
+        return
+    _retire_unwritable_console(broken)
+
+
+def _retire_unwritable_console(broken) -> None:
+    """Point the failed stream at the null device after a permanent failure.
+
+    Only the stream that actually raised is retired: the launchers merge
+    stderr into stdout, but a caller that kept them separate must not lose a
+    still-writable stderr to a dead stdout.
+
+    KNOWN GAP (not auto-fixed, Journal Pass 553): under the launchers'
+    ``2>&1 | tee`` the shell dup2s fd 1 onto fd 2, so both descriptors die
+    together while remaining distinct Python objects, and stderr stays broken
+    here. Every explicit stderr write in trainer.py (the checkpoint writer's
+    and the self-play producer's tracebacks, Journal Pass 557) therefore goes
+    through ``_diagnostic_print(..., file=sys.stderr)``, which retires stderr
+    on its own first failure, and CPython's excepthook swallows its own write
+    failures. Detecting the shared pipe would need ``os.fstat`` device/inode
+    comparison, which is too fragile to add on a failure path; route any new
+    stderr write through that guard as well.
+    """
+
+    try:
+        null_stream = open(os.devnull, 'w')
+    except OSError:
+        return
+    replaced = False
+    for name in ('stdout', 'stderr'):
+        if getattr(sys, name, None) is broken:
+            setattr(sys, name, null_stream)
+            replaced = True
+    if not replaced:
+        null_stream.close()
+        return
+    # The buffered data is unreachable, and closing now keeps the interpreter
+    # from retrying that flush at shutdown. Dropping it must not raise here.
+    # This is only safe because CPython builds the std streams with
+    # closefd=False, so fd 1 stays occupied and no later open() can reuse the
+    # number a copied stream might still flush into (the hazard
+    # fork_writers._drop_registered_fds_in_fork_child handles with dup2).
+    try:
+        broken.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a completed rename on platforms that expose directory fds."""
+
+    if os.name == 'nt':
+        # Native Windows does not allow opening a directory this way. The
+        # same-directory replacement remains atomic there, while Linux and
+        # the supported WSL DrvFS path can make its directory entry durable.
+        return
+    directory_fd = os.open(
+        path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _prepare_checkpoint_directory(path: str | Path) -> Path:
+    """Create and commit the checkpoint namespace before model setup."""
+
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    # Numbered checkpoint publication commits names inside this directory, but
+    # directory fsync is not recursive. Commit a newly created namespace in its
+    # parent before a writer can publish into it, and retry on every Trainer
+    # construction after a prior failed parent sync. See Journal Pass 427.
+    _fsync_directory(directory.parent)
+    return directory
+
+
+def _ordered_difficulty_matchups(difficulties: list[str]) -> list[tuple[str, str]]:
+    """Assign every teacher difficulty to both player positions."""
+    return [(p1, p2) for p1 in difficulties for p2 in difficulties]
+
+
+def _training_opening_assignment(
+    opening_choices: tuple[int, ...],
+    opening_seed_base: int,
+    game_index: int,
+    *,
+    cycle_rotation: int = 0,
+) -> tuple[int, int]:
+    """Return one stratified opening while keeping its seed slot stable."""
+
+    choice_index = (game_index + cycle_rotation) % len(opening_choices)
+    return int(opening_choices[choice_index]), opening_seed_base + game_index
+
+
+def _stamp_selfplay_tasks(
+    tasks: Iterable[tuple],
+    *,
+    opening_choices: tuple[int, ...],
+    opening_seed_base: int,
+    start_index: int,
+    cycle_rotation: int,
+    trajectory_source: str,
+    game_id_kind: str,
+    cycle_id: int,
+    teacher_difficulty: str,
+    inference_depth: Optional[int] = None,
+) -> list[tuple]:
+    """Add deterministic opening and provenance fields to self-play tasks."""
+
+    stamped = []
+    for local_index, task in enumerate(tasks):
+        game_index = start_index + local_index
+        opening_plies, opening_seed = _training_opening_assignment(
+            opening_choices,
+            opening_seed_base,
+            game_index,
+            cycle_rotation=cycle_rotation,
+        )
+        suffix = (
+            opening_plies,
+            opening_seed,
+            trajectory_source,
+            f"cycle-{cycle_id:06d}-{game_id_kind}-{local_index:06d}",
+            teacher_difficulty,
+        )
+        if inference_depth is not None:
+            suffix += (inference_depth,)
+        stamped.append(task + suffix)
+    return stamped
+
+
+def _stage_runtime_model_checkpoint(
+    checkpoint: Mapping[str, Any],
+    path: Path,
+    *,
+    persist_to_disk: bool,
+) -> str:
+    """Serialize one behavior checkpoint and return its exact byte digest.
+
+    Linux fork workers inherit the already-folded CPU model, so writing the
+    fallback checkpoint to drvfs only to read it back for SHA-256 is redundant.
+    Streaming the discarded fork-only archive through a digest sink keeps the
+    provenance tied to the exact loadable ``torch.save`` bytes without owning
+    a second model-sized buffer. Spawn workers and failed fork-model builds
+    retain the buffered bytes needed by ``get_model()``.
+    """
+
+    if not persist_to_disk:
+        sink = _RuntimeCheckpointHashSink()
+        torch.save(checkpoint, sink)
+        return sink.hexdigest()
+
+    buffer = io.BytesIO()
+    torch.save(checkpoint, buffer)
+    serialized = buffer.getbuffer()
+    try:
+        digest = hashlib.sha256(serialized).hexdigest().upper()
+        # The Linux fork fast path needs only the returned digest and should
+        # not materialize a runtime-model namespace. Spawn and failed-fork
+        # fallbacks create it only when they actually persist worker input.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.unlink(missing_ok=True)
+        try:
+            with temporary.open("wb") as handle:
+                written = handle.write(serialized)
+                if written != len(serialized):
+                    raise OSError(
+                        f"short runtime-checkpoint write: "
+                        f"{written}/{len(serialized)} bytes"
+                    )
+                handle.flush()
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    finally:
+        serialized.release()
+        buffer.close()
+    return digest
+
+
+class _RuntimeCheckpointHashSink:
+    """Tellable write-only stream that hashes exact ``torch.save`` bytes."""
+
+    __slots__ = ("_digest", "_position")
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._position = 0
+
+    def write(self, payload) -> int:
+        self._digest.update(payload)
+        length = len(payload)
+        self._position += length
+        return length
+
+    def flush(self) -> None:
+        pass
+
+    def tell(self) -> int:
+        return self._position
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest().upper()
+
+
+def _build_fork_behavior_model(
+    live_model: nn.Module,
+    arch_params: Mapping[str, Any],
+    state: Optional[Mapping[str, Any]] = None,
+) -> nn.Module:
+    """Copy live weights directly into the one fork-inherited CPU model.
+
+    ``load_state_dict`` copies each source tensor into the destination
+    parameter.  Passing the live state mapping directly avoids first owning a
+    detached CPU tensor copy that would otherwise survive into every worker
+    fork alongside this model.
+    """
+
+    # Conv2d and Linear constructors initialize their tensors, then the model's
+    # project-specific initializer normally writes them a second time. Both
+    # passes are dead work here because the complete live state is copied next.
+    fork_arch = dict(arch_params)
+    fork_arch["initialize_weights"] = False
+    fork_model = create_model(**fork_arch)
+    # ``state`` is CPU weights the training thread published (MPS only).
+    fork_model.load_state_dict(
+        live_model.state_dict() if state is None else state)
+    fork_model.eval()
+    return fork_model.cpu()
+
+
+def _call_under_model_state_lock(state_lock, operation, *args, **kwargs):
+    """Run one model read or mutation without crossing another revision."""
+    guard = state_lock if state_lock is not None else nullcontext()
+    with guard:
+        return operation(*args, **kwargs)
+
+
+def _capture_model_revision(state_lock, step_getter, capture):
+    """Capture one model snapshot and its step under the same state lock."""
+    guard = state_lock if state_lock is not None else nullcontext()
+    with guard:
+        step = int(step_getter())
+        return step, capture()
+
+
+def _copy_behavior_state_to_cpu(live_model, device, state=None) -> dict:
+    """Own a stable CPU copy of behavior weights before releasing its lock."""
+    if state is not None:
+        # Weights the training thread already published (MPS only).
+        return {key: value.detach().clone() for key, value in state.items()}
+    if device.type == 'cuda':
+        state = {
+            key: value.to('cpu', non_blocking=True)
+            for key, value in live_model.state_dict().items()
+        }
+        torch.cuda.current_stream().synchronize()
+        return state
+    if device.type == 'mps':
+        # ``.cpu()`` blocks until queued Metal work finishes and returns CPU
+        # tensors, which spawned self-play workers need.
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in live_model.state_dict().items()
+        }
+    # ``Tensor.cpu()`` aliases storage when a tensor is already on CPU.
+    return {
+        key: value.detach().clone()
+        for key, value in live_model.state_dict().items()
+    }
+
+
+def _new_grad_scaler(device, **kwargs) -> GradScaler:
+    """GradScaler bound to the training device's AMP backend.
+
+    MPS needs its own scaler (the default one is CUDA's).  Every other device
+    keeps the historical ``GradScaler()`` -- CUDA's -- which on a CPU-only run
+    disables itself exactly as it always has.
+    """
+    if getattr(device, 'type', None) == 'mps':
+        return GradScaler('mps', **kwargs)
+    return GradScaler(**kwargs)
+
+
+def _match_optimizer_state_layout(optimizer: optim.Optimizer) -> int:
+    """Re-lay each per-parameter optimizer tensor out like its parameter.
+
+    ``Optimizer.load_state_dict()`` moves moments to the parameter's device
+    and dtype but keeps the strides they were saved with.  CUDA trains conv
+    weights in channels_last while MPS/CPU keep them contiguous, so a
+    checkpoint crossing between the two leaves ``exp_avg``/``exp_avg_sq``
+    strided differently from their parameters -- which the fused AdamW
+    kernel rejects ("params, grads, exp_avgs, and exp_avg_sqs must have same
+    dtype, device, and layout").  Values are copied unchanged; a checkpoint
+    written on the same backend matches already and is left untouched.
+    Returns the number of tensors re-laid out.
+    """
+    relaid = 0
+    for group in optimizer.param_groups:
+        for param in group['params']:
+            state = optimizer.state.get(param)
+            if not state:
+                continue
+            for key, value in state.items():
+                if (isinstance(value, torch.Tensor)
+                        and value.shape == param.shape
+                        and value.stride() != param.stride()):
+                    state[key] = torch.empty_strided(
+                        param.size(), param.stride(),
+                        dtype=value.dtype, device=value.device,
+                    ).copy_(value)
+                    relaid += 1
+    return relaid
+
+
+def _autocast_enabled(device, amp: bool) -> bool:
+    """Whether the training/validation forward runs under torch.autocast.
+
+    CUDA always (when AMP is configured), MPS when this build's autocast
+    supports it, CPU never -- a CPU run used to enter a CUDA autocast region,
+    which is a no-op for CPU tensors, so it stays full precision.
+    """
+    return bool(amp) and ml_device.amp_supported(device)
+
+
+def _gpu_memory_allocated_mb(device) -> float:
+    """Allocated accelerator memory for logs/stats, in MB.
+
+    Non-MPS devices keep the historical ``torch.cuda.memory_allocated()``
+    reading; on MPS it is the Metal allocator's live-tensor total.
+    """
+    if getattr(device, 'type', None) == 'mps':
+        return ml_device.memory_allocated(device) / 1e6
+    return torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+
+
+def _shutdown_selfplay_executor(executor, timeout: float = 5.0) -> None:
+    """Tear down a self-play pool without waiting indefinitely.
+
+    ``ProcessPoolExecutor``'s context manager always calls ``shutdown(wait=True)``
+    on exit.  That can deadlock when a worker has completed its future but is
+    stuck during process teardown.  Keep references to the private worker
+    processes before the non-blocking shutdown clears them, give all workers a
+    single bounded grace period, and escalate only the workers that remain.
+
+    The helper deliberately does not touch futures or their bookkeeping.  The
+    caller therefore retains its ``unfinished`` batches for the sequential
+    fallback path when the pool is broken or a stop is requested.
+    """
+    process_map = getattr(executor, '_processes', None) or {}
+    processes = tuple(process_map.values())
+    manager_thread = getattr(executor, '_executor_manager_thread', None)
+
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        # Escalation below is still useful if shutdown itself races with a
+        # broken pool or a test double has a narrower shutdown signature.
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    try:
+        timeout = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        timeout = 5.0
+    deadline = time.monotonic() + timeout
+
+    def _alive(process) -> bool:
+        try:
+            return bool(process.is_alive())
+        except (AssertionError, OSError, ValueError):
+            return False
+
+    def _wait_until(deadline_value: float) -> list:
+        while True:
+            alive = [process for process in processes if _alive(process)]
+            remaining = deadline_value - time.monotonic()
+            if not alive or remaining <= 0.0:
+                return alive
+            time.sleep(min(0.05, remaining))
+
+    lingering = _wait_until(deadline)
+    for process in lingering:
+        try:
+            process.terminate()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    # Termination is normally immediate, but give all workers one short,
+    # shared grace window before resorting to SIGKILL.  No per-worker unbounded
+    # join is allowed here.
+    terminate_deadline = time.monotonic() + min(1.0, max(0.1, timeout))
+    lingering = _wait_until(terminate_deadline)
+    for process in lingering:
+        try:
+            kill = getattr(process, 'kill', None)
+            if callable(kill):
+                kill()
+            else:
+                process.terminate()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    # Reap what we can, including the manager thread, with one final shared
+    # deadline.  This is bounded even when a fake or native process ignores
+    # termination signals.
+    reap_deadline = time.monotonic() + 1.0
+    for process in processes:
+        join = getattr(process, 'join', None)
+        if not callable(join):
+            continue
+        remaining = reap_deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        try:
+            join(timeout=remaining)
+        except (AssertionError, OSError, ValueError):
+            pass
+    if manager_thread is not None:
+        remaining = reap_deadline - time.monotonic()
+        if remaining > 0.0:
+            try:
+                manager_thread.join(timeout=remaining)
+            except (RuntimeError, OSError, ValueError):
+                pass
+
+
+def _consume_and_release_selfplay_batch(
+    entries_data: list[dict], batch_game_count: int, consumer
+) -> None:
+    """Transfer a worker result to its durable owners, then empty the Future.
+
+    ``Future.result()`` returns the same list retained by the Future itself.
+    The unified pool keeps those Future objects through cycle teardown, so an
+    otherwise consumed batch remains live unless its list is cleared in place.
+    Replay, collection, and preprocessing owners take their references inside
+    ``consumer`` before this ownership boundary releases the delivery list.
+    """
+
+    try:
+        consumer(entries_data, batch_game_count)
+    finally:
+        entries_data.clear()
+
+
+def _selfplay_batch_result_is_complete(entries_data, batch) -> bool:
+    """Return whether worker records match every requested game and source."""
+    expected: dict[str, str] = {}
+    for task in batch:
+        if len(task) >= 12:  # extended ML task
+            game_id = task[11]
+            max_moves = task[1]
+            trajectory_source = task[10]
+        elif len(task) >= 9:  # extended algorithm task
+            game_id = task[8]
+            max_moves = task[2]
+            trajectory_source = task[7]
+        else:
+            return False
+        try:
+            emits_positions = int(max_moves) > 0
+        except (TypeError, ValueError):
+            return False
+        if emits_positions:
+            if not isinstance(game_id, str) or not game_id:
+                return False
+            if not isinstance(trajectory_source, str) or not trajectory_source:
+                return False
+            # A duplicated task id cannot prove that both requested games ran:
+            # every position record would collapse onto the same identity.
+            if game_id in expected:
+                return False
+            expected[game_id] = trajectory_source
+
+    seen: set[str] = set()
+    for entry in entries_data:
+        # The consumer mutates provenance onto each record, so accepting a
+        # read-only Mapping here would only defer failure until annotation.
+        if not isinstance(entry, dict):
+            return False
+        game_id = entry.get('game_id')
+        if not isinstance(game_id, str) or not game_id:
+            return False
+        if entry.get('trajectory_source') != expected.get(game_id):
+            return False
+        seen.add(game_id)
+    return seen == expected.keys()
+
+
+def _summarize_selfplay_batch(
+    entries_data: list[dict], num_games: int,
+) -> tuple[dict[str, int], list[int]]:
+    """Count outcomes once per game and recorded plies after the opening.
+
+    Called only after game/source completeness validation. Results are relative
+    to each row's player, and interleaved workers need not group rows by game.
+    Malformed or conflicting outcomes stay unknown; telemetry must not invent
+    draws or reject a batch that the existing generation contract accepts.
+    """
+    games = {}
+    for entry in entries_data:
+        game_id = entry['game_id']
+        result = entry.get('result')
+        state = entry.get('state')
+        turn = state.get('turn') if isinstance(state, dict) else None
+        outcome = 'unknown'
+        if (not isinstance(turn, bool) and not isinstance(result, bool)
+                and turn in (1, 2) and result in (-1, 0, 1)):
+            if result == 0:
+                outcome = 'draw'
+            else:
+                winner = turn if result == 1 else 3 - turn
+                outcome = 'p1_win' if winner == 1 else 'p2_win'
+        if game_id in games:
+            game = games[game_id]
+            game[0] += 1
+            if game[1] != outcome:
+                game[1] = 'unknown'
+        else:
+            games[game_id] = [1, outcome]
+
+    # Zero-move tasks legitimately return no rows. Their outcome is unavailable
+    # through this worker protocol, but they must still appear in length stats.
+    missing = max(0, num_games - len(games))
+    results = {'p1_win': 0, 'p2_win': 0, 'draw': 0, 'unknown': missing}
+    lengths = [0] * missing
+    for length, outcome in games.values():
+        results[outcome] += 1
+        lengths.append(length)
+    return results, lengths
+
+
+def _make_compiled_fwd_loss(model, compile_mode):
+    """Build and compile a fused forward_padded + loss function.
+
+    Keeping forward and loss in one compiled graph lets the inductor fuse
+    kernels across the boundary and capture everything in a single CUDAGraph,
+    eliminating per-kernel launch overhead from separate forward and loss calls.
+
+    NaN/Inf loss is replaced with 0.0 inside the graph via nan_to_num. Return
+    the detached original scalar as well, so sampled diagnostics can distinguish
+    that replacement from a legitimate zero without a per-step CUDA sync.
+    Sanitizing the scalar does not establish that backward gradients are finite.
+    """
+    def _fwd_loss(boards, move_features, move_counts, targets, reward_weights):
+        # Forward — model.forward_padded is inlined by the compiler
+        scores = model.forward_padded(boards, move_features, move_counts)
+
+        # Loss — inlined from _compute_loss_padded for single-graph capture.
+        # move_counts/targets are int32 (sufficient for 0-32 range);
+        # cast to int64 once for gather (which requires LongTensor).
+        no_moves = move_counts == 0
+        stable = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
+        # dtype= fuses the bf16→f32 upcast into the softmax kernel,
+        # eliminating a separate cast kernel launch (~5μs per batch).
+        log_probs = nn.functional.log_softmax(stable, dim=1, dtype=torch.float32)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+        max_m = scores.shape[1]
+        safe_tgt = targets.long().clamp(0, max_m - 1).unsqueeze(1)
+        chosen_lp = log_probs.gather(1, safe_tgt).squeeze(1)
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
+        w = reward_weights.float() * valid.float()
+        tw = w.sum().clamp(min=1.0)
+        loss = -(chosen_lp * w).sum() / tw
+
+        # Preserve the original scalar for sampled sanitization diagnostics.
+        raw_loss = loss.detach()
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return loss, scores.detach(), raw_loss
+
+    return torch.compile(_fwd_loss, mode=compile_mode, fullgraph=True)
+
+
+def _make_compiled_fwd_loss_value(model, compile_mode, value_weight):
+    """Build and compile a fused forward_padded_with_value + policy+value loss.
+
+    Same benefits as _make_compiled_fwd_loss (kernel fusion, CUDAGraph capture,
+    inline NaN sanitization) but includes the value head path.  Previously,
+    value_head_enabled forced fallback to model-only compilation — losing the
+    fused loss benefit that eliminates ~30% of kernel launch overhead.
+    """
+    def _fwd_loss_value(boards, move_features, move_counts, targets,
+                        reward_weights, value_targets):
+        # Forward — shared backbone → policy scores + value predictions
+        scores, values = model.forward_padded_with_value(
+            boards, move_features, move_counts)
+
+        # Policy loss (inlined from _compute_loss_padded)
+        no_moves = move_counts == 0
+        stable = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
+        log_probs = nn.functional.log_softmax(stable, dim=1, dtype=torch.float32)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+        max_m = scores.shape[1]
+        safe_tgt = targets.long().clamp(0, max_m - 1).unsqueeze(1)
+        chosen_lp = log_probs.gather(1, safe_tgt).squeeze(1)
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
+        w = reward_weights.float() * valid.float()
+        tw = w.sum().clamp(min=1.0)
+        policy_loss = -(chosen_lp * w).sum() / tw
+
+        # Value loss (MSE)
+        value_loss = nn.functional.mse_loss(values, value_targets)
+
+        loss = policy_loss + value_weight * value_loss
+
+        raw_loss = loss.detach()
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return loss, scores.detach(), raw_loss
+
+    return torch.compile(_fwd_loss_value, mode=compile_mode, fullgraph=True)
+
+
+def parse_duration(duration_str: Optional[str]) -> Optional[datetime]:
+    """Parse duration string and return the stop time.
+    
+    Supported formats:
+    - Nd or Ndays (e.g., 2d, 2days) - N days
+    - Nh or Nhours (e.g., 4h, 4hours) - N hours  
+    - Nm or Nmin (e.g., 30m, 30min) - N minutes
+    - Combined (e.g., 1d12h, 2d6h30m) - multiple units
+    """
+    if not duration_str:
+        return None
+    
+    duration_str = duration_str.strip().lower()
+    
+    import re
+    from datetime import timedelta
+    
+    total_seconds = 0
+    
+    # Match patterns like 2d, 4h, 30m
+    patterns = [
+        (r'(\d+)\s*d(?:ays?)?', 86400),   # days
+        (r'(\d+)\s*h(?:ours?)?', 3600),    # hours
+        (r'(\d+)\s*m(?:in(?:utes?)?)?', 60),  # minutes
+        (r'(\d+)\s*s(?:ec(?:onds?)?)?', 1),   # seconds
+    ]
+    
+    matched_any = False
+    for pattern, multiplier in patterns:
+        for match in re.finditer(pattern, duration_str):
+            total_seconds += int(match.group(1)) * multiplier
+            matched_any = True
+    
+    if not matched_any:
+        # Try parsing as plain number (assume hours)
+        try:
+            hours = float(duration_str)
+            total_seconds = int(hours * 3600)
+            matched_any = True
+        except ValueError:
+            pass
+    
+    if not matched_any or total_seconds <= 0:
+        raise ValueError(f"Could not parse duration '{duration_str}'. Use format like: 2d, 4h, 30m, 1d12h, 2days, etc.")
+    
+    stop_time = datetime.now() + timedelta(seconds=total_seconds)
+    return stop_time
+
+
+def _parse_rest_duration(duration_str: str) -> int:
+    """Parse a duration string like '5m', '1m30s', '10m' into total seconds."""
+    import re
+    duration_str = duration_str.strip().lower()
+    total = 0
+    for match in re.finditer(r'(\d+)\s*([hms])', duration_str):
+        value, unit = int(match.group(1)), match.group(2)
+        if unit == 'h':
+            total += value * 3600
+        elif unit == 'm':
+            total += value * 60
+        elif unit == 's':
+            total += value
+    if total == 0:
+        # Fallback: try as plain integer (assume minutes)
+        try:
+            total = int(float(duration_str)) * 60
+        except ValueError:
+            total = 300  # default 5 minutes
+    return total
+
+
+def _eval_expr(value):
+    """Evaluate simple arithmetic expressions from YAML config values.
+
+    YAML doesn't support math, so ``8192*2`` is parsed as the string
+    ``"8192*2"`` instead of ``16384``.  This helper safely evaluates
+    expressions that contain only integers, floats, and the operators
+    ``+ - * / // **`` (plus parentheses and whitespace).
+
+    Non-string values and strings that aren't arithmetic expressions are
+    returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    import re
+    # Only allow digits, decimal points, operators, parens, whitespace
+    if not re.fullmatch(r'[\d\s\+\-\*\/\.\(\)]+', value):
+        return value
+    try:
+        result = eval(value, {"__builtins__": {}})  # noqa: S307
+        # Preserve int when possible (e.g. 8192*2 -> 16384, not 16384.0)
+        if isinstance(result, float) and result == int(result):
+            result = int(result)
+        return result
+    except Exception:
+        return value
+
+
+_STATS_HISTORY_CAP = 10000  # Max entries per history list (trim oldest on overflow)
+# Private hand-off metadata used only between _snapshot_stats() and _save_stats().
+# It is removed before JSON publication, so the durable stats schema is unchanged.
+_STATS_WRITE_GENERATION_KEY = "__dama_stats_write_generation"
+
+
+@dataclass
+class TrainingStats:
+    """Training statistics tracking."""
+    start_time: str = ""
+    end_time: str = ""
+    total_steps: int = 0
+    epochs_completed: int = 0
+    current_train_loss: Optional[float] = None
+    current_dataset_best_train_loss: float = float('inf')
+    historical_best_train_loss: float = float('inf')
+    dataset_fingerprint: str = ""
+    dataset_metadata: dict = field(default_factory=dict)
+    generation_cycles_completed: int = 0
+    best_teacher_agreement: float = 0.0
+    best_loss: float = float('inf')
+    best_val_loss: float = float('inf')
+
+    # History deques — maxlen=_STATS_HISTORY_CAP provides O(1) eviction of
+    # oldest entries, replacing the old O(n) list slice + reallocation that
+    # fired every ~10K appends.  Deques also avoid the GC spike from discarding
+    # the old list object (which held ~10K dicts = ~200K Python objects).
+    # to_dict() converts to list for JSON; from_dict() wraps back to deque.
+    loss_history: object = None
+    val_loss_history: object = None
+    lr_history: object = None
+    gpu_mem_history: object = None
+    step_times: object = None
+    test_history: list = None  # Model vs algorithm test results (low-volume, list is fine)
+    teacher_agreement_history: list = None
+    promotion_history: list = None
+    acceptance_history: list = None
+
+    def __post_init__(self):
+        _cap = _STATS_HISTORY_CAP
+        if self.loss_history is None:
+            self.loss_history = deque(maxlen=_cap)
+        elif not isinstance(self.loss_history, deque):
+            self.loss_history = deque(self.loss_history, maxlen=_cap)
+        if self.val_loss_history is None:
+            self.val_loss_history = deque(maxlen=_cap)
+        elif not isinstance(self.val_loss_history, deque):
+            self.val_loss_history = deque(self.val_loss_history, maxlen=_cap)
+        if self.lr_history is None:
+            self.lr_history = deque(maxlen=_cap)
+        elif not isinstance(self.lr_history, deque):
+            self.lr_history = deque(self.lr_history, maxlen=_cap)
+        if self.gpu_mem_history is None:
+            self.gpu_mem_history = deque(maxlen=_cap)
+        elif not isinstance(self.gpu_mem_history, deque):
+            self.gpu_mem_history = deque(self.gpu_mem_history, maxlen=_cap)
+        if self.step_times is None:
+            self.step_times = deque(maxlen=_cap)
+        elif not isinstance(self.step_times, deque):
+            self.step_times = deque(self.step_times, maxlen=_cap)
+        if self.test_history is None:
+            self.test_history = []
+        if self.teacher_agreement_history is None:
+            self.teacher_agreement_history = []
+        if self.promotion_history is None:
+            self.promotion_history = []
+        if self.acceptance_history is None:
+            self.acceptance_history = []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization.
+
+        Returns shallow copies of all mutable lists so the dict is safe to
+        pass to a background thread (e.g., for async checkpoint writes) while
+        the main thread continues to append to the originals.
+
+        float('inf') values are serialized as None to produce valid JSON
+        (Python's json.dump writes 'Infinity' which is non-standard).
+        """
+        import math
+        _historical = self.historical_best_train_loss
+        _dataset_best = self.current_dataset_best_train_loss
+        _bvl = self.best_val_loss
+        return {
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'total_steps': self.total_steps,
+            'epochs_completed': self.epochs_completed,
+            'current_train_loss': self.current_train_loss,
+            'current_dataset_best_train_loss': (
+                _dataset_best if math.isfinite(_dataset_best) else None
+            ),
+            'historical_best_train_loss': (
+                _historical if math.isfinite(_historical) else None
+            ),
+            # Legacy key retained for older report readers. It is explicitly
+            # historical and is never used for checkpoint promotion.
+            'best_loss': _historical if math.isfinite(_historical) else None,
+            'best_val_loss': _bvl if math.isfinite(_bvl) else None,
+            'dataset_fingerprint': self.dataset_fingerprint,
+            'dataset_metadata': dict(self.dataset_metadata),
+            'generation_cycles_completed': self.generation_cycles_completed,
+            'best_teacher_agreement': self.best_teacher_agreement,
+            'loss_history': list(self.loss_history),
+            'val_loss_history': list(self.val_loss_history),
+            'lr_history': list(self.lr_history),
+            'gpu_mem_history': list(self.gpu_mem_history),
+            'step_times': list(self.step_times),
+            'test_history': list(self.test_history),
+            'teacher_agreement_history': list(self.teacher_agreement_history),
+            'promotion_history': list(self.promotion_history),
+            'acceptance_history': list(self.acceptance_history),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TrainingStats':
+        """Create from dictionary.
+
+        JSON deserialization returns Python lists; __post_init__ converts
+        them to deques with maxlen so eviction is automatic.
+
+        Handles backwards compatibility:
+        - None best_loss/best_val_loss → float('inf') (from to_dict inf→None)
+        - Unix timestamp floats in loss_history → ISO strings (from older code)
+        """
+        # Normalize old Unix-float timestamps in loss_history to ISO strings
+        loss_history = data.get('loss_history', [])
+        for entry in loss_history:
+            ts = entry.get('timestamp')
+            if isinstance(ts, (int, float)):
+                entry['timestamp'] = datetime.fromtimestamp(ts).isoformat()
+
+        _legacy_best = data.get('best_loss')
+        _historical = data.get('historical_best_train_loss', _legacy_best)
+        _dataset_best = data.get('current_dataset_best_train_loss')
+        _bvl = data.get('best_val_loss')
+        return cls(
+            start_time=data.get('start_time', ''),
+            end_time=data.get('end_time', ''),
+            total_steps=data.get('total_steps', 0),
+            epochs_completed=data.get('epochs_completed', 0),
+            current_train_loss=data.get('current_train_loss'),
+            current_dataset_best_train_loss=(
+                float('inf') if _dataset_best is None else _dataset_best
+            ),
+            historical_best_train_loss=(
+                float('inf') if _historical is None else _historical
+            ),
+            dataset_fingerprint=data.get('dataset_fingerprint', ''),
+            dataset_metadata=data.get('dataset_metadata', {}),
+            generation_cycles_completed=int(
+                data.get('generation_cycles_completed', 0)),
+            best_teacher_agreement=float(data.get('best_teacher_agreement', 0.0) or 0.0),
+            best_loss=float('inf') if _legacy_best is None else _legacy_best,
+            best_val_loss=float('inf') if _bvl is None else _bvl,
+            loss_history=loss_history,
+            val_loss_history=data.get('val_loss_history', []),
+            lr_history=data.get('lr_history', []),
+            gpu_mem_history=data.get('gpu_mem_history', []),
+            step_times=data.get('step_times', []),
+            test_history=data.get('test_history', []),
+            teacher_agreement_history=data.get('teacher_agreement_history', []),
+            promotion_history=data.get('promotion_history', []),
+            acceptance_history=data.get('acceptance_history', []),
+        )
+
+
+_STAGE_MUTABLE_PATH_FIELDS = (
+    'checkpoint_dir',
+    'runtime_model_root',
+    'latest_path',
+    'promoted_path',
+    'accepted_path',
+    'replay_dir',
+    'log_dir',
+    'stats_file',
+    'promotion_registry',
+    'acceptance_dir',
+    'stats_output_dir',
+    'snapshot_root',
+    'ram_cache_file',
+)
+
+_STAGE_MUTABLE_DIRECTORY_FIELDS = frozenset({
+    'checkpoint_dir',
+    'runtime_model_root',
+    'replay_dir',
+    'log_dir',
+    'acceptance_dir',
+    'stats_output_dir',
+    'snapshot_root',
+})
+
+_OUTPUT_NAMESPACE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
+
+# A recovery anchor is always an immutable numbered checkpoint.  Aliases
+# (latest/promoted/accepted) are republished in place, so pinning one would
+# make the "resume-only from a preserved checkpoint" rule unverifiable.
+_RECOVERY_ANCHOR_NAME_RE = re.compile(r'^model_step_\d+\.pt$')
+
+
+def _recovery_lineage_payload_matches(
+    checkpoint: Any,
+    baseline_sha256: str,
+    training_stage: str,
+) -> bool:
+    """True when a loaded checkpoint carries the approved recovery lineage stamp.
+
+    Audit Suggestion 7.  Every checkpoint this experiment writes records the
+    anchor it descends from (``recovery_experiment``), so descent from the
+    pinned baseline is a property of the artifact rather than of who launched
+    it.  Finiteness is checked here too: a checkpoint holding NaN weights is
+    not a valid continuation point even when its lineage is impeccable.
+    """
+    if not isinstance(checkpoint, dict):
+        return False
+    lineage = checkpoint.get('recovery_experiment')
+    if not isinstance(lineage, dict) or not lineage.get('enabled'):
+        return False
+    if (
+        str(lineage.get('baseline_sha256') or '').upper()
+        != str(baseline_sha256 or '').upper()
+    ):
+        return False
+    if lineage.get('training_stage') != training_stage:
+        return False
+    state_dict = checkpoint.get('model_state_dict')
+    if not isinstance(state_dict, dict) or not state_dict:
+        return False
+    tensors = [
+        value for value in state_dict.values()
+        if isinstance(value, torch.Tensor)
+    ]
+    # A payload with no weights proves nothing about finiteness: a
+    # metadata-only state dict must not pass as a continuation point.
+    if not tensors:
+        return False
+    return all(torch.isfinite(value).all() for value in tensors)
+
+
+def recovery_checkpoint_continues_lineage(
+    path: Path,
+    baseline_sha256: str,
+    training_stage: str,
+) -> bool:
+    """True when ``path`` is a checkpoint proven to descend from the pinned anchor."""
+    try:
+        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    except Exception:
+        # Deliberately broad: a corrupt file raises arbitrary unpickler errors
+        # (pickle.UnpicklingError and EOFError are not subclasses of the
+        # ValueError/RuntimeError family), and every caller treats "cannot
+        # load" as "not a verified continuation point". Never let one
+        # truncated file crash the resume scan or dead-epoch rollback.
+        return False
+    return _recovery_lineage_payload_matches(
+        checkpoint, baseline_sha256, training_stage)
+
+
+def _checkpoint_step_number(path: Path) -> int:
+    try:
+        return int(path.stem.rsplit('_', 1)[-1])
+    except ValueError:
+        return -1
+
+
+def newest_verified_recovery_continuation(
+    checkpoint_dir: str | Path,
+    baseline_sha256: str,
+    training_stage: str,
+    *,
+    max_step: Optional[int] = None,
+) -> Optional[Path]:
+    """Newest numbered checkpoint in ``checkpoint_dir`` that continues the lineage.
+
+    Audit Suggestion 7.  Deliberately scoped to one directory: a stamped
+    checkpoint sitting in a foreign namespace is still refused, because the
+    isolation guarantee the continuation namespace exists to provide is
+    per-directory.  Returns ``None`` when the namespace holds no verified
+    checkpoint, which is the normal state on the very first launch.
+    """
+    directory = Path(checkpoint_dir)
+    if not directory.is_dir():
+        return None
+    candidates = sorted(
+        directory.glob('model_step_*.pt'),
+        key=_checkpoint_step_number,
+        reverse=True,
+    )
+    for candidate in candidates:
+        step = _checkpoint_step_number(candidate)
+        if step < 0 or (max_step is not None and step > max_step):
+            continue
+        if recovery_checkpoint_continues_lineage(
+            candidate, baseline_sha256, training_stage
+        ):
+            return candidate.resolve()
+    return None
+
+
+# Hand-off sentinel from the background producer to the collector: the freshly
+# admitted snapshot's held-out entry set is provably identical to the one behind
+# the currently published validation tensors, so the collector must keep those
+# tensors instead of clearing or rebuilding them.
+_VALIDATION_TENSORS_CURRENT = object()
+
+# Free-RAM floor for retaining the assembled train window's CPU tensors between
+# admissions for per-shard reuse. Once the replaced window is released, free
+# RAM must still exceed this floor by one more window (Journal Pass 569).
+# Below it the cache is dropped and the next admission takes the full parse path.
+_TRAIN_WINDOW_CACHE_MIN_FREE_GB = 4.0
+# Tensorize at shard boundaries so parsing does not retain a whole window's
+# Python object graph beside the old cache and forked preprocessing workers.
+_TRAIN_WINDOW_PARSE_CHUNK_ENTRIES = 250_000
+
+
+@dataclass
+class TrainingConfig:
+    """Training configuration."""
+    # Device settings
+    device: str = 'cuda'
+    amp: bool = True
+    amp_dtype: str = 'float16'  # 'float16' or 'bfloat16' (bfloat16 recommended for the server GPU)
+    compile_model: bool = True
+    compile_mode: str = 'reduce-overhead'
+    matmul_precision: str = 'medium'  # 'highest', 'high', 'medium' — medium enables TF32
+
+    # Model architecture settings
+    model_channels: int = 64       # CNN channels in ResidualBlocks
+    model_blocks: int = 4          # Number of residual blocks
+    model_embedding: int = 128     # Board embedding size
+    model_hidden: int = 64         # MoveScorer MLP hidden size
+
+    # Self-play settings
+    cpu_workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 2)))
+    selfplay_games: int = 500
+    selfplay_difficulties: list = field(default_factory=lambda: ['medium'])  # List of difficulties to cycle
+    selfplay_focus_side: str = 'both'  # white, black, both
+    selfplay_opponent_focus: str = 'both'  # ml, algorithm, both
+    selfplay_noise_prob: float = 0.1  # Probability of random move for exploration
+    selfplay_max_moves: int = 200  # Maximum moves per game
+    selfplay_opening_plies: tuple = (0, 2, 4, 6, 8)
+    selfplay_opening_seed: int = 20260819
+    symmetry_augmentation: str = 'none'
+    trajectory_algorithm_fraction: float = 0.70
+    trajectory_model_fraction: float = 0.30
+    teacher_difficulty: str = 'hard'
+    pipeline_mode: str = 'simultaneous'  # 'simultaneous' or 'alternate'
+    max_stale_epochs: int = 0  # Max epochs on unchanged data before yielding (0 = unlimited)
+    # Pause persistent background generation below this free-space floor.
+    # Zero preserves the historical unchecked behavior for generic configs.
+    selfplay_min_free_disk_gb: float = 0.0
+
+    # Algo-vs-algo data generation (pure algorithmic games as training data)
+    algo_vs_algo_enabled: bool = False
+    algo_vs_algo_games: int = 100  # Games per self-play epoch
+    algo_vs_algo_difficulties: list = field(default_factory=lambda: ['easy', 'medium', 'hard'])
+
+    # Training settings
+    batch_size: int = 256
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-5  # Weight decay for regularization
+    train_steps: int = 999999999  # Default to essentially indefinite
+    checkpoint_every: int = 1000
+
+    # Reward scoring mode:
+    #   'scoring'  - always use the scoring system reward weights
+    #   'none'     - never use scoring (uniform weights, classic behavior)
+    #   'cycle'    - alternate epochs: odd epochs use scoring, even epochs don't
+    reward_mode: str = 'cycle'
+
+    # Gradient accumulation: effective batch = batch_size * gradient_accumulation_steps.
+    # Allows larger effective batches on memory-constrained hardware without
+    # increasing VRAM usage.  Optimizer steps every N mini-batches.
+    gradient_accumulation_steps: int = 1
+
+    # Learning rate scheduler
+    lr_scheduler_enabled: bool = False
+    lr_scheduler_type: str = 'cosine_warm_restarts'  # CosineAnnealingWarmRestarts
+    lr_scheduler_T0: int = 500       # Steps for first cosine cycle
+    lr_scheduler_T_mult: int = 2     # Cycle length multiplier after each restart
+    lr_scheduler_eta_min: float = 1e-5  # Minimum LR
+    lr_warmup_steps: int = 0         # Linear warmup from 0 to base LR over N steps
+
+    # Value head / TD learning
+    value_head_enabled: bool = False
+    value_head_hidden: int = 128
+    value_weight: float = 0.15  # Weight of value loss relative to policy loss (85% policy / 15% value)
+    policy_stage: str = 'policy_only'
+    teacher_target_type: str = 'hard'
+    teacher_soft_temperature: float = 1.0
+    teacher_value_scale: float = 1000.0
+    teacher_score_depth: int = 3
+    teacher_hard_label_blend: float = 0.25
+    require_policy_gate_for_enhanced: bool = True
+
+    # DataLoader settings
+    dataloader_workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 2)))
+    pin_memory: bool = True
+    ram_cache_enabled: bool = True
+    ram_cache_threshold_gb: float = 8.0
+    ram_cache_file: Optional[str] = None
+    ram_cache_compress: bool = False
+    replay_max_entries: int = 100000  # Max entries to sample from replay buffer per epoch
+    clear_replay_after_load: bool = False  # Delete replay files after loading into memory
+    max_moves_per_sample: int = 32  # Padding width for move features (max legal moves ~20)
+
+    # Leakage-resistant validation and corpus snapshots
+    validation_enabled: bool = False
+    validation_fraction: float = 0.15
+    validation_split_seed: int = 20260819
+    validation_every_checkpoints: int = 1
+    frozen_suite_path: str = 'data/validation/frozen_hard_5000.jsonl'
+    frozen_suite_size: int = 5000
+    frozen_suite_seed: int = 20260819
+    frozen_suite_auto_create: bool = False
+    validation_tensor_cache_file: Optional[str] = None
+    validation_tensor_cache_compress: bool = False
+    teacher_agreement_threshold: float = 0.50
+    snapshot_enabled: bool = False
+    snapshot_root: str = 'data/corpus_snapshots'
+    snapshot_min_fresh_fraction: float = 0.50
+    # 0 keeps every admitted snapshot (historical behaviour). Each admission
+    # copies the whole replay corpus, so an unbounded root fills the volume on
+    # a long run; a positive value keeps only that many newest snapshots.
+    snapshot_max_retained: int = 0
+    # Hardlink shards unchanged since the previous snapshot instead of copying
+    # the whole corpus at every admission (digest-verified both before linking
+    # and on every load; see corpus._store_shard).  Cuts steady-state snapshot
+    # growth to only the new/rotated shards per cycle.
+    snapshot_reuse_previous_shards: bool = True
+    # Audit Suggestion 10. The identical lesson as snapshot_max_retained, never
+    # applied to checkpoints: ~52 MB every checkpoint_every steps is ~13 GB/day
+    # here, so a multi-day run exhausts the volume long before its time limit.
+    # 0 keeps every checkpoint (historical behaviour). A positive value keeps
+    # that many newest, plus -- unconditionally -- every checkpoint a promotion
+    # record marks as promoted and the checkpoint this run resumed from, so
+    # retention can never delete the artifact an acceptance claim rests on.
+    max_retained_checkpoints: int = 0
+    # Append-only growth of the whole-file validation hold-out so its realized
+    # share tracks validation_fraction as the rolling corpus expands. Held
+    # files are never released, so states only move train -> validation.
+    validation_grow_holdout: bool = True
+    # Generation of the whole-file hold-out artifact. Bumping it forces a fresh
+    # split under validation_v<N>/ and refuses to load the superseded one, so a
+    # contaminated hold-out is replaced rather than repaired in place.
+    validation_split_version: int = 1
+    # Approved external predecessor for a rebuilt corpus lineage, plus the
+    # fingerprints of snapshots that must never appear in it.
+    snapshot_lineage_base_manifest: Optional[str] = None
+    snapshot_lineage_base_fingerprint: Optional[str] = None
+    snapshot_lineage_excluded_fingerprints: tuple = ()
+    # Append-only all-time record of every shard/state served as training data.
+    # Off by default: enabling it writes a ledger directory into the snapshot
+    # root, and preserved historical namespaces must stay byte-immutable.
+    snapshot_trained_ledger_enabled: bool = False
+    snapshot_trained_ledger_seed_roots: tuple = ()
+
+    # Stability
+    grad_clip_norm: Optional[float] = 1.0
+
+    # Model testing settings
+    test_vs_algo: bool = False
+    test_promoted_only: bool = False
+    test_every: int = 5000  # Run tests every N steps
+    test_games: int = 50  # Number of test games per evaluation
+    # [Pass 109] Persist self-play JSONL on every cycle, not just the first.
+    # Without this the corpus never grows across restarts (see the background
+    # self-play loop). replay_max_files bounds the resulting disk usage.
+    persist_selfplay: bool = True
+    replay_max_files: int = 60
+    test_difficulty: str = 'medium'
+    # [Pass 109] Random-opening lengths (plies) cycled across test games.
+    # (0,) reproduces the old fixed GameState.initial() opening, which made a
+    # 50-game test only ~2 distinct games under a deterministic argmax model.
+    test_opening_plies: tuple = (0, 2, 4, 6, 8)
+    test_opening_seed: int = 20260819
+    test_opponents: tuple = ('random', 'easy')
+    test_confidence_method: str = 'wilson_score'
+    test_confidence_level: float = 0.95
+    random_match_score_threshold: float = 0.80
+    random_match_score_lower_bound: float = 0.70
+    easy_match_score_lower_bound: float = 0.50
+    easy_side_score_floor: float = 0.50
+    inference_depth: int = 1
+
+    # Statistics collection settings
+    stats_enabled: bool = True
+    stats_record_every: int = 10        # Record loss/grad every N steps
+    stats_system_every: int = 500       # Record GPU/CPU metrics every N steps
+    stats_model_health_every: int = 2000  # Record param norms every N steps
+    stats_score_dist_every: int = 50    # Record score distribution every N steps
+    stats_buffer_size: int = 50000      # Ring buffer size for high-frequency metrics
+    stats_flush_every: int = 5000       # Flush incremental stats to disk
+    progress_report_every_seconds: float = 30.0  # Regenerate dashboard at most this often
+    stats_output_dir: str = 'logs/stats'
+
+    # Paths
+    checkpoint_dir: str = 'models/checkpoints'
+    runtime_model_root: str = 'logs/runtime_models'
+    latest_path: str = 'models/latest.pt'
+    promoted_path: str = 'models/promoted.pt'
+    accepted_path: str = 'models/accepted.pt'
+    replay_dir: str = 'data/replay'
+    log_dir: str = 'logs'
+    stats_file: str = 'models/training_stats.json'
+    # One-time continuity seed for a new namespace: copied to stats_file only
+    # when that file does not yet exist, so the source is never mutated.  The
+    # three launcher shells implement this themselves; the trainer implements
+    # it too, or a GUI-spawned or bare `python -m dama.ai.ml.trainer` run would
+    # silently start a continuation with no training history.
+    stats_seed_file: Optional[str] = None
+    promotion_registry: str = 'logs/policy_distillation/promotions.jsonl'
+    acceptance_dir: str = 'logs/policy_distillation/acceptance'
+    # The gated enhanced stage derives a second, fully isolated mutable
+    # namespace from these two explicit tokens.  ``policy_output_paths`` and
+    # ``policy_gate_promotion_registry`` are populated in memory by
+    # activate_enhanced_stage(); the policy checkpoint, frozen suite, and gate
+    # registry remain read-only inputs rather than enhanced-stage outputs.
+    policy_output_namespace: Optional[str] = None
+    enhanced_output_namespace: Optional[str] = None
+    policy_output_paths: Dict[str, str] = field(default_factory=dict)
+    policy_gate_promotion_registry: Optional[str] = None
+
+    # Thermal protection
+    thermal_enabled: bool = False
+    thermal_temp_limit_c: int = 90        # Temperature threshold in Celsius
+    thermal_rest_seconds: int = 300       # Rest duration in seconds (parsed from duration string)
+    thermal_check_every: int = 30         # Check temperature every N seconds
+
+    # Resume
+    resume: Optional[str] = None
+    recovery_enforced: bool = False
+    recovery_baseline_path: Optional[str] = None
+    recovery_baseline_sha256: Optional[str] = None
+
+    # Time-based stopping
+    stop_time: Optional[datetime] = None  # Calculated from train_duration
+
+
+def _validated_output_namespace(value: Optional[str], label: str) -> str:
+    """Return one safe path-component token used for stage isolation."""
+    token = str(value or '').strip()
+    if not token or not _OUTPUT_NAMESPACE_RE.fullmatch(token):
+        raise ValueError(
+            f"{label} must be a non-empty path-component token containing "
+            "only letters, digits, underscores, and hyphens"
+        )
+    return token
+
+
+def _stage_path_overlap_failures(
+    policy_paths: Mapping[str, str],
+    enhanced_paths: Mapping[str, str],
+) -> list[str]:
+    """Find cross-stage mutable path equality and directory containment."""
+    failures: list[str] = []
+    resolved_policy = {
+        field: Path(value).resolve()
+        for field, value in policy_paths.items()
+    }
+    resolved_enhanced = {
+        field: Path(value).resolve()
+        for field, value in enhanced_paths.items()
+    }
+    for policy_field, policy_path in resolved_policy.items():
+        for enhanced_field, enhanced_path in resolved_enhanced.items():
+            if policy_path == enhanced_path:
+                failures.append(
+                    f"enhanced {enhanced_field} equals policy {policy_field}: "
+                    f"{enhanced_path}"
+                )
+                continue
+            if (
+                policy_field in _STAGE_MUTABLE_DIRECTORY_FIELDS
+                and policy_path in enhanced_path.parents
+            ):
+                failures.append(
+                    f"enhanced {enhanced_field} is inside policy "
+                    f"{policy_field}: {enhanced_path}"
+                )
+            if (
+                enhanced_field in _STAGE_MUTABLE_DIRECTORY_FIELDS
+                and enhanced_path in policy_path.parents
+            ):
+                failures.append(
+                    f"policy {policy_field} is inside enhanced "
+                    f"{enhanced_field}: {policy_path}"
+                )
+    return failures
+
+
+def _derive_enhanced_output_paths(config: TrainingConfig) -> None:
+    """Replace the policy namespace in every mutable output path atomically."""
+    if config.policy_output_paths or config.policy_gate_promotion_registry:
+        raise ValueError("Enhanced output namespace has already been activated")
+    policy_namespace = _validated_output_namespace(
+        config.policy_output_namespace, "policy_output_namespace")
+    enhanced_namespace = _validated_output_namespace(
+        config.enhanced_output_namespace, "enhanced_output_namespace")
+    if policy_namespace == enhanced_namespace:
+        raise ValueError("Policy and enhanced output namespaces must be distinct")
+    if policy_namespace in enhanced_namespace or enhanced_namespace in policy_namespace:
+        raise ValueError(
+            "Policy and enhanced output namespaces must not contain one another"
+        )
+
+    policy_paths: dict[str, str] = {}
+    enhanced_paths: dict[str, str] = {}
+    failures: list[str] = []
+    for field_name in _STAGE_MUTABLE_PATH_FIELDS:
+        raw_value = getattr(config, field_name, None)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            failures.append(f"{field_name} must be a non-empty path")
+            continue
+        if raw_value.count(policy_namespace) != 1:
+            failures.append(
+                f"{field_name} must contain policy namespace exactly once: "
+                f"{raw_value}"
+            )
+            continue
+        derived = raw_value.replace(policy_namespace, enhanced_namespace, 1)
+        policy_paths[field_name] = raw_value
+        enhanced_paths[field_name] = derived
+
+    if not failures:
+        failures.extend(_stage_path_overlap_failures(policy_paths, enhanced_paths))
+    if failures:
+        raise ValueError(
+            "Enhanced output namespace is unsafe: " + "; ".join(failures)
+        )
+
+    config.policy_output_paths = dict(policy_paths)
+    config.policy_gate_promotion_registry = policy_paths['promotion_registry']
+    for field_name, derived in enhanced_paths.items():
+        setattr(config, field_name, derived)
+
+
+def _enhanced_output_isolation_failures(config: TrainingConfig) -> list[str]:
+    """Validate the in-memory policy/enhanced split before any writes occur."""
+    failures: list[str] = []
+    try:
+        policy_namespace = _validated_output_namespace(
+            config.policy_output_namespace, "policy_output_namespace")
+        enhanced_namespace = _validated_output_namespace(
+            config.enhanced_output_namespace, "enhanced_output_namespace")
+    except ValueError as exc:
+        return [str(exc)]
+    if policy_namespace == enhanced_namespace:
+        failures.append("policy and enhanced namespaces are identical")
+    if policy_namespace in enhanced_namespace or enhanced_namespace in policy_namespace:
+        failures.append("policy and enhanced namespaces contain one another")
+
+    policy_paths = dict(config.policy_output_paths or {})
+    expected_fields = set(_STAGE_MUTABLE_PATH_FIELDS)
+    missing = sorted(expected_fields - set(policy_paths))
+    extra = sorted(set(policy_paths) - expected_fields)
+    if missing:
+        failures.append(f"policy output path map is missing: {missing}")
+    if extra:
+        failures.append(f"policy output path map has unknown fields: {extra}")
+
+    enhanced_paths: dict[str, str] = {}
+    for field_name in _STAGE_MUTABLE_PATH_FIELDS:
+        policy_value = policy_paths.get(field_name)
+        enhanced_value = getattr(config, field_name, None)
+        if not isinstance(policy_value, str) or not policy_value:
+            continue
+        if not isinstance(enhanced_value, str) or not enhanced_value:
+            failures.append(f"enhanced {field_name} is empty")
+            continue
+        expected_value = policy_value.replace(
+            policy_namespace, enhanced_namespace, 1)
+        if policy_value.count(policy_namespace) != 1:
+            failures.append(
+                f"policy {field_name} does not contain its namespace exactly once"
+            )
+        elif enhanced_value != expected_value:
+            failures.append(
+                f"enhanced {field_name} was not derived from policy path: "
+                f"{enhanced_value}"
+            )
+        enhanced_paths[field_name] = enhanced_value
+
+    expected_gate_registry = policy_paths.get('promotion_registry')
+    if (
+        not expected_gate_registry
+        or config.policy_gate_promotion_registry != expected_gate_registry
+    ):
+        failures.append(
+            "policy gate registry must remain the original read-only policy registry"
+        )
+    if not missing and not extra and len(enhanced_paths) == len(expected_fields):
+        failures.extend(_stage_path_overlap_failures(policy_paths, enhanced_paths))
+
+        # The enhanced-stage validator runs after activation, so the normal
+        # recovery alias checks below only see the *enhanced* paths.  Check the
+        # preserved policy paths as well: a mutated config must not be able to
+        # turn a policy alias into a numbered checkpoint (or place it inside
+        # the immutable policy checkpoint directory).
+        for stage_name, stage_paths in (
+            ('policy', policy_paths),
+            ('enhanced', enhanced_paths),
+        ):
+            checkpoint_dir = Path(stage_paths['checkpoint_dir']).resolve()
+            numbered_paths = (
+                set(checkpoint_dir.glob('model_step_*.pt'))
+                if checkpoint_dir.is_dir() else set()
+            )
+            for alias_name in ('latest_path', 'promoted_path', 'accepted_path'):
+                alias_path = Path(stage_paths[alias_name]).resolve()
+                if checkpoint_dir == alias_path or checkpoint_dir in alias_path.parents:
+                    failures.append(
+                        f"{stage_name} {alias_name} alias must remain outside "
+                        "its checkpoint directory"
+                    )
+                if re.fullmatch(r'model_step_\d+\.pt', alias_path.name):
+                    failures.append(
+                        f"{stage_name} {alias_name} alias cannot use a numbered "
+                        "checkpoint filename"
+                    )
+                if alias_path in numbered_paths:
+                    failures.append(
+                        f"{stage_name} {alias_name} alias targets an existing "
+                        "numbered checkpoint"
+                    )
+    return failures
+
+
+# IPC message types for GUI <-> trainer communication.  These mirror the
+# protocol constants in ui/training_panel.py, which cannot be imported here:
+# the GUI process loads that module without torch installed in scope, and
+# this module must stay importable headless.
+MSG_PAUSE = 'PAUSE'
+MSG_RESUME = 'RESUME'
+MSG_STOP = 'STOP'
+MSG_STATUS = 'STATUS'
+MSG_STATUS_REPLY = 'STATUS_REPLY'
+MSG_CHECKPOINT = 'CHECKPOINT'
+
+
+class Trainer:
+    """
+    Trainer for the move scorer model.
+
+    Supports:
+    - Self-play data generation
+    - Imitation learning from algorithmic AI
+    - Checkpoint saving and resume
+    - Mixed precision training
+    - IPC control for GUI integration
+    """
+
+    def __init__(self, config: TrainingConfig):
+        # Validate the recovery contract at the last common entry point, before
+        # creating directories, loading a model, or starting any worker.  CLI
+        # launchers and the GUI perform earlier checks for better diagnostics,
+        # but programmatic callers must not be able to bypass the resume-only
+        # lineage and validation gates.
+        validate_recovery_experiment_config(config)
+        self.config = config
+        experiment_seed = int(config.selfplay_opening_seed)
+        random.seed(experiment_seed)
+        np.random.seed(experiment_seed & 0xFFFFFFFF)
+        torch.manual_seed(experiment_seed)
+        ml_device.manual_seed_all(experiment_seed)
+
+        # Set up device.  'auto' picks CUDA, then Apple MPS, then CPU; the
+        # concrete choice is written back so everything downstream (stats
+        # snapshot, fused-optimizer gate) sees a real device name.
+        if config.device is None or str(config.device).strip().lower() == 'auto':
+            config.device = ml_device.resolve_device_type(config.device)
+            print(f"Device 'auto' resolved to: {config.device}")
+        if config.device == 'cuda' and not torch.cuda.is_available():
+            print("ERROR: CUDA requested but not available.")
+            print("\nTroubleshooting:")
+            if platform.system() == 'Darwin':
+                print("  Macs have no CUDA. Set device to 'mps' (Apple GPU), "
+                      "'auto', or 'cpu' (YAML device.type or --device).")
+            else:
+                print("  1. Ensure NVIDIA GPU driver is installed on Windows")
+                print("  2. Run 'nvidia-smi' to verify GPU access in WSL")
+                print("  3. Reinstall PyTorch with CUDA support")
+            sys.exit(1)
+        if torch.device(config.device).type == 'mps' and not ml_device.mps_available():
+            print("ERROR: MPS (Apple GPU) requested but not available.")
+            print("\nTroubleshooting:")
+            print("  1. MPS needs an Apple Silicon Mac on macOS 12.3 or newer")
+            print("  2. Python must run natively, not under Rosetta: "
+                  "python -c \"import platform; print(platform.machine())\" "
+                  "should print arm64")
+            print("  3. Check the PyTorch build: "
+                  "python -c \"import torch; print(torch.backends.mps.is_available())\"")
+            print("  Or set device to 'cpu' / 'auto'.")
+            sys.exit(1)
+
+        self.device = torch.device(config.device)
+        # Apply config-driven matmul precision (overrides module-level default)
+        torch.set_float32_matmul_precision(config.matmul_precision)
+        print(f"Using device: {self.device}")
+
+        if self.device.type == 'cuda':
+            print(f"GPU: {torch.cuda.get_device_name()}")
+            print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        elif self.device.type == 'mps':
+            # Unified memory: the GPU budget is Metal's recommended working
+            # set, carved out of the same RAM self-play workers use.
+            print(f"GPU: {ml_device.device_name(self.device)}")
+            print(f"GPU memory (unified, shared with CPU): "
+                  f"{ml_device.total_memory(self.device) / 1e9:.1f} GB")
+
+        # Set thread count for CPU operations — minimize to free cores for self-play.
+        # With GPU training (compiled forward+loss, GPU-resident data), the training
+        # thread does almost zero CPU work. 1 thread is sufficient for the rare
+        # CPU-side tensor ops (loss casting, index creation). Every extra thread here
+        # steals a core from self-play workers that need them.
+        # MPS counts as a GPU here: the Apple GPU runs the training compute.
+        _total_cores = os.cpu_count() or 1
+        _gpu_trains = ml_device.is_gpu(self.device)
+        if _gpu_trains:
+            cpu_threads = 1  # GPU handles all compute; 1 CPU thread for housekeeping
+        else:
+            cpu_threads = max(4, min(64, _total_cores // 2))
+        torch.set_num_threads(cpu_threads)
+        # Inter-op threads for parallel independent ops (e.g. data loading + compute)
+        interop_threads = 1 if _gpu_trains else max(2, min(4, _total_cores // 16))
+        try:
+            torch.set_num_interop_threads(interop_threads)
+        except Exception:
+            pass
+        print(f"CPU threads: {cpu_threads} intra-op, {interop_threads} inter-op (of {_total_cores} cores)")
+
+        # Create directories
+        _prepare_checkpoint_directory(config.checkpoint_dir)
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+
+        # Initialize components
+        self.model = create_model(
+            embedding_size=config.model_embedding,
+            num_blocks=config.model_blocks,
+            hidden_size=config.model_hidden,
+            channels=config.model_channels,
+            value_head_enabled=config.value_head_enabled,
+            value_head_hidden=config.value_head_hidden,
+        )
+        self.model.to(self.device)
+        # NHWC memory format for conv weights — cuDNN selects faster kernels
+        if self.device.type == 'cuda':
+            self.model = self.model.to(memory_format=torch.channels_last)
+
+        # Determine AMP dtype (must come before optimizer — fused AdamW is
+        # incompatible with GradScaler's grad_scale/found_inf kwargs).
+        self.amp_dtype = torch.float16
+        if config.amp:
+            if config.amp_dtype == 'bfloat16':
+                # MPS probes its own bf16 support; every other device keeps the
+                # historical CUDA query (False on a CUDA-less CPU run).
+                if self.device.type == 'mps':
+                    _bf16_ok = ml_device.bf16_supported(self.device)
+                else:
+                    _bf16_ok = torch.cuda.is_bf16_supported()
+                if _bf16_ok:
+                    self.amp_dtype = torch.bfloat16
+                    print("Using BFloat16 mixed precision (no GradScaler needed)")
+                else:
+                    print("BFloat16 not supported, falling back to Float16")
+                    self.amp_dtype = torch.float16
+            else:
+                print("Using Float16 mixed precision with GradScaler")
+
+        # GradScaler only needed for float16, not bfloat16
+        _needs_scaler = config.amp and self.amp_dtype == torch.float16
+        self.scaler = _new_grad_scaler(self.device) if _needs_scaler else None
+
+        # Use fused AdamW for faster training on CUDA (PyTorch 2.0+).
+        # Fused AdamW runs the entire optimizer step in a single CUDA kernel
+        # (vs ~N kernels for N parameter groups), reducing launch overhead.
+        # Disabled when GradScaler is active: the fused kernel can fall back to
+        # _single_tensor_adam which rejects GradScaler's grad_scale/found_inf.
+        # PyTorch ships a fused Metal kernel too, so MPS qualifies under the
+        # same no-scaler rule; the probe runs on the device actually used.
+        use_fused = False
+        if config.device in ('cuda', 'mps') and not _needs_scaler:
+            try:
+                _test_opt = optim.AdamW([torch.zeros(1, device=config.device)], fused=True)
+                del _test_opt
+                use_fused = True
+            except Exception:
+                pass
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            fused=use_fused,
+        )
+        if use_fused:
+            print("Using fused AdamW optimizer for faster training")
+
+        # Learning rate scheduler with optional warmup
+        self._build_scheduler()
+
+        self.replay_buffer = ReplayBuffer(
+            config.replay_dir,
+            max_files=config.replay_max_files,
+            # Snapshot training consumes closed shards through the verified
+            # corpus manager, never ReplayBuffer.load_all_entries().  Releasing
+            # their Python object graphs is essential on the 24 GB local host.
+            # See Journal Pass 183.
+            cache_written_entries=not config.snapshot_enabled,
+        )
+
+        # Training state
+        self.step = 0
+        self.best_loss = float('inf')
+        self.epoch = 0
+
+        # Control flags for IPC
+        self._paused = False
+        self._stopped = False
+        self._process_title_base = os.environ.get('PROCESS_TITLE')
+        self._process_title_setter = None
+        self._last_process_title = None
+
+        # GUI IPC queues (attached via set_control_queues when run from the
+        # GUI).  When attached, train() drains control messages and pushes
+        # status/checkpoint updates while it runs.
+        self._control_queue = None
+        self._status_queue = None
+        self._next_control_poll = 0.0
+        self._next_status_push = 0.0
+        self._control_lock = threading.Lock()
+
+        # Background self-play state
+        self._bg_selfplay_thread: Optional[threading.Thread] = None
+        self._bg_selfplay_entries: Optional[list] = None
+        self._bg_selfplay_dataset: Optional[CachedTensorDataset] = None
+        self._bg_selfplay_incremental: Optional[CachedTensorDataset] = None
+        self._bg_snapshot_manifest: Optional[dict] = None
+        self._bg_validation_entries: Optional[list] = None
+        # Identity of the held-out entry set a hand-off was built from, and the
+        # identity plus leakage accounting behind the currently published
+        # validation tensors. Guarded by _bg_selfplay_lock: the producer reads
+        # the published identity to decide whether re-parsing and re-tensorizing
+        # an unchanged hold-out can be skipped for a fresh admission.
+        self._bg_validation_identity: Optional[dict] = None
+        self._validation_tensor_identity: Optional[dict] = None
+        self._pending_validation_reuse_identity: Optional[dict] = None
+        # MPS only: CPU weights the training thread publishes for the
+        # background self-play thread (see _publish_selfplay_model_state).
+        self._selfplay_state_snapshot: Optional[dict] = None
+        self._bg_selfplay_lock = threading.Lock()
+        # Self-play copies live tensors while the training thread performs
+        # forwards and optimizer updates. Keep those short state boundaries
+        # exclusive so one behavior model cannot mix trainer revisions.
+        self._model_state_lock = threading.Lock()
+        # Duration expiry must stop the continuous producer without setting
+        # _stopped, which is reserved for an operator stop and controls the
+        # terminal run-status reason.
+        self._bg_selfplay_stop_event = threading.Event()
+        self._last_selfplay_dicts: Optional[list] = None
+        self._last_selfplay_preprocessed: Optional[CachedTensorDataset] = None
+        # A verified manifest-keyed tensor cache may satisfy the initial
+        # training window without rebuilding every ReplayEntry on a relaunch.
+        # The value is consumed immediately by _run_training and is never used
+        # for a newly admitted background snapshot.
+        self._preloaded_snapshot_dataset: Optional[CachedTensorDataset] = None
+        self._preloaded_snapshot_cache_metadata: Optional[dict] = None
+        self._preloaded_snapshot_cache_checked = False
+        # The held-out tensor cache is a separate, source-verified warm-start
+        # artifact.  It is consumed only by the initial immutable split.
+        self._preloaded_validation_dataset: Optional[CachedTensorDataset] = None
+        self._preloaded_validation_cache_metadata: Optional[dict] = None
+        # Per-file durable replay-cycle maxima.  Replay shards are immutable
+        # for normal operation, so avoid reparsing every line on each cycle;
+        # stat identity invalidates entries after a rewrite or append.
+        self._generation_cycle_file_cache: dict = {}
+        # Event signalled by the background thread when new data is ready.
+        # Replaces time.sleep(0.5) polling in the stale-data wait loop with
+        # zero-latency wakeup (~0ms vs up to 500ms).
+        self._data_ready_event = threading.Event()
+
+        # Background checkpoint write thread — tracked to avoid concurrent
+        # disk I/O from overlapping checkpoints.
+        self._checkpoint_thread: Optional[threading.Thread] = None
+        # Disk errors happen on the daemon writer rather than the training
+        # thread. Preserve the outcome so the next/final join can fail the run
+        # instead of reporting successful completion without a durable alias.
+        self._checkpoint_write_error: Optional[RuntimeError] = None
+        self._acceptance_thread: Optional[threading.Thread] = None
+        self._acceptance_queue: Queue = Queue()
+        self._acceptance_task_lock = threading.Lock()
+        self._acceptance_task_ids: set[str] = set()
+
+        # Padded training path flag (set when CachedTensorDataset is used)
+        self._use_padded = False
+
+        # Thermal protection state
+        self._last_thermal_check: float = 0.0  # time.time() of last check
+
+        # Training statistics. Checkpoint and acceptance workers can publish in
+        # parallel with the main progress writer. Atomic replace protects each
+        # individual file, while this generation gate also prevents a delayed
+        # older snapshot from replacing a newer one.
+        self._stats_write_lock = threading.RLock()
+        self._stats_snapshot_generation = 0
+        self._stats_persisted_generation = -1
+        self.stats = TrainingStats()
+        self._load_stats()
+        self._prelaunch_free_ram_gb: Optional[float] = None
+        self._runtime_model_dir: Optional[Path] = None
+        self._active_snapshot_manifest: Dict[str, Any] = {}
+        self._validation_entries = []
+        self._validation_dataloader = None
+        self._frozen_suite_entries = []
+        self._frozen_suite_manifest: Dict[str, Any] = {}
+        self._last_promotion_decision = None
+        self._snapshot_manager = None
+        if config.snapshot_enabled:
+            self._snapshot_manager = CorpusSnapshotManager(
+                replay_dir=config.replay_dir,
+                snapshot_root=config.snapshot_root,
+                validation_fraction=config.validation_fraction,
+                split_seed=config.validation_split_seed,
+                min_fresh_fraction=config.snapshot_min_fresh_fraction,
+                enforce_policy_contract=config.recovery_enforced,
+                allowed_opening_plies=config.selfplay_opening_plies,
+                max_retained_snapshots=config.snapshot_max_retained,
+                reuse_previous_shards=config.snapshot_reuse_previous_shards,
+                grow_holdout=config.validation_grow_holdout,
+                validation_split_version=config.validation_split_version,
+                lineage_base_manifest=config.snapshot_lineage_base_manifest,
+                lineage_base_fingerprint=(
+                    config.snapshot_lineage_base_fingerprint),
+                lineage_excluded_fingerprints=(
+                    config.snapshot_lineage_excluded_fingerprints),
+                trained_ledger_enabled=config.snapshot_trained_ledger_enabled,
+                trained_ledger_seed_roots=(
+                    config.snapshot_trained_ledger_seed_roots),
+            )
+        self._promotion_registry = PromotionRegistry(
+            config.promotion_registry,
+            agreement_threshold=config.teacher_agreement_threshold,
+        )
+        # Audit Suggestion 8: which run wrote a given artifact was not
+        # recoverable from the artifact.  Populated when the run marker opens;
+        # empty only for a Trainer that never reached train().
+        self._run_identity: Dict[str, Any] = {}
+        
+        # Timing for step tracking
+        self._last_step_time = None
+        self._last_progress_report_time = 0.0
+        self._last_progress_report_step = -1
+
+        # Enhanced statistics collector
+        self.stats_collector: Optional[StatsCollector] = None
+        if config.stats_enabled:
+            self.stats_collector = StatsCollector(
+                output_dir=config.stats_output_dir,
+                buffer_size=config.stats_buffer_size,
+                flush_every=config.stats_flush_every,
+            )
+            # Snapshot the config for the session report
+            self.stats_collector.set_config_snapshot({
+                'device': config.device,
+                'amp': config.amp,
+                'amp_dtype': config.amp_dtype,
+                'compile_model': config.compile_model,
+                'compile_mode': config.compile_mode,
+                'model_channels': config.model_channels,
+                'model_blocks': config.model_blocks,
+                'model_embedding': config.model_embedding,
+                'model_hidden': config.model_hidden,
+                'batch_size': config.batch_size,
+                'learning_rate': config.learning_rate,
+                'weight_decay': config.weight_decay,
+                'grad_clip_norm': config.grad_clip_norm,
+                'train_steps': config.train_steps,
+                'checkpoint_every': config.checkpoint_every,
+                'cpu_workers': config.cpu_workers,
+                'selfplay_games': config.selfplay_games,
+                'selfplay_difficulties': config.selfplay_difficulties,
+                'selfplay_noise_prob': config.selfplay_noise_prob,
+                'selfplay_max_moves': config.selfplay_max_moves,
+                'selfplay_min_free_disk_gb': config.selfplay_min_free_disk_gb,
+                'pipeline_mode': config.pipeline_mode,
+                'algo_vs_algo_enabled': config.algo_vs_algo_enabled,
+                'algo_vs_algo_games': config.algo_vs_algo_games,
+                'algo_vs_algo_difficulties': config.algo_vs_algo_difficulties,
+                'dataloader_workers': config.dataloader_workers,
+                'ram_cache_enabled': config.ram_cache_enabled,
+                'ram_cache_threshold_gb': config.ram_cache_threshold_gb,
+                'test_vs_algo': config.test_vs_algo,
+                'test_every': config.test_every,
+                'test_games': config.test_games,
+                'test_difficulty': config.test_difficulty,
+                'lr_scheduler_enabled': config.lr_scheduler_enabled,
+                'lr_scheduler_type': config.lr_scheduler_type,
+                'lr_scheduler_T0': config.lr_scheduler_T0,
+                'lr_scheduler_T_mult': config.lr_scheduler_T_mult,
+                'lr_scheduler_eta_min': config.lr_scheduler_eta_min,
+                'value_head_enabled': config.value_head_enabled,
+                'value_head_hidden': config.value_head_hidden,
+                'value_weight': config.value_weight,
+            })
+
+        if self._process_title_base:
+            try:
+                import setproctitle
+                self._process_title_setter = setproctitle.setproctitle
+                self._process_title_setter(self._process_title_base)
+            except Exception:
+                self._process_title_setter = None
+
+        # Logging
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = Path(config.log_dir) / f"train_{timestamp}.jsonl"
+
+        # Resume if specified
+        if config.resume:
+            self._load_checkpoint(config.resume)
+        if self.stats_collector:
+            self.stats_collector.set_training_start_step(self.step)
+
+        # Compile a fused forward+loss function for maximum performance.
+        # Fusing forward and loss in one compiled graph lets the inductor fuse
+        # kernels and capture everything in a single CUDAGraph.
+        # Falls back to model-only compilation if fused compile fails.
+        self._compiled_fwd_loss = None
+        if self.config.compile_model and hasattr(torch, "compile"):
+            # Guard: Triton's autotuner segfaults on small GPUs (e.g. RTX 5050)
+            # when reduce-overhead/max-autotune modes trigger CUDAGraph recording.
+            # Fall back to 'default' mode which still provides inductor operator
+            # fusion without CUDAGraphs — significant speedup vs eager mode.
+            _MIN_SM_COUNT = 64  # safe threshold; server GPU=104, A100=108, RTX 4090=128
+            # Compilation (Inductor + CUDAGraphs) is only exercised on CUDA;
+            # MPS and CPU run the same model eagerly.
+            if self.device.type == 'mps':
+                print("torch.compile: skipped on MPS (Inductor's Metal backend "
+                      "is experimental); running in eager mode")
+                sys.stdout.flush()
+            if ml_device.compile_supported(self.device):
+                _props = torch.cuda.get_device_properties(self.device)
+                _sm_count = _props.multi_processor_count
+                if _sm_count < _MIN_SM_COUNT and self.config.compile_mode in (
+                        'reduce-overhead', 'max-autotune'):
+                    print(f"GPU has {_sm_count} SMs (< {_MIN_SM_COUNT}): "
+                          f"using torch.compile mode='default' instead of "
+                          f"'{self.config.compile_mode}' "
+                          f"(avoids Triton autotuner crash)")
+                    sys.stdout.flush()
+                    self.config.compile_mode = 'default'
+                _warmup_bs = self.config.batch_size
+                _warmup_max_moves = self.config.max_moves_per_sample
+                _wb = torch.randn(_warmup_bs, 5, 8, 8, device=self.device)
+                _wm = torch.randn(_warmup_bs, _warmup_max_moves, 8, device=self.device)
+                _wc = torch.full((_warmup_bs,), 4, dtype=torch.int32, device=self.device)
+
+                # Stage 1: try fused forward+loss compilation.
+                # With value_head: fuses forward_padded_with_value + policy+value loss.
+                # Without value_head: fuses forward_padded + policy loss.
+                try:
+                    if config.value_head_enabled:
+                        print(f"Enabling torch.compile for fused forward+loss+value "
+                              f"(mode={self.config.compile_mode}, fullgraph=True)...")
+                        sys.stdout.flush()
+                        self._compiled_fwd_loss = _make_compiled_fwd_loss_value(
+                            self.model, self.config.compile_mode, config.value_weight)
+                        print("  Running compile warmup (fused forward+loss+value)...")
+                        sys.stdout.flush()
+                        _wt = torch.zeros(_warmup_bs, dtype=torch.int32, device=self.device)
+                        _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
+                        _wv = torch.zeros(_warmup_bs, dtype=torch.float32, device=self.device)
+                        with torch.no_grad():
+                            if self.config.amp:
+                                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                    self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr, _wv)
+                            else:
+                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr, _wv)
+                        del _wt, _wr, _wv
+                    else:
+                        print(f"Enabling torch.compile for fused forward+loss "
+                              f"(mode={self.config.compile_mode}, fullgraph=True)...")
+                        sys.stdout.flush()
+                        self._compiled_fwd_loss = _make_compiled_fwd_loss(
+                            self.model, self.config.compile_mode)
+                        print("  Running compile warmup (fused forward+loss)...")
+                        sys.stdout.flush()
+                        _wt = torch.zeros(_warmup_bs, dtype=torch.int32, device=self.device)
+                        _wr = torch.ones(_warmup_bs, dtype=torch.float32, device=self.device)
+                        with torch.no_grad():
+                            if self.config.amp:
+                                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                    self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                            else:
+                                self._compiled_fwd_loss(_wb, _wm, _wc, _wt, _wr)
+                        del _wt, _wr
+                    print("torch.compile warmup OK — compiled fused forward+loss active")
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"Fused compile failed ({e}), trying model-only compile...")
+                    sys.stdout.flush()
+                    self._compiled_fwd_loss = None
+
+                # Stage 2: model-only compilation — used as fallback when
+                # fused compile fails (Stage 1 now supports both policy-only
+                # and value_head paths via _make_compiled_fwd_loss_value).
+                if self._compiled_fwd_loss is None:
+                    try:
+                        _stage2_label = "fused compile unavailable"
+                        print(f"Enabling torch.compile for model forward "
+                              f"(mode={self.config.compile_mode}, {_stage2_label})...")
+                        sys.stdout.flush()
+                        compiled_model = torch.compile(
+                            self.model, mode=self.config.compile_mode, fullgraph=True)
+                        print("  Running compile warmup (model forward only)...")
+                        sys.stdout.flush()
+                        _total_moves = int(_wc.sum().item())
+                        _wm_flat = torch.randn(_total_moves, _wm.shape[-1], device=self.device)
+                        with torch.no_grad():
+                            if self.config.amp:
+                                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                                    compiled_model.forward_padded(_wb, _wm, _wc)
+                                    compiled_model(_wb, _wm_flat, _wc)
+                                    if config.value_head_enabled:
+                                        compiled_model.forward_padded_with_value(
+                                            _wb, _wm, _wc)
+                            else:
+                                compiled_model.forward_padded(_wb, _wm, _wc)
+                                compiled_model(_wb, _wm_flat, _wc)
+                                if config.value_head_enabled:
+                                    compiled_model.forward_padded_with_value(
+                                        _wb, _wm, _wc)
+                        del _wm_flat
+                        self.model = compiled_model
+                        print("torch.compile warmup OK — compiled model active (loss uncompiled)")
+                        sys.stdout.flush()
+                    except Exception as e2:
+                        print(f"torch.compile failed ({e2}), falling back to eager mode")
+                        sys.stdout.flush()
+
+                del _wb, _wm, _wc
+                torch.cuda.empty_cache()
+
+        self._recover_pending_checkpoint_acceptance()
+
+    # ------------------------------------------------------------------
+    # Thermal protection
+    # ------------------------------------------------------------------
+
+    # Lazily-initialised NVML handle — avoids subprocess per temp check
+    _nvml_handle = None
+    _nvml_failed = False
+
+    @classmethod
+    def _ensure_nvml(cls) -> bool:
+        """One-time NVML init; returns True if handle is available."""
+        if cls._nvml_handle is not None:
+            return True
+        if cls._nvml_failed:
+            return False
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            cls._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return True
+        except Exception:
+            cls._nvml_failed = True
+            return False
+
+    @classmethod
+    def _get_gpu_temperature(cls) -> Optional[float]:
+        """Read GPU temperature in Celsius. Prefers NVML (~0.1 ms) over
+        subprocess nvidia-smi (~50 ms)."""
+        # macOS exposes no GPU temperature to NVML, nvidia-smi or rocm-smi
+        # (none of them exist there), so return "no data" before trying to
+        # launch tools that can only fail, every thermal_check_every seconds.
+        if platform.system() == 'Darwin':
+            return None
+        # Fast path: NVML
+        if cls._ensure_nvml():
+            try:
+                import pynvml
+                return float(pynvml.nvmlDeviceGetTemperature(
+                    cls._nvml_handle, pynvml.NVML_TEMPERATURE_GPU))
+            except Exception:
+                pass
+
+        # Fallback: subprocess
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=temperature.gpu',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                return float(result.stdout.strip().split('\n')[0])
+        except Exception:
+            pass
+        # Server GPU (ROCm)
+        try:
+            result = subprocess.run(
+                ['rocm-smi', '--showtemp', '--json'],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                import json as _json
+                data = _json.loads(result.stdout)
+                for card in data.values():
+                    if isinstance(card, dict):
+                        for key in ('Temperature (Sensor edge) (C)',
+                                    'edge temperature', 'temperature'):
+                            if key in card:
+                                return float(str(card[key]).rstrip('Cc °'))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _get_cpu_temperature() -> Optional[float]:
+        """Read highest CPU core temperature via psutil (Linux)."""
+        # psutil has no sensors_temperatures() on macOS; report "no data".
+        if platform.system() == 'Darwin':
+            return None
+        try:
+            import psutil
+            temps = psutil.sensors_temperatures()
+            if not temps:
+                return None
+            # Check common sensor groups: coretemp (Intel), k10temp (AMD), etc.
+            for group_name in ('coretemp', 'k10temp', 'zenpower', 'cpu_thermal',
+                               'acpitz', 'thinkpad'):
+                if group_name in temps:
+                    return max(s.current for s in temps[group_name])
+            # Fallback: return max across all sensors
+            all_temps = [s.current for entries in temps.values() for s in entries
+                         if s.current > 0]
+            return max(all_temps) if all_temps else None
+        except Exception:
+            return None
+
+    def _training_time_limit_reached(self) -> bool:
+        """Check duration without turning it into an operator STOP request."""
+        stop_time = getattr(self.config, 'stop_time', None)
+        return stop_time is not None and datetime.now() >= stop_time
+
+    def _check_thermal_and_rest(self) -> None:
+        """If thermal protection is enabled, check temps and sleep if too hot.
+
+        Called periodically from the training loop. Uses wall-clock gating
+        so we don't shell out to nvidia-smi on every batch.
+        """
+        if not self.config.thermal_enabled or self._training_time_limit_reached():
+            return
+
+        now = time.time()
+        if now - self._last_thermal_check < self.config.thermal_check_every:
+            return
+        self._last_thermal_check = now
+
+        limit = self.config.thermal_temp_limit_c
+        gpu_temp = self._get_gpu_temperature()
+        cpu_temp = self._get_cpu_temperature()
+
+        hot_source = None
+        hot_temp = None
+        if gpu_temp is not None and gpu_temp >= limit:
+            hot_source, hot_temp = 'GPU', gpu_temp
+        elif cpu_temp is not None and cpu_temp >= limit:
+            hot_source, hot_temp = 'CPU', cpu_temp
+
+        if hot_source is None:
+            return
+
+        rest_secs = self.config.thermal_rest_seconds
+        rest_min = rest_secs / 60
+        print(f"\n{'=' * 50}")
+        print(f"THERMAL PROTECTION: {hot_source} temperature is {hot_temp:.0f}°C "
+              f"(limit: {limit}°C)")
+        print(f"Pausing training for {rest_min:.1f} minutes to cool down...")
+        print(f"{'=' * 50}")
+        sys.stdout.flush()
+
+        # Service GUI controls during cooldown even without a self-play thread.
+        end_time = time.time() + rest_secs
+        while True:
+            if self._control_queue is not None:
+                self._service_control_queue()
+            if self._stopped:
+                print("Thermal rest interrupted by stop request.")
+                sys.stdout.flush()
+                return
+            if self._training_time_limit_reached():
+                print("Thermal rest ended at the training time limit.")
+                sys.stdout.flush()
+                return
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(5.0, remaining))
+
+        # Log temps after resting
+        gpu_after = self._get_gpu_temperature()
+        cpu_after = self._get_cpu_temperature()
+        print(f"Thermal rest complete. Temps now — "
+              f"GPU: {gpu_after or 'N/A'}°C, CPU: {cpu_after or 'N/A'}°C")
+        print("Training remains paused." if self._paused else "Resuming training...")
+        sys.stdout.flush()
+        self._last_thermal_check = time.time()
+
+    def _has_non_finite_tensors(self) -> bool:
+        """Check if model parameters or buffers contain NaN/Inf.
+
+        Uses a single batched check (flatten + cat + isfinite) to avoid
+        N separate CUDA syncs (one per parameter). One sync for the whole
+        model instead of ~40.
+        """
+        all_tensors = [p.data.flatten() for p in self.model.parameters()]
+        all_tensors.extend(b.flatten() for b in self.model.buffers()
+                           if b is not None and b.numel() > 0)
+        if not all_tensors:
+            return False
+        combined = torch.cat(all_tensors)
+        if torch.isfinite(combined).all():
+            return False
+        # Detailed report: identify which parameter is bad (only on failure)
+        for name, param in self.model.named_parameters():
+            if not torch.isfinite(param).all():
+                print(f"  Non-finite parameter detected: {name}")
+                return True
+        for name, buf in self.model.named_buffers():
+            if buf is not None and buf.numel() > 0 and not torch.isfinite(buf).all():
+                print(f"  Non-finite buffer detected: {name}")
+                return True
+        # Combined check already found non-finite — individual checks may miss
+        # due to GPU state changes between reads.  Trust the batched result.
+        return True
+
+    def _repair_batchnorm_stats(self) -> bool:
+        """Check and repair corrupted BatchNorm running stats.
+
+        FP16 overflow during a forward pass can produce NaN activations that
+        corrupt BatchNorm running_mean / running_var.  The GradScaler catches
+        NaN *gradients* and skips the optimizer step, but running stats are
+        updated in the forward pass — before any loss/gradient check.  Once
+        corrupted, every subsequent forward pass outputs NaN, creating a
+        cascade that no amount of batch-skipping can break.
+
+        This method detects corrupted stats and resets them to defaults
+        (mean=0, var=1), allowing the next forward pass to re-estimate
+        clean statistics from the batch.
+        """
+        def _repair() -> bool:
+            repaired = False
+            for _name, module in self.model.named_modules():
+                if (isinstance(module, nn.BatchNorm2d)
+                        and module.track_running_stats):
+                    rm = module.running_mean
+                    rv = module.running_var
+                    if (rm is not None and not torch.isfinite(rm).all()) or \
+                       (rv is not None and not torch.isfinite(rv).all()):
+                        module.running_mean.zero_()
+                        module.running_var.fill_(1.0)
+                        module.num_batches_tracked.zero_()
+                        repaired = True
+            return repaired
+
+        return _call_under_model_state_lock(
+            getattr(self, '_model_state_lock', None), _repair)
+
+    def _build_scheduler(self) -> None:
+        """Create self.scheduler around the current self.optimizer.
+
+        Called from __init__ and again from _reset_model_state: a scheduler
+        wraps a specific optimizer instance, so it must be rebuilt whenever
+        the optimizer is replaced.
+        """
+        config = self.config
+        self.scheduler = None
+        if config.lr_scheduler_enabled:
+            main_scheduler = None
+            if config.lr_scheduler_type == 'cosine_warm_restarts':
+                main_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self.optimizer,
+                    T_0=config.lr_scheduler_T0,
+                    T_mult=config.lr_scheduler_T_mult,
+                    eta_min=config.lr_scheduler_eta_min,
+                )
+                sched_desc = (f"CosineAnnealingWarmRestarts "
+                              f"(T_0={config.lr_scheduler_T0}, T_mult={config.lr_scheduler_T_mult}, "
+                              f"eta_min={config.lr_scheduler_eta_min})")
+            else:
+                print(f"Warning: Unknown LR scheduler type '{config.lr_scheduler_type}'")
+
+            if main_scheduler is not None:
+                if config.lr_warmup_steps > 0:
+                    warmup_scheduler = optim.lr_scheduler.LinearLR(
+                        self.optimizer,
+                        start_factor=1e-3,  # start at 0.1% of base LR
+                        end_factor=1.0,
+                        total_iters=config.lr_warmup_steps,
+                    )
+                    self.scheduler = optim.lr_scheduler.SequentialLR(
+                        self.optimizer,
+                        schedulers=[warmup_scheduler, main_scheduler],
+                        milestones=[config.lr_warmup_steps],
+                    )
+                    print(f"LR Scheduler: {config.lr_warmup_steps}-step warmup → {sched_desc}")
+                else:
+                    self.scheduler = main_scheduler
+                    print(f"LR Scheduler: {sched_desc}")
+
+    def _reset_model_state(self, reason: str) -> None:
+        """Reset model/optimizer if checkpoint is corrupt."""
+        if self.config.recovery_enforced:
+            raise RuntimeError(
+                f"{reason}. Fresh-weight reset is forbidden during the "
+                "resume-only policy-distillation recovery experiment."
+            )
+        print(f"WARNING: {reason}. Resetting model and optimizer state.")
+        self.model = create_model(
+            embedding_size=self.config.model_embedding,
+            num_blocks=self.config.model_blocks,
+            hidden_size=self.config.model_hidden,
+            channels=self.config.model_channels,
+            value_head_enabled=self.config.value_head_enabled,
+            value_head_hidden=self.config.value_head_hidden,
+        )
+        self.model.to(self.device)
+        if self.device.type == 'cuda':
+            self.model = self.model.to(memory_format=torch.channels_last)
+        # Invalidate compiled function — it captured the old model's parameters.
+        # Next train_epoch() will use eager mode (recompilation would require
+        # re-running the full compile+warmup sequence).
+        self._compiled_fwd_loss = None
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
+        self.scaler = _new_grad_scaler(self.device, init_scale=2**10) if (self.config.amp and self.amp_dtype == torch.float16) else None
+        self.step = 0
+        self.epoch = 0
+        self.best_loss = float('inf')
+        # Rebuild the scheduler around the new optimizer; the old scheduler
+        # would keep stepping the discarded one, freezing the live LR.
+        # Scheduler progress (warmup/cosine position) restarts from zero,
+        # which is expected after a full model reset.
+        self._build_scheduler()
+
+    @staticmethod
+    def _history_step(entry: Any) -> Optional[int]:
+        """Return an entry's integer step, or ``None`` for legacy metadata."""
+        if not isinstance(entry, dict) or entry.get('step') is None:
+            return None
+        try:
+            return int(entry['step'])
+        except (TypeError, ValueError):
+            return None
+
+    def _rewind_stats_to_checkpoint(self, checkpoint: Mapping[str, Any]) -> bool:
+        """Remove sidecar observations that occurred after a resumed checkpoint.
+
+        The stats sidecar is process-independent and can be newer than an
+        explicitly selected checkpoint.  Keeping its later observations while
+        rewinding weights produces duplicate/inverted step histories and makes
+        the reported "current" loss belong to a different model trajectory.
+        Durable checkpoint-selection records remain independently preserved in
+        the append-only promotion registry.
+        """
+        resume_step = int(checkpoint.get('step', 0))
+        try:
+            previous_total = int(self.stats.total_steps)
+        except (TypeError, ValueError):
+            previous_total = 0
+
+        history_fields = (
+            'loss_history',
+            'val_loss_history',
+            'lr_history',
+            'gpu_mem_history',
+            'step_times',
+            'test_history',
+            'teacher_agreement_history',
+            'promotion_history',
+            'acceptance_history',
+        )
+        removed_by_field: Dict[str, int] = {}
+        for name in history_fields:
+            history = getattr(self.stats, name, None)
+            if history is None:
+                continue
+            original = list(history)
+            kept = [
+                entry for entry in original
+                if ((entry_step := self._history_step(entry)) is None
+                    or entry_step <= resume_step)
+            ]
+            removed = len(original) - len(kept)
+            if removed:
+                removed_by_field[name] = removed
+            if isinstance(history, deque):
+                setattr(
+                    self.stats,
+                    name,
+                    deque(kept, maxlen=history.maxlen or _STATS_HISTORY_CAP),
+                )
+            else:
+                setattr(self.stats, name, kept)
+
+        rewound = previous_total > resume_step or bool(removed_by_field)
+        if not rewound:
+            return False
+
+        self.stats.total_steps = resume_step
+        self.stats.epochs_completed = int(
+            checkpoint.get('epoch', self.stats.epochs_completed))
+        self.stats.end_time = ''
+
+        checkpoint_loss = checkpoint.get(
+            'current_train_loss', checkpoint.get('loss'))
+        try:
+            checkpoint_loss = float(checkpoint_loss)
+        except (TypeError, ValueError):
+            checkpoint_loss = None
+        self.stats.current_train_loss = (
+            checkpoint_loss
+            if checkpoint_loss is not None and math.isfinite(checkpoint_loss)
+            else None
+        )
+
+        # The current-dataset baseline belongs to the resumed checkpoint, not
+        # to the later sidecar.  The normal checkpoint-baseline restoration
+        # below repopulates this value after the rewind.
+        self.stats.dataset_fingerprint = str(
+            checkpoint.get('dataset_fingerprint', '') or '')
+        checkpoint_metadata = checkpoint.get('dataset_metadata')
+        self.stats.dataset_metadata = (
+            dict(checkpoint_metadata)
+            if isinstance(checkpoint_metadata, dict) else {}
+        )
+        self.stats.current_dataset_best_train_loss = float('inf')
+        self.stats.generation_cycles_completed = int(
+            checkpoint.get('generation_cycles_completed', 0) or 0)
+
+        agreement_values = []
+        for entry in self.stats.teacher_agreement_history:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                # ``record_teacher_agreement`` writes this history with the key
+                # ``top1_teacher_agreement``; reading ``teacher_agreement``
+                # silently discarded every entry and rewound the best agreement
+                # to 0.0 on resume.  The second key is kept as a fallback for
+                # any sidecar written before this was corrected.
+                value = float(entry.get(
+                    'top1_teacher_agreement',
+                    entry.get('teacher_agreement'),
+                ))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                agreement_values.append(value)
+        self.stats.best_teacher_agreement = max(agreement_values, default=0.0)
+
+        validation_values = []
+        for entry in self.stats.val_loss_history:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                value = float(entry.get('val_loss'))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                validation_values.append(value)
+        try:
+            checkpoint_validation = float(checkpoint.get('validation_loss'))
+        except (TypeError, ValueError):
+            checkpoint_validation = float('inf')
+        if math.isfinite(checkpoint_validation):
+            validation_values.append(checkpoint_validation)
+        self.stats.best_val_loss = min(
+            validation_values, default=float('inf'))
+
+        removed_text = ', '.join(
+            f"{name}={count}" for name, count in removed_by_field.items())
+        print(
+            f"Rewound training stats from step {previous_total} to "
+            f"checkpoint step {resume_step}"
+            + (f"; removed {removed_text}" if removed_text else '')
+        )
+        return True
+
+    def _load_checkpoint(self, path: str) -> None:
+        """Load training state from checkpoint."""
+        print(f"Resuming from {path}")
+        # map_location remaps every storage whatever device wrote it, so a
+        # CUDA-server checkpoint loads here unchanged.  MPS maps through the
+        # CPU instead: Metal has no float64, and load_state_dict() already
+        # moves model weights and optimizer moments onto the parameters'
+        # device -- while leaving AdamW's step counters on the CPU, exactly
+        # where a fresh non-fused MPS optimizer keeps them.
+        _map_location = 'cpu' if getattr(self.device, 'type', None) == 'mps' else self.device
+        checkpoint = torch.load(path, map_location=_map_location, weights_only=True)
+
+        checkpoint_encoding = checkpoint.get('encoding_version', 1)
+        if checkpoint_encoding != ENCODING_VERSION:
+            print(
+                f"WARNING: Migrating checkpoint encoding v{checkpoint_encoding} "
+                f"to v{ENCODING_VERSION}. Model and optimizer state will be "
+                "preserved; Player 2 behavior may shift while training adapts."
+            )
+
+        # Handle state_dict from compiled models (torch.compile adds "_orig_mod." prefix)
+        state_dict = checkpoint['model_state_dict']
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+        # Load with strict=False to handle old checkpoints that lack value_head keys.
+        # New value_head parameters will keep their random initialization.
+        # In-run rollback can target the model-only torch.compile wrapper,
+        # whose state-dict keys still have the prefix removed above. Load the
+        # shared original parameters without replacing the live wrapper.
+        checkpoint_model = getattr(self.model, '_orig_mod', self.model)
+        missing, unexpected = checkpoint_model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  New parameters (randomly initialized): {missing}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {unexpected}")
+
+        # Restore usable optimizer state, or keep the weights with fresh moments.
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # Finite weights do not prove that saved Adam moments or step
+            # counters are usable. A bad buffer poisons the next update even
+            # when the newly computed loss and gradients are finite.
+            for state in getattr(self.optimizer, 'state', {}).values():
+                for name, value in state.items():
+                    if (isinstance(value, torch.Tensor)
+                            and not torch.isfinite(value).all()):
+                        raise ValueError(f"non-finite optimizer state: {name}")
+        except (ValueError, KeyError) as e:
+            # Rollback reuses an already-trained optimizer. Failed restore
+            # must not retain its later (possibly nonfinite) moment buffers.
+            self.optimizer.state.clear()
+            print(f"  Warning: Could not restore optimizer state ({e}). "
+                  f"Using fresh optimizer — momentum/variance buffers will be re-estimated.")
+        else:
+            _relaid = _match_optimizer_state_layout(self.optimizer)
+            if _relaid:
+                print(f"  Optimizer state: re-laid out {_relaid} moment tensors "
+                      f"to match this device's parameter memory format")
+
+        # Reset configured optimizer hyperparameters after loading optimizer
+        # state.  load_state_dict() overwrites param-group values with the
+        # checkpoint's saved settings, which would otherwise silently ignore
+        # recovery-config changes while retaining the useful moment estimates.
+        old_lr = self.optimizer.param_groups[0]['lr']
+        old_weight_decay = self.optimizer.param_groups[0].get(
+            'weight_decay', self.config.weight_decay)
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.config.learning_rate
+            pg['weight_decay'] = self.config.weight_decay
+        print(f"  LR reset: {old_lr:.2e} (checkpoint) → {self.config.learning_rate:.2e} (config)")
+        print(
+            f"  Weight decay reset: {old_weight_decay:.2e} (checkpoint) "
+            f"→ {self.config.weight_decay:.2e} (config)"
+        )
+
+        self.step = checkpoint.get('step', 0)
+        self.epoch = checkpoint.get('epoch', self.stats.epochs_completed)
+        stats_rewound = self._rewind_stats_to_checkpoint(checkpoint)
+        if not stats_rewound:
+            self.stats.generation_cycles_completed = max(
+                self.stats.generation_cycles_completed,
+                int(checkpoint.get('generation_cycles_completed', 0)),
+            )
+        self.best_loss = checkpoint.get('loss', float('inf'))
+
+        # Checkpoints carry loss baselines independently of the optional
+        # training-stats sidecar.  Restore them monotonically so a stale or
+        # partially-written sidecar cannot make a resume look better than the
+        # checkpoint already proved, while retaining compatibility with older
+        # checkpoints that did not persist these fields.
+        def _restore_finite_min(name: str, value) -> None:
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(candidate):
+                return
+            current = getattr(self.stats, name, float('inf'))
+            try:
+                current = float(current)
+            except (TypeError, ValueError):
+                current = float('inf')
+            setattr(self.stats, name, min(current, candidate))
+
+        checkpoint_fingerprint = str(checkpoint.get('dataset_fingerprint', '') or '')
+        stats_fingerprint = str(getattr(self.stats, 'dataset_fingerprint', '') or '')
+        if not stats_fingerprint and checkpoint_fingerprint:
+            # A checkpoint is self-contained when the optional stats sidecar
+            # is absent: preserve its dataset identity so activation does not
+            # spuriously reset the just-restored current-dataset baseline.
+            self.stats.dataset_fingerprint = checkpoint_fingerprint
+            checkpoint_metadata = checkpoint.get('dataset_metadata')
+            if isinstance(checkpoint_metadata, dict) and not self.stats.dataset_metadata:
+                self.stats.dataset_metadata = dict(checkpoint_metadata)
+            stats_fingerprint = checkpoint_fingerprint
+        if (not stats_fingerprint or not checkpoint_fingerprint
+                or stats_fingerprint == checkpoint_fingerprint):
+            _restore_finite_min(
+                'current_dataset_best_train_loss',
+                checkpoint.get('current_dataset_best_train_loss'),
+            )
+        _restore_finite_min(
+            'historical_best_train_loss',
+            checkpoint.get('historical_best_train_loss'),
+        )
+        self.stats.best_loss = self.stats.historical_best_train_loss
+
+        # Restore scheduler state if available
+        if (self.scheduler is not None and
+                'scheduler_state_dict' in checkpoint):
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print(f"Restored LR scheduler state")
+            except Exception as e:
+                print(f"Warning: Could not restore scheduler state: {e}")
+
+        # Restore GradScaler state if available (prevents float16 overflow on resume)
+        if self.scaler is not None:
+            if 'scaler_state_dict' in checkpoint:
+                try:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                    print(f"Restored GradScaler state (scale={self.scaler.get_scale():.0f})")
+                except Exception as e:
+                    print(f"Warning: Could not restore GradScaler state: {e}. "
+                          f"Using conservative scale=1024.")
+                    self.scaler = _new_grad_scaler(self.device, init_scale=2**10)
+            else:
+                # Old checkpoint without scaler state: use conservative scale.
+                # Default init_scale=65536 causes float16 overflow on trained models
+                # whose parameter magnitudes have grown beyond the initial range.
+                self.scaler = _new_grad_scaler(self.device, init_scale=2**10)
+                print(f"GradScaler: no saved state in checkpoint, using conservative "
+                      f"scale={self.scaler.get_scale():.0f} (will auto-adjust)")
+
+        # Restore RNG state if available.
+        #
+        # The checkpoint above is loaded with map_location=self.device, so every
+        # tensor in it -- the RNG states included, even though torch always
+        # saves those on the CPU -- arrives on the GPU. All three setters below
+        # require a CPU uint8 tensor and reject a CUDA one with
+        # "RNG state must be a torch.ByteTensor", so each state is moved back
+        # explicitly. The single-device branches always did this; the
+        # set_rng_state_all() branch did not, which made every CUDA resume of a
+        # checkpoint written after cuda_all was introduced abort during
+        # Trainer.__init__ -- including the recovery anchor this run resumes.
+        #
+        # Reproducibility of the RNG stream is a convenience, never a reason to
+        # lose a resume, so failures warn and training continues from a fresh
+        # stream -- matching how the scheduler and scaler restores above behave.
+        if 'rng_state' in checkpoint:
+            rng = checkpoint['rng_state']
+            try:
+                self._restore_rng_state(rng)
+            except Exception as e:
+                print(f"Warning: Could not restore RNG state: {e}. "
+                      f"Continuing with a fresh random stream.")
+
+        print(f"Resumed at step {self.step}, epoch {self.epoch}")
+
+        if self._has_non_finite_tensors():
+            self._reset_model_state("Loaded checkpoint contains NaN/Inf")
+
+    @staticmethod
+    def _as_cpu_byte_state(state) -> 'torch.Tensor':
+        """Return a saved RNG state as the CPU uint8 tensor the setters demand."""
+        return state.detach().to(device='cpu', dtype=torch.uint8)
+
+    def _restore_rng_state(self, rng: dict) -> None:
+        """Restore the python/numpy/torch/MPS/CUDA RNG streams from a checkpoint."""
+        if 'python' in rng:
+            random.setstate(rng['python'])
+        if 'numpy' in rng:
+            numpy_rng = rng['numpy']
+            np.random.set_state((
+                numpy_rng['bit_generator'],
+                np.asarray(numpy_rng['state'], dtype=np.uint32),
+                int(numpy_rng['position']),
+                int(numpy_rng['has_gauss']),
+                float(numpy_rng['cached_gaussian']),
+            ))
+        if 'torch' in rng:
+            torch.set_rng_state(self._as_cpu_byte_state(rng['torch']))
+        # Backend RNG keys are restored only where that backend exists, so a
+        # checkpoint moves between the CUDA server and a Mac in either
+        # direction: the foreign backend's state is simply not applied.
+        if 'mps' in rng and ml_device.mps_available():
+            torch.mps.set_rng_state(self._as_cpu_byte_state(rng['mps']))
+        if not torch.cuda.is_available():
+            return
+        device_count = torch.cuda.device_count()
+        if 'cuda_all' in rng:
+            states = [self._as_cpu_byte_state(s) for s in rng['cuda_all']]
+            if len(states) == device_count:
+                torch.cuda.set_rng_state_all(states)
+                return
+            # Saved on a host with a different GPU count. set_rng_state_all()
+            # indexes devices positionally, so handing it the wrong-length list
+            # either targets a device that does not exist or silently leaves
+            # the trailing ones unseeded. Seed the overlap and say so.
+            print(f"Warning: checkpoint holds {len(states)} CUDA RNG state(s) "
+                  f"but this host has {device_count} device(s); seeding the "
+                  f"first {min(len(states), device_count)}.")
+            for index in range(min(len(states), device_count)):
+                torch.cuda.set_rng_state(states[index], index)
+            return
+        if 'cuda' in rng:
+            torch.cuda.set_rng_state(self._as_cpu_byte_state(rng['cuda']))
+
+    @staticmethod
+    def _checkpoint_file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest().upper()
+
+    def _verified_recovery_rollback_checkpoint(self) -> Path:
+        """Return the newest checkpoint proven to belong to this recovery arm."""
+        anchor = Path(str(self.config.resume)).resolve()
+        baseline_sha256 = str(
+            self.config.recovery_baseline_sha256 or '').upper()
+        anchor_sha256 = baseline_sha256
+        if self.config.policy_stage == 'enhanced':
+            anchor_sha256 = ''
+            gate_registry = PromotionRegistry(
+                str(self.config.policy_gate_promotion_registry or ''),
+                agreement_threshold=self.config.teacher_agreement_threshold,
+            )
+            for promotion in gate_registry.records():
+                promoted_path = promotion.get('checkpoint_path')
+                if (
+                    promotion.get('promoted')
+                    and promoted_path
+                    and Path(str(promoted_path)).resolve() == anchor
+                ):
+                    anchor_sha256 = str(
+                        promotion.get('checkpoint_sha256', '')).upper()
+                    break
+        candidates = list(Path(self.config.checkpoint_dir).glob('model_step_*.pt'))
+        if anchor.is_file() and anchor not in candidates:
+            candidates.append(anchor)
+
+        _step = _checkpoint_step_number
+
+        for candidate in sorted(candidates, key=_step, reverse=True):
+            if _step(candidate) > self.step:
+                continue
+            resolved = candidate.resolve()
+            if resolved == anchor:
+                # Recheck the approved anchor on every rollback; it may have
+                # changed on disk after the startup readiness gate.
+                if anchor_sha256 and hmac.compare_digest(
+                    self._checkpoint_file_sha256(resolved), anchor_sha256
+                ):
+                    return resolved
+                continue
+            # Audit Suggestion 7: the lineage test is shared with the startup
+            # continuation gate, so rollback and resume can never disagree
+            # about what counts as a checkpoint in this recovery arm.
+            if recovery_checkpoint_continues_lineage(
+                candidate, baseline_sha256, self.config.policy_stage
+            ):
+                return resolved
+        raise RuntimeError(
+            "No verified checkpoint remains in the approved recovery lineage; "
+            "fresh-weight reset is forbidden")
+
+    def _rollback_checkpoint_candidates(self, pattern: str) -> list:
+        """Snapshot the current rollback candidates (newest last).
+
+        Proofread 2026-08-25 B2: retention prunes from the background
+        checkpoint-writer thread while dead-epoch rollback runs on the main
+        thread, so a glob hit can be unlinked milliseconds after selection.
+        The snapshot is taken once per attempt so the retry loop below sees a
+        consistent view; vanishing entries are tolerated by the caller.
+        """
+        # The six-digit format is a minimum width; lexical order breaks at
+        # step 1,000,000 and each later power of ten.
+        return sorted(
+            Path(self.config.checkpoint_dir).glob(pattern),
+            key=_checkpoint_step_number,
+        )
+
+    def _rollback_after_dead_epoch(self, reason: str) -> None:
+        """Load the newest usable checkpoint after repeated dead epochs.
+
+        Extracted from the training loop and hardened for the prune-vs-
+        rollback race: each candidate is re-checked for existence right before
+        ``_load_checkpoint``, and a vanished pick falls back to the next
+        candidate -- or, under recovery enforcement, to the verified recovery
+        lineage resolver -- instead of aborting the run inside
+        ``_load_checkpoint``.
+        """
+        ckpts = self._rollback_checkpoint_candidates("model_step_*.pt")
+        # Guarded like the loop that calls this: rollback loads a checkpoint
+        # from disk (seconds), so a console that dies during that window would
+        # make a bare print here the first dead-pipe write and raise out of the
+        # training loop before the final checkpoint (Journal Pass 558).
+        _diagnostic_print(f"  Dead-epoch rollback triggered ({reason}).")
+        if self.config.recovery_enforced:
+            # Bound retries by the initial numbered files plus the external
+            # anchor, even if another writer keeps publishing vanishing picks.
+            for _attempt in range(len(ckpts) + 1):
+                last_ckpt = None
+                try:
+                    last_ckpt = str(self._verified_recovery_rollback_checkpoint())
+                    _diagnostic_print(f"  Rolling back within verified recovery lineage: {last_ckpt}")
+                    _call_under_model_state_lock(
+                        getattr(self, '_model_state_lock', None),
+                        self._load_checkpoint,
+                        last_ckpt,
+                    )
+                    if self.scaler is not None:
+                        self.scaler = _new_grad_scaler(
+                            getattr(self, 'device', None), init_scale=2**10)
+                        _diagnostic_print(
+                            "  GradScaler reset to conservative "
+                            f"scale={self.scaler.get_scale():.0f}")
+                    return
+                except FileNotFoundError as exc:
+                    if last_ckpt is None:
+                        _diagnostic_print(
+                            f"  [warn] Rollback verification input unavailable ({exc}); "
+                            "retrying verified recovery selection")
+                        continue
+                    if Path(last_ckpt).exists():
+                        # Missing auxiliary state is a load failure, not pruning.
+                        raise
+                    # Reselect through the complete recovery gate: the approved
+                    # anchor can live outside checkpoint_dir, and future steps
+                    # must remain ineligible even after a pruning race.
+                    _diagnostic_print(f"  [warn] Verified rollback pick vanished ({exc}); "
+                                      f"retrying verified recovery selection")
+            else:
+                raise RuntimeError(
+                    "No verified checkpoint remains available within the "
+                    "recovery retry limit; fresh-weight reset is forbidden")
+        for candidate in reversed(ckpts):
+            if not candidate.is_file():
+                continue
+            last_ckpt = str(candidate)
+            _diagnostic_print(f"  Rolling back to checkpoint: {last_ckpt}")
+            try:
+                _call_under_model_state_lock(
+                    getattr(self, '_model_state_lock', None),
+                    self._load_checkpoint,
+                    last_ckpt,
+                )
+            except FileNotFoundError as exc:
+                # Retention can win after is_file(), including while rollback
+                # waits for the model-state lock.
+                if candidate.exists():
+                    raise
+                _diagnostic_print(f"  [warn] Rollback pick vanished ({exc}); "
+                                  f"trying remaining checkpoints")
+                continue
+            # Reset GradScaler with conservative scale to prevent
+            # re-triggering the same overflow.  Default init_scale=65536
+            # is too aggressive for trained models — use 1024 (same as
+            # the resume-without-scaler-state path).
+            if self.scaler is not None:
+                self.scaler = _new_grad_scaler(
+                    getattr(self, 'device', None), init_scale=2**10)
+                _diagnostic_print(f"  GradScaler reset to conservative scale={self.scaler.get_scale():.0f}")
+            return
+        _diagnostic_print("  No checkpoints found — resetting model from scratch")
+        _call_under_model_state_lock(
+            getattr(self, '_model_state_lock', None),
+            self._reset_model_state,
+            "No checkpoint for recovery",
+        )
+
+    def _seed_stats_file(self) -> None:
+        """Copy ``paths.seed_stats_from`` into a not-yet-existing stats file.
+
+        A continuation namespace starts empty, so without this the progress
+        report and every "previous steps" figure restart from zero even though
+        the run resumes a real anchor. The trainer is the sole seeding owner so
+        every launcher, GUI start, and bare CLI start uses the same durability
+        boundary. It is a no-op once the destination exists, and it never
+        touches the source.
+        """
+        seed = getattr(self.config, 'stats_seed_file', None)
+        if not seed or self.config.policy_stage != 'policy_only':
+            return
+        stats_path = Path(self.config.stats_file)
+        seed_path = Path(seed)
+        if stats_path.exists() or not seed_path.is_file():
+            return
+        if seed_path.resolve() == stats_path.resolve():
+            return
+        temp_path = None
+        try:
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=stats_path.name + '.',
+                suffix='.seed.tmp',
+                dir=stats_path.parent,
+            )
+            temp_path = Path(temp_name)
+            os.close(fd)
+            shutil.copyfile(seed_path, temp_path)
+            # Atomic visibility is insufficient for recovery history. Commit
+            # the copied inode before publishing it, then commit the public
+            # name so a successful seed survives an abrupt host or storage
+            # loss just like every later aggregate-statistics replacement.
+            with temp_path.open('r+b') as seed_handle:
+                os.fsync(seed_handle.fileno())
+            os.replace(temp_path, stats_path)
+            temp_path = None
+            _fsync_directory(stats_path.parent)
+        except OSError as exc:
+            print(f"Could not seed training stats from {seed_path}: {exc}")
+            return
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        print(
+            "Recovery stats seeded without modifying the legacy stats file: "
+            f"{stats_path}"
+        )
+
+    def _load_stats(self) -> None:
+        """Load training stats from file if exists, and merge in any missing test history from log files."""
+        self._seed_stats_file()
+        stats_path = Path(self.config.stats_file)
+        if stats_path.exists():
+            try:
+                with open(stats_path, 'r') as f:
+                    data = json.load(f)
+                self.stats = TrainingStats.from_dict(data)
+                print(f"Loaded training stats: {self.stats.total_steps} previous steps")
+            except Exception as e:
+                print(f"Could not load stats: {e}")
+                self.stats = TrainingStats()
+        
+        # Merge any missing test results from JSONL log files
+        self._merge_test_history_from_logs()
+
+    def _merge_test_history_from_logs(self) -> None:
+        """Merge test_vs_algo entries from JSONL log files into stats.test_history."""
+        log_dir = Path(self.config.log_dir)
+        if not log_dir.exists():
+            return
+        
+        # Build a set of existing steps to avoid duplicates
+        existing_steps = {entry.get('step') for entry in self.stats.test_history}
+        
+        # Find all training log files
+        log_files = sorted(log_dir.glob("train_*.jsonl"))
+        merged_count = 0
+        
+        for log_file in log_files:
+            try:
+                with open(log_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            if entry.get('type') == 'test_vs_algo':
+                                step = entry.get('step')
+                                if step is not None and step not in existing_steps:
+                                    # Remove the 'type' field before adding to test_history
+                                    entry_copy = {k: v for k, v in entry.items() if k != 'type'}
+                                    self.stats.test_history.append(entry_copy)
+                                    existing_steps.add(step)
+                                    merged_count += 1
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                continue
+        
+        if merged_count > 0:
+            # Sort by step
+            self.stats.test_history.sort(key=lambda x: x.get('step', 0))
+            print(f"Merged {merged_count} test entries from log files into stats")
+
+    def _save_stats(
+        self,
+        *,
+        _snapshot: Optional[dict] = None,
+        _raise_on_error: bool = False,
+    ) -> bool:
+        """Save training stats to file.
+
+        When called from a background thread, pass a pre-computed ``_snapshot``
+        (from ``_snapshot_stats()``) to avoid reading ``self.stats`` while the
+        main thread mutates it. Snapshot generations preserve their logical
+        capture order even when background disk I/O completes out of order.
+        Most telemetry callers remain fail-open. Durable task finalizers can
+        request an exception so they do not acknowledge work whose result was
+        not persisted.
+        """
+        guard = getattr(self, '_stats_write_lock', None) or nullcontext()
+        with guard:
+            stats_path = Path(self.config.stats_file)
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if _snapshot is None:
+                # Main-thread path: safe to touch self.stats directly.
+                self.stats.total_steps = self.step
+                self.stats.end_time = datetime.now().isoformat()
+                generation = int(getattr(
+                    self, '_stats_snapshot_generation', 0)) + 1
+                self._stats_snapshot_generation = generation
+                snapshot = self.stats.to_dict()
+            else:
+                # Never remove the private generation marker from a caller's
+                # retained snapshot. The checkpoint writer still augments that
+                # mapping with its promotion record before handing it off here.
+                snapshot = dict(_snapshot)
+                raw_generation = snapshot.pop(
+                    _STATS_WRITE_GENERATION_KEY, None)
+                try:
+                    generation = int(raw_generation)
+                except (TypeError, ValueError):
+                    generation = int(getattr(
+                        self, '_stats_snapshot_generation', 0)) + 1
+                    self._stats_snapshot_generation = generation
+
+            persisted_generation = int(getattr(
+                self, '_stats_persisted_generation', -1))
+            if generation < persisted_generation:
+                return True
+
+            # The file and directory syncs make the replace a durability
+            # boundary, not merely an atomic-visibility boundary. This matters
+            # for strict acceptance finalizers: they may acknowledge and remove
+            # pending work only after its statistics history survives a sudden
+            # host or storage loss. The lock protects the complete write plus
+            # report-refresh transaction, while the generation check rejects a
+            # delayed checkpoint snapshot after newer progress has landed.
+            _tmp_path = None
+            try:
+                with fork_safe_temporary_file(
+                        mode='w', dir=stats_path.parent, suffix='.tmp',
+                        delete=False) as tmp:
+                    _tmp_path = tmp.name
+                    json.dump(snapshot, tmp, indent=2)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.replace(_tmp_path, stats_path)
+                _fsync_directory(stats_path.parent)
+            except Exception as e:
+                _diagnostic_print(f"Warning: Failed to save stats: {e}")
+                # Clean up temp file on failure
+                if _tmp_path is not None:
+                    try:
+                        os.unlink(_tmp_path)
+                    except Exception:
+                        pass
+                if _raise_on_error:
+                    raise
+                return False
+
+            self._stats_persisted_generation = generation
+            self._update_training_progress_report(stats_path)
+            return True
+
+    def _update_training_progress_report(self, stats_path: Path) -> None:
+        """Regenerate the HTML training report and PNG snapshot after each save."""
+        try:
+            try:
+                from plot_training import write_progress_outputs
+            except ImportError:
+                import importlib.util
+
+                script_path = Path(__file__).resolve().parents[4] / 'plot_training.py'
+                spec = importlib.util.spec_from_file_location('_dama_plot_training', script_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Could not load {script_path}")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                write_progress_outputs = module.write_progress_outputs
+
+            html_output_path = (
+                Path(self.config.log_dir) / 'training_progress.html'
+                if self.config.recovery_enforced
+                else stats_path.parent / 'training_progress.html'
+            )
+
+            write_progress_outputs(
+                stats_path=stats_path,
+                logs_dir=Path(self.config.log_dir),
+                html_output_path=html_output_path,
+            )
+        except Exception as e:
+            _diagnostic_print(f"Warning: Failed to update training progress artifacts: {e}")
+
+    def _snapshot_stats(self) -> dict:
+        """Take a consistent snapshot of training stats for background I/O.
+
+        Must be called on the main thread (where self.stats is mutated).
+        The returned dict is a deep copy safe for use in a background thread.
+        """
+        guard = getattr(self, '_stats_write_lock', None) or nullcontext()
+        with guard:
+            self.stats.total_steps = self.step
+            self.stats.end_time = datetime.now().isoformat()
+            generation = int(getattr(
+                self, '_stats_snapshot_generation', 0)) + 1
+            self._stats_snapshot_generation = generation
+            snapshot = self.stats.to_dict()
+            snapshot[_STATS_WRITE_GENERATION_KEY] = generation
+            return snapshot
+
+    def _record_step_stats(self, loss: float, lr: float) -> None:
+        """Record statistics for a training step."""
+        current_time = time.time()
+        _step = self.step
+
+        # Record loss — keep dict format for checkpoint JSON compat.
+        # Use ISO timestamp for consistency with all other timestamp fields
+        # (val_loss_history, test_history, JSONL logs, stats_collector).
+        self.stats.loss_history.append({
+            'step': _step,
+            'loss': loss,
+            'timestamp': datetime.now().isoformat(),
+        })
+
+        # Record learning rate
+        self.stats.lr_history.append({
+            'step': _step,
+            'lr': lr,
+        })
+
+        # Record GPU memory
+        _device = getattr(self, 'device', None)
+        if torch.cuda.is_available() or getattr(_device, 'type', None) == 'mps':
+            gpu_mem = _gpu_memory_allocated_mb(_device)
+            self.stats.gpu_mem_history.append({
+                'step': _step,
+                'gpu_mem_mb': gpu_mem,
+            })
+
+        # Record step time
+        if self._last_step_time is not None:
+            step_time = current_time - self._last_step_time
+            self.stats.step_times.append({
+                'step': _step,
+                'time_sec': step_time,
+            })
+        self._last_step_time = current_time
+
+        # Trimming is handled automatically by deque(maxlen=_STATS_HISTORY_CAP).
+        # Previous approach rebuilt the list via slice + copy every ~10K appends.
+
+        self.stats.current_train_loss = loss
+        if loss < self.stats.current_dataset_best_train_loss:
+            self.stats.current_dataset_best_train_loss = loss
+        if loss < self.stats.historical_best_train_loss:
+            self.stats.historical_best_train_loss = loss
+        # Keep the legacy attribute synchronized for in-process compatibility.
+        self.stats.best_loss = self.stats.historical_best_train_loss
+
+    def _record_epoch_loss(self, loss: float) -> None:
+        """Record the epoch-average loss shown by the console heartbeat."""
+        if self.step <= 0:
+            return
+
+        entry = {
+            'step': self.step,
+            'loss': loss,
+            'timestamp': datetime.now().isoformat(),
+            'source': 'epoch',
+        }
+
+        # If a stats-step loss was recorded at the same step, prefer the
+        # epoch-average value because it is the value printed in "[epoch end]".
+        if self.stats.loss_history and self.stats.loss_history[-1].get('step') == self.step:
+            self.stats.loss_history[-1] = entry
+        else:
+            self.stats.loss_history.append(entry)
+
+        self.stats.current_train_loss = loss
+        if loss < self.stats.current_dataset_best_train_loss:
+            self.stats.current_dataset_best_train_loss = loss
+        if loss < self.stats.historical_best_train_loss:
+            self.stats.historical_best_train_loss = loss
+        self.stats.best_loss = self.stats.historical_best_train_loss
+
+    def _save_progress_report_if_due(self, *, force: bool = False) -> None:
+        """Persist stats and refresh the dashboard without waiting for checkpoints."""
+        if self.step <= 0:
+            return
+
+        now = time.monotonic()
+        interval = max(1.0, float(self.config.progress_report_every_seconds))
+        if not force:
+            if self.step == self._last_progress_report_step:
+                return
+            if now - self._last_progress_report_time < interval:
+                return
+            # Checkpoint saves already persist stats and regenerate the report.
+            if self.config.checkpoint_every > 0 and self.step % self.config.checkpoint_every == 0:
+                return
+
+        self._save_stats()
+        self._last_progress_report_time = now
+        self._last_progress_report_step = self.step
+
+    def _activate_dataset_manifest(self, manifest: Mapping[str, Any]) -> None:
+        fingerprint = str(manifest.get('fingerprint', ''))
+        if not fingerprint:
+            raise ValueError("Active corpus manifest is missing its fingerprint")
+        if fingerprint != self.stats.dataset_fingerprint:
+            old = self.stats.dataset_fingerprint or '(none)'
+            self.stats.dataset_fingerprint = fingerprint
+            self.stats.current_dataset_best_train_loss = float('inf')
+            print(
+                f"Dataset fingerprint changed: {old[:12]} to {fingerprint[:12]}; "
+                "reset current-dataset training-loss baseline"
+            )
+        self._active_snapshot_manifest = dict(manifest)
+        self.stats.dataset_metadata = {
+            'fingerprint': fingerprint,
+            'version': manifest.get('version'),
+            'manifest_path': manifest.get('manifest_path'),
+            'validation_manifest_path': manifest.get('validation_manifest_path'),
+            'files': [record.get('path', record.get('name'))
+                      for record in manifest.get('files', [])],
+            'metrics': dict(manifest.get('metrics', {})),
+            'teacher_settings': dict(manifest.get('teacher_settings', {})),
+            'noise_settings': dict(manifest.get('noise_settings', {})),
+            'generation_settings': dict(manifest.get('generation_settings', {})),
+        }
+        if getattr(self, 'stats_collector', None) is not None:
+            file_records = manifest.get('files', [])
+            self.stats_collector.record_replay_buffer_state(
+                step=self.step,
+                total_entries=int(manifest.get('metrics', {}).get(
+                    'records', 0)),
+                num_files=len(file_records),
+                total_size_bytes=sum(
+                    int(record.get('size_bytes', 0)) for record in file_records),
+                corpus_metrics=dict(manifest.get('metrics', {})),
+            )
+
+    def _runtime_models_dir(self) -> Path:
+        if self._runtime_model_dir is None:
+            # Absolute on macOS, because these files are read back through
+            # inference.get_model(), which resolves a relative path against
+            # the repo root rather than this process's CWD.  The spawned
+            # self-play workers there would otherwise miss the file whenever
+            # the trainer runs from another directory (forked workers on
+            # Linux use the inherited model).  Same file when the CWD is the
+            # repo root; other platforms keep the path as configured.
+            root = Path(self.config.runtime_model_root)
+            if sys.platform == 'darwin':
+                root = root.resolve()
+            self._runtime_model_dir = root / f"process-{os.getpid()}-{time.time_ns()}"
+        return self._runtime_model_dir
+
+    def _runtime_model_path(self, filename: str) -> Path:
+        return self._runtime_models_dir() / filename
+
+    def _cleanup_runtime_model_file(self, path: str | Path) -> None:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _cleanup_runtime_models_dir(self) -> None:
+        runtime_model_dir = self._runtime_model_dir
+        if runtime_model_dir is None:
+            return
+        try:
+            if not any(runtime_model_dir.iterdir()):
+                runtime_model_dir.rmdir()
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+
+    def _corpus_settings(
+        self, *, model_behavior_step: Optional[int] = None
+    ) -> tuple[dict, dict, dict]:
+        behavior_step = int(
+            self.step if model_behavior_step is None else model_behavior_step)
+        teacher = {
+            'difficulty': self.config.teacher_difficulty,
+            'target_type': self.config.teacher_target_type,
+            'stage': self.config.policy_stage,
+            'soft_temperature': self.config.teacher_soft_temperature,
+            'score_depth': self.config.teacher_score_depth,
+            'value_scale': self.config.teacher_value_scale,
+            'hard_label_blend': self.config.teacher_hard_label_blend,
+        }
+        noise = {
+            'played_action_probability': self.config.selfplay_noise_prob,
+            'label_is_teacher_move': True,
+        }
+        generation = {
+            'contract_version': 1,
+            'total_games_per_cycle': (
+                self.config.selfplay_games
+                + (self.config.algo_vs_algo_games
+                   if self.config.algo_vs_algo_enabled else 0)
+            ),
+            'algorithm_fraction': self.config.trajectory_algorithm_fraction,
+            'model_fraction': self.config.trajectory_model_fraction,
+            'opening_plies': list(self.config.selfplay_opening_plies),
+            'opening_seed': self.config.selfplay_opening_seed,
+            'algorithm_opening_schedule': _ALGORITHM_OPENING_SCHEDULE,
+            'max_moves': self.config.selfplay_max_moves,
+            'algorithm_difficulties': list(self.config.selfplay_difficulties),
+            'algo_vs_algo_difficulties': list(
+                self.config.algo_vs_algo_difficulties),
+            'opponent_focus': self.config.selfplay_opponent_focus,
+            'focus_side': self.config.selfplay_focus_side,
+            'symmetry_augmentation': self.config.symmetry_augmentation,
+            'current_model_inference_depth': self.config.inference_depth,
+            # The behavior policy is the exact model state used to generate
+            # this corpus.  A step-qualified identity prevents snapshots from
+            # silently mixing trajectories from different model revisions.
+            'model_behavior_id': f"trainer-step-{behavior_step}",
+            'model_behavior_step': behavior_step,
+        }
+        return teacher, noise, generation
+
+    def _discard_incomplete_selfplay_cycle(
+        self, skip_replay, collected, preprocess_chunks, temp_model_path,
+    ) -> None:
+        """Drop every artifact of a self-play cycle that did not complete.
+
+        Never leave a partial file discoverable by replay/corpus scans: one
+        off-ratio replay file permanently fails the exact 70/30 admission
+        contract.  The in-memory paths are cleared as well because callers may
+        use collect_dicts or inline preprocessing instead of replay I/O.
+        """
+        if not skip_replay:
+            try:
+                self.replay_buffer.discard_current_file()
+            except Exception as exc:  # never mask the originating failure
+                print(f"Failed to discard partial replay file: {exc}")
+        if collected is not None:
+            collected.clear()
+        if preprocess_chunks is not None:
+            preprocess_chunks.clear()
+        self._last_selfplay_dicts = None
+        self._last_selfplay_preprocessed = None
+        self._cleanup_runtime_model_file(temp_model_path)
+        self._cleanup_runtime_models_dir()
+
+    @staticmethod
+    def _snapshot_cache_key_digest(state_keys: Iterable[str]) -> str:
+        """Return a stable digest for the state keys excluded from training."""
+
+        digest = hashlib.sha256()
+        for key in sorted(str(value) for value in state_keys):
+            digest.update(key.encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _manifest_cache_digest(manifest: Mapping[str, Any]) -> str:
+        """Return the exact manifest identity used by a derived tensor cache."""
+
+        payload = json.dumps(
+            dict(manifest), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _validated_validation_leakage(
+        value: Any,
+        entry_count: int,
+    ) -> Optional[dict]:
+        """Validate cached leakage accounting before publishing it as evidence."""
+
+        if not isinstance(value, Mapping):
+            return None
+        ledger_enabled = value.get("ledger_enabled")
+        if not isinstance(ledger_enabled, bool):
+            return None
+        normalized = {"ledger_enabled": ledger_enabled}
+        for field in (
+            "all_time_trained_state_count",
+            "removed_validation_entry_count",
+            "removed_validation_state_count",
+            "retained_validation_entry_count",
+        ):
+            raw_value = value.get(field)
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, int)
+                or raw_value < 0
+            ):
+                return None
+            normalized[field] = int(raw_value)
+        if normalized["retained_validation_entry_count"] != int(entry_count):
+            return None
+        if (
+            normalized["removed_validation_state_count"]
+            > normalized["removed_validation_entry_count"]
+        ):
+            return None
+        return normalized
+
+    def _validation_tensor_cache_metadata(self, context) -> Optional[dict]:
+        """Return a complete source key for the immutable held-out tensors.
+
+        ``prepare_split`` verifies every validation shard, the canonical state
+        set, frozen-suite exclusions, and the canonical trained ledger before
+        this helper is reached.  The cache can therefore eliminate only the
+        repeat JSON/materialization and tensorization work on a warm relaunch.
+        """
+
+        cache_file = getattr(
+            self.config, "validation_tensor_cache_file", None)
+        manager = getattr(self, "_snapshot_manager", None)
+        ledger_digest_getter = getattr(
+            manager, "trained_ledger_source_sha256", None)
+        if (
+            self.config.policy_stage != "policy_only"
+            or not cache_file
+            or not callable(ledger_digest_getter)
+        ):
+            return None
+        ledger_digest = ledger_digest_getter()
+        if not isinstance(ledger_digest, str) or len(ledger_digest) != 64:
+            return None
+        try:
+            validation_manifest = context.validation_manifest
+            validation_keys = context.validation_keys
+        except AttributeError:
+            return None
+        if not isinstance(validation_manifest, Mapping):
+            return None
+        return {
+            "cache_version": 3,
+            "validation_tensor_cache_version": 1,
+            "validation_manifest_sha256": self._manifest_cache_digest(
+                validation_manifest),
+            "validation_exclusion_keys_sha256": self._snapshot_cache_key_digest(
+                validation_keys),
+            "trained_ledger_source_sha256": ledger_digest,
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+        }
+
+    def _load_matching_validation_tensor_cache(
+        self,
+        cache_metadata: Mapping[str, Any],
+    ) -> Optional[tuple[CachedTensorDataset, dict]]:
+        """Return a fully source-keyed held-out cache, or a safe miss."""
+
+        cache_file = getattr(
+            self.config, "validation_tensor_cache_file", None)
+        cached_dataset = load_matching_cached_tensor_dataset(
+            cache_file,
+            cache_metadata,
+            migrate_to_compressed=getattr(
+                self.config, "validation_tensor_cache_compress", False),
+        )
+        if cached_dataset is None:
+            return None
+        leakage = self._validated_validation_leakage(
+            cached_dataset.metadata.get("validation_leakage"),
+            len(cached_dataset),
+        )
+        if leakage is None:
+            print(
+                "Validation tensor cache lacks valid leakage accounting; "
+                "rebuilding cache."
+            )
+            return None
+        return cached_dataset, leakage
+
+    def _save_validation_tensor_cache(
+        self,
+        dataset: CachedTensorDataset,
+        cache_metadata: Mapping[str, Any],
+    ) -> None:
+        """Best-effort persist of already-verified immutable validation tensors."""
+
+        cache_file = getattr(
+            self.config, "validation_tensor_cache_file", None)
+        if not cache_file:
+            return
+        leakage = self._validated_validation_leakage(
+            getattr(self, "_active_snapshot_manifest", {}).get(
+                "validation_leakage"),
+            len(dataset),
+        )
+        if leakage is None:
+            print(
+                "Warning: immutable validation leakage accounting was invalid; "
+                "not caching held-out tensors."
+            )
+            return
+        metadata = {
+            **dict(cache_metadata),
+            "entry_count": len(dataset),
+            "validation_leakage": leakage,
+        }
+        try:
+            dataset.save(
+                str(cache_file),
+                metadata=metadata,
+                compress=getattr(
+                    self.config, "validation_tensor_cache_compress", False),
+            )
+            print("Saved source-verified validation tensor cache.")
+        except Exception as exc:
+            # The cache is an accelerator.  A failed write must leave the
+            # verified in-memory validation dataset usable for this session.
+            print(f"Warning: could not save validation tensor cache: {exc}")
+
+    def _validation_reuse_identity(self, context) -> Optional[dict]:
+        """Parse-free identity of the held-out entry list a context would yield.
+
+        Mid-run reuse of already-materialized validation tensors is exact only
+        when the verified validation manifest and the ledger-fingerprint subset
+        that filters its entries are both unchanged.  The persisted cache's
+        full-ledger digest cannot serve here because the ledger legitimately
+        grows with every admission while that filtered subset stays fixed
+        whenever the hold-out itself did not change.
+        """
+
+        if getattr(self.config, "policy_stage", None) != "policy_only":
+            return None
+        manager = getattr(self, "_snapshot_manager", None)
+        leak_getter = getattr(manager, "validation_leak_fingerprints", None)
+        if not callable(leak_getter):
+            return None
+        stored_keys = getattr(context, "stored_validation_keys", None)
+        validation_manifest = getattr(context, "validation_manifest", None)
+        if not stored_keys or not isinstance(validation_manifest, Mapping):
+            return None
+        return {
+            "validation_manifest_sha256": self._manifest_cache_digest(
+                validation_manifest),
+            "leak_fingerprints": leak_getter(context),
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+        }
+
+    def _commit_validation_tensor_identity(self, reuse_identity) -> None:
+        """Publish or clear the identity behind the current held-out tensors.
+
+        Called after every validation tensor publication.  An identity is
+        recorded only for a non-empty dataset whose activated manifest carries
+        validated leakage accounting; anything less clears the record so the
+        producer can never skip a rebuild it cannot prove redundant.
+        """
+
+        record = None
+        dataset = getattr(self, "_validation_dataloader", None)
+        if reuse_identity is not None and dataset is not None and len(dataset) > 0:
+            leakage = self._validated_validation_leakage(
+                getattr(self, "_active_snapshot_manifest", {}).get(
+                    "validation_leakage"),
+                len(dataset),
+            )
+            if leakage is not None:
+                record = {
+                    "identity": reuse_identity,
+                    "leakage": {
+                        key: leakage[key]
+                        for key in (
+                            "removed_validation_entry_count",
+                            "removed_validation_state_count",
+                            "retained_validation_entry_count",
+                        )
+                    },
+                }
+        with self._bg_selfplay_lock:
+            self._validation_tensor_identity = record
+
+    def _load_or_reuse_validation_entries(self, context):
+        """Return (entries_or_sentinel, reuse_identity) for a fresh admission.
+
+        When the verified held-out inputs are provably identical to the ones
+        behind the currently published validation tensors, skip the whole
+        validation shard parse and hand the sentinel instead, so the collector
+        keeps the existing tensors rather than rebuilding equal ones.  Any
+        missing proof falls through to the exact load path.
+        """
+
+        manager = self._snapshot_manager
+        identity = self._validation_reuse_identity(context)
+        if identity is not None:
+            with self._bg_selfplay_lock:
+                current = getattr(self, "_validation_tensor_identity", None)
+            if current is not None and current.get("identity") == identity:
+                leakage_counts = dict(current.get("leakage") or {})
+                context.manifest["validation_leakage"] = {
+                    "ledger_enabled": manager.trained_ledger_enabled,
+                    "all_time_trained_state_count": len(
+                        context.historically_trained),
+                    **leakage_counts,
+                }
+                print(
+                    "Validation hold-out unchanged: reusing "
+                    f"{leakage_counts.get('retained_validation_entry_count', 0):,} "
+                    "held-out tensor entry/entries without re-parsing"
+                )
+                return _VALIDATION_TENSORS_CURRENT, identity
+        return manager.load_validation_entries(context), identity
+
+    @staticmethod
+    def _train_shard_identity(record) -> Optional[tuple]:
+        """Immutable identity of one manifest train shard, or None if unproven.
+
+        Both consecutive manifests are integrity-verified before this runs, so
+        equal (relative path, size, SHA-256) triples pin equal shard bytes.
+        """
+
+        if not isinstance(record, Mapping):
+            return None
+        path = record.get("path")
+        size = record.get("size_bytes")
+        sha256 = record.get("sha256")
+        if not path or not sha256 or size is None:
+            return None
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return None
+        return (str(path), size, str(sha256).lower())
+
+    def _train_window_reuse_params(self) -> Optional[dict]:
+        """Static tensorization inputs that must match for shard-row reuse."""
+
+        if getattr(self.config, "policy_stage", None) != "policy_only":
+            return None
+        return {
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+        }
+
+    def _load_or_reuse_train_dataset(self, context, should_abort=None):
+        """Build the admitted window's train tensors, reusing unchanged shards.
+
+        Per manifest shard, the filtered entry list is a pure function of the
+        manifest-pinned shard bytes and ``context.validation_keys`` (no
+        cross-shard state; the entry cap samples the assembled window), and
+        every tensor row is a pure per-entry function of the entry, the move
+        padding, and the encoding version.  A shard whose identity and filter
+        inputs match the previously assembled window therefore reuses its
+        tensor rows without re-parsing; anything unproven takes the exact
+        per-shard parse path.  The producer thread is the only reader and
+        writer of the retained window.  Returns None only when aborted.
+        """
+
+        manager = self._snapshot_manager
+        params = self._train_window_reuse_params()
+        cache = getattr(self, "_train_tensor_window", None)
+        if cache is not None and (
+            params is None
+            or cache.get("params") != params
+            or cache.get("filter_keys") != context.validation_keys
+        ):
+            cache = None
+        cached_files = cache.get("files") if cache is not None else None
+        cached_dataset = cache.get("dataset") if cache is not None else None
+        if cached_dataset is None:
+            cached_files = None
+
+        records = list(context.manifest.get("files") or [])
+        pieces = []  # (identity, cached (start, end) span, miss index)
+        miss_records = []
+        reused_rows = 0
+        for record in records:
+            identity = self._train_shard_identity(record)
+            span = (
+                cached_files.get(identity)
+                if cached_files is not None and identity is not None
+                else None
+            )
+            if span is not None:
+                pieces.append((identity, span, None))
+                reused_rows += span[1] - span[0]
+            else:
+                pieces.append((identity, None, len(miss_records)))
+                miss_records.append(record)
+
+        if reused_rows:
+            print(
+                f"  Train window: reusing tensor rows for "
+                f"{len(records) - len(miss_records)}/{len(records)} unchanged "
+                f"shard(s) ({reused_rows} row(s)); parsing "
+                f"{len(miss_records)} shard(s)"
+            )
+        fields = (
+            "boards", "move_features", "move_counts",
+            "targets", "reward_weights", "value_targets",
+        )
+        miss_counts: list = []
+        miss_entries: list = []
+        miss_offsets = []
+        miss_tensors = []
+
+        def encode_misses():
+            dataset = CachedTensorDataset.from_entries(
+                miss_entries,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                show_progress=True,
+            )
+            miss_tensors.append({field: getattr(dataset, field) for field in fields})
+            # from_entries has joined its workers and copied every output.
+            # Only the tensors need to survive while the next shards parse.
+            miss_entries.clear()
+
+        # Each parse chunk keeps up to a quarter-million entries alive as
+        # small containers, and CPython's cyclic collector re-walks all of
+        # them on every full collection it schedules while the chunk grows.
+        # Pause it for the parse and encode loop only; the assembly below
+        # runs with the collector restored (Journal Pass 552).
+        with paused_cyclic_gc():
+            for record in miss_records:
+                if should_abort is not None and should_abort():
+                    return None
+                entries = manager.load_train_file_entries(context, record)
+                miss_counts.append(len(entries))
+                miss_offsets.append((
+                    len(miss_tensors), len(miss_entries),
+                    len(miss_entries) + len(entries),
+                ))
+                miss_entries.extend(entries)
+                entries = None
+                if len(miss_entries) >= _TRAIN_WINDOW_PARSE_CHUNK_ENTRIES:
+                    if should_abort is not None and should_abort():
+                        return None
+                    encode_misses()
+            if should_abort is not None and should_abort():
+                return None
+            if miss_entries:
+                encode_misses()
+        miss_entries = None
+        if should_abort is not None and should_abort():
+            return None
+
+        # These freshly encoded arrays have no consumer outside this assembly.
+        # Retire each source after its independent copy instead of keeping the
+        # temporary chunks alive beside all six completed outputs.
+        assembled = {}
+        for field in fields:
+            if should_abort is not None and should_abort():
+                return None
+            miss_arrays = [tensors.pop(field) for tensors in miss_tensors]
+            parts = []
+            for identity, span, miss_index in pieces:
+                if span is not None:
+                    parts.append(
+                        getattr(cached_dataset, field)[span[0]:span[1]])
+                else:
+                    chunk, low, high = miss_offsets[miss_index]
+                    if high > low:
+                        parts.append(miss_arrays[chunk][low:high])
+            if parts:
+                # torch.cat copies, so the window never aliases the previous
+                # cache's storage and replacing the cache frees the old rows.
+                assembled[field] = torch.cat(parts, dim=0)
+            parts = None
+            miss_arrays = None
+        if should_abort is not None and should_abort():
+            return None
+        if assembled:
+            window_dataset = CachedTensorDataset(**assembled)
+        else:
+            window_dataset = CachedTensorDataset(
+                torch.empty(0, BOARD_PLANES, 8, 8),
+                torch.empty(
+                    0, int(self.config.max_moves_per_sample),
+                    MOVE_FEATURE_SIZE),
+                torch.empty(0, dtype=torch.int32),
+                torch.empty(0, dtype=torch.int32),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+            )
+        assembled = None
+
+        indices = manager.train_cap_sample_indices(
+            len(window_dataset), context.max_train_entries)
+        if should_abort is not None and should_abort():
+            return None
+        if indices is not None:
+            index_tensor = torch.tensor(indices, dtype=torch.int64)
+            sampled = {}
+            for field in fields:
+                if should_abort is not None and should_abort():
+                    return None
+                sampled[field] = getattr(window_dataset, field)[index_tensor]
+            handed = CachedTensorDataset(**sampled)
+            sampled = None
+        else:
+            handed = window_dataset
+        if should_abort is not None and should_abort():
+            return None
+
+        retain = params is not None
+        if retain:
+            def tensor_bytes(dataset):
+                return sum(
+                    getattr(dataset, field).element_size()
+                    * getattr(dataset, field).nelement()
+                    for field in fields
+                )
+
+            window_bytes = tensor_bytes(window_dataset)
+            # Free RAM is read with the new window already resident while the
+            # previous window, released at publication below, is still held.
+            # Credit that release: counting it refused every other warm
+            # retention once RAM tightened, forcing full-window re-parses
+            # (Journal Pass 569). Use the attribute, not the local cache, which
+            # is dropped on a params/filter mismatch while still resident.
+            previous = getattr(self, "_train_tensor_window", None)
+            previous_dataset = (
+                previous.get("dataset") if isinstance(previous, Mapping) else None
+            )
+            previous_bytes = (
+                tensor_bytes(previous_dataset) if previous_dataset is not None else 0
+            )
+            try:
+                import psutil
+                available = psutil.virtual_memory().available
+            except Exception:
+                available = None
+            retain = (
+                available is not None
+                and (available + previous_bytes - window_bytes)
+                >= _TRAIN_WINDOW_CACHE_MIN_FREE_GB * (1024 ** 3)
+            )
+            if not retain and available is not None:
+                _diagnostic_print(
+                    f"  Train window: not retaining {len(window_dataset)} row(s) "
+                    f"for reuse: {(available + previous_bytes) / 1024 ** 3:.2f} GiB "
+                    f"free after release, below the "
+                    f"{_TRAIN_WINDOW_CACHE_MIN_FREE_GB:.1f} GiB floor plus "
+                    f"{window_bytes / 1024 ** 3:.2f} GiB window margin"
+                )
+        if should_abort is not None and should_abort():
+            return None
+        next_cache = None
+        if retain:
+            files_map = {}
+            row = 0
+            for identity, span, miss_index in pieces:
+                length = (
+                    span[1] - span[0]
+                    if span is not None else miss_counts[miss_index]
+                )
+                if identity is not None:
+                    files_map[identity] = (row, row + length)
+                row += length
+            next_cache = {
+                "params": params,
+                "filter_keys": frozenset(context.validation_keys),
+                "files": files_map,
+                "dataset": window_dataset,
+            }
+        # A stop during assembly must leave the previous reusable window intact.
+        # Only publish after every allocation and retention check has completed.
+        if should_abort is not None and should_abort():
+            return None
+        self._train_tensor_window = next_cache
+        return handed
+
+    def _snapshot_train_cache_metadata(
+        self,
+        manifest: Mapping[str, Any],
+        validation_keys: Iterable[str],
+    ) -> Optional[dict]:
+        """Return the immutable source key for a policy-stage tensor cache.
+
+        A cache is never sufficient by itself: ``prepare_split`` verifies the
+        snapshot and held-out manifests first.  This key then ties the tensors
+        to that verified train snapshot, the configured entry cap and padding,
+        and every validation exclusion that participates in train filtering.
+        """
+
+        if (
+            getattr(self.config, "policy_stage", None) != "policy_only"
+            or not getattr(self.config, "ram_cache_enabled", False)
+            or not getattr(self.config, "ram_cache_file", None)
+        ):
+            return None
+        # Preserve the cache's existing minimum-free-RAM safety gate.  On the
+        # warm path no replay entries have inflated RSS yet, so the pre-launch
+        # reading is the conservative equivalent of the normal fallback gate.
+        threshold_gb = float(
+            getattr(self.config, "ram_cache_threshold_gb", 0.0) or 0.0)
+        prelaunch_gb = getattr(self, "_prelaunch_free_ram_gb", None)
+        if prelaunch_gb is None or prelaunch_gb <= threshold_gb:
+            return None
+        fingerprint = str(manifest.get("fingerprint", "")).lower()
+        if not fingerprint:
+            return None
+        external_keys = getattr(
+            self._snapshot_manager, "external_validation_state_keys", ())
+        return {
+            # Version 3 is deliberately distinct from the sampled-entry cache
+            # metadata used before the manifest key existed.
+            "cache_version": 3,
+            "snapshot_train_cache_version": 2,
+            "snapshot_fingerprint": fingerprint,
+            "external_validation_keys_sha256": self._snapshot_cache_key_digest(
+                external_keys),
+            "validation_exclusion_keys_sha256": self._snapshot_cache_key_digest(
+                validation_keys),
+            "max_train_entries": int(self.config.replay_max_entries),
+            "max_moves_per_sample": int(self.config.max_moves_per_sample),
+            "encoding_version": ENCODING_VERSION,
+            "policy_stage": "policy_only",
+            "side_weight_balance_version": 1,
+        }
+
+    def _prepare_training_split(self, *, use_train_cache: bool = True):
+        # This field is consumed by the startup path immediately after this
+        # method returns.  Clear it first so an alternate-mode rebuild or a
+        # failed cache lookup can never reuse a previous window's tensors.
+        self._preloaded_snapshot_dataset = None
+        self._preloaded_snapshot_cache_metadata = None
+        self._preloaded_snapshot_cache_checked = False
+        self._preloaded_validation_dataset = None
+        self._preloaded_validation_cache_metadata = None
+        self._pending_validation_reuse_identity = None
+        if self._snapshot_manager is not None:
+            behavior_step = int(self.step)
+            teacher, noise, generation = self._corpus_settings(
+                model_behavior_step=behavior_step
+            )
+            while True:
+                decision = self._snapshot_manager.consider_snapshot(
+                    teacher_settings=teacher,
+                    noise_settings=noise,
+                    generation_settings=generation,
+                )
+                if decision.manifest_path is None:
+                    raise RuntimeError(
+                        f"Corpus snapshot unavailable: {decision.reason}"
+                    )
+                settings_match = self._snapshot_manager.snapshot_matches_settings(
+                    decision.manifest_path,
+                    teacher_settings=teacher,
+                    noise_settings=noise,
+                    generation_settings=generation,
+                )
+                if decision.admitted and not settings_match:
+                    raise RuntimeError(
+                        "New corpus snapshot does not match the active data contract"
+                    )
+                if decision.admitted or settings_match:
+                    break
+
+                # Repairing the contract costs one whole self-play cycle per
+                # iteration until admission passes, so this loop is exactly
+                # the unbounded startup work a session deadline has to bound.
+                # Stop before dispatching another cycle, matching the replay
+                # bootstrap loop in _run_training (Journal Pass 553).
+                self._service_control_queue()
+                if self._stopped or self._training_time_limit_reached():
+                    return [], []
+
+                eligible_before, _ = (
+                    self._snapshot_manager.eligible_replay_files()
+                )
+                before_metrics, _ = analyze_replay_files(eligible_before)
+                print(
+                    "Corpus contract changed; generating repaired data until "
+                    "a fresh snapshot passes the admission gate"
+                )
+                _, behavior_step = self.run_selfplay(
+                    self.config.selfplay_games,
+                    return_behavior_step=True,
+                )
+                pruned = self.replay_buffer.cleanup_old_files()
+                if pruned:
+                    print(
+                        f"Replay: pruned {pruned} old file(s) while preparing "
+                        "the new data contract"
+                    )
+                # Expiry during the cycle is observed here too: the caller
+                # rechecks immediately, and an empty split leaves the active
+                # dataloader untouched in alternate mode.
+                self._service_control_queue()
+                if self._stopped or self._training_time_limit_reached():
+                    return [], []
+
+                eligible_after, _ = (
+                    self._snapshot_manager.eligible_replay_files()
+                )
+                after_metrics, _ = analyze_replay_files(eligible_after)
+                if (
+                    len(eligible_after) == len(eligible_before)
+                    and int(after_metrics.get('records', 0))
+                    == int(before_metrics.get('records', 0))
+                    and after_metrics.get('state_set_sha256')
+                    == before_metrics.get('state_set_sha256')
+                ):
+                    raise RuntimeError(
+                        "Self-play made no eligible corpus progress for the "
+                        "new data contract"
+                    )
+                teacher, noise, generation = self._corpus_settings(
+                    model_behavior_step=behavior_step
+                )
+            rejected = decision.metrics.get('rejected_replay_files') or {}
+            if rejected:
+                summary = ', '.join(
+                    f"{name} ({'/'.join(sorted(audit.get('errors', {}))) or 'unknown'})"
+                    for name, audit in sorted(rejected.items())[:5]
+                )
+                more = '' if len(rejected) <= 5 else f", +{len(rejected) - 5} more"
+                print(
+                    f"Corpus admission rejected {len(rejected)} replay file(s): "
+                    f"{summary}{more}"
+                )
+            if decision.admitted:
+                print(
+                    f"Admitted corpus snapshot {decision.manifest_path.parent.name}: "
+                    f"{decision.metrics.get('fresh_unique_state_rate', 0.0):.1%} fresh, "
+                    f"{decision.metrics.get('unique_state_count', 0):,} unique states"
+                )
+            else:
+                print(f"Corpus snapshot unchanged: {decision.reason}")
+            manager = self._snapshot_manager
+            staged_split = (
+                use_train_cache
+                and all(callable(getattr(manager, name, None)) for name in (
+                    "prepare_split", "load_validation_entries", "load_train_entries",
+                ))
+            )
+            if staged_split:
+                # Integrity and leakage checks deliberately run before a cache
+                # is considered.  The cache can skip only redundant materializing
+                # of the already-verified training shards.
+                split_context = manager.prepare_split(
+                    decision.manifest_path,
+                    max_train_entries=self.config.replay_max_entries,
+                )
+                # Recorded after the startup tensors are published, so the
+                # first mid-run admission with an unchanged hold-out can skip
+                # its redundant validation re-parse and re-tensorization.
+                self._pending_validation_reuse_identity = (
+                    self._validation_reuse_identity(split_context))
+                validation_cache_metadata = (
+                    self._validation_tensor_cache_metadata(split_context))
+                cached_validation = (
+                    self._load_matching_validation_tensor_cache(
+                        validation_cache_metadata)
+                    if validation_cache_metadata is not None else None
+                )
+                if cached_validation is not None:
+                    validation_dataset, validation_leakage = cached_validation
+                    # The cache is only accepted after prepare_split's source
+                    # verification.  Restore the accounting the materializer
+                    # would have attached to the activated manifest.
+                    split_context.manifest["validation_leakage"] = (
+                        validation_leakage)
+                    self._preloaded_validation_dataset = validation_dataset
+                    validation_entries = []
+                else:
+                    validation_entries = manager.load_validation_entries(
+                        split_context)
+                    self._preloaded_validation_cache_metadata = (
+                        validation_cache_metadata)
+                if (type(manager) is CorpusSnapshotManager
+                        and type(split_context) is _SnapshotSplitContext):
+                    # Validation, leakage accounting and cache identities are
+                    # complete. Drop the context's ledger reference before train
+                    # loading, preserving external aliases and custom contracts.
+                    # The built-in manager shares one immutable index (Journal
+                    # Pass 556), so no full-ledger copy remains to retire.
+                    split_context = replace(
+                        split_context, historically_trained=set())
+                manifest = split_context.manifest
+                cache_metadata = self._snapshot_train_cache_metadata(
+                    manifest, split_context.validation_keys)
+                self._preloaded_snapshot_cache_metadata = cache_metadata
+                if cache_metadata is not None:
+                    self._preloaded_snapshot_cache_checked = True
+                    cached_dataset = load_matching_cached_tensor_dataset(
+                        self.config.ram_cache_file,
+                        cache_metadata,
+                        migrate_to_compressed=getattr(
+                            self.config, "ram_cache_compress", False),
+                    )
+                    if cached_dataset is not None:
+                        self._preloaded_snapshot_dataset = cached_dataset
+                        train_entries = []
+                    else:
+                        train_entries = manager.load_train_entries(split_context)
+                else:
+                    train_entries = manager.load_train_entries(split_context)
+            else:
+                train_entries, validation_entries, manifest = manager.load_split(
+                    decision.manifest_path,
+                    max_train_entries=self.config.replay_max_entries,
+                )
+            self._activate_dataset_manifest(manifest)
+            return train_entries, validation_entries
+
+        train_entries, validation_entries = prepare_training_data(
+            self.replay_buffer,
+            max_entries=self.config.replay_max_entries,
+            val_split=(self.config.validation_fraction
+                       if self.config.validation_enabled else 0.0),
+            split_seed=self.config.validation_split_seed,
+        )
+        files = self.replay_buffer.get_replay_files()
+        metrics, _ = analyze_replay_files(files)
+        file_records = [
+            {
+                'name': path.name,
+                'path': str(path),
+                'sha256': replay_file_sha256(path),
+                'size_bytes': path.stat().st_size,
+            }
+            for path in files
+        ]
+        teacher, noise, generation = self._corpus_settings()
+        fingerprint = hashlib.sha256(json.dumps({
+            'files': file_records,
+            'state_set_sha256': metrics.get('state_set_sha256'),
+            'teacher_settings': teacher,
+            'noise_settings': noise,
+            'generation_settings': generation,
+        }, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+        self._activate_dataset_manifest({
+            'fingerprint': fingerprint,
+            'version': None,
+            'files': file_records,
+            'metrics': metrics,
+            'teacher_settings': teacher,
+            'noise_settings': noise,
+            'generation_settings': generation,
+        })
+        return train_entries, validation_entries
+
+    def _ensure_frozen_teacher_suite(self) -> None:
+        if not self.config.validation_enabled:
+            return
+        suite_path = Path(self.config.frozen_suite_path)
+        if self._snapshot_manager is not None:
+            replay_files, _ = self._snapshot_manager.eligible_replay_files()
+        else:
+            replay_files = self.replay_buffer.get_replay_files()
+        _, replay_state_keys = analyze_replay_files(replay_files)
+        if not suite_path.exists() and not self.config.frozen_suite_auto_create:
+            raise FileNotFoundError(
+                f"Frozen teacher suite is required before training: {suite_path}"
+            )
+        if not suite_path.exists():
+            print(
+                f"Creating immutable {self.config.frozen_suite_size:,}-state "
+                f"{self.config.teacher_difficulty} teacher suite at {suite_path}"
+            )
+        suite_already_exists = (
+            suite_path.exists()
+            or suite_path.with_suffix(
+                suite_path.suffix + '.manifest.json'
+            ).exists()
+        )
+        create_frozen_teacher_suite(
+            str(suite_path),
+            target_states=self.config.frozen_suite_size,
+            seed=self.config.frozen_suite_seed,
+            teacher_difficulty=self.config.teacher_difficulty,
+            opening_plies=self.config.selfplay_opening_plies,
+            played_action_noise=self.config.selfplay_noise_prob,
+            max_moves_per_game=self.config.selfplay_max_moves,
+            exclude_state_keys=(
+                None if suite_already_exists else replay_state_keys
+            ),
+        )
+        entries, manifest = load_frozen_teacher_suite(
+            str(suite_path),
+            expected_count=self.config.frozen_suite_size,
+        )
+        self._frozen_suite_entries = entries
+        self._frozen_suite_manifest = manifest
+        suite_state_keys = {
+            canonical_state_key(entry.state) for entry in entries
+        }
+        replay_overlap = suite_state_keys.intersection(replay_state_keys)
+        if replay_overlap and self._snapshot_manager is None:
+            raise RuntimeError(
+                "Frozen teacher suite overlaps replay data and no snapshot "
+                "manager is available to filter it"
+            )
+        if self._snapshot_manager is not None:
+            self._snapshot_manager.set_external_validation_state_keys(
+                suite_state_keys)
+            if replay_overlap:
+                print(
+                    f"Frozen suite overlap: excluding {len(replay_overlap):,} "
+                    "revisited state(s) from recovery training"
+                )
+        print(
+            f"Frozen teacher suite verified: {len(entries):,} unique states, "
+            f"SHA-256 {manifest['suite_sha256'][:12]}"
+        )
+
+    def _set_validation_entries(
+        self,
+        entries,
+        *,
+        preloaded_dataset: Optional[CachedTensorDataset] = None,
+        cache_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Publish immutable validation tensors from entries or a verified cache."""
+
+        self._validation_entries = list(entries)
+        if preloaded_dataset is not None:
+            if self._validation_entries:
+                raise RuntimeError(
+                    "Preloaded validation tensors cannot accompany replay entries"
+                )
+            self._validation_dataloader = preloaded_dataset
+            print(
+                f"Immutable validation entries: {len(preloaded_dataset):,} "
+                "from source-verified tensor cache"
+            )
+            return
+        if not self._validation_entries:
+            self._validation_dataloader = None
+            return
+        if self.config.policy_stage == 'enhanced':
+            iterator = create_enhanced_dataloader(
+                self._validation_entries,
+                batch_size=max(1, self.config.batch_size),
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                teacher_depth=self.config.teacher_score_depth,
+                temperature=self.config.teacher_soft_temperature,
+                value_scale=self.config.teacher_value_scale,
+                hard_label_blend=self.config.teacher_hard_label_blend,
+                shuffle=False,
+                show_progress=True,
+            )
+            self._validation_dataloader = iterator.dataset
+        else:
+            self._validation_dataloader = CachedTensorDataset.from_entries(
+                self._validation_entries,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                show_progress=True,
+            )
+            if cache_metadata is not None:
+                self._save_validation_tensor_cache(
+                    self._validation_dataloader, cache_metadata)
+        print(
+            f"Immutable validation entries: {len(self._validation_entries):,} "
+            "from held-out replay files"
+        )
+        # Validation reads only the copied tensors. Background refreshes do
+        # not pass through startup's entry-list cleanup, so release this
+        # redundant mirror here without mutating the caller's input list.
+        self._validation_entries = []
+
+    def _evaluate_validation_loss(self) -> Optional[float]:
+        dataset = self._validation_dataloader
+        if dataset is None or len(dataset) == 0:
+            return None
+        was_training = self.model.training
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        batch_size = max(1, self.config.batch_size)
+        with torch.inference_mode():
+            for start in range(0, len(dataset), batch_size):
+                end = min(start + batch_size, len(dataset))
+                boards = dataset.boards[start:end].to(self.device)
+                move_features = dataset.move_features[start:end].to(self.device)
+                move_counts = dataset.move_counts[start:end].to(self.device)
+                targets = dataset.targets[start:end].to(self.device)
+                weights = dataset.reward_weights[start:end].to(self.device)
+                value_targets = dataset.value_targets[start:end].to(self.device)
+                amp_enabled = _autocast_enabled(self.device, self.config.amp)
+                with autocast(
+                    device_type=self.device.type,
+                    dtype=self.amp_dtype,
+                    enabled=amp_enabled,
+                ):
+                    if self.config.value_head_enabled:
+                        scores, values = self.model.forward_padded_with_value(
+                            boards, move_features, move_counts)
+                        if self.config.policy_stage == 'enhanced':
+                            teacher_probabilities = (
+                                dataset.teacher_probabilities[start:end].to(self.device)
+                            )
+                            policy_loss = soft_target_cross_entropy(
+                                scores, move_counts, teacher_probabilities, weights)
+                        else:
+                            policy_loss = self._compute_loss_padded(
+                                scores, move_counts, targets, weights)
+                        value_loss = torch.nn.functional.mse_loss(
+                            values.float(), value_targets.float())
+                        loss = policy_loss + self.config.value_weight * value_loss
+                    else:
+                        scores = self.model.forward_padded(
+                            boards, move_features, move_counts)
+                        loss = self._compute_loss_padded(
+                            scores, move_counts, targets, weights)
+                count = end - start
+                total_loss += float(loss.item()) * count
+                total_samples += count
+        if was_training:
+            self.model.train()
+        value = total_loss / max(1, total_samples)
+        self._record_validation_stats(value)
+        return value
+
+    def _live_optimizer_context(self) -> dict:
+        """Return metadata from the optimizer state that training actually uses."""
+        param_groups = list(self.optimizer.param_groups)
+        if not param_groups:
+            raise RuntimeError("Optimizer has no parameter groups")
+
+        def _group_value(name: str):
+            try:
+                values = [float(group[name]) for group in param_groups]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Optimizer parameter groups have no valid {name!r} value"
+                ) from exc
+            first = values[0]
+            if all(value == first for value in values[1:]):
+                return first
+            # Retain every group value rather than publishing a false scalar
+            # if a future optimizer intentionally uses heterogeneous groups.
+            return values
+
+        return {
+            'optimizer': type(self.optimizer).__name__,
+            'learning_rate': _group_value('lr'),
+            'weight_decay': _group_value('weight_decay'),
+            'batch_size': self.config.batch_size,
+            'gradient_accumulation_steps': (
+                self.config.gradient_accumulation_steps),
+            'scheduler_enabled': self.config.lr_scheduler_enabled,
+            'scheduler_type': self.config.lr_scheduler_type,
+        }
+
+    def _evaluate_teacher_promotion(self, checkpoint_path: Path) -> Optional[dict]:
+        if not self._frozen_suite_entries:
+            return None
+        result = evaluate_teacher_agreement(
+            self.model,
+            self._frozen_suite_entries,
+            max_moves_per_sample=self.config.max_moves_per_sample,
+            batch_size=max(1, min(self.config.batch_size, 2048)),
+        )
+        record = {
+            'step': self.step,
+            'epoch': self.epoch,
+            'generation_cycles_completed': self.stats.generation_cycles_completed,
+            'timestamp': datetime.now().isoformat(),
+            'suite_fingerprint': self._frozen_suite_manifest['suite_sha256'],
+            **result,
+        }
+        self.stats.teacher_agreement_history.append(record)
+        agreement = float(result['top1_teacher_agreement'])
+        self.stats.best_teacher_agreement = max(
+            self.stats.best_teacher_agreement, agreement)
+        decision = self._promotion_registry.consider(
+            checkpoint_path=str(checkpoint_path),
+            step=self.step,
+            agreement=agreement,
+            suite_fingerprint=self._frozen_suite_manifest['suite_sha256'],
+            dataset_fingerprint=self.stats.dataset_fingerprint,
+            training_stage=self.config.policy_stage,
+            comparison_context={
+                **self._live_optimizer_context(),
+                'opening_seed': self.config.selfplay_opening_seed,
+                'validation_split_seed': self.config.validation_split_seed,
+                'frozen_suite_seed': self.config.frozen_suite_seed,
+            },
+            persist=False,
+        )
+        promotion_record = dict(decision.record)
+        promotion_record.update({
+            'teacher_correct_states': int(result['correct_states']),
+            'teacher_total_states': int(result['total_states']),
+            'teacher_decision_correct_states': int(
+                result['decision_correct_states']),
+            'teacher_decision_states': int(result['decision_states']),
+            'teacher_forced_move_fraction': float(
+                result['forced_move_fraction']),
+        })
+        _diagnostic_print(
+            f"Frozen-suite teacher agreement: {agreement:.2%} "
+            f"({result['correct_states']}/{result['total_states']}), "
+            f"promotion={decision.promoted} ({decision.reason})"
+        )
+        return {'agreement': record, 'promotion': promotion_record}
+
+    def _enqueue_checkpoint_acceptance(
+        self,
+        checkpoint_path: Path,
+        selection: Mapping[str, Any],
+    ) -> None:
+        """Durably record, then queue one promoted-checkpoint evaluation."""
+        promotion = selection.get('promotion', {})
+        if not promotion.get('promoted'):
+            return
+        agreement = float(
+            selection.get('agreement', {}).get('top1_teacher_agreement', 0.0))
+        task = checkpoint_acceptance_tasks.make_pending_acceptance_task(
+            str(checkpoint_path),
+            step=promotion.get('step', self.step),
+            teacher_agreement=agreement,
+            opening_plies=self.config.test_opening_plies,
+            opening_seed=self.config.test_opening_seed,
+            inference_depth=self.config.inference_depth,
+            max_moves=self.config.selfplay_max_moves,
+            num_workers=min(self.config.cpu_workers, 4),
+            training_stage=self.config.policy_stage,
+            checkpoint_sha256=promotion.get('checkpoint_sha256'),
+            suite_fingerprint=promotion.get('suite_fingerprint'),
+            teacher_correct_states=promotion.get('teacher_correct_states'),
+            teacher_total_states=promotion.get('teacher_total_states'),
+        )
+        self._queue_checkpoint_acceptance_task(task, persist=True)
+
+    def _acceptance_task_from_promotion(
+        self,
+        promotion: Mapping[str, Any],
+    ) -> Optional[dict]:
+        """Reconstruct the durable acceptance input for a promotion record."""
+        promoted = promotion.get('promoted')
+        if type(promoted) is not bool:
+            raise ValueError(
+                "Promotion record promoted decision must be a boolean")
+        if not promoted:
+            return None
+        checkpoint_path = promotion.get('checkpoint_path')
+        checkpoint_sha256 = promotion.get('checkpoint_sha256')
+        suite_fingerprint = promotion.get('suite_fingerprint')
+        if not checkpoint_path or not checkpoint_sha256 or not suite_fingerprint:
+            raise ValueError(
+                "Promoted checkpoint record lacks path, checkpoint SHA-256, "
+                "or frozen-suite provenance")
+        return checkpoint_acceptance_tasks.make_pending_acceptance_task(
+            checkpoint_path,
+            step=promotion['step'],
+            teacher_agreement=promotion['teacher_agreement'],
+            opening_plies=self.config.test_opening_plies,
+            opening_seed=self.config.test_opening_seed,
+            inference_depth=self.config.inference_depth,
+            max_moves=self.config.selfplay_max_moves,
+            num_workers=min(self.config.cpu_workers, 4),
+            training_stage=promotion.get(
+                'training_stage', self.config.policy_stage),
+            checkpoint_sha256=checkpoint_sha256,
+            suite_fingerprint=suite_fingerprint,
+            teacher_correct_states=promotion.get('teacher_correct_states'),
+            teacher_total_states=promotion.get('teacher_total_states'),
+        )
+
+    def _queue_checkpoint_acceptance_task(
+        self,
+        task: Mapping[str, Any],
+        *,
+        persist: bool,
+    ) -> bool:
+        """Queue a task once, with its pending file already durable."""
+        task = dict(task)
+        task_id = str(task['task_id'])
+        output_dir = self.config.acceptance_dir
+
+        terminal = checkpoint_acceptance_tasks.terminal_acceptance_report_path(
+            output_dir, task)
+        if terminal is not None:
+            _diagnostic_print(
+                f"Acceptance task {task_id} already has terminal report: {terminal}")
+            return False
+
+        with self._acceptance_task_lock:
+            if task_id in self._acceptance_task_ids:
+                return False
+            pending_path = checkpoint_acceptance_tasks.pending_acceptance_task_path(
+                output_dir, task)
+            if persist:
+                checkpoint_acceptance_tasks.persist_pending_acceptance_task(
+                    output_dir, task)
+            elif not pending_path.exists():
+                raise FileNotFoundError(
+                    f"Recovered acceptance task has no pending file: {pending_path}")
+
+            self._acceptance_task_ids.add(task_id)
+            try:
+                self._ensure_checkpoint_acceptance_worker()
+                self._acceptance_queue.put(task)
+            except Exception:
+                self._acceptance_task_ids.discard(task_id)
+                raise
+
+        _diagnostic_print(f"Queued acceptance protocol for promoted step {task['step']}")
+        return True
+
+    def _ensure_checkpoint_acceptance_worker(self) -> None:
+        if self._acceptance_thread is not None and self._acceptance_thread.is_alive():
+            return
+
+        def _acceptance_worker() -> None:
+            while True:
+                queued = self._acceptance_queue.get()
+                try:
+                    if queued is None:
+                        return
+                    self._process_checkpoint_acceptance_task(queued)
+                finally:
+                    if queued is not None:
+                        with self._acceptance_task_lock:
+                            self._acceptance_task_ids.discard(
+                                str(queued['task_id']))
+                    self._acceptance_queue.task_done()
+
+        self._acceptance_thread = threading.Thread(
+            target=_acceptance_worker,
+            name='checkpoint-acceptance',
+            daemon=True,
+        )
+        self._acceptance_thread.start()
+
+    def _finish_checkpoint_acceptance(self) -> None:
+        """Drain already queued acceptance work before normal termination."""
+        if self._acceptance_thread is not None and not self._stopped:
+            _diagnostic_print(
+                "Waiting for queued promoted-checkpoint acceptance evaluations...")
+            self._acceptance_queue.join()
+            self._acceptance_queue.put(None)
+            self._acceptance_thread.join(timeout=5)
+
+    def _finalize_checkpoint_acceptance_report(
+        self,
+        task: Mapping[str, Any],
+        report: Mapping[str, Any],
+        durable_report: Path,
+        *,
+        publish_alias: bool = True,
+    ) -> None:
+        """Publish a passing alias and record one durable acceptance result."""
+        report = dict(report)
+        report['report_path'] = str(durable_report)
+        already_recorded = any(
+            isinstance(record, Mapping)
+            and dict(record) == report
+            for record in self.stats.acceptance_history
+        )
+        if report['passed'] and publish_alias:
+            # The durable history and accepted alias are independent outputs.
+            # A prior finalization can persist the history while a later alias
+            # deletion or failed pending cleanup leaves startup responsible for
+            # repairing the alias.  Publish it before the history idempotency
+            # return so pending recovery never clears its only repair marker.
+            self._publish_verified_checkpoint_alias(
+                Path(task['checkpoint_path']),
+                Path(self.config.accepted_path),
+                task.get('checkpoint_sha256'),
+            )
+        if already_recorded:
+            return
+
+        # Normal evaluations arrive in increasing checkpoint order. Recovery
+        # can instead restore an older missing row after newer rows have
+        # survived a statistics rollback. Insert it before the first later
+        # checkpoint so callers that read the final row still see the newest
+        # acceptance result.
+        report_step = int(report.get('step', -1))
+        insert_at = len(self.stats.acceptance_history)
+        for index, existing in enumerate(self.stats.acceptance_history):
+            if not isinstance(existing, Mapping):
+                continue
+            try:
+                existing_step = int(existing.get('step', -1))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if existing_step > report_step:
+                insert_at = index
+                break
+        self.stats.acceptance_history.insert(insert_at, report)
+        self._save_stats(_raise_on_error=True)
+        state = 'PASSED' if report['passed'] else 'FAILED'
+        _diagnostic_print(
+            f"Acceptance {state} for step {task['step']}: "
+            f"{durable_report}"
+        )
+        self._put_status({
+            'type': MSG_STATUS,
+            'acceptance': report,
+        })
+
+    def _process_checkpoint_acceptance_task(
+        self,
+        queued: Mapping[str, Any],
+    ) -> None:
+        """Run one durable task and retain it until a terminal report exists."""
+        task = dict(queued)
+        output_dir = self.config.acceptance_dir
+        task_completed = False
+        try:
+            checkpoint_acceptance_tasks.run_checkpoint_acceptance(
+                task['checkpoint_path'],
+                step=task['step'],
+                teacher_agreement=task['teacher_agreement'],
+                opening_plies=task['opening_plies'],
+                opening_seed=task['opening_seed'],
+                inference_depth=task['inference_depth'],
+                max_moves=task['max_moves'],
+                num_workers=task['num_workers'],
+                output_dir=output_dir,
+                training_stage=task['training_stage'],
+                task_id=task['task_id'],
+                checkpoint_sha256=task.get('checkpoint_sha256'),
+                suite_fingerprint=task.get('suite_fingerprint'),
+                teacher_correct_states=task.get('teacher_correct_states'),
+                teacher_total_states=task.get('teacher_total_states'),
+            )
+            completed = (
+                checkpoint_acceptance_tasks.load_completed_acceptance_report(
+                    output_dir, task))
+            if completed is None:
+                raise RuntimeError(
+                    "Acceptance evaluator returned without a matching durable report")
+            durable_report, report = completed
+
+            self._finalize_checkpoint_acceptance_report(
+                task, report, durable_report)
+            task_completed = True
+        except Exception as exc:
+            # The evaluator publishes its report before the accepted alias and
+            # statistics are finalized. If that finalization fails, keep the
+            # pending task so startup can repair the alias without replaying
+            # the 200-game protocol or misclassifying the passed gate as an
+            # evaluation failure.
+            durable_success = (
+                checkpoint_acceptance_tasks.load_completed_acceptance_report(
+                    output_dir, task))
+            if durable_success is not None:
+                _diagnostic_print(
+                    f"Acceptance finalization error for step {task['step']}: "
+                    f"{exc}. Pending task retained for startup recovery."
+                )
+                return
+            try:
+                failure_path = (
+                    checkpoint_acceptance_tasks.write_acceptance_failure_report(
+                        output_dir, task, exc))
+            except Exception as report_exc:
+                _diagnostic_print(
+                    f"Acceptance evaluation error for step {task['step']}: {exc}. "
+                    f"Failure report could not be written: {report_exc}"
+                )
+                return
+
+            try:
+                terminal = (
+                    checkpoint_acceptance_tasks.load_terminal_acceptance_report(
+                        output_dir, task))
+                if terminal is None or terminal[0] != failure_path:
+                    raise RuntimeError(
+                        "Acceptance failure writer returned without a matching "
+                        "durable report")
+                _, failure = terminal
+                self._finalize_checkpoint_acceptance_report(
+                    task, failure, failure_path)
+            except Exception as stats_exc:
+                _diagnostic_print(
+                    f"Acceptance failure finalization error for step "
+                    f"{task['step']}: {stats_exc}. Pending task retained for "
+                    f"startup recovery."
+                )
+                return
+            _diagnostic_print(
+                f"Acceptance evaluation error for step {task['step']}: {exc}. "
+                f"Failure report: {failure_path}"
+            )
+            task_completed = True
+        finally:
+            if task_completed:
+                try:
+                    checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                        output_dir, task)
+                except OSError as cleanup_exc:
+                    _diagnostic_print(
+                        f"Pending acceptance task cleanup failed for "
+                        f"{task['task_id']}: {cleanup_exc}"
+                    )
+
+    def _recover_pending_checkpoint_acceptance(self) -> int:
+        """Requeue pending work and reconcile durable acceptance results."""
+        recovered = 0
+        latest_passing_completion = None
+        passing_completions = []
+
+        # The promotion record becomes durable before its pending evaluation
+        # task. When the registry is available, derive the authoritative task
+        # inputs from that append-only record before trusting a recoverable
+        # JSON file. A modified pending file can otherwise win the task-id
+        # deduplication race and replace the frozen teacher evidence used by
+        # the fixed game-strength gate.
+        promotion_registry = getattr(self, '_promotion_registry', None)
+        if promotion_registry is None:
+            promotion_records = ()
+            promotion_tasks = None
+        else:
+            promotion_records = promotion_registry.records()
+            promotion_tasks = {}
+            conflicting_task_ids = set()
+            for promotion in promotion_records:
+                try:
+                    candidate = self._acceptance_task_from_promotion(promotion)
+                    if candidate is None:
+                        continue
+                    task_id = candidate['task_id']
+                    existing = promotion_tasks.get(task_id)
+                    if (
+                        existing is not None
+                        and not (
+                            checkpoint_acceptance_tasks
+                            ._pending_acceptance_tasks_match(
+                                existing, candidate)
+                        )
+                    ):
+                        conflicting_task_ids.add(task_id)
+                        promotion_tasks.pop(task_id, None)
+                    elif task_id not in conflicting_task_ids:
+                        promotion_tasks[task_id] = candidate
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    print(
+                        "Could not reconstruct promoted checkpoint acceptance "
+                        f"task for step {promotion.get('step')}: {exc}"
+                    )
+
+        for task in checkpoint_acceptance_tasks.discover_pending_acceptance_tasks(
+            self.config.acceptance_dir
+        ):
+            if promotion_tasks is not None:
+                expected_task = promotion_tasks.get(task['task_id'])
+                task_matches = (
+                    expected_task is not None
+                    and (
+                        checkpoint_acceptance_tasks
+                        ._pending_acceptance_tasks_match(
+                            task, expected_task)
+                    )
+                )
+                if not task_matches:
+                    try:
+                        quarantine = (
+                            checkpoint_acceptance_tasks
+                            .quarantine_pending_acceptance_task(
+                                self.config.acceptance_dir, task))
+                    except OSError as exc:
+                        print(
+                            "Could not quarantine pending acceptance task "
+                            f"{task.get('task_id')}: {exc}"
+                        )
+                    else:
+                        print(
+                            "Quarantined pending acceptance task without an "
+                            "exact promoted-checkpoint record as "
+                            f"{quarantine}"
+                        )
+                    continue
+                task = expected_task
+
+            completed = (
+                checkpoint_acceptance_tasks.load_completed_acceptance_report(
+                    self.config.acceptance_dir, task))
+            if completed is not None:
+                durable_success, report = completed
+                try:
+                    self._finalize_checkpoint_acceptance_report(
+                        task, report, durable_success)
+                    checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                        self.config.acceptance_dir, task)
+                except Exception as exc:
+                    print(
+                        f"Could not finalize durable acceptance report for "
+                        f"step {task.get('step')}: {exc}. Pending task retained."
+                    )
+                    continue
+                recovered += 1
+                continue
+            completed = checkpoint_acceptance_tasks.load_terminal_acceptance_report(
+                self.config.acceptance_dir, task)
+            if completed is not None:
+                terminal, report = completed
+                try:
+                    self._finalize_checkpoint_acceptance_report(
+                        task, report, terminal)
+                    checkpoint_acceptance_tasks.remove_pending_acceptance_task(
+                        self.config.acceptance_dir, task)
+                except Exception as exc:
+                    print(
+                        f"Could not finalize durable acceptance failure for "
+                        f"step {task.get('step')}: {exc}. Pending task retained."
+                    )
+                    continue
+                recovered += 1
+                continue
+            if self._queue_checkpoint_acceptance_task(task, persist=False):
+                recovered += 1
+
+        # A checkpoint and promotion registry entry become durable before the
+        # pending task is written.  Reconcile that narrow crash window by
+        # rebuilding any missing task from the append-only promotion record.
+        # A few lightweight integrations construct a Trainer shell without
+        # initializing the registry (for example, GUI/status recovery tests).
+        # Pending-file recovery remains valid in that case; registry
+        # reconciliation is simply unavailable.
+        registry_tasks = (
+            () if promotion_tasks is None else promotion_tasks.values())
+        for task in registry_tasks:
+            try:
+                completed = (
+                    checkpoint_acceptance_tasks
+                    .load_terminal_acceptance_report(
+                        self.config.acceptance_dir, task)
+                )
+                if completed is not None:
+                    durable_report, report = completed
+                    if report.get('passed') is True:
+                        candidate = (
+                            int(task['step']), task, report, durable_report)
+                        passing_completions.append(candidate)
+                        if (
+                            latest_passing_completion is None
+                            or candidate[0] >= latest_passing_completion[0]
+                        ):
+                            latest_passing_completion = candidate
+                    else:
+                        expected_history = dict(report)
+                        expected_history['report_path'] = str(durable_report)
+                        history_matches = any(
+                            isinstance(record, Mapping)
+                            and dict(record) == expected_history
+                            for record in self.stats.acceptance_history
+                        )
+                        if not history_matches:
+                            try:
+                                self._finalize_checkpoint_acceptance_report(
+                                    task, report, durable_report)
+                            except Exception as exc:
+                                print(
+                                    "Could not reconcile terminal checkpoint "
+                                    f"acceptance for step {task.get('step')}: {exc}"
+                                )
+                            else:
+                                recovered += 1
+                    continue
+                if self._queue_checkpoint_acceptance_task(task, persist=True):
+                    recovered += 1
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                print(
+                    "Could not reconcile promoted checkpoint acceptance task "
+                    f"for step {task.get('step')}: {exc}"
+                )
+
+        # The accepted alias identifies only the newest passing checkpoint, but
+        # acceptance_history is the durable audit trail for every evaluated
+        # checkpoint. Restore older passing rows without repeatedly publishing
+        # and hashing the public alias. The newest completion is handled below
+        # so one finalization can repair its row and alias together.
+        for _, task, report, durable_report in passing_completions:
+            if (
+                latest_passing_completion is not None
+                and task['task_id'] == latest_passing_completion[1]['task_id']
+                and durable_report == latest_passing_completion[3]
+            ):
+                continue
+            expected_history = dict(report)
+            expected_history['report_path'] = str(durable_report)
+            history_matches = any(
+                isinstance(record, Mapping)
+                and dict(record) == expected_history
+                for record in self.stats.acceptance_history
+            )
+            if history_matches:
+                continue
+            try:
+                self._finalize_checkpoint_acceptance_report(
+                    task, report, durable_report, publish_alias=False)
+            except Exception as exc:
+                print(
+                    "Could not reconcile historical completed checkpoint "
+                    f"acceptance for step {task.get('step')}: {exc}"
+                )
+            else:
+                recovered += 1
+
+        # The report and promotion registry are sufficient authority to
+        # reconstruct a passing alias even after the pending marker has been
+        # cleaned up. This also repairs an older accepted alias or a statistics
+        # file restored from before finalization, without replaying 200 games.
+        if latest_passing_completion is not None:
+            _, task, report, durable_report = latest_passing_completion
+            accepted_path = Path(self.config.accepted_path)
+            alias_matches = False
+            if accepted_path.is_file():
+                try:
+                    alias_matches = os.path.samefile(
+                        accepted_path, Path(task['checkpoint_path']))
+                except OSError:
+                    alias_matches = False
+                if not alias_matches:
+                    try:
+                        checkpoint_acceptance_tasks.verify_pending_acceptance_checkpoint({
+                            'checkpoint_path': str(accepted_path),
+                            'checkpoint_sha256': task.get('checkpoint_sha256'),
+                        })
+                        alias_matches = True
+                    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+                        alias_matches = False
+
+            expected_history = dict(report)
+            expected_history['report_path'] = str(durable_report)
+            history_matches = any(
+                isinstance(record, Mapping)
+                and dict(record) == expected_history
+                for record in self.stats.acceptance_history
+            )
+            if not alias_matches or not history_matches:
+                try:
+                    self._finalize_checkpoint_acceptance_report(
+                        task, report, durable_report)
+                except Exception as exc:
+                    print(
+                        "Could not reconcile completed checkpoint acceptance "
+                        f"for step {task.get('step')}: {exc}"
+                    )
+                else:
+                    recovered += 1
+        if recovered:
+            print(f"Recovered {recovered} checkpoint acceptance task(s)")
+        return recovered
+
+    def _publish_verified_checkpoint_alias(
+        self,
+        source: Path,
+        destination: Path,
+        expected_sha256: Optional[str],
+    ) -> None:
+        """Atomically publish the exact checkpoint bytes pinned by acceptance."""
+        # Hashing ``source`` and then resolving that pathname again for the
+        # hardlink leaves a replacement window between the two operations.
+        # Stage the alias first, verify that stable inode, and only then replace
+        # the public destination. Numbered checkpoints are published by atomic
+        # rename and never modified in place, so a later pathname replacement
+        # cannot change the already-linked staging inode.
+        staged = destination.with_name(destination.name + '.verified.tmp')
+        staged.unlink(missing_ok=True)
+        try:
+            self._publish_checkpoint_alias(source, staged)
+            checkpoint_acceptance_tasks.verify_pending_acceptance_checkpoint({
+                'checkpoint_path': str(staged),
+                'checkpoint_sha256': expected_sha256,
+            })
+            os.replace(staged, destination)
+            # The verified staging inode is the one that must survive under
+            # the public accepted name. The staging publisher committed its
+            # own name, but this second rename needs its own directory commit.
+            _fsync_directory(destination.parent)
+        finally:
+            staged.unlink(missing_ok=True)
+
+    @staticmethod
+    def _publish_checkpoint_alias(source: Path, destination: Path) -> None:
+        """Durably publish a latest, promoted, or accepted checkpoint alias."""
+        import shutil
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + '.tmp')
+        temporary.unlink(missing_ok=True)
+        try:
+            try:
+                os.link(str(source), str(temporary))
+            except OSError:
+                # Copy and sync through one protected writer: copy2 opens an
+                # unregistered destination that self-play forks can inherit.
+                with fork_safe_temporary_file(
+                    delete=False, dir=destination.parent,
+                    prefix=destination.name + '.', suffix='.tmp',
+                ) as alias_handle:
+                    temporary = Path(alias_handle.name)
+                    with source.open('rb') as source_handle:
+                        shutil.copyfileobj(source_handle, alias_handle, 1024 * 1024)
+                    alias_handle.flush()
+                    shutil.copystat(source, temporary)
+                    os.fsync(alias_handle.fileno())
+            os.replace(temporary, destination)
+            _fsync_directory(destination.parent)
+        finally:
+            # A failed copy or replace must not strand a partial checkpoint
+            # alias. Keep cleanup best-effort so the publication error remains
+            # the failure reported to the checkpoint writer.
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _generation_cycle_id_from_replay_entry(entry: Mapping[str, Any]) -> Optional[int]:
+        """Extract a durable generation-cycle id from replay metadata."""
+        for key in ('generation_cycle_id', 'cycle_id'):
+            value = entry.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                cycle_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if cycle_id >= 0:
+                return cycle_id
+
+        game_id = entry.get('game_id')
+        match = re.match(r'^cycle-(\d+)(?:-|$)', str(game_id or ''))
+        if match is None:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _generation_cycle_file_identity(path: Path) -> tuple:
+        """Return the identity used to invalidate a replay-cycle cache entry."""
+        stat = path.stat()
+        return (
+            str(path),
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        )
+
+    # Journal Pass 119: the newest shard grows every self-play cycle, so the
+    # tail window below must comfortably cover the last complete record even
+    # when that record is long (legal_moves dominates record length).
+    _GENERATION_CYCLE_TAIL_BYTES = 262144
+
+    @classmethod
+    def _generation_cycle_tail_max(cls, path: Path) -> Optional[int]:
+        """Return the highest durable cycle id visible in a file's last record.
+
+        Replay shards are write-once per generation cycle (``ReplayBuffer``
+        opens a fresh timestamped file 'w', appends for that cycle only), and
+        ``generation_cycle_id`` never decreases within a file (measured across
+        all 862,170 records of the live c174k corpus), so the maximum lives on
+        the final non-empty line.  Reading only the tail turns the cold-start
+        rescan of a 60-file corpus from ~110 s of whole-corpus JSON parsing
+        into sub-second work.  Returns None whenever the tail cannot prove a
+        cycle id (malformed or torn final record, absent field, unreadable
+        file); a file smaller than the window is simply read whole.  The
+        caller falls back to the exact full scan.
+        """
+        try:
+            with path.open('rb') as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                if size <= 0:
+                    return None
+                window = min(size, cls._GENERATION_CYCLE_TAIL_BYTES)
+                handle.seek(size - window)
+                tail = handle.read(window).decode('utf-8', errors='replace')
+        except OSError:
+            return None
+        for line in reversed(tail.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            if not isinstance(entry, Mapping):
+                return None
+            # The last complete record carries the file maximum under the
+            # monotonicity invariant; anything else is proven only by a scan.
+            return cls._generation_cycle_id_from_replay_entry(entry)
+        return None
+
+    def _generation_cycle_sidecar_path(self, replay_dir: Path) -> Path:
+        """Sidecar location for the durable per-file cycle-id cache."""
+        return replay_dir / 'generation_cycle_cache.json'
+
+    def _load_generation_cycle_sidecar(
+        self, replay_dir: Path,
+    ) -> Dict[str, tuple]:
+        """Load persisted (size, mtime_ns, cycle_id) triples per shard name.
+
+        Best-effort by contract: any read/parse problem simply yields an empty
+        mapping and the scan re-derives everything from the files themselves.
+        Keys are shard basenames inside ``replay_dir``; identities are
+        deliberately name+size+mtime (no inode) so a corpus relocated across
+        mounts or machines stays warm.  A cycle id of -1 is a valid cached
+        answer for a legacy shard that contains no cycle metadata.
+        """
+        sidecar = self._generation_cycle_sidecar_path(replay_dir)
+        try:
+            raw = json.loads(sidecar.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return {}
+        if not isinstance(raw, dict) or raw.get('schema') != 1:
+            return {}
+        entries = raw.get('entries')
+        if not isinstance(entries, dict):
+            return {}
+        loaded: Dict[str, tuple] = {}
+        for name, record in entries.items():
+            if not isinstance(name, str) or not isinstance(record, list):
+                continue
+            if len(record) != 3:
+                continue
+            size, mtime_ns, cycle_id = record
+            if not all(isinstance(v, int) and not isinstance(v, bool)
+                       for v in (size, mtime_ns, cycle_id)):
+                continue
+            if cycle_id < -1:
+                continue
+            loaded[name] = (size, mtime_ns, cycle_id)
+        return loaded
+
+    def _save_generation_cycle_sidecar(
+        self, replay_dir: Path, entries: Dict[str, tuple],
+    ) -> bool:
+        """Persist per-shard cycle ids durably; report whether committed."""
+        payload = {
+            'schema': 1,
+            'entries': {
+                name: [size, mtime_ns, cycle_id]
+                for name, (size, mtime_ns, cycle_id) in sorted(entries.items())
+            },
+        }
+        sidecar = self._generation_cycle_sidecar_path(replay_dir)
+        temp_name = ''
+        try:
+            fd, temp_name = tempfile.mkstemp(
+                dir=str(replay_dir), prefix='.generation_cycle_cache.',
+                suffix='.tmp')
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, sidecar)
+            temp_name = ''
+            # This cache avoids an exact replay scan during recovery. Commit
+            # its public name so a sudden host or storage loss cannot roll a
+            # successful rebuild back and reintroduce that startup delay.
+            _fsync_directory(replay_dir)
+            return True
+        except OSError:
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+            return False
+
+    def _durable_generation_cycle_max(self) -> int:
+        """Read the highest cycle id already durable in replay JSONL files.
+
+        Replay shards themselves are treated read-only and answered exactly:
+        every non-empty JSONL record is inspected for any file whose stored
+        cycle maximum cannot be proven cheaply, including legacy records whose
+        cycle is carried only by ``game_id``.  Malformed lines are ignored
+        because corpus loading already treats them as invalid records; an
+        unreadable replay file fails closed so a new cycle cannot
+        accidentally reuse its id.
+
+        Journal Pass 119: unchanged shards are answered from a persistent
+        name+(size, mtime_ns)-keyed sidecar next to the corpus, and shards
+        that do change are re-read from their tail only (the per-cycle cycle
+        id is monotonic within a write-once shard).  Both fast paths degrade
+        to the original whole-file scan the moment they cannot prove their
+        answer, so allocation stays exact in every case.
+        """
+        replay_dir = Path(self.config.replay_dir)
+        cache = getattr(self, '_generation_cycle_file_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._generation_cycle_file_cache = cache
+        if not replay_dir.is_dir():
+            cache.clear()
+            return -1
+
+        try:
+            replay_files = sorted(replay_dir.glob('replay_*.jsonl'))
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot enumerate replay files for generation-cycle allocation: "
+                f"{replay_dir}: {exc}"
+            ) from exc
+
+        sidecar_loaded = self._load_generation_cycle_sidecar(replay_dir)
+
+        # Canonicalize keys so equivalent relative/absolute config paths do
+        # not create duplicate cache entries.  A file disappearing before its
+        # identity is read is simply evicted on this pass.
+        current_paths = set()
+        highest = -1
+        sidecar_entries: Dict[str, tuple] = {}
+        for replay_path in replay_files:
+            try:
+                replay_path = replay_path.resolve()
+                identity = self._generation_cycle_file_identity(replay_path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot stat replay file for generation-cycle allocation: "
+                    f"{replay_path}: {exc}"
+                ) from exc
+            current_paths.add(replay_path)
+            cached = cache.get(replay_path)
+            if cached is not None and cached[0] == identity:
+                file_highest = int(cached[1])
+            else:
+                # identity[3]/[4] are this file's size/mtime_ns from the
+                # already-guarded _generation_cycle_file_identity stat; reuse
+                # them instead of a second stat() that could race a deletion.
+                _, _, _, size, mtime_ns = identity
+                persisted = sidecar_loaded.get(replay_path.name)
+                file_highest = None
+                if (persisted is not None
+                        and persisted[0] == size
+                        and persisted[1] == mtime_ns):
+                    file_highest = int(persisted[2])
+                if file_highest is None:
+                    file_highest = self._generation_cycle_tail_max(replay_path)
+                if file_highest is None:
+                    # Exact fallback: inspect every record of this shard.
+                    file_highest = -1
+                    try:
+                        with replay_path.open('r', encoding='utf-8') as handle:
+                            for line in handle:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    entry = json.loads(line)
+                                except (json.JSONDecodeError, TypeError,
+                                        ValueError):
+                                    continue
+                                if not isinstance(entry, Mapping):
+                                    continue
+                                cycle_id = (
+                                    self._generation_cycle_id_from_replay_entry(
+                                        entry))
+                                if cycle_id is not None:
+                                    file_highest = max(file_highest, cycle_id)
+                    except FileNotFoundError:
+                        # The shard disappeared after its identity check.
+                        # Rotation is allowed to do that, so drop it rather
+                        # than turning a harmless race into a startup failure.
+                        current_paths.discard(replay_path)
+                        cache.pop(replay_path, None)
+                        continue
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot read replay file for generation-cycle "
+                            f"allocation: {replay_path}: {exc}"
+                        ) from exc
+                cache[replay_path] = (identity, file_highest)
+                sidecar_entries[replay_path.name] = (
+                    size, mtime_ns, int(file_highest))
+            highest = max(highest, file_highest)
+
+        # Do not retain cache records for replay shards removed since the last
+        # allocation scan.
+        for stale_path in set(cache) - current_paths:
+            cache.pop(stale_path, None)
+
+        # Merge untouched sidecar records for shards that vanished from the
+        # process cache but still exist on disk (identity-hit files above are
+        # recorded in sidecar_entries only when re-derived, so re-add them).
+        for replay_path in current_paths:
+            name = Path(replay_path).name
+            if name not in sidecar_entries:
+                cached = cache.get(replay_path)
+                if cached is not None:
+                    _, _, _, size, mtime_ns = cached[0]
+                    sidecar_entries[name] = (size, mtime_ns, int(cached[1]))
+        if sidecar_entries != sidecar_loaded:
+            self._save_generation_cycle_sidecar(replay_dir, sidecar_entries)
+        return highest
+
+    def _allocate_generation_cycle_id(self) -> int:
+        """Allocate a cycle id above both stats and durable replay history."""
+        try:
+            stats_cycle = int(self.stats.generation_cycles_completed)
+        except (AttributeError, TypeError, ValueError):
+            stats_cycle = 0
+        stats_cycle = max(0, stats_cycle)
+        durable_next = self._durable_generation_cycle_max() + 1
+        return max(stats_cycle, durable_next)
+
+    @staticmethod
+    def _annotate_selfplay_entries(
+        entries_data: list,
+        *,
+        cycle_id: int,
+        behavior_step: int,
+        behavior_id: str,
+        behavior_checkpoint_sha256: Optional[str],
+    ) -> None:
+        """Attach additive behavior provenance before raw JSONL persistence."""
+        # These values are invariant across a delivered worker batch. Normalize
+        # them once and select the digest shape once instead of repeating both
+        # operations for every replay row in the cycle.
+        normalized_cycle_id = int(cycle_id)
+        normalized_behavior_step = int(behavior_step)
+        if behavior_checkpoint_sha256 is None:
+            for entry in entries_data:
+                if not isinstance(entry, dict):
+                    continue
+                entry['generation_cycle_id'] = normalized_cycle_id
+                entry['model_behavior_step'] = normalized_behavior_step
+                entry['model_behavior_id'] = behavior_id
+        else:
+            for entry in entries_data:
+                if not isinstance(entry, dict):
+                    continue
+                entry['generation_cycle_id'] = normalized_cycle_id
+                entry['model_behavior_step'] = normalized_behavior_step
+                entry['model_behavior_id'] = behavior_id
+                entry['model_behavior_checkpoint_sha256'] = (
+                    behavior_checkpoint_sha256)
+
+    def _record_validation_stats(self, val_loss: float) -> None:
+        """Record validation statistics."""
+        self.stats.val_loss_history.append({
+            'step': self.step,
+            'val_loss': val_loss,
+            'timestamp': datetime.now().isoformat(),
+        })
+        # Trimming handled by deque(maxlen=_STATS_HISTORY_CAP)
+
+        if val_loss < self.stats.best_val_loss:
+            self.stats.best_val_loss = val_loss
+
+    @staticmethod
+    def _paths_identify_same_file(left: Path, right: Path) -> bool:
+        """Compare paths by file identity when possible, then lexically."""
+        try:
+            return left.is_file() and right.is_file() and os.path.samefile(left, right)
+        except OSError:
+            return left.resolve() == right.resolve()
+
+    def _verify_existing_checkpoint_collision(self, checkpoint_path: Path) -> None:
+        """Fail closed unless an existing step artifact proves its lineage.
+
+        Numbered checkpoints are immutable.  A restart may legitimately reach
+        a step that is already durable, but existence alone is not evidence
+        that the file belongs to this run or is usable.  Verification never
+        writes, replaces, or removes the existing artifact.
+        """
+        try:
+            checkpoint = torch.load(
+                checkpoint_path, map_location='cpu', weights_only=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Existing checkpoint cannot be verified and will not be "
+                f"overwritten: {checkpoint_path}: {exc}"
+            ) from exc
+
+        try:
+            recorded_step = int(checkpoint.get('step'))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Existing checkpoint has no valid step and will not be "
+                f"overwritten: {checkpoint_path}"
+            ) from exc
+        if recorded_step != int(self.step):
+            raise RuntimeError(
+                f"Existing checkpoint step mismatch at {checkpoint_path}: "
+                f"expected {self.step}, found {recorded_step}"
+            )
+
+        state_dict = checkpoint.get('model_state_dict')
+        if not isinstance(state_dict, Mapping):
+            raise RuntimeError(
+                f"Existing checkpoint has no model state and will not be "
+                f"overwritten: {checkpoint_path}"
+            )
+        tensors = [value for value in state_dict.values()
+                   if isinstance(value, torch.Tensor)]
+        if not tensors or any(not torch.isfinite(value).all() for value in tensors):
+            raise RuntimeError(
+                f"Existing checkpoint model state is empty or non-finite and "
+                f"will not be overwritten: {checkpoint_path}"
+            )
+
+        if not self.config.recovery_enforced:
+            return
+
+        recovery = checkpoint.get('recovery_experiment')
+        if not isinstance(recovery, Mapping) or not recovery.get('enabled'):
+            raise RuntimeError(
+                f"Existing checkpoint lacks recovery lineage metadata: "
+                f"{checkpoint_path}"
+            )
+        expected_baseline = str(
+            self.config.recovery_baseline_sha256 or '').upper()
+        recorded_baseline = str(
+            recovery.get('baseline_sha256') or '').upper()
+        if not expected_baseline or recorded_baseline != expected_baseline:
+            raise RuntimeError(
+                f"Existing checkpoint recovery baseline mismatch at "
+                f"{checkpoint_path}"
+            )
+        if str(recovery.get('training_stage')) != str(self.config.policy_stage):
+            raise RuntimeError(
+                f"Existing checkpoint training stage mismatch at "
+                f"{checkpoint_path}"
+            )
+
+        registry = getattr(self, '_promotion_registry', None)
+        if registry is None:
+            raise RuntimeError(
+                f"Cannot verify existing recovery checkpoint without its "
+                f"promotion registry: {checkpoint_path}"
+            )
+        matching_records = []
+        for record in registry.records():
+            try:
+                record_step = int(record.get('step'))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if record_step != int(self.step):
+                continue
+            record_path_value = record.get('checkpoint_path')
+            if not record_path_value:
+                continue
+            if self._paths_identify_same_file(
+                    Path(record_path_value), checkpoint_path):
+                matching_records.append(record)
+        if not matching_records:
+            raise RuntimeError(
+                f"Existing recovery checkpoint has no durable promotion "
+                f"record and will not be reused: {checkpoint_path}"
+            )
+
+        optimizer_state = checkpoint.get('optimizer_state_dict')
+        param_groups = (
+            optimizer_state.get('param_groups')
+            if isinstance(optimizer_state, Mapping) else None
+        )
+        if not isinstance(param_groups, list) or not param_groups:
+            raise RuntimeError(
+                f"Existing recovery checkpoint has no optimizer parameter "
+                f"groups and will not be reused: {checkpoint_path}"
+            )
+
+        def _optimizer_context_matches(record: Mapping[str, Any]) -> bool:
+            context = record.get('comparison_context')
+            if not isinstance(context, Mapping):
+                return False
+            for context_name, group_name in (
+                ('learning_rate', 'lr'),
+                ('weight_decay', 'weight_decay'),
+            ):
+                expected = context.get(context_name)
+                expected_values = (
+                    list(expected) if isinstance(expected, (list, tuple))
+                    else [expected] * len(param_groups)
+                )
+                if len(expected_values) != len(param_groups):
+                    return False
+                try:
+                    actual_values = [
+                        float(group[group_name]) for group in param_groups
+                    ]
+                    expected_values = [float(value) for value in expected_values]
+                except (KeyError, TypeError, ValueError):
+                    return False
+                if any(
+                    not math.isclose(actual, expected_value, rel_tol=1e-12)
+                    for actual, expected_value in zip(
+                        actual_values, expected_values)
+                ):
+                    return False
+            return True
+
+        if not any(_optimizer_context_matches(record)
+                   for record in matching_records):
+            raise RuntimeError(
+                f"Existing recovery checkpoint optimizer state does not match "
+                f"its durable promotion metadata and will not be reused: "
+                f"{checkpoint_path}"
+            )
+
+        digest = hashlib.sha256()
+        with checkpoint_path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        actual_digest = digest.hexdigest().upper()
+        recorded_digests = {
+            str(record.get('checkpoint_sha256') or '').upper()
+            for record in matching_records
+            if record.get('checkpoint_sha256')
+        }
+        if actual_digest not in recorded_digests:
+            raise RuntimeError(
+                f"Existing recovery checkpoint hash does not match its "
+                f"durable promotion record: {checkpoint_path}"
+            )
+
+    def _protected_checkpoint_paths(self) -> set:
+        """Checkpoints retention must never delete, whatever their age.
+
+        Audit Suggestion 10.  Three classes, all of them artifacts something
+        durable already points at:
+
+        * every checkpoint a promotion record marks ``promoted`` -- the
+          acceptance trail and the promoted alias both rest on those files --
+          and the best recorded teacher agreement even when it never cleared
+          the promotion gate;
+        * the checkpoint this run resumed from, so a session can never delete
+          its own starting point;
+        * the pinned recovery anchor, if it happens to live in this directory
+          (the path validator keeps it out, but retention must not depend on
+          another control holding).
+        """
+        protected = set()
+        for source in (
+            self.config.resume,
+            self.config.recovery_baseline_path,
+        ):
+            if source:
+                try:
+                    protected.add(Path(str(source)).resolve())
+                except OSError:
+                    continue
+        try:
+            records = self._promotion_registry.records()
+        except (OSError, ValueError):
+            # A registry that cannot be read is not evidence that nothing is
+            # promoted; fail closed by protecting everything.
+            return None
+
+        directory = Path(self.config.checkpoint_dir)
+
+        def _protect(raw_path) -> None:
+            if not raw_path:
+                return
+            candidate = Path(str(raw_path))
+            # Registry paths are recorded project-relative, so resolve them
+            # against the checkpoint directory by name as well: retention must
+            # not depend on the working directory a session was launched from.
+            for form in (candidate, directory / candidate.name):
+                try:
+                    protected.add(form.resolve())
+                except OSError:
+                    continue
+
+        best_agreement = float('-inf')
+        validated_records = []
+        for record in records:
+            # Retention is destructive, so semantically malformed registry
+            # evidence must fail closed just like unreadable JSON. In
+            # particular, bool is an int subclass: float(True) used to turn a
+            # corrupt row into a perfect 1.0 high-water mark and could leave
+            # the real best-agreement checkpoint eligible for deletion.
+            if not isinstance(record, Mapping):
+                return None
+            raw_agreement = record.get('teacher_agreement')
+            promoted = record.get('promoted')
+            checkpoint_path = record.get('checkpoint_path')
+            if (
+                type(raw_agreement) not in (int, float)
+                or not math.isfinite(float(raw_agreement))
+                or not 0.0 <= float(raw_agreement) <= 1.0
+                or type(promoted) is not bool
+                or type(checkpoint_path) is not str
+                or not checkpoint_path
+            ):
+                return None
+            agreement = float(raw_agreement)
+            validated_records.append((record, agreement))
+            if agreement > best_agreement:
+                best_agreement = agreement
+            if promoted:
+                _protect(checkpoint_path)
+        # The registry high-water mark, promoted or not.  Nothing has cleared
+        # the 0.50 gate on this arm, so protecting only promotions would leave
+        # the whole agreement series prunable and discard the best result the
+        # run has actually produced.
+        if best_agreement > float('-inf'):
+            for record, agreement in validated_records:
+                if agreement == best_agreement:
+                    _protect(record['checkpoint_path'])
+        return protected
+
+    def _prune_old_checkpoints(self, keep_path: Path) -> list:
+        """Delete all but the newest ``max_retained_checkpoints`` checkpoints.
+
+        Audit Suggestion 10.  Individual unlinks remain best-effort, so a file
+        held open elsewhere (common on drvfs) does not reject the completed
+        checkpoint write and a later write retries it.  A successful deletion
+        batch is directory-synced before it is reported as reclaimed.
+
+        Proofread 2026-08-25 B1: candidates are walked oldest-first until the
+        budget is met among unprotected files.  A fixed window sized before
+        protection is known would skip a protected entry without replacement,
+        letting every promotion record and registry best-agreement entry add
+        permanent protection and grow the live checkpoint count without bound.
+        Skipped protected entries therefore extend the deletion window, and an
+        overage above ``max_retained_checkpoints`` that only protection can
+        explain is reported instead of silently accepted.
+        """
+        keep_count = int(getattr(self.config, 'max_retained_checkpoints', 0) or 0)
+        if keep_count <= 0:
+            return []
+        directory = Path(self.config.checkpoint_dir)
+        if not directory.is_dir():
+            return []
+        protected = self._protected_checkpoint_paths()
+        if protected is None:
+            return []
+        try:
+            protected.add(Path(keep_path).resolve())
+        except OSError:
+            pass
+        candidates = sorted(
+            directory.glob('model_step_*.pt'),
+            key=_checkpoint_step_number,
+        )
+        candidates = [
+            path for path in candidates if _checkpoint_step_number(path) >= 0
+        ]
+        if len(candidates) <= keep_count:
+            return []
+        removed = []
+        skipped_protected = 0
+        # Oldest-first; budget counts only unprotected deletions, so each
+        # protected entry encountered extends the window by one file.
+        for path in candidates:
+            if len(candidates) - len(removed) <= keep_count:
+                break
+            try:
+                if path.resolve() in protected:
+                    skipped_protected += 1
+                    continue
+                path.unlink()
+            except OSError as exc:
+                _diagnostic_print(f"  [warn] Could not prune checkpoint {path.name}: {exc}")
+                continue
+            removed.append(path.name)
+        if removed:
+            # One directory commit covers the whole successful batch. Without
+            # it, a sudden host or storage loss can resurrect large checkpoint
+            # names that retention already reported as reclaimed and consume
+            # the launcher's disk headroom. See Journal Pass 434.
+            _fsync_directory(directory)
+        live_count = len(candidates) - len(removed)
+        if live_count > keep_count and skipped_protected > 0:
+            # One cheap disk_usage() query (only on a protection overage, not on
+            # every prune) turns the pinned count into a runway signal: unbounded
+            # promoted-checkpoint pinning only matters against the real free space
+            # and the self-play floor it will eventually cross. A per-file byte sum
+            # is deliberately avoided here: it is one stat() per pinned checkpoint
+            # on drvfs, the metadata cost the corpus caches exist to remove. See
+            # Journal Pass 559.
+            minimum_gb = float(
+                getattr(self.config, 'selfplay_min_free_disk_gb', 0.0) or 0.0
+            )
+            try:
+                free_gb = shutil.disk_usage(directory).free / _GIB
+            except OSError:
+                headroom = ""
+            else:
+                headroom = " Disk: {:.1f} GiB free{}".format(
+                    free_gb,
+                    " vs {:.1f} GiB self-play floor.".format(minimum_gb)
+                    if minimum_gb > 0 else ".",
+                )
+            _diagnostic_print(
+                f"  [warn] {live_count} checkpoints are live but "
+                f"max_retained_checkpoints is {keep_count}: promoted, "
+                f"best-agreement and resume protection pins "
+                f"{skipped_protected} file(s). Retention cannot reclaim them."
+                f"{headroom}"
+            )
+        return removed
+
+    def _wait_for_checkpoint_writer(
+        self, timeout: Optional[float] = None,
+    ) -> None:
+        """Wait for checkpoint I/O and propagate its background failure."""
+        thread = getattr(self, '_checkpoint_thread', None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                timeout_text = (
+                    f" within {timeout:g} seconds" if timeout is not None else ""
+                )
+                raise RuntimeError(
+                    f"Previous checkpoint write did not finish{timeout_text}")
+
+        error = getattr(self, '_checkpoint_write_error', None)
+        if error is not None:
+            raise error
+
+    def _save_checkpoint(self, loss: float, log_entry: Optional[dict] = None) -> str:
+        """Save a checkpoint atomically.
+
+        The state_dict copy happens on the main thread (requires CUDA sync),
+        but the actual disk I/O is offloaded to a background thread so the
+        GPU can continue training while the file is being written.
+
+        Args:
+            loss: Current loss value for checkpoint metadata.
+            log_entry: Optional dict to append to the JSONL log file.  Written
+                in the background thread alongside the checkpoint, keeping disk
+                I/O off the training thread (~50-100μs saved per checkpoint).
+        """
+        # Finish the prior write before selecting against the promotion registry.
+        # This keeps the best-agreement comparison and checkpoint durability in
+        # one strict order.
+        self._wait_for_checkpoint_writer(timeout=30)
+
+        checkpoint_path = Path(self.config.checkpoint_dir) / f"model_step_{self.step:06d}.pt"
+        if checkpoint_path.exists():
+            self._verify_existing_checkpoint_collision(checkpoint_path)
+            # Refusing to overwrite is correct; refusing to *measure* was not.
+            # This early return used to skip _evaluate_validation_loss() and
+            # _evaluate_teacher_promotion() as well, so resuming into a
+            # directory that already holds later checkpoints trained blind --
+            # 31 collisions across ~62,000 steps produced no validation loss and
+            # no teacher-agreement reading at all. Evaluate and record into the
+            # run's own stats; the checkpoint file, latest alias, and the
+            # append-only promotion registry are all left untouched, so nothing
+            # in models/ changes and no duplicate registry record is created.
+            # Measurement is strictly additive: a trainer that cannot measure
+            # (no validation split, no frozen suite, stats not yet wired) must
+            # still complete the collision path exactly as before rather than
+            # turn a benign collision into a crash.
+            collision_val_loss = None
+            collision_selection = None
+            try:
+                collision_val_loss = self._evaluate_validation_loss()
+                if collision_val_loss is not None:
+                    self._record_validation_stats(collision_val_loss)
+                collision_selection = self._evaluate_teacher_promotion(
+                    checkpoint_path)
+                self._save_stats()
+            except Exception as exc:  # never block on measurement
+                _diagnostic_print(f"  [warn] Collision-path measurement skipped: {exc}")
+            _val_text = (
+                f", val_loss={collision_val_loss:.4f}"
+                if collision_val_loss is not None else ""
+            )
+            _diagnostic_print(
+                f"Verified existing checkpoint; it will remain unchanged: "
+                f"{checkpoint_path}"
+            )
+            _diagnostic_print(
+                f"  Measured without writing (step {self.step}"
+                f"{_val_text}); promotion registry not modified"
+                if collision_selection is not None else
+                f"  Measured without writing (step {self.step}{_val_text})"
+            )
+            return str(checkpoint_path)
+        latest_path = Path(self.config.latest_path)
+        validation_loss = self._evaluate_validation_loss()
+        selection = self._evaluate_teacher_promotion(checkpoint_path)
+
+        # Copy state dicts to CPU. This requires CUDA sync on the main thread.
+        # Both model AND optimizer states must be moved to CPU here, not in the
+        # background thread.  optimizer.state_dict() returns references to live
+        # CUDA tensors (exp_avg, exp_avg_sq); if the background torch.save()
+        # accesses them while the main thread runs optimizer.step(), the tensors
+        # may be mid-update.  Copying to CPU on the main thread gives a consistent
+        # snapshot and eliminates CUDA sync contention in the background thread.
+        #
+        # Batch all D2H copies with non_blocking=True and sync once at the end.
+        # Each individual .cpu() call forces a stream sync (~50μs); with ~120
+        # parameter tensors, batching saves ~6ms per checkpoint (120 × 50μs).
+        _opt_sd = self.optimizer.state_dict()
+        _cpu_state = {}
+        for k, v in _opt_sd['state'].items():
+            _cpu_state[k] = {
+                sk: sv.to('cpu', non_blocking=True, copy=True)
+                if isinstance(sv, torch.Tensor) else sv
+                for sk, sv in v.items()
+            }
+        _opt_sd = {'state': _cpu_state, 'param_groups': _opt_sd['param_groups']}
+        # copy=True also isolates CPU training and Adam's CPU step counters
+        # on CUDA hosts before the asynchronous writer can inspect them.
+        _model_sd = {
+            k: v.to('cpu', non_blocking=True, copy=True)
+            for k, v in self.model.state_dict().items()}
+        if self.device.type == 'cuda':
+            # Single sync: all D2H copies are on the default stream; wait for all.
+            torch.cuda.current_stream().synchronize()
+        elif self.device.type == 'mps':
+            # MPS copies from the live tensors may still be queued; wait for
+            # all Metal work so the CPU copies above are complete.
+            torch.mps.synchronize()
+        checkpoint = {
+            'model_state_dict': _model_sd,
+            'optimizer_state_dict': _opt_sd,
+            'step': self.step,
+            'loss': loss,
+            'current_train_loss': loss,
+            'current_dataset_best_train_loss': (
+                self.stats.current_dataset_best_train_loss
+                if math.isfinite(self.stats.current_dataset_best_train_loss) else None
+            ),
+            'historical_best_train_loss': (
+                self.stats.historical_best_train_loss
+                if math.isfinite(self.stats.historical_best_train_loss) else None
+            ),
+            'validation_loss': validation_loss,
+            'epoch': self.epoch,
+            # Resume can outlive its optional stats sidecar and replay window.
+            'generation_cycles_completed': self.stats.generation_cycles_completed,
+            'arch_params': getattr(self.model, 'arch_params', {
+                'embedding_size': self.config.model_embedding,
+                'num_blocks': self.config.model_blocks,
+                'hidden_size': self.config.model_hidden,
+                'channels': self.config.model_channels,
+                'value_head_enabled': self.config.value_head_enabled,
+                'value_head_hidden': self.config.value_head_hidden,
+            }),
+            'encoding_version': ENCODING_VERSION,
+            'dataset_fingerprint': self.stats.dataset_fingerprint,
+            'dataset_metadata': dict(self.stats.dataset_metadata),
+            'snapshot_manifest_path': self._active_snapshot_manifest.get(
+                'manifest_path'),
+            'snapshot_file_list': [
+                dict(record)
+                for record in self._active_snapshot_manifest.get('files', [])
+            ],
+            'snapshot_unique_state_count': self._active_snapshot_manifest.get(
+                'metrics', {}).get('post_dedup_unique_state_count'),
+            'snapshot_forced_move_rate': self._active_snapshot_manifest.get(
+                'metrics', {}).get('forced_move_rate'),
+            'snapshot_forced_move_count': self._active_snapshot_manifest.get(
+                'metrics', {}).get('forced_move_count'),
+            'teacher_settings': dict(
+                self._active_snapshot_manifest.get('teacher_settings', {})),
+            'noise_settings': dict(
+                self._active_snapshot_manifest.get('noise_settings', {})),
+            'generation_settings': dict(
+                self._active_snapshot_manifest.get('generation_settings', {})),
+            'optimizer_context': self._live_optimizer_context(),
+            'seed_context': {
+                'selfplay_opening_seed': self.config.selfplay_opening_seed,
+                'validation_split_seed': self.config.validation_split_seed,
+                'frozen_suite_seed': self.config.frozen_suite_seed,
+                'test_opening_seed': self.config.test_opening_seed,
+            },
+            'selection': selection,
+            'selection_basis': 'held_out_teacher_agreement',
+            'checkpoint_role': (
+                'promoted' if selection and selection['promotion'].get('promoted')
+                else 'periodic'
+            ),
+            'recovery_experiment': {
+                'enabled': bool(self.config.recovery_enforced),
+                'baseline_checkpoint': self.config.recovery_baseline_path,
+                'baseline_sha256': self.config.recovery_baseline_sha256,
+                'training_stage': self.config.policy_stage,
+                'resume_anchor': self.config.resume,
+            },
+            # Audit Suggestion 8: names the session that wrote this file, so a
+            # numbered range can be read for what it is rather than assumed
+            # continuous.
+            'run_identity': dict(getattr(self, '_run_identity', {}) or {}),
+            'rng_state': {
+                'python': random.getstate(),
+                'numpy': {
+                    'bit_generator': np.random.get_state()[0],
+                    'state': np.random.get_state()[1].tolist(),
+                    'position': int(np.random.get_state()[2]),
+                    'has_gauss': int(np.random.get_state()[3]),
+                    'cached_gaussian': float(np.random.get_state()[4]),
+                },
+                'torch': torch.get_rng_state(),
+            }
+        }
+
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+
+        if self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+
+        if torch.cuda.is_available():
+            checkpoint['rng_state']['cuda'] = torch.cuda.get_rng_state()
+            checkpoint['rng_state']['cuda_all'] = torch.cuda.get_rng_state_all()
+        if self.device.type == 'mps':
+            # Restored only where MPS exists (see _restore_rng_state), so the
+            # extra key is inert when a CUDA host resumes this checkpoint.
+            checkpoint['rng_state']['mps'] = torch.mps.get_rng_state()
+
+        _step = self.step
+        _stats_collector = self.stats_collector
+        # Snapshot stats on main thread to avoid reading self.stats from the
+        # background thread while the main thread appends to history lists.
+        _stats_snapshot = self._snapshot_stats()
+
+        # Capture log file path and entry for background writing.
+        _log_file = self.log_file
+        _log_entry = log_entry
+
+        # Offload disk I/O to background thread — GPU resumes training immediately.
+        def _write_checkpoint():
+            # Measure this writer's serialization/publication work, including
+            # its statistics, retention, promotion and acceptance task writes.
+            # Main-thread validation and CPU snapshot copies are not save I/O time.
+            write_started = time.perf_counter()
+            stage = 'checkpoint serialization'
+            numbered_rewrite_attempted = False
+
+            def _write_numbered_checkpoint() -> None:
+                tmp_path = None
+                try:
+                    # Serialize in memory, then write through the one
+                    # registered temporary handle. ``torch.save`` by name opens
+                    # a second descriptor that a concurrent self-play fork can
+                    # inherit, which hides the published name on DrvFS until
+                    # that worker exits.
+                    buffer = io.BytesIO()
+                    torch.save(checkpoint, buffer)
+                    serialized = buffer.getbuffer()
+                    try:
+                        with fork_safe_temporary_file(
+                            delete=False, dir=self.config.checkpoint_dir,
+                        ) as tmp:
+                            tmp_path = Path(tmp.name)
+                            written = tmp.write(serialized)
+                            if written != len(serialized):
+                                raise OSError(
+                                    f"short checkpoint write: "
+                                    f"{written}/{len(serialized)} bytes"
+                                )
+                            tmp.flush()
+                            # Recovery resumes only from verified numbered
+                            # checkpoints. Make the completed archive
+                            # durable before publishing its pathname so an
+                            # abrupt host shutdown cannot leave an accepted
+                            # atomic rename backed only by volatile cache
+                            # pages.
+                            os.fsync(tmp.fileno())
+                    finally:
+                        serialized.release()
+                        buffer.close()
+                    os.replace(tmp_path, checkpoint_path)
+                    # fsyncing the archive alone does not make the renamed
+                    # pathname crash-durable. Recovery discovers numbered
+                    # checkpoints through this directory entry, so commit it
+                    # before publishing any aliases or promotion evidence.
+                    _fsync_directory(checkpoint_path.parent)
+                finally:
+                    # The random temporary name cannot be recovered reliably
+                    # by a later launch. Remove a partial serialization or a
+                    # source left behind by a failed atomic replacement.
+                    if tmp_path is not None:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+            def _rewrite_missing_numbered_checkpoint() -> None:
+                nonlocal numbered_rewrite_attempted
+                if numbered_rewrite_attempted:
+                    raise FileNotFoundError(
+                        f"numbered checkpoint missing after one rewrite: "
+                        f"{checkpoint_path}"
+                    )
+                numbered_rewrite_attempted = True
+                _diagnostic_print(
+                    f"  [warn] Numbered checkpoint disappeared after "
+                    f"publication; rewriting once: {checkpoint_path}"
+                )
+                _write_numbered_checkpoint()
+
+            try:
+                # Save to temp file then rename (atomic)
+                _write_numbered_checkpoint()
+
+                # latest.pt = hardlink to checkpoint (instant, avoids second
+                # torch.save serialization + disk write of ~55MB). The shared
+                # publisher keeps the copy fallback atomic too, so readers
+                # never observe a truncated latest checkpoint.
+                stage = 'latest alias publication'
+                try:
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, latest_path)
+                except FileNotFoundError:
+                    if checkpoint_path.is_file():
+                        raise
+                    _rewrite_missing_numbered_checkpoint()
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, latest_path)
+
+                # One production write disappeared between its successful
+                # atomic replace and the promotion digest on the Windows
+                # mounted project volume (step 252000, 2026-09-02). Repair the
+                # numbered artifact from the in-memory snapshot before any
+                # registry/task side effect. This also prevents a non-promoted
+                # checkpoint from being reported as saved when only its latest
+                # alias survived.
+                stage = 'post-publication checkpoint verification'
+                if not checkpoint_path.is_file():
+                    _rewrite_missing_numbered_checkpoint()
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, latest_path)
+                if not checkpoint_path.is_file():
+                    _rewrite_missing_numbered_checkpoint()
+
+                if selection:
+                    stage = 'checkpoint promotion digest'
+                    promotion_record = dict(selection.get('promotion', {}))
+                    promotion_record['run_identity'] = dict(
+                        getattr(self, '_run_identity', {}) or {})
+                    checkpoint_digest = hashlib.sha256()
+                    with checkpoint_path.open('rb') as checkpoint_handle:
+                        for chunk in iter(
+                            lambda: checkpoint_handle.read(1024 * 1024), b''
+                        ):
+                            checkpoint_digest.update(chunk)
+                    promotion_record['checkpoint_sha256'] = (
+                        checkpoint_digest.hexdigest().upper()
+                    )
+                    durable_decision = PromotionDecision(
+                        bool(promotion_record.get('promoted')),
+                        str(promotion_record.get('reason', '')),
+                        promotion_record,
+                    )
+                    self._promotion_registry.persist(durable_decision)
+                    self._last_promotion_decision = durable_decision
+                    self.stats.promotion_history.append(promotion_record)
+                    _stats_snapshot['promotion_history'] = [
+                        *_stats_snapshot.get('promotion_history', []),
+                        promotion_record,
+                    ]
+                    selection['promotion'] = promotion_record
+
+                stage = 'training statistics write'
+                self._save_stats(_snapshot=_stats_snapshot)
+
+                # Write JSONL log entry (moved from training thread).
+                if _log_entry is not None:
+                    _log_entry['timestamp'] = datetime.now().isoformat()
+                    with open(_log_file, 'a') as f:
+                        f.write(json.dumps(_log_entry) + '\n')
+
+                stage = 'checkpoint retention'
+                pruned = self._prune_old_checkpoints(checkpoint_path)
+                if pruned:
+                    _diagnostic_print(
+                        f"  Retention: pruned {len(pruned)} checkpoint(s) "
+                        f"(keeping newest {self.config.max_retained_checkpoints}"
+                        f", plus promoted and resumed)"
+                    )
+
+                if selection and selection.get('promotion', {}).get('promoted'):
+                    stage = 'promoted checkpoint publication'
+                    self._publish_checkpoint_alias(
+                        checkpoint_path, Path(self.config.promoted_path))
+                    stage = 'acceptance task enqueue'
+                    self._enqueue_checkpoint_acceptance(checkpoint_path, selection)
+                # Record completion only after every required publication has
+                # succeeded, including promoted aliases and acceptance tasks.
+                stage = 'checkpoint telemetry'
+                if _stats_collector:
+                    ckpt_size = checkpoint_path.stat().st_size / 1e6 if checkpoint_path.exists() else 0
+                    _stats_collector.record_checkpoint(
+                        step=_step, loss=loss, path=str(checkpoint_path),
+                        save_time_sec=time.perf_counter() - write_started,
+                        file_size_mb=ckpt_size,
+                    )
+                _diagnostic_print(f"Checkpoint saved: {checkpoint_path}")
+                # Notify the GUI so the panel can log the checkpoint and
+                # refresh its stats view (no-op when training headless).
+                self._put_status({
+                    'type': MSG_CHECKPOINT,
+                    'step': _step,
+                    'checkpoint_path': str(checkpoint_path),
+                })
+            except BaseException as e:
+                message = (
+                    f"Checkpoint save error during {stage} at step {_step}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                # Keep only a compact exception, not the worker exception's
+                # traceback, which can retain the full checkpoint tensor graph.
+                self._checkpoint_write_error = RuntimeError(message)
+                _diagnostic_print(message)
+                _diagnostic_print(
+                    traceback.format_exc(), file=sys.stderr, end='')
+
+        self._checkpoint_write_error = None
+        self._checkpoint_thread = threading.Thread(target=_write_checkpoint, daemon=True)
+        self._checkpoint_thread.start()
+
+        return str(checkpoint_path)
+
+    def _log(self, data: Dict[str, Any]) -> None:
+        """Log training metrics."""
+        data['timestamp'] = datetime.now().isoformat()
+        with open(self.log_file, 'a') as f:
+            f.write(json.dumps(data) + '\n')
+
+    @staticmethod
+    def _balance_side_sample_weights(
+        entry_dicts: list,
+    ) -> Optional[Dict[str, float]]:
+        """Equalize total reward weight for Player.ONE and Player.TWO entries."""
+        if not entry_dicts:
+            return None
+
+        side_weight = {1: 0.0, 2: 0.0}
+        side_count = {1: 0, 2: 0}
+        valid_entries = []
+
+        for entry in entry_dicts:
+            is_dict = isinstance(entry, dict)
+            state = entry.get('state') if is_dict else getattr(entry, 'state', None)
+            if not isinstance(state, dict):
+                continue
+            try:
+                turn = int(state.get('turn'))
+            except (TypeError, ValueError):
+                continue
+            if turn not in side_weight:
+                continue
+
+            try:
+                score_value = entry.get('score', 0.0) if is_dict else getattr(entry, 'score', 0.0)
+                score = float(score_value)
+            except (TypeError, ValueError):
+                score = 0.0
+            try:
+                weight_value = (
+                    entry.get('sample_weight', 1.0)
+                    if is_dict else getattr(entry, 'sample_weight', 1.0)
+                )
+                sample_weight = float(weight_value)
+            except (TypeError, ValueError):
+                sample_weight = 1.0
+            if not math.isfinite(sample_weight) or sample_weight < 0.0:
+                sample_weight = 1.0
+
+            weight = compute_reward_weight(score) * sample_weight
+            side_weight[turn] += weight
+            side_count[turn] += 1
+            valid_entries.append((entry, is_dict, turn, sample_weight))
+
+        if side_count[1] == 0 or side_count[2] == 0:
+            return None
+        if side_weight[1] <= 0.0 or side_weight[2] <= 0.0:
+            return None
+
+        target_weight = (side_weight[1] + side_weight[2]) * 0.5
+        side_scale = {
+            1: target_weight / side_weight[1],
+            2: target_weight / side_weight[2],
+        }
+
+        for entry, is_dict, turn, sample_weight in valid_entries:
+            balanced_weight = sample_weight * side_scale[turn]
+            if math.isclose(balanced_weight, 1.0, rel_tol=0.0, abs_tol=1e-6):
+                if is_dict:
+                    entry.pop('sample_weight', None)
+                else:
+                    entry.sample_weight = 1.0
+            else:
+                if is_dict:
+                    entry['sample_weight'] = round(balanced_weight, 6)
+                else:
+                    entry.sample_weight = round(balanced_weight, 6)
+
+        return {
+            'p1_count': side_count[1],
+            'p2_count': side_count[2],
+            'p1_weight_before': side_weight[1],
+            'p2_weight_before': side_weight[2],
+            'p1_weight_after': target_weight,
+            'p2_weight_after': target_weight,
+        }
+
+    def run_selfplay(
+        self,
+        num_games: int,
+        callback=None,
+        collect_dicts: bool = False,
+        skip_replay: bool = False,
+        preprocess_inline: bool = False,
+        return_behavior_step: bool = False,
+    ) -> int | tuple[int, int]:
+        """Run self-play to generate training data.
+
+        Args:
+            num_games: Number of games to generate.
+            callback: Progress callback.
+            collect_dicts: If True, store all raw dicts in self._last_selfplay_dicts
+                for incremental dataset updates (avoids re-loading from replay).
+            skip_replay: If True, skip JSONL replay I/O entirely. The dicts are
+                kept in memory via collect_dicts. Avoids json.dumps + disk writes
+                when the data won't be re-read from replay (background self-play
+                after the first cycle).
+            preprocess_inline: If True, preprocess each completed batch into
+                tensors immediately using Cython (or Python fallback) in the
+                completion-delivery loop.  Eliminates the separate from_dicts()
+                preprocessing phase after self-play.  Result stored in
+                self._last_selfplay_preprocessed (a CachedTensorDataset).
+
+        Returns:
+            Total number of training entries generated, or a tuple of
+            ``(entries, behavior_step)`` when ``return_behavior_step=True``.
+        """
+        if skip_replay and not collect_dicts and not preprocess_inline:
+            raise ValueError(
+                "skip_replay=True requires collect_dicts=True or "
+                "preprocess_inline=True, otherwise generated data is "
+                "silently discarded (not saved to disk or memory)."
+            )
+
+        _selfplay_start = time.time()
+        total_games = max(0, num_games)
+        cycle_id = self._allocate_generation_cycle_id()
+        # Reserve the identifier for deterministic seeds, but only commit the
+        # completed-cycle counter after every requested game has succeeded.
+        # An interrupted cycle must not look like a valid generation to corpus
+        # recovery or to the next cycle's provenance.
+        opening_choices = tuple(self.config.selfplay_opening_plies) or (0,)
+        opening_seed_base = (
+            int(self.config.selfplay_opening_seed) + cycle_id * 1_000_003)
+        task_order_rng = random.Random(opening_seed_base ^ 0xBB67AE8584CAA73B)
+
+        opponent_focus = self.config.selfplay_opponent_focus
+        side_focus = self.config.selfplay_focus_side
+        _collected = [] if collect_dicts else None
+        self._last_selfplay_dicts = None  # Reset previous collection
+        self._last_selfplay_preprocessed = None  # Reset previous preprocessed data
+
+        # Inline preprocessing: preprocess each completed batch immediately
+        # using Cython/Python encoding in the completion-delivery loop.
+        # Eliminates the separate CachedTensorDataset.from_dicts() call that
+        # spawns a ProcessPoolExecutor after all games finish.
+        # Each batch has ~420-1050 entries; Cython processes them in <2ms.
+        _preprocess_chunks = [] if preprocess_inline else None
+        _pp_max_moves = self.config.max_moves_per_sample if preprocess_inline else 0
+        if preprocess_inline:
+            from .dataset import _preprocess_chunk as _pp_chunk
+        else:
+            _pp_chunk = None
+
+        # Algo-vs-algo games are additional (on top of regular self-play)
+        algo_vs_algo_games = (
+            self.config.algo_vs_algo_games if self.config.algo_vs_algo_enabled else 0
+        )
+
+        if opponent_focus == 'ml':
+            ml_self_games = total_games
+            vs_algo_games = 0
+        elif opponent_focus == 'algorithm':
+            ml_self_games = 0
+            vs_algo_games = total_games
+        else:
+            ml_self_games = total_games // 2
+            vs_algo_games = total_games - ml_self_games
+
+        grand_total = total_games + algo_vs_algo_games
+        if self.config.recovery_enforced:
+            expected_algorithm, expected_model = (
+                allocate_policy_distillation_games(grand_total))
+            if algo_vs_algo_games != expected_algorithm or total_games != expected_model:
+                raise RuntimeError(
+                    "Recovery generation must use an exact 70/30 trajectory split: "
+                    f"expected {expected_algorithm}/{expected_model}, got "
+                    f"{algo_vs_algo_games}/{total_games}"
+                )
+
+        if opponent_focus == 'ml':
+            focus_desc = "ML self-play"
+        elif opponent_focus == 'algorithm':
+            focus_desc = "ML vs algorithm"
+        else:
+            focus_desc = "half ML self-play, half vs algorithm"
+        if algo_vs_algo_games > 0:
+            focus_desc += f" + {algo_vs_algo_games} algo-vs-algo"
+
+        print(
+            f"\nGenerating {grand_total} self-play games "
+            f"({focus_desc}; focus side: {side_focus})..."
+        )
+
+        temp_model_path = self._runtime_model_path("temp_selfplay_model.pt")
+        behavior_step = int(self.step)
+        behavior_id = f"trainer-step-{behavior_step}"
+        behavior_checkpoint_sha256: Optional[str] = None
+
+        entries = 0
+        completed_total = 0
+        difficulties = self.config.selfplay_difficulties or ['medium']
+
+        # Log difficulties being used
+        print(f"  Cycling through difficulties: {difficulties}")
+
+        # ==================================================================
+        # Build ALL task arguments upfront, then submit to ONE executor.
+        # Previous approach created 4-6+ sequential ProcessPoolExecutors
+        # (one per SelfPlayRunner + one for algo-vs-algo). Unified pool:
+        #   - eliminates repeated process creation/teardown overhead
+        #   - allows ML and algo games to run concurrently
+        #   - better CPU utilization (no idle gaps between phases)
+        # ==================================================================
+
+        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
+
+        _max_moves = self.config.selfplay_max_moves
+        _noise_prob = self.config.selfplay_noise_prob
+        _model_path_str = str(temp_model_path)
+
+        # --- ML task args: (diff, max_moves, noise, start, p1_pol, p2_pol, model_path, device) ---
+        all_ml_tasks = []
+
+        if ml_self_games > 0:
+            for g in range(ml_self_games):
+                start = 1 if g % 2 == 0 else 2
+                all_ml_tasks.append((
+                    'medium', _max_moves, _noise_prob, start,
+                    'ml', 'ml', _model_path_str, self.device,
+                ))
+
+        if vs_algo_games > 0:
+            if side_focus == 'white':
+                ml_as_p1, ml_as_p2 = vs_algo_games, 0
+            elif side_focus == 'black':
+                ml_as_p1, ml_as_p2 = 0, vs_algo_games
+            else:
+                ml_as_p1 = vs_algo_games // 2
+                ml_as_p2 = vs_algo_games - ml_as_p1
+
+            algo_difficulties = [d for d in difficulties if d != 'self'] or ['medium']
+
+            for side_count, p1_pol, p2_pol in [
+                (ml_as_p1, 'ml', 'algorithmic'),
+                (ml_as_p2, 'algorithmic', 'ml'),
+            ]:
+                if side_count <= 0:
+                    continue
+                gpd = side_count // len(algo_difficulties)
+                rem = side_count % len(algo_difficulties)
+                for i, diff in enumerate(algo_difficulties):
+                    n = gpd + (1 if i < rem else 0)
+                    for g in range(n):
+                        start = 1 if g % 2 == 0 else 2
+                        all_ml_tasks.append((
+                            diff, _max_moves, _noise_prob, start,
+                            p1_pol, p2_pol, _model_path_str, self.device,
+                        ))
+
+        all_ml_tasks = _stamp_selfplay_tasks(
+            all_ml_tasks,
+            opening_choices=opening_choices,
+            opening_seed_base=opening_seed_base,
+            start_index=0,
+            cycle_rotation=0,
+            trajectory_source='current_model',
+            game_id_kind='model',
+            cycle_id=cycle_id,
+            teacher_difficulty=self.config.teacher_difficulty,
+            inference_depth=self.config.inference_depth,
+        )
+        task_order_rng.shuffle(all_ml_tasks)
+
+        # --- Algo-vs-algo task args: (p1_diff, p2_diff, max_moves, noise, start) ---
+        all_algo_tasks = []
+
+        if algo_vs_algo_games > 0:
+            ava_diffs = self.config.algo_vs_algo_difficulties or ['medium']
+            # Use ordered matchups.  combinations_with_replacement assigned the
+            # weaker difficulty to P1 and the stronger difficulty to P2 in every
+            # mixed game (e.g. hard vs super_hard), but never generated the
+            # reverse.  That taught Player 2 from a systematically stronger
+            # teacher and created a side-specific policy-quality bias.
+            matchups = _ordered_difficulty_matchups(ava_diffs)
+            gpmu = algo_vs_algo_games // len(matchups)
+            rem = algo_vs_algo_games % len(matchups)
+
+            print(f"  Algo-vs-algo: {algo_vs_algo_games} games across matchups {matchups}")
+
+            for idx, (d1, d2) in enumerate(matchups):
+                n = gpmu + (1 if idx < rem else 0)
+                for g in range(n):
+                    start = 1 if g % 2 == 0 else 2
+                    all_algo_tasks.append((d1, d2, _max_moves, _noise_prob, start))
+
+            all_algo_tasks = _stamp_selfplay_tasks(
+                all_algo_tasks,
+                opening_choices=opening_choices,
+                opening_seed_base=opening_seed_base,
+                start_index=len(all_ml_tasks),
+                cycle_rotation=cycle_id,
+                trajectory_source='algorithm',
+                game_id_kind='algorithm',
+                cycle_id=cycle_id,
+                teacher_difficulty=self.config.teacher_difficulty,
+            )
+            task_order_rng.shuffle(all_algo_tasks)
+
+        # [Pass 70] Build a CPU model copy for fork-inherited self-play.
+        # On Linux (fork start method), workers inherit this global via
+        # copy-on-write — zero torch.save/load disk I/O per cycle.
+        # Falls back to disk path on Windows (spawn mode) or if anything fails.
+        # The loadable payload is always serialized for provenance, but is
+        # persisted only when fork inheritance is unavailable.
+        import dama.ai.ml.selfplay as _sp_mod
+        if all_ml_tasks:
+            runtime_arch = getattr(self.model, 'arch_params', {
+                'embedding_size': self.config.model_embedding,
+                'num_blocks': self.config.model_blocks,
+                'hidden_size': self.config.model_hidden,
+                'channels': self.config.model_channels,
+            })
+            _sp_mod._FORK_MODEL = None
+            # On MPS the background self-play thread must not touch the live
+            # tensors (see _published_behavior_state).
+            _published_state = self._published_behavior_state()
+
+            # On fork hosts, copy live weights directly into the sole CPU model.
+            # Hash its still-unfolded state before folding mutates the conv
+            # tensors. The temporary dict contains references only and is gone
+            # before the worker pool forks.
+            if mp.get_context().get_start_method() == 'fork':
+                try:
+                    behavior_step, _fork_model = _capture_model_revision(
+                        getattr(self, '_model_state_lock', None),
+                        lambda: self.step,
+                        lambda: _build_fork_behavior_model(
+                            self.model, runtime_arch, _published_state),
+                    )
+                    behavior_id = f"trainer-step-{behavior_step}"
+                except Exception:
+                    _fork_model = None
+                if _fork_model is not None:
+                    fork_state_refs = dict(_fork_model.state_dict().items())
+                    runtime_checkpoint = {
+                        'model_state_dict': fork_state_refs,
+                        'arch_params': runtime_arch,
+                        'encoding_version': ENCODING_VERSION,
+                        'step': behavior_step,
+                    }
+                    behavior_checkpoint_sha256 = (
+                        _stage_runtime_model_checkpoint(
+                            runtime_checkpoint,
+                            temp_model_path,
+                            persist_to_disk=False,
+                        )
+                    )
+                    del runtime_checkpoint, fork_state_refs
+                    try:
+                        from .model import fold_batchnorm
+                        fold_batchnorm(_fork_model)
+                    except Exception:
+                        _fork_model = None
+                    else:
+                        _sp_mod._FORK_MODEL = _fork_model
+
+            # Spawn workers, or a failed folded-model build, retain the exact
+            # serialized fallback consumed by get_model(). The detached CPU
+            # state is released after persistence, before workers start.
+            if _sp_mod._FORK_MODEL is None:
+                behavior_step, fallback_state = _capture_model_revision(
+                    getattr(self, '_model_state_lock', None),
+                    lambda: self.step,
+                    lambda: _copy_behavior_state_to_cpu(
+                        self.model, self.device, _published_state),
+                )
+                behavior_id = f"trainer-step-{behavior_step}"
+                runtime_checkpoint = {
+                    'model_state_dict': fallback_state,
+                    'arch_params': runtime_arch,
+                    'encoding_version': ENCODING_VERSION,
+                    'step': behavior_step,
+                }
+                behavior_checkpoint_sha256 = _stage_runtime_model_checkpoint(
+                    runtime_checkpoint,
+                    temp_model_path,
+                    persist_to_disk=True,
+                )
+                del runtime_checkpoint, fallback_state
+
+        # --- Batch tasks for the unified pool ---
+        effective_workers = (
+            min(self.config.cpu_workers, 8)
+            if platform.system() == 'Windows'
+            else self.config.cpu_workers
+        )
+
+        # Cap per-batch game count for finer-grained load balancing.
+        # Without a cap, 3600 algo games / 10 workers = 360 per batch — one slow
+        # batch (e.g., heavy on hard matchups) starves other workers.
+        # [Pass 72] Raised from 25→40: with mixed difficulties (easy/medium/hard),
+        # average game time drops ~40%. Larger batches amortize IPC overhead while
+        # shuffle distributes difficulties evenly across batches, preventing
+        # straggler-heavy batches.  40 × 0.67s avg = ~27s worst-case batch.
+        _ALGO_BATCH_CAP = 40
+        _ML_BATCH_CAP = 20  # [Pass 67] Increased from 10. Interleaved play batches
+                            # all active ML positions per step — more games per batch
+                            # = more positions per forward_padded() call = better CPU
+                            # BLAS amortization. batch=10 gave 3-5x; 20 should be better.
+
+        def _make_batches(tasks, cap):
+            # Target ~1 batch per worker, but cap per batch for load balancing
+            if not tasks:
+                return []
+            bs = max(1, min(cap, (len(tasks) + effective_workers - 1) // effective_workers))
+            return [tasks[i:i + bs] for i in range(0, len(tasks), bs)]
+
+        ml_batches = _make_batches(all_ml_tasks, _ML_BATCH_CAP)
+        algo_batches = _make_batches(all_algo_tasks, _ALGO_BATCH_CAP)
+
+        total_batches = len(ml_batches) + len(algo_batches)
+        if ml_batches:
+            print(f"  ML games: {len(all_ml_tasks)} in {len(ml_batches)} batches")
+        if algo_batches:
+            print(f"  Algo games: {len(all_algo_tasks)} in {len(algo_batches)} batches")
+        print(f"  Unified pool: {effective_workers} workers, {total_batches} batches")
+        sys.stdout.flush()
+
+        # --- Open one replay file for the entire self-play cycle ---
+        if not skip_replay:
+            # Only this method writes replay entries, and a complete cycle
+            # closes its file before returning. A writer still open here
+            # belongs to a cycle whose exception escaped the discard below,
+            # such as a failed console write in an error handler, and
+            # start_new_file() would publish it: possibly partial, and under
+            # the generation id this cycle reuses, because the hidden staging
+            # shard is invisible to the durable id scan (Journal Pass 557).
+            discard_unclosed = getattr(
+                self.replay_buffer, 'discard_unclosed_file', None)
+            stale_file = discard_unclosed() if callable(discard_unclosed) else None
+            if stale_file is not None:
+                _diagnostic_print(
+                    "  [warn] Discarded replay file left open by an "
+                    f"interrupted self-play cycle: {stale_file.name}")
+            self.replay_buffer.start_new_file()
+
+        side_balance_totals = {
+            'batches': 0,
+            'p1_count': 0,
+            'p2_count': 0,
+            'p1_weight_before': 0.0,
+            'p2_weight_before': 0.0,
+            'p1_weight_after': 0.0,
+            'p2_weight_after': 0.0,
+        }
+        selfplay_results = {'p1_win': 0, 'p2_win': 0, 'draw': 0, 'unknown': 0}
+        selfplay_lengths = []
+
+        # --- Submit ALL to one ProcessPoolExecutor ---
+        # initializer reseeds each worker's RNG: forked workers otherwise
+        # inherit identical random state, correlating exploration noise.
+
+        # Consume one batch's results into the replay buffer / preprocessing
+        # pipeline.  Shared by the pool loop and the sequential fallbacks so
+        # all three paths stay in sync.
+        def _consume_batch(entries_data, batch_game_count):
+            nonlocal entries, completed_total
+            # Worker output is a raw dict pipeline, so retain provenance in
+            # the durable JSONL without changing ReplayEntry's legacy schema.
+            # The parser intentionally ignores these additive metadata keys.
+            self._annotate_selfplay_entries(
+                entries_data,
+                cycle_id=cycle_id,
+                behavior_step=behavior_step,
+                behavior_id=behavior_id,
+                behavior_checkpoint_sha256=behavior_checkpoint_sha256,
+            )
+            balance_stats = self._balance_side_sample_weights(entries_data)
+            if balance_stats is not None:
+                side_balance_totals['batches'] += 1
+                for key in (
+                    'p1_count', 'p2_count',
+                    'p1_weight_before', 'p2_weight_before',
+                    'p1_weight_after', 'p2_weight_after',
+                ):
+                    side_balance_totals[key] += balance_stats[key]
+            if not skip_replay:
+                self.replay_buffer.add_entry_dicts(entries_data)
+            entries += len(entries_data)
+            if _collected is not None:
+                _collected.extend(entries_data)
+            # Inline preprocessing: convert dicts to tensors now, while the
+            # thread is otherwise idle waiting for the next game batch.
+            # Cython processes ~1000 entries in <2ms — negligible vs the
+            # seconds between batches.
+            if _preprocess_chunks is not None and entries_data:
+                _preprocess_chunks.append(
+                    _pp_chunk((entries_data, _pp_max_moves)))
+            if self.stats_collector:
+                batch_results, batch_lengths = _summarize_selfplay_batch(
+                    entries_data, batch_game_count)
+                for outcome, count in batch_results.items():
+                    selfplay_results[outcome] += count
+                selfplay_lengths.extend(batch_lengths)
+            completed_total += batch_game_count
+            if callback:
+                callback(completed_total, grand_total)
+            if completed_total % 100 == 0 or completed_total == grand_total:
+                print(f"  Games: {completed_total}/{grand_total}")
+
+        def _selfplay_shutdown_requested():
+            """Keep operator and duration stops responsive between results."""
+            stop_event = getattr(self, '_bg_selfplay_stop_event', None)
+            return self._stopped or (
+                stop_event is not None and stop_event.is_set()
+            )
+
+        # Worker fn per task type, for re-running a batch in-process. ML
+        # batches reuse the fork-inherited _FORK_MODEL (set above), so they
+        # run correctly in the main process too.
+        _batch_fn = {
+            'ml': _play_games_batch_worker_full,
+            'algo': _play_games_batch_worker_algo,
+        }
+        # Batches still owed when the pool breaks, so we can finish them
+        # sequentially instead of silently dropping their game data.
+        unfinished = {}  # future → (task_type, batch_game_count, batch)
+
+        executor = None
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=effective_workers,
+                initializer=_selfplay_worker_init,
+                initargs=(opening_seed_base,),
+            )
+            try:
+                # future → (task_type, num_games_in_batch, batch)
+                future_meta = {}
+                for batch in ml_batches:
+                    f = executor.submit(_play_games_batch_worker_full, batch)
+                    future_meta[f] = ('ml', len(batch), batch)
+                for batch in algo_batches:
+                    f = executor.submit(_play_games_batch_worker_algo, batch)
+                    future_meta[f] = ('algo', len(batch), batch)
+                unfinished = dict(future_meta)
+
+                # as_completed() blocks until some Future finishes, so the old
+                # future.result(timeout=600) could never make STOP responsive
+                # when every worker was stalled. Completion callbacks preserve the
+                # same delivery boundary while the bounded queue wait gives
+                # the trainer a chance to service controls and duration expiry.
+                completed_futures = Queue()
+                pending_results = set(future_meta)
+                for future in future_meta:
+                    future.add_done_callback(completed_futures.put)
+
+                while pending_results:
+                    self._service_control_queue()
+                    if _selfplay_shutdown_requested():
+                        # Stop requested: drop queued game batches and return
+                        # with whatever already finished.  The bounded pool
+                        # teardown below terminates lingering workers without
+                        # waiting indefinitely for a context-manager exit.
+                        unfinished.clear()
+                        break
+                    try:
+                        future = completed_futures.get(timeout=0.1)
+                    except Empty:
+                        continue
+                    self._service_control_queue()
+                    if _selfplay_shutdown_requested():
+                        unfinished.clear()
+                        break
+                    if future not in pending_results:
+                        continue
+                    pending_results.remove(future)
+                    task_type, batch_game_count, batch = future_meta[future]
+                    try:
+                        entries_data = future.result()
+                        if not _selfplay_batch_result_is_complete(
+                            entries_data, batch
+                        ):
+                            raise RuntimeError(
+                                "self-play worker returned an incomplete batch"
+                            )
+                        unfinished.pop(future, None)
+                        _consume_and_release_selfplay_batch(
+                            entries_data, batch_game_count, _consume_batch)
+                    except BrokenProcessPool:
+                        # A worker died abruptly (OOM, native crash, external
+                        # kill).  The pool is now poisoned — every remaining
+                        # future will also raise BrokenProcessPool.  Stop
+                        # draining it and finish the owed batches sequentially
+                        # below so this cycle's data isn't silently lost.
+                        print(f"Self-play worker died abruptly (broken pool); "
+                              f"finishing {len(unfinished)} remaining batch(es) "
+                              f"sequentially")
+                        break
+                    except Exception as e:
+                        print(f"Self-play error ({task_type}): {e}")
+            finally:
+                # Once an operator or duration stop is visible, no pending
+                # worker result remains useful: an incomplete cycle will be
+                # quarantined below, while an already complete one has all of
+                # its results. Skip the normal five-second grace period so
+                # terminal status is not held hostage by a stalled native
+                # search. Ordinary completion and broken-pool recovery retain
+                # the grace period.
+                shutdown_timeout = (
+                    0.0 if _selfplay_shutdown_requested() else 5.0
+                )
+                _shutdown_selfplay_executor(
+                    executor, timeout=shutdown_timeout)
+
+            # Pool torn down. Re-run any batches the broken pool never
+            # delivered, in-process (single process = less memory pressure
+            # than the worker pool that just died).
+            if unfinished and not _selfplay_shutdown_requested():
+                for task_type, batch_game_count, batch in list(unfinished.values()):
+                    self._service_control_queue()
+                    if _selfplay_shutdown_requested():
+                        break
+                    try:
+                        entries_data = _batch_fn[task_type](batch)
+                        if not _selfplay_batch_result_is_complete(
+                            entries_data, batch
+                        ):
+                            raise RuntimeError(
+                                "self-play sequential re-run returned an "
+                                "incomplete batch"
+                            )
+                        _consume_and_release_selfplay_batch(
+                            entries_data, batch_game_count, _consume_batch)
+                    except Exception as e:
+                        print(f"Self-play sequential re-run error ({task_type}): {e}")
+        except Exception as e:
+            # KNOWN GAP (not auto-fixed, Journal Pass 557): this and the four
+            # other handler prints in this pool block are bare. A dead-pipe
+            # write in one re-raises past the BaseException discard below and
+            # abandons the cycle; the cycle-start discard_unclosed_file() call
+            # keeps that shard out of the corpus. Guarding them would let such
+            # a cycle complete instead.
+            print(f"Unified pool failed ({e}), falling back to sequential")
+            # Retry every still-owed batch in-process.  A partial retry is not
+            # admissible: the completion gate below quarantines the whole
+            # cycle if any batch remains incomplete.
+            if not unfinished:
+                for batch in ml_batches:
+                    unfinished[('ml', id(batch))] = ('ml', len(batch), batch)
+                for batch in algo_batches:
+                    unfinished[('algo', id(batch))] = ('algo', len(batch), batch)
+            for task_type, batch_game_count, batch in list(unfinished.values()):
+                self._service_control_queue()
+                if _selfplay_shutdown_requested():
+                    break
+                try:
+                    entries_data = _batch_fn[task_type](batch)
+                    if not _selfplay_batch_result_is_complete(
+                        entries_data, batch
+                    ):
+                        raise RuntimeError(
+                            "self-play sequential retry returned an incomplete batch"
+                        )
+                    _consume_and_release_selfplay_batch(
+                        entries_data, batch_game_count, _consume_batch)
+                except Exception as e:
+                    print(f"Sequential fallback error ({task_type}): {e}")
+        except BaseException:
+            # Ctrl-C and SystemExit are not ``Exception``, so they used to
+            # escape past the completion gate below and leave the partial cycle
+            # file on disk.  Under the enforced 70/30 contract that single
+            # off-ratio file then blocks every later run at corpus admission.
+            self._discard_incomplete_selfplay_cycle(
+                skip_replay, _collected, _preprocess_chunks, temp_model_path)
+            raise
+
+        # [Pass 70] Clean up fork-inherited model to free CPU memory.
+        _sp_mod._FORK_MODEL = None
+
+        # A duration stop cuts off pending work, but if every batch was already
+        # consumed before the event was observed the complete immutable shard
+        # is still valid and should be preserved for the next launch.
+        cycle_complete = completed_total == grand_total and not self._stopped
+        if not cycle_complete:
+            self._discard_incomplete_selfplay_cycle(
+                skip_replay, _collected, _preprocess_chunks, temp_model_path)
+            raise RuntimeError(
+                f"self-play cycle {cycle_id} incomplete: "
+                f"completed {completed_total}/{grand_total} games"
+            )
+        if not skip_replay:
+            self.replay_buffer.close()
+        self.stats.generation_cycles_completed = cycle_id + 1
+        if side_balance_totals['batches'] > 0:
+            print(
+                "  Side weight balance: "
+                f"P1 {side_balance_totals['p1_weight_before']:.1f}->"
+                f"{side_balance_totals['p1_weight_after']:.1f}, "
+                f"P2 {side_balance_totals['p2_weight_before']:.1f}->"
+                f"{side_balance_totals['p2_weight_after']:.1f} "
+                f"({side_balance_totals['p1_count']}/"
+                f"{side_balance_totals['p2_count']} entries)"
+            )
+        print(f"Generated {entries} training entries")
+
+        # Store collected dicts for incremental preprocessing
+        if _collected is not None:
+            self._last_selfplay_dicts = _collected
+
+        # Assemble inline-preprocessed chunks into a CachedTensorDataset.
+        # All chunks were preprocessed during the completion-delivery loop, so
+        # this is just numpy concatenation + torch.from_numpy (~1ms total).
+        if _preprocess_chunks is not None and _preprocess_chunks:
+            import numpy as _np
+            boards = _np.concatenate([c[0] for c in _preprocess_chunks])
+            mf = _np.concatenate([c[1] for c in _preprocess_chunks])
+            mc = _np.concatenate([c[2] for c in _preprocess_chunks])
+            tgt = _np.concatenate([c[3] for c in _preprocess_chunks])
+            rw = _np.concatenate([c[4] for c in _preprocess_chunks])
+            vt = _np.concatenate([c[5] for c in _preprocess_chunks])
+            self._last_selfplay_preprocessed = CachedTensorDataset(
+                torch.from_numpy(boards), torch.from_numpy(mf),
+                torch.from_numpy(mc), torch.from_numpy(tgt),
+                torch.from_numpy(rw), torch.from_numpy(vt),
+            )
+            print(f"  Inline preprocessing: {len(self._last_selfplay_preprocessed)} entries "
+                  f"({len(_preprocess_chunks)} chunks, zero extra latency)")
+
+        # Record self-play stats
+        if self.stats_collector:
+            _selfplay_elapsed = time.time() - _selfplay_start
+            self.stats_collector.record_selfplay_epoch(
+                step=self.step,
+                epoch=self.epoch,
+                num_games=grand_total,
+                num_entries=entries,
+                elapsed_sec=_selfplay_elapsed,
+                result_distribution=selfplay_results,
+                game_lengths=selfplay_lengths,
+                game_length_basis='recorded_post_opening_plies',
+            )
+
+            # Record replay buffer state (skip when replay I/O was bypassed —
+            # file counts would be stale and count_entries() does unnecessary I/O)
+            if not skip_replay:
+                try:
+                    # One immutable identity snapshot supplies all three
+                    # aggregates.  Re-enumerating and restatting the 60-shard
+                    # drvfs window made this recurring statistic measurable.
+                    buf_entries, num_files, total_bytes = (
+                        self.replay_buffer.get_buffer_state())
+                    self.stats_collector.record_replay_buffer_state(
+                        step=self.step,
+                        total_entries=buf_entries,
+                        num_files=num_files,
+                        total_size_bytes=total_bytes,
+                    )
+                except Exception:
+                    pass  # Non-critical
+        if return_behavior_step:
+            self._cleanup_runtime_model_file(temp_model_path)
+            self._cleanup_runtime_models_dir()
+            return entries, behavior_step
+        self._cleanup_runtime_model_file(temp_model_path)
+        self._cleanup_runtime_models_dir()
+        return entries
+
+    # ------------------------------------------------------------------
+    # Background self-play: overlap CPU game generation with GPU training
+    # ------------------------------------------------------------------
+
+    def _background_selfplay_shutdown_requested(self) -> bool:
+        """Observe expiry even while the foreground is finishing native work."""
+        return (self._stopped or self._bg_selfplay_stop_event.is_set()
+                or self._training_time_limit_reached())
+
+    def _wait_for_selfplay_disk_headroom(self) -> bool:
+        """Wait until persistent self-play and corpus writes have headroom.
+
+        Returns false on shutdown or duration expiry. The check runs
+        both before generation and before snapshot admission: the former avoids
+        spending a complete CPU cycle on a replay shard that cannot close, and
+        the latter keeps a concurrent drop in free space away from the much
+        larger trained-ledger transaction.
+        """
+        minimum_gb = float(
+            getattr(self.config, 'selfplay_min_free_disk_gb', 0.0) or 0.0
+        )
+        if minimum_gb <= 0:
+            return not self._background_selfplay_shutdown_requested()
+
+        required_bytes = int(minimum_gb * _GIB)
+        replay_dir = Path(self.config.replay_dir)
+        waiting = False
+        while not self._background_selfplay_shutdown_requested():
+            try:
+                free_bytes = int(shutil.disk_usage(replay_dir).free)
+                measurement_error = None
+            except OSError as exc:
+                free_bytes = None
+                measurement_error = exc
+
+            # A filesystem query can itself outlive the session. Do not
+            # authorize another write phase just because space is available.
+            if self._background_selfplay_shutdown_requested():
+                return False
+            if free_bytes is not None and free_bytes >= required_bytes:
+                if waiting:
+                    print(
+                        "  Self-play storage headroom recovered: "
+                        f"{free_bytes / _GIB:.2f} GiB free, resuming"
+                    )
+                return True
+
+            if not waiting:
+                if measurement_error is None:
+                    detail = f"{free_bytes / _GIB:.2f} GiB free"
+                else:
+                    detail = f"free-space check failed: {measurement_error}"
+                print(
+                    "  Self-play paused for storage headroom: "
+                    f"{detail}, requires {minimum_gb:g} GiB"
+                )
+                waiting = True
+            self._bg_selfplay_stop_event.wait(
+                timeout=_SELFPLAY_DISK_HEADROOM_POLL_SECONDS
+            )
+        return False
+
+
+    def _publish_selfplay_model_state(self) -> None:
+        """Copy the weights to the CPU for background self-play (MPS only).
+
+        Runs on the training thread -- when background self-play starts and
+        after every epoch -- because MPS work must stay on one thread (see
+        run_selfplay).  The self-play model therefore lags the live weights
+        by at most one epoch; CUDA keeps copying the live weights directly.
+        """
+        self._selfplay_state_snapshot = {
+            k: v.cpu() for k, v in self.model.state_dict().items()}
+
+    def _published_behavior_state(self):
+        """CPU weights for the background self-play thread on MPS, else None.
+
+        PyTorch's MPS stream must not be driven from two threads: a copy
+        issued from the self-play thread while the training thread encodes
+        kernels aborts the process (Metal assertion). That thread uses the
+        weights the training thread published instead.
+        """
+        if (self.device.type == 'mps'
+                and threading.current_thread()
+                is getattr(self, '_bg_selfplay_thread', None)):
+            return self._selfplay_state_snapshot
+        return None
+
+    def _start_background_selfplay(self, num_games: int) -> None:
+        """Launch continuous self-play + data preparation in a background thread.
+
+        The thread runs a continuous loop: generate games → preprocess →
+        store dataset → immediately start next cycle.  This eliminates the
+        CPU idle gap between self-play cycles that existed when the thread
+        was one-shot and the main thread had to restart it.
+
+        The main thread picks up completed datasets via _collect_background_selfplay()
+        at epoch boundaries.  If multiple cycles complete between collections,
+        only the latest dataset is kept.
+
+        Uses incremental preprocessing when possible: only preprocesses the
+        new self-play entries to tensors, then concatenates with the existing
+        dataset.  Falls back to full rebuild when no existing dataset exists.
+        """
+        if self._bg_selfplay_thread is not None and self._bg_selfplay_thread.is_alive():
+            return  # already running
+        self._bg_selfplay_stop_event.clear()
+
+        _shutdown_requested = self._background_selfplay_shutdown_requested
+
+        def _worker():
+            if self._snapshot_manager is not None:
+                pending_snapshot_path = None
+                while not _shutdown_requested():
+                    try:
+                        while self._paused and not _shutdown_requested():
+                            self._bg_selfplay_stop_event.wait(timeout=0.5)
+                        if _shutdown_requested():
+                            break
+                        if not self._wait_for_selfplay_disk_headroom():
+                            break
+
+                        _, selfplay_behavior_step = self.run_selfplay(
+                            num_games,
+                            return_behavior_step=True,
+                            collect_dicts=False,
+                            skip_replay=False,
+                            preprocess_inline=False,
+                        )
+                        pruned = self.replay_buffer.cleanup_old_files()
+                        if pruned:
+                            print(
+                                f"  Replay: pruned {pruned} old file(s) "
+                                f"(keeping newest {self.config.replay_max_files})"
+                            )
+                        # Preserve the completed replay shard, but do not start
+                        # corpus work that can outlive a duration-triggered
+                        # shutdown. The next launch will consider this shard.
+                        if _shutdown_requested():
+                            break
+                        if not self._wait_for_selfplay_disk_headroom():
+                            break
+
+                        teacher, noise, generation = self._corpus_settings(
+                            model_behavior_step=selfplay_behavior_step
+                        )
+                        take_replay_stats = getattr(
+                            self.replay_buffer,
+                            'take_replay_file_stats_handoff',
+                            None,
+                        )
+                        replay_file_stats_handoff = (
+                            take_replay_stats()
+                            if callable(take_replay_stats) else None
+                        )
+                        # Time the admission call so a live run can separate the
+                        # O(all-time-ledger) work it does on an admit (canonical
+                        # ledger merge + sidecar + retention) from the O(window)
+                        # split prep below. Journal Pass 560 measured the summed
+                        # per-admission overhead (~162 s mean, growing) but could
+                        # not attribute it; this is the missing instrument.
+                        _admit_start = time.monotonic()
+                        decision = self._snapshot_manager.consider_snapshot(
+                            teacher_settings=teacher,
+                            noise_settings=noise,
+                            generation_settings=generation,
+                            replay_file_stats_handoff=replay_file_stats_handoff,
+                        )
+                        _admit_sec = time.monotonic() - _admit_start
+                        # Admission is already durable. If STOP arrived while
+                        # the manager was auditing or publishing it, leave the
+                        # snapshot for the next launch instead of making the
+                        # terminal join wait for a full split load and tensor
+                        # rebuild that no consumer can activate.
+                        if _shutdown_requested():
+                            break
+                        if decision.admitted:
+                            # Admission advances the durable freshness reference
+                            # before parsing/tensorization can fail. Retain only
+                            # its path until the dataset handoff succeeds, so a
+                            # later rejected cycle can retry the verified load.
+                            pending_snapshot_path = decision.manifest_path
+                        else:
+                            print(
+                                "  Corpus candidate not activated: "
+                                f"{decision.reason}"
+                            )
+                        if pending_snapshot_path is None:
+                            continue
+
+                        # Split-prep clocks. _verify_sec is prepare_split's
+                        # integrity work (manifest + lineage + shard-integrity
+                        # check); its per-shard SHA-256 is identity-cached
+                        # (_REPLAY_HASH_CACHE keyed by dev/inode/size/mtime), so
+                        # on the c174k producer it hashes only the newly rotated
+                        # train shards (the "parsing N shard(s)" set) while reused
+                        # hardlinked shards and the stable hold-out hit the cache.
+                        # The remainder is the O(window) parse + tensorize. Both
+                        # are separate levers from consider_snapshot, which on an
+                        # admit contains the O(all-time-ledger) merge plus the
+                        # snapshot install; Pass 560 could not attribute the
+                        # summed overhead. On a Pass 445 retry the ledger work
+                        # happened on an earlier cycle, so _admit_sec then
+                        # reflects only this cycle's cheap reject (no "Trained
+                        # ledger: +N" line). _verify_sec stays 0 on the legacy
+                        # load_split path, which does verify and load together.
+                        _prep_start = time.monotonic()
+                        _verify_sec = 0.0
+                        manager = self._snapshot_manager
+                        dataset = None
+                        train_entries = None
+                        staged_split = all(
+                            callable(getattr(manager, name, None))
+                            for name in (
+                                "prepare_split",
+                                "load_validation_entries",
+                                "load_train_entries",
+                            )
+                        )
+                        if staged_split:
+                            split_context = manager.prepare_split(
+                                pending_snapshot_path,
+                                max_train_entries=self.config.replay_max_entries,
+                            )
+                            _verify_sec = time.monotonic() - _prep_start
+                            # Verification can outlive STOP. Do not begin a
+                            # new materialization phase without a consumer.
+                            if _shutdown_requested():
+                                break
+                            validation_entries, validation_identity = (
+                                self._load_or_reuse_validation_entries(
+                                    split_context))
+                            if _shutdown_requested():
+                                break
+                            if (type(manager) is CorpusSnapshotManager
+                                    and type(split_context) is _SnapshotSplitContext):
+                                # Validation and its leakage accounting are
+                                # complete. Training uses only the exclusions,
+                                # so drop this context's ledger reference
+                                # before allocating train tensors. Replace the
+                                # context to preserve any external aliases;
+                                # custom managers retain their own contracts.
+                                # The built-in index is shared, not copied
+                                # (Journal Pass 556).
+                                split_context = replace(
+                                    split_context, historically_trained=set())
+                            per_file_split = all(
+                                callable(getattr(manager, name, None))
+                                for name in (
+                                    "load_train_file_entries",
+                                    "train_cap_sample_indices",
+                                )
+                            )
+                            if per_file_split:
+                                dataset = self._load_or_reuse_train_dataset(
+                                    split_context,
+                                    should_abort=_shutdown_requested,
+                                )
+                                if dataset is None:
+                                    break
+                            else:
+                                train_entries = manager.load_train_entries(
+                                    split_context)
+                            manifest = split_context.manifest
+                            split_context = None
+                        else:
+                            train_entries, validation_entries, manifest = (
+                                manager.load_split(
+                                    pending_snapshot_path,
+                                    max_train_entries=self.config.replay_max_entries,
+                                )
+                            )
+                            validation_identity = None
+                        if _shutdown_requested():
+                            break
+                        if dataset is None:
+                            dataset = CachedTensorDataset.from_entries(
+                                train_entries,
+                                max_moves_per_sample=self.config.max_moves_per_sample,
+                                show_progress=True,
+                            )
+                        if _shutdown_requested():
+                            break
+                        with self._bg_selfplay_lock:
+                            self._bg_selfplay_entries = None
+                            self._bg_selfplay_dataset = dataset
+                            self._bg_selfplay_incremental = None
+                            self._bg_snapshot_manifest = manifest
+                            self._bg_validation_entries = validation_entries
+                            self._bg_validation_identity = validation_identity
+                        pending_snapshot_path = None
+                        self._data_ready_event.set()
+                        _prep_sec = time.monotonic() - _prep_start
+                        _load_sec = max(0.0, _prep_sec - _verify_sec)
+                        print(
+                            f"  Corpus snapshot {manifest['version']} ready: "
+                            f"{manifest['metrics']['fresh_unique_state_rate']:.1%} "
+                            "fresh canonical states"
+                        )
+                        # Per-admission phase split, so a post-Pass-556 live run
+                        # can decide which lever is behind Pass 560's ~27% GPU
+                        # idle: consider_snapshot (O(all-time-ledger) merge +
+                        # sidecar + retention + snapshot install), verify
+                        # (prepare_split's integrity check; hashes only newly
+                        # rotated shards, the rest identity-cached) or
+                        # load+tensorize (O(window) parse). Guarded because the
+                        # producer shares the dead-console path (Pass 557); fires
+                        # only on an admission (rare path, like the Pass 559
+                        # retention warning).
+                        _diagnostic_print(
+                            "  Admission timing: consider_snapshot "
+                            f"{_admit_sec:.1f}s, verify {_verify_sec:.1f}s, "
+                            f"load+tensorize {_load_sec:.1f}s"
+                        )
+                    except Exception as exc:
+                        import traceback
+                        # A bare print here re-raised a dead console's
+                        # BrokenPipeError and ended the producer, leaving the
+                        # main loop on its standing snapshot (Journal Pass 557).
+                        _diagnostic_print(
+                            f"Background snapshot self-play error: {exc}")
+                        _diagnostic_print(
+                            traceback.format_exc(), file=sys.stderr, end='')
+                        if not _shutdown_requested():
+                            self._bg_selfplay_stop_event.wait(timeout=2.0)
+                    finally:
+                        # The pending handoff owns tensors and validation rows
+                        # after publication. Keep no cycle-local payloads while
+                        # generating again or retrying a failed preparation;
+                        # parsed training rows were copied into the tensors.
+                        train_entries = validation_entries = dataset = None
+                        split_context = validation_identity = None
+                return
+
+            _existing = getattr(self, '_current_dataset', None)
+            _max_entries = self.config.replay_max_entries
+            # Track entry count as integer to avoid holding ~2GB of CPU
+            # tensors between cycles.  When GPU-resident, update_data()
+            # handles trimming on GPU; the CPU concat result is never
+            # iterated — it only served as a concat base and length check.
+            _existing_count = len(_existing) if _existing is not None else 0
+            # Only hold the full dataset reference for the first cycle
+            # (needed for fallback paths).  After that, free the ~2GB CPU
+            # copy — the data lives on GPU.
+            _first_cycle = True
+
+            while not _shutdown_requested():
+                try:
+                    # Respect Pause: do not start a new self-play cycle while
+                    # paused (games already in flight still finish).
+                    # NOTE: this loop relies on the main training thread to
+                    # service RESUME/STOP from the control queue (it does not
+                    # call _service_control_queue itself). If train() completes
+                    # naturally while paused, the main loop has exited and won't
+                    # clear _paused; shutdown is then bounded by the bg-thread
+                    # join timeout (see end of train()). Harmless but noted.
+                    while self._paused and not _shutdown_requested():
+                        self._bg_selfplay_stop_event.wait(timeout=0.5)
+                    if _shutdown_requested():
+                        break
+
+                    _has_existing = _existing_count > 0
+
+                    # [Pass 109] JSONL persistence used to be skipped for every
+                    # cycle after the first (`skip_replay = _existing_count > 0`).
+                    # Self-play then lived only in the GPU-resident buffer and
+                    # died with the process, so each restart reloaded the SAME
+                    # stale corpus and every fresh game generated since was lost.
+                    # That is why data/replay_policy_distillation/ had no file
+                    # newer than 2026-08-11 despite weeks of training. The write
+                    # happens on this background thread between game batches, so
+                    # it costs the training loop nothing; persist unless the
+                    # config explicitly opts out.
+                    _skip = _has_existing and not self.config.persist_selfplay
+
+                    # Always use inline preprocessing: preprocess entries as each
+                    # game batch completes in the delivery loop. Eliminates
+                    # the separate from_dicts() / from_entries() call that spawns
+                    # a ProcessPoolExecutor after all games finish.  Saves 5-30s
+                    # per cycle (entire preprocessing phase overlapped with games).
+                    # collect_dicts is still needed on first cycle for fallback.
+                    self.run_selfplay(
+                        num_games, collect_dicts=not _has_existing,
+                        skip_replay=_skip, preprocess_inline=True)
+
+                    if not _skip:
+                        _pruned = self.replay_buffer.cleanup_old_files()
+                        if _pruned:
+                            print(f"  Replay: pruned {_pruned} old file(s) "
+                                  f"(keeping newest {self.config.replay_max_files})")
+                    if _shutdown_requested():
+                        break
+
+                    # Check for inline-preprocessed data first (fast path).
+                    incremental = getattr(self, '_last_selfplay_preprocessed', None)
+
+                    if incremental is not None and _existing_count > 0:
+                        # Incremental update path: skip CPU concat entirely.
+                        # GPU update_data() handles trimming old entries.
+                        # Just track the expected total count.
+                        _new_n = len(incremental)
+                        if _max_entries > 0 and _existing_count + _new_n > _max_entries:
+                            _existing_count = _max_entries
+                        else:
+                            _existing_count += _new_n
+                        dataset = None  # No CPU concat — saves ~2GB alloc+copy
+                        print(f"  Incremental: +{_new_n} entries "
+                              f"(total ~{_existing_count}, no CPU concat)")
+                    elif incremental is not None:
+                        # First cycle with inline preprocessing, or no existing
+                        # data to concat with.  On first cycle, also load any
+                        # existing replay data from disk and merge.
+                        if _existing_count == 0:
+                            # Check for existing replay data on disk
+                            train_entries, _ = prepare_training_data(
+                                self.replay_buffer, max_entries=_max_entries,
+                                val_split=(self.config.validation_fraction
+                                           if self.config.validation_enabled else 0.0),
+                                split_seed=self.config.validation_split_seed)
+                            if train_entries:
+                                existing_ds = CachedTensorDataset.from_entries(
+                                    train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
+                                dataset = existing_ds.concat(incremental, max_entries=_max_entries)
+                                _existing_count = len(dataset)
+                                print(f"  Loaded {len(existing_ds)} existing + "
+                                      f"{len(incremental)} inline-preprocessed = "
+                                      f"{_existing_count} total entries")
+                            else:
+                                dataset = incremental
+                                _existing_count = len(incremental)
+                                print(f"  New dataset: {_existing_count} entries (inline-preprocessed)")
+                        else:
+                            dataset = incremental
+                            _existing_count = len(incremental)
+                            print(f"  New dataset: {_existing_count} entries (inline-preprocessed)")
+                    else:
+                        # Fallback: no inline preprocessing available.
+                        # Use collected dicts or load from replay.
+                        new_dicts = getattr(self, '_last_selfplay_dicts', None)
+
+                        if new_dicts and _existing_count > 0 and _existing is not None:
+                            print(f"  Incremental preprocessing: {len(new_dicts)} new entries "
+                                  f"(existing: {_existing_count})")
+                            incremental = CachedTensorDataset.from_dicts(
+                                new_dicts, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
+                            dataset = _existing.concat(incremental, max_entries=_max_entries)
+                            _existing_count = len(dataset)
+                            print(f"  Merged dataset: {_existing_count} entries")
+                        else:
+                            incremental = None
+                            train_entries, _ = prepare_training_data(
+                                self.replay_buffer, max_entries=_max_entries,
+                                val_split=(self.config.validation_fraction
+                                           if self.config.validation_enabled else 0.0),
+                                split_seed=self.config.validation_split_seed)
+                            if self.config.clear_replay_after_load:
+                                deleted = self.replay_buffer.clear_files()
+                                if deleted:
+                                    print(f"Cleared {deleted} replay files after loading")
+                            dataset = CachedTensorDataset.from_entries(
+                                train_entries, max_moves_per_sample=self.config.max_moves_per_sample, show_progress=True)
+                            _existing_count = len(dataset)
+
+                    with self._bg_selfplay_lock:
+                        self._bg_selfplay_entries = None
+                        self._bg_selfplay_dataset = dataset
+                        self._bg_selfplay_incremental = incremental
+                    # Wake the main thread immediately if it's waiting for data.
+                    self._data_ready_event.set()
+
+                    # After first cycle, free the CPU dataset reference.
+                    # Data is on GPU; keeping _existing alive wastes ~2GB RAM.
+                    if _first_cycle:
+                        _existing = None
+                        _first_cycle = False
+
+                except Exception as e:
+                    import traceback
+                    # Guarded like the snapshot branch: a dead console must
+                    # not turn this handler into the thread's exit.
+                    _diagnostic_print(f"Background self-play error: {e}")
+                    _diagnostic_print(
+                        traceback.format_exc(), file=sys.stderr, end='')
+                    # Don't crash the loop — sleep briefly and retry
+                    if not _shutdown_requested():
+                        self._bg_selfplay_stop_event.wait(timeout=2.0)
+
+        if getattr(getattr(self, 'device', None), 'type', None) == 'mps':
+            self._publish_selfplay_model_state()
+        self._bg_selfplay_thread = threading.Thread(target=_worker, daemon=True)
+        self._bg_selfplay_thread.start()
+
+    def _stop_background_selfplay(self) -> None:
+        """Stop the continuous producer and wait until its process pool is gone.
+
+        The terminal run marker is written after ``_run_training`` returns, so
+        this wait is deliberately not timed out. Otherwise a marker could say
+        ``terminated`` while self-play workers are still live, allowing a
+        colliding trainer launch in the same namespace.
+        """
+        self._bg_selfplay_stop_event.set()
+        self._data_ready_event.set()
+        thread = self._bg_selfplay_thread
+        if thread is not None and thread.is_alive():
+            _diagnostic_print("Waiting for background self-play to finish...")
+            thread.join()
+
+    def _collect_background_selfplay(self):
+        """Check if background self-play produced new data. Non-blocking.
+
+        Returns (dataset, incremental) where:
+        - dataset: Full merged dataset (first cycle only), or None when
+          concat was skipped (GPU-resident incremental-only path).
+        - incremental: Only the new entries from this cycle, used for GPU
+          update_data to avoid re-uploading the entire dataset via PCIe.
+
+        Returns (None, None) when no new data is available.
+        The background thread keeps running — no need to restart.
+        """
+        with self._bg_selfplay_lock:
+            dataset = self._bg_selfplay_dataset
+            incremental = self._bg_selfplay_incremental
+            # No new data: both are None (or incremental is None when dataset
+            # hasn't been set yet).
+            if dataset is None and incremental is None:
+                return None, None
+            self._bg_selfplay_dataset = None
+            self._bg_selfplay_incremental = None
+            self._bg_selfplay_entries = None
+            manifest = self._bg_snapshot_manifest
+            validation_entries = self._bg_validation_entries
+            validation_identity = getattr(self, "_bg_validation_identity", None)
+            self._bg_snapshot_manifest = None
+            self._bg_validation_entries = None
+            self._bg_validation_identity = None
+        if manifest is not None:
+            self._activate_dataset_manifest(manifest)
+            if validation_entries is _VALIDATION_TENSORS_CURRENT:
+                # The producer proved the held-out inputs unchanged, so the
+                # published tensors and their recorded identity stay current.
+                pass
+            else:
+                self._set_validation_entries(validation_entries or [])
+                self._commit_validation_tensor_identity(validation_identity)
+        return dataset, incremental
+
+    def _refresh_dataloader(self, dataloader, bg_dataset, bg_incremental,
+                            effective_workers):
+        """Apply new self-play data to the dataloader.
+
+        Handles both FastBatchIterator (in-place GPU update) and standard
+        DataLoader (full recreate) paths.  Returns the (possibly new)
+        dataloader and whether data is GPU-resident.
+
+        When bg_dataset is None but bg_incremental is not, the background
+        thread skipped the CPU concat (GPU-resident incremental-only path).
+        Only the incremental data is uploaded to the GPU buffer.
+        """
+        if bg_dataset is not None:
+            self._current_dataset = bg_dataset
+        _is_fast = isinstance(dataloader, FastBatchIterator)
+        if _is_fast:
+            if bg_incremental is not None:
+                dataloader.update_data(
+                    bg_incremental, max_entries=self.config.replay_max_entries)
+            elif bg_dataset is not None:
+                # This is the complete admitted snapshot or merged window.
+                # Appending it retains old rows outside its fingerprint and
+                # duplicates overlap whenever the replay cap leaves room.
+                dataloader.replace_data(bg_dataset)
+            if bg_dataset is not None:
+                dataloader.dataset = bg_dataset
+            # Free CPU dataset references after GPU upload.  The data lives
+            # on GPU (update_data copied it); keeping CPU tensors alive wastes
+            # ~2GB RAM on memory-constrained systems (26GB local machine).
+            # _current_dataset is only read once — at background thread start
+            # (which copies the reference immediately).  dataloader.dataset is
+            # a compatibility attribute never read during training.
+            if getattr(dataloader, 'on_gpu', False):
+                self._current_dataset = None
+                dataloader.dataset = None
+        else:
+            # Non-fast path requires the full dataset.  If concat was skipped
+            # (bg_dataset is None), fall back to bg_incremental — this only
+            # happens in the first cycle transition.
+            _src = bg_dataset if bg_dataset is not None else bg_incremental
+            if _src is None:
+                return dataloader, getattr(dataloader, 'on_gpu', False)
+            _was_gpu = getattr(dataloader, 'on_gpu', False)
+            if _was_gpu:
+                dataloader = None
+                ml_device.empty_cache(self.device)
+            dataloader = create_dataloader_from_dataset(
+                _src,
+                batch_size=self.config.batch_size,
+                num_workers=effective_workers,
+                pin_memory=self.config.pin_memory,
+                device=self.device,
+                amp_enabled=self.config.amp,
+            )
+        self._use_padded = True
+        # [Pass 86] Flag that fresh self-play data was applied. train_epoch reads
+        # and resets this so the next epoch's stats record data_refresh=True.
+        # Previously record_epoch always defaulted data_refresh=False, making the
+        # epochs CSV show False for every epoch even though refreshes happen each
+        # epoch — actively misleading throughput analysis.
+        self._data_refreshed_pending = True
+        _gpu_resident = getattr(dataloader, 'on_gpu', False)
+        return dataloader, _gpu_resident
+
+    def run_test_vs_algo(self, num_games: int = None) -> Dict[str, Any]:
+        """
+        Run test games between current model and algorithmic AI.
+
+        Args:
+            num_games: Number of test games (defaults to config)
+
+        Returns:
+            Test statistics dictionary
+        """
+        if num_games is None:
+            num_games = self.config.test_games
+
+        print(f"\nRunning {num_games} test games vs algorithm ({self.config.test_difficulty})...")
+
+        from .model_vs_algo import ModelVsAlgoTester
+
+        # Save current model temporarily for testing.
+        # Non_blocking D2H copies + single sync (same as _save_checkpoint).
+        temp_path = self._runtime_model_path("temp_test_model.pt")
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.device.type == 'cuda':
+            _sd = {k: v.to('cpu', non_blocking=True)
+                   for k, v in self.model.state_dict().items()}
+            torch.cuda.current_stream().synchronize()
+        else:
+            _sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
+        torch.save({
+            'model_state_dict': _sd,
+            'arch_params': getattr(self.model, 'arch_params', {}),
+            'encoding_version': ENCODING_VERSION,
+            'step': self.step,
+        }, temp_path)
+
+        try:
+            tester = ModelVsAlgoTester(
+                model_path=str(temp_path),
+                algo_difficulty=self.config.test_difficulty,
+                num_workers=min(self.config.cpu_workers, 4),
+                max_moves=self.config.selfplay_max_moves,
+                opening_plies=self.config.test_opening_plies,
+            )
+
+            def progress(completed, total, stats):
+                if completed % 10 == 0:
+                    print(f"  Test games: {completed}/{total} (ML: {stats.ml_win_rate*100:.1f}%)")
+
+            stats = tester.run_tests(num_games=num_games, callback=progress)
+
+            # Record in training stats
+            test_record = {
+                'step': self.step,
+                'epoch': self.epoch,
+                'total_games': stats.total_games,
+                'ml_wins': stats.ml_wins,
+                'algo_wins': stats.algo_wins,
+                'draws': stats.draws,
+                'ml_win_rate': stats.ml_win_rate,
+                'draw_rate': stats.draw_rate,
+                'ml_as_p1_win_rate': stats.ml_as_p1_win_rate,
+                'ml_as_p2_win_rate': stats.ml_as_p2_win_rate,
+                'avg_game_length': stats.avg_game_length,
+                'timestamp': datetime.now().isoformat(),
+            }
+            self.stats.test_history.append(test_record)
+
+            # Record in enhanced stats collector
+            if self.stats_collector:
+                self.stats_collector.record_evaluation(
+                    step=self.step, epoch=self.epoch, test_record=test_record,
+                )
+
+            print(f"  ML Win Rate: {stats.ml_win_rate*100:.1f}%")
+            print(f"    As P1 (White): {stats.ml_as_p1_win_rate*100:.1f}%")
+            print(f"    As P2 (Black): {stats.ml_as_p2_win_rate*100:.1f}%")
+            if self.stats_collector and self.stats_collector.eval_records:
+                latest = self.stats_collector.eval_records[-1]
+                elo = latest.get('estimated_elo_diff', 0)
+                print(f"    Est. ELO diff:  {elo:+.0f}")
+
+            # Log to JSONL
+            self._log({
+                'type': 'test_vs_algo',
+                **test_record
+            })
+
+            # Save stats to JSON file immediately so plot_training.py can read them
+            self._save_stats()
+
+            return test_record
+
+        finally:
+            # Clean up temp file
+            self._cleanup_runtime_model_file(temp_path)
+            self._cleanup_runtime_models_dir()
+
+    def _run_test_cpu_only(self, model_path: str, num_games: int,
+                           difficulty: str, max_moves: int,
+                           num_workers: int) -> Dict[str, Any]:
+        """Run test games using a pre-saved model path. CPU-only, thread-safe.
+
+        Does NOT access self.model or modify self.stats — safe to call from
+        a background thread while the main thread continues GPU training.
+        """
+        from .model_vs_algo import ModelVsAlgoTester
+
+        tester = ModelVsAlgoTester(
+            model_path=model_path,
+            algo_difficulty=difficulty,
+            num_workers=num_workers,
+            max_moves=max_moves,
+            opening_plies=self.config.test_opening_plies,
+        )
+
+        def progress(completed, total, stats):
+            if completed % 10 == 0:
+                print(f"  [async test] {completed}/{total} "
+                      f"(ML: {stats.ml_win_rate*100:.1f}%)")
+
+        stats = tester.run_tests(num_games=num_games, callback=progress)
+
+        return {
+            'total_games': stats.total_games,
+            'ml_wins': stats.ml_wins,
+            'algo_wins': stats.algo_wins,
+            'draws': stats.draws,
+            'ml_win_rate': stats.ml_win_rate,
+            'draw_rate': stats.draw_rate,
+            'ml_as_p1_win_rate': stats.ml_as_p1_win_rate,
+            'ml_as_p2_win_rate': stats.ml_as_p2_win_rate,
+            'avg_game_length': stats.avg_game_length,
+        }
+
+    def _record_test_result(self, test_result: Dict[str, Any],
+                            at_step: int, at_epoch: int) -> None:
+        """Record a completed test result into stats. Main-thread only."""
+        test_record = {
+            'step': at_step,
+            'epoch': at_epoch,
+            'timestamp': datetime.now().isoformat(),
+            **test_result,
+        }
+        self.stats.test_history.append(test_record)
+
+        if self.stats_collector:
+            self.stats_collector.record_evaluation(
+                step=at_step, epoch=at_epoch, test_record=test_record,
+            )
+
+        wr = test_result.get('ml_win_rate', 0)
+        p1wr = test_result.get('ml_as_p1_win_rate', 0)
+        p2wr = test_result.get('ml_as_p2_win_rate', 0)
+        _diagnostic_print(
+            f"  [async test @ step {at_step}] ML Win Rate: {wr*100:.1f}%"
+            f"  (P1: {p1wr*100:.1f}%, P2: {p2wr*100:.1f}%)")
+
+        self._log({'type': 'test_vs_algo', **test_record})
+        self._save_stats()
+
+    def _should_use_scoring_for_epoch(self, epoch: int) -> bool:
+        """Determine whether to use the scoring system for a given epoch number."""
+        mode = self.config.reward_mode.lower()
+        if mode == 'scoring':
+            return True
+        elif mode == 'none':
+            return False
+        else:  # 'cycle'
+            # Odd epochs (1, 3, 5...) use scoring; even epochs (2, 4, 6...) don't
+            return (epoch % 2) == 1
+
+    def _should_use_scoring(self) -> bool:
+        """Determine whether to use the scoring system for the upcoming epoch."""
+        return self._should_use_scoring_for_epoch(self.epoch + 1)
+
+    def _update_process_title(self, step: int, loss: Optional[float] = None) -> None:
+        if self._process_title_setter is None:
+            return
+        if loss is None:
+            title = self._process_title_base
+        else:
+            try:
+                title = f"{self._process_title_base} | step={step} loss={float(loss):.4f}"
+            except (TypeError, ValueError):
+                title = self._process_title_base
+        if title is None or title == self._last_process_title:
+            return
+        try:
+            self._process_title_setter(title)
+            self._last_process_title = title
+        except Exception:
+            self._process_title_setter = None
+
+    # Interval for expensive sanity checks (isfinite on large tensors).
+    # Each check forces a CUDA sync (~20-100μs). Checking every step wastes
+    # GPU pipeline throughput; periodic checks still catch numerical issues.
+    # Numerical instability evolves gradually (over hundreds of steps), so
+    # checking every 2000 steps catches problems well before they cascade
+    # while minimizing GPU pipeline stalls from forced CUDA syncs.
+    _SANITY_CHECK_INTERVAL = 2000
+
+    def train_epoch(self, dataloader, use_scoring: bool = True,
+                    _loss_acc: Optional[torch.Tensor] = None) -> float:
+        """Train for one epoch, returns average loss.
+
+        Args:
+            dataloader: Training data loader
+            use_scoring: If True, apply reward weights from the scoring system.
+                         If False, use uniform weights (classic behavior).
+            _loss_acc: Optional pre-allocated GPU scalar for loss accumulation.
+                       When provided, avoids per-epoch torch.tensor() allocation.
+        """
+        # model.train() is set once before the main loop in train() — not
+        # per-epoch.  The model never switches to eval() during training.
+        # Accumulate loss on GPU to avoid per-step CUDA sync from .item()
+        if _loss_acc is not None:
+            total_loss_acc = _loss_acc
+            total_loss_acc.zero_()
+        else:
+            total_loss_acc = torch.tensor(0.0, device=self.device)
+        num_batches = 0
+        total_batches = len(dataloader)
+        first_batch = True
+        epoch_start_time = time.time()
+        _step_start = 0.0  # lazily set only when stats recording needs it
+        _will_record = False
+        accum_steps = self.config.gradient_accumulation_steps
+        # [Pass 81] Pre-compute loss scale factor: eliminates conditional check
+        # in 3 separate code paths (compiled, AMP, no-AMP) on every step.
+        _loss_scale = 1.0 / accum_steps if accum_steps > 1 else None
+        _micro_step = 0  # counts mini-batches within an accumulation window
+
+        # Cache frequently accessed config/state as locals to eliminate
+        # attribute lookup overhead on every step (~50ns each, adds up at 10+ steps/sec).
+        _cfg = self.config
+        _device = self.device
+        _stats_collector = self.stats_collector
+        _stats_record_every = _cfg.stats_record_every
+        _stats_score_dist_every = _cfg.stats_score_dist_every
+        _stats_system_every = _cfg.stats_system_every
+        _stats_model_health_every = _cfg.stats_model_health_every
+        _checkpoint_every = _cfg.checkpoint_every
+        _train_steps = _cfg.train_steps
+        _grad_clip_norm = _cfg.grad_clip_norm
+        # [Pass 84] Pre-collect parameters into a list for clip_grad_norm_.
+        # model.parameters() creates a new generator on every call, which is
+        # consumed by clip_grad_norm_ into an internal list anyway.  Caching
+        # the list avoids ~40 generator next() calls per optimizer step.
+        # Safe because parameters don't change during training (no layer
+        # freezing/unfreezing in this model).
+        _model_params = list(self.model.parameters()) if _grad_clip_norm is not None else None
+        _use_amp = _cfg.amp
+        _amp_dtype = self.amp_dtype
+        # Autocast follows the training device (CUDA or MPS).  On CPU the
+        # region is entered disabled: runs there were always full precision
+        # (they used to enter a CUDA autocast, a no-op for CPU tensors).
+        _autocast_type = _device.type
+        _autocast_on = _autocast_enabled(_device, _use_amp)
+        # clip_grad_norm_(foreach=True) raises on MPS, which has no foreach
+        # norm kernel; None lets torch pick the per-tensor path there.
+        _clip_foreach = None if _device.type == 'mps' else True
+        # A CPU->MPS copy with non_blocking=True returns before Metal has read
+        # the host pages (it wraps them rather than staging a copy), so the
+        # result is only correct if the batch tensor is not freed and reused
+        # before the GPU gets to the blit -- which nothing here guarantees.
+        # CPU-resident batches bound for MPS are copied synchronously instead
+        # (no measurable throughput cost); CUDA keeps non-blocking transfers.
+        _h2d_non_blocking = _device.type != 'mps'
+        # The AMP path computes the value MSE after the autocast region, so the
+        # value head's half-precision output meets float32 targets.  CUDA
+        # promotes that pair itself; MPS fails an MPSGraph "same element type"
+        # assertion that aborts the whole process, so upcast there first.
+        _value_loss_fp32 = _device.type == 'mps'
+        _value_head_enabled = _cfg.value_head_enabled
+        _value_weight = _cfg.value_weight
+        _soft_targets_enabled = _cfg.policy_stage == 'enhanced'
+        _scaler = self.scaler
+        _optimizer = self.optimizer
+        _scheduler = self.scheduler
+        _model = self.model
+        _use_padded = self._use_padded
+        _sanity_interval = self._SANITY_CHECK_INTERVAL
+        _thermal_enabled = _cfg.thermal_enabled
+        _model_state_lock = getattr(self, '_model_state_lock', None)
+
+        def _run_model_operation(operation, *args):
+            return _call_under_model_state_lock(
+                _model_state_lock, operation, *args)
+
+        def _apply_scaled_optimizer_step() -> bool:
+            # With GradScaler active the trainer uses an unfused optimizer,
+            # whose step is not called when nonfinite gradients reject it.
+            # Observe that call directly instead of guessing from scale changes.
+            updated = False
+
+            def _mark_updated(*_args):
+                nonlocal updated
+                updated = True
+
+            handle = _optimizer.register_step_post_hook(_mark_updated)
+            try:
+                _scaler.step(_optimizer)
+            finally:
+                handle.remove()
+            _scaler.update()
+            if updated:
+                self.step += 1
+            return updated
+
+        def _apply_plain_optimizer_step() -> None:
+            _optimizer.step()
+            self.step += 1
+
+        # GUI control servicing: None when training headless (CLI), so the
+        # hot loop pays only a None check per batch.  The method itself is
+        # time-throttled (_CONTROL_POLL_INTERVAL) when a queue is attached.
+        _service_control = (self._service_control_queue
+                            if self._control_queue is not None else None)
+
+        # Compiled fwd+loss: use when available and padded.
+        # Now supports both policy-only and policy+value head paths.
+        _compiled_fwd_loss = self._compiled_fwd_loss
+        _use_compiled = (
+            _compiled_fwd_loss is not None
+            and _use_padded
+            and not _soft_targets_enabled
+        )
+
+        # Pre-allocate uniform weights for non-scoring epochs so the compiled
+        # path always receives a tensor (never None).
+        if _use_compiled and not use_scoring:
+            _uniform_rw = torch.ones(_cfg.batch_size, dtype=torch.float32, device=_device)
+            _uniform_rw_n = _uniform_rw.shape[0]  # [Pass 81] Cache to avoid .shape access per step
+        else:
+            _uniform_rw = None
+            _uniform_rw_n = 0
+
+        # Use CUDA prefetcher for overlapped H2D transfer — but skip when data
+        # is already GPU-resident (no transfer to overlap, prefetcher just adds
+        # stream-sync overhead).
+        _data_on_gpu = getattr(dataloader, 'on_gpu', False)
+        _use_prefetcher = (
+            _device.type == 'cuda'
+            and not _data_on_gpu
+            and not _soft_targets_enabled
+        )
+        if _use_prefetcher:
+            iter_loader = CUDAPrefetcher(dataloader, _device)
+        else:
+            iter_loader = dataloader
+
+        def _finish_optimizer_step(
+            loss, _raw_loss, _current_scores, move_counts, microbatches,
+        ) -> bool:
+            # A short final window contains fewer scaled losses. Restore its
+            # mean gradient before unscaling/clipping so the update has the
+            # same normalization as an ordinary full window.
+            if microbatches < accum_steps:
+                correction = accum_steps / microbatches
+                for parameter in _model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(correction)
+            _grad_norm = None
+            _grad_norms_per_layer = None
+            # Gradient clipping + stats.  clip_grad_norm_ returns the total
+            # (unclipped) grad norm, so we capture it instead of iterating all
+            # parameters a second time in compute_gradient_stats.  Per-layer
+            # norms are only collected at model_health frequency (much lower)
+            # to avoid ~40 .item() CUDA syncs per stats step.
+            # Defer .item() on grad norm: store the GPU tensor and call .item()
+            # only when we already sync for loss.item() — avoids an extra CUDA
+            # sync on every stats interval (~50μs saved per recorded step).
+            # [Pass 84] _will_record already computes the same condition as
+            # _want_grad_stats — reuse it to avoid a redundant modulo per step.
+            _clip_norm_tensor = None  # GPU tensor, deferred .item()
+
+            if _use_amp and _scaler is not None:
+                if _grad_clip_norm is not None:
+                    _scaler.unscale_(_optimizer)
+                    _clip_norm = torch.nn.utils.clip_grad_norm_(
+                        _model_params, _grad_clip_norm,
+                        foreach=_clip_foreach)
+                    if _will_record:
+                        _clip_norm_tensor = _clip_norm
+                updated = _run_model_operation(_apply_scaled_optimizer_step)
+                if not updated:
+                    details = 'Non-finite gradients; optimizer update skipped'
+                    if _clip_norm_tensor is not None:
+                        details += f'; grad_norm={_clip_norm_tensor.item()!r}'
+                    _diagnostic_print(f"  Warning: {details}")
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
+                            self.step, 'grad_scaler', details)
+                    # A rejected window consumes no optimizer-step budget and
+                    # cannot advance LR, checkpoint or healthy-step telemetry.
+                    return False
+            else:
+                if _grad_clip_norm is not None:
+                    _clip_norm = torch.nn.utils.clip_grad_norm_(
+                        _model_params, _grad_clip_norm,
+                        foreach=_clip_foreach)
+                    if _will_record:
+                        _clip_norm_tensor = _clip_norm
+                _run_model_operation(_apply_plain_optimizer_step)
+
+            _step_elapsed = 0.0
+
+            # Step the LR scheduler (per-step, not per-epoch)
+            if _scheduler is not None:
+                _scheduler.step()
+
+            # Only call loss.item() (CUDA sync) when we actually need the scalar.
+            # Avoid hardcoded intervals — piggyback on stats_record_every to
+            # eliminate extra CUDA sync points on the critical path.
+            # [Pass 81] Pre-compute all modulo flags once per step instead of
+            # repeating the same checks in 6+ locations below.
+            _step = self.step  # cache for repeated use below
+            _is_stats_step = (_step % _stats_record_every == 0)
+            _is_checkpoint_step = (_step % _checkpoint_every == 0)
+            _need_loss_val = _is_stats_step or _is_checkpoint_step
+            # `loss` was divided by accum_steps for gradient scaling; undo that
+            # for human-readable reporting (no extra sync — same .item() call).
+            # Piggyback grad_norm .item() on the same CUDA sync as loss.item()
+            # to avoid a separate sync (both values are ready after optimizer.step).
+            _loss_val = (loss.item() * accum_steps) if _need_loss_val else None
+            # [Pass 82] Only .item() grad norm when loss sync already happened
+            # (coalesced — same CUDA stream, second sync is a no-op).
+            # Without this guard, _clip_norm_tensor.item() triggers an
+            # independent CUDA sync (~30-50μs) when _need_loss_val is False.
+            if _need_loss_val and _clip_norm_tensor is not None:
+                _grad_norm = _clip_norm_tensor.item()  # coalesced with loss sync
+                _clip_norm_tensor = None
+            if _will_record:
+                _step_elapsed = time.perf_counter() - _step_start
+
+            # Zero can be valid (forced moves, saturated scores or zero weights).
+            # Consult the original scalar only for a sampled zero, after the
+            # existing loss sync, before claiming nan_to_num replaced NaN/Inf.
+            if _loss_val is not None and _loss_val == 0.0 and _step > 0:
+                _raw_loss_val = _raw_loss.item()
+                if not math.isfinite(_raw_loss_val):
+                    if self._repair_batchnorm_stats():
+                        _diagnostic_print("  Repaired corrupted BatchNorm running stats (NaN/Inf loss detected)")
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
+                            _step, 'nan_to_num',
+                            f'NaN/Inf loss replaced with 0 by nan_to_num; raw_loss={_raw_loss_val!r}')
+
+            # Compute current LR only at stats/checkpoint boundaries (not every step).
+            # get_last_lr() creates a list copy; deferring it to where it's consumed
+            # eliminates ~99% of calls (stats_record_every=100 → only 1% of steps).
+            if _need_loss_val:
+                current_lr = (_scheduler.get_last_lr()[0]
+                              if _scheduler is not None
+                              else _cfg.learning_rate)
+
+            # Record step stats every N steps (to avoid excessive memory usage)
+            if _loss_val is not None and _is_stats_step:
+                self._record_step_stats(_loss_val, current_lr)
+
+                # Enhanced stats collection
+                if _stats_collector:
+                    # Score distribution stats
+                    _score_stats = None
+                    if (_current_scores is not None and
+                            _step % _stats_score_dist_every == 0):
+                        if _use_padded:
+                            _score_stats = StatsCollector.compute_score_stats_padded(
+                                _current_scores, move_counts)
+                        else:
+                            _score_stats = StatsCollector.compute_score_stats(
+                                _current_scores, move_counts)
+
+                    _stats_collector.record_training_step(
+                        step=_step,
+                        loss=_loss_val,
+                        lr=current_lr,
+                        batch_size=_step_samples,
+                        step_time=_step_elapsed,
+                        grad_norm=_grad_norm,
+                        grad_norms_per_layer=_grad_norms_per_layer,
+                        score_stats=_score_stats,
+                    )
+
+            # System metrics (lower frequency)
+            if _stats_collector and _step % _stats_system_every == 0:
+                _stats_collector.record_system_metrics(_step)
+
+            # Model health (even lower frequency)
+            if _stats_collector and _step % _stats_model_health_every == 0:
+                _stats_collector.record_model_health(_model, _step)
+
+            # Checkpoint — reuse _loss_val if already computed at this step
+            # (avoids a redundant .item() CUDA sync when checkpoint and stats
+            # recording align on the same step).
+            if _is_checkpoint_step:
+                if _loss_val is not None:
+                    avg_loss = _loss_val
+                else:
+                    avg_loss = (total_loss_acc / max(num_batches, 1)).item()
+                # Log entry written in the background thread alongside the
+                # checkpoint — keeps file open/write/close off the training thread.
+                gpu_mem = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                self._save_checkpoint(avg_loss, log_entry={
+                    'step': _step,
+                    'loss': avg_loss,
+                    'lr': current_lr,
+                    'gpu_mem_mb': gpu_mem,
+                })
+
+            # Progress — print at the stats interval (which already computed .item()).
+            # Avoids extra CUDA syncs from a separate hardcoded interval.
+            if _loss_val is not None and _is_stats_step:
+                self._update_process_title(_step, _loss_val)
+                _diagnostic_print(f"  Step {_step}, Loss: {_loss_val:.4f}")
+
+            return _step >= _train_steps
+
+        def _wait_for_training_controls() -> bool:
+            if _service_control is not None:
+                _service_control()
+            if self._stopped or self._training_time_limit_reached():
+                return False
+            if _thermal_enabled:
+                self._check_thermal_and_rest()
+            while self._paused:
+                if _service_control is not None:
+                    _service_control()
+                if self._stopped or self._training_time_limit_reached():
+                    return False
+                time.sleep(0.1)
+            return not (self._stopped or self._training_time_limit_reached())
+
+        _pending_loss = _pending_raw_loss = None
+        _pending_scores = _pending_move_counts = None
+        for batch in iter_loader:
+            if len(batch) == 7:
+                (boards, move_features, move_counts, targets, reward_weights,
+                 value_targets, teacher_probabilities) = batch
+            else:
+                (boards, move_features, move_counts, targets, reward_weights,
+                 value_targets) = batch
+                teacher_probabilities = None
+
+            # Measure the complete sampled optimizer step, including every
+            # accumulation micro-batch, forward/backward, clipping and the
+            # optimizer update.  The matching stop is deliberately after the
+            # stats step's existing loss.item() synchronization, so CUDA work
+            # is complete without introducing another synchronization point.
+            if _micro_step == 0:
+                _will_record = bool(
+                    _stats_collector
+                    and (self.step + 1) % _stats_record_every == 0
+                )
+                if _will_record:
+                    _step_start = time.perf_counter()
+                    _step_samples = 0
+            if first_batch:
+                _diagnostic_print(
+                    f"  First batch loaded. Processing {total_batches} batches...",
+                    flush=True)
+
+            if not _wait_for_training_controls():
+                break
+
+            # Move to device — skip when CUDAPrefetcher already transferred
+            # or when data is GPU-resident (already on device)
+            if not _use_prefetcher and not _data_on_gpu:
+                boards = boards.to(_device, non_blocking=_h2d_non_blocking)
+                move_features = move_features.to(_device, non_blocking=_h2d_non_blocking)
+                move_counts = move_counts.to(_device, non_blocking=_h2d_non_blocking)
+                targets = targets.to(_device, non_blocking=_h2d_non_blocking)
+                if teacher_probabilities is not None:
+                    teacher_probabilities = teacher_probabilities.to(
+                        _device, non_blocking=_h2d_non_blocking)
+            # Conditionally load reward weights / value targets
+            if not use_scoring:
+                # Compiled path needs a tensor (never None); reuse pre-allocated ones.
+                # Slice to actual batch size in case drop_last=False yields a smaller batch.
+                if _uniform_rw is not None:
+                    _bs = boards.shape[0]
+                    reward_weights = _uniform_rw[:_bs] if _bs < _uniform_rw_n else _uniform_rw
+                else:
+                    reward_weights = None
+            elif not _use_prefetcher and not _data_on_gpu:
+                reward_weights = reward_weights.to(_device, non_blocking=_h2d_non_blocking)
+            if not _value_head_enabled:
+                value_targets = None
+            elif not _use_prefetcher and not _data_on_gpu:
+                value_targets = value_targets.to(_device, non_blocking=_h2d_non_blocking)
+
+            # Periodic sanity check — avoids CUDA sync on every step
+            _do_sanity = (self.step % _sanity_interval == 0)
+            if _do_sanity:
+                if not torch.isfinite(boards).all() or not torch.isfinite(move_features).all():
+                    _diagnostic_print("  Warning: non-finite inputs detected; skipping batch")
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
+                            self.step, 'input_data', 'Non-finite board or move features')
+                    continue
+
+            # Only zero gradients at the start of an accumulation window
+            if _micro_step == 0:
+                # set_to_none=True avoids a memset, letting PyTorch deallocate instead
+                _optimizer.zero_grad(set_to_none=True)
+
+            # --- Forward + backward ---
+            _grad_norm = None
+            _grad_norms_per_layer = None
+            _current_scores = None
+
+            if _use_compiled:
+                # ── Compiled path: fused forward+loss in single CUDAGraph ──
+                # nan_to_num inside the compiled function sanitizes NaN/Inf loss
+                # without CUDA sync.  No per-step torch.isfinite() needed.
+                # Value-head variant takes an extra value_targets argument.
+                if _value_head_enabled:
+                    if _use_amp:
+                        with autocast(device_type=_autocast_type, dtype=_amp_dtype,
+                                      enabled=_autocast_on):
+                            loss, _current_scores, _raw_loss = _run_model_operation(
+                                _compiled_fwd_loss,
+                                boards, move_features, move_counts, targets,
+                                reward_weights, value_targets)
+                    else:
+                        loss, _current_scores, _raw_loss = _run_model_operation(
+                            _compiled_fwd_loss,
+                            boards, move_features, move_counts, targets,
+                            reward_weights, value_targets)
+                else:
+                    if _use_amp:
+                        with autocast(device_type=_autocast_type, dtype=_amp_dtype,
+                                      enabled=_autocast_on):
+                            loss, _current_scores, _raw_loss = _run_model_operation(
+                                _compiled_fwd_loss,
+                                boards, move_features, move_counts, targets, reward_weights)
+                    else:
+                        loss, _current_scores, _raw_loss = _run_model_operation(
+                            _compiled_fwd_loss,
+                            boards, move_features, move_counts, targets, reward_weights)
+
+                # Score-level NaN check at sanity interval only (expensive array-wide check)
+                if _do_sanity and torch.isnan(_current_scores).any():
+                    _diagnostic_print("  Warning: NaN scores detected; skipping batch")
+                    if self._repair_batchnorm_stats():
+                        _diagnostic_print("  Repaired corrupted BatchNorm running stats")
+                    if _stats_collector:
+                        _stats_collector.record_non_finite_event(
+                            self.step, 'compiled_fwd_loss', 'NaN scores')
+                    continue
+
+                if _loss_scale is not None:
+                    loss = loss * _loss_scale
+
+                if _scaler is not None:
+                    _scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            elif _use_amp:
+                # ── AMP path (fallback: value head or non-padded) ──
+                try:
+                    with autocast(device_type=_autocast_type, dtype=_amp_dtype,
+                                  enabled=_autocast_on):
+                        if _use_padded:
+                            if _value_head_enabled:
+                                scores, value_preds = _run_model_operation(
+                                    _model.forward_padded_with_value,
+                                    boards, move_features, move_counts)
+                            else:
+                                scores = _run_model_operation(
+                                    _model.forward_padded,
+                                    boards, move_features, move_counts)
+                                value_preds = None
+                        else:
+                            if _value_head_enabled:
+                                scores, value_preds = _run_model_operation(
+                                    _model.forward_with_value,
+                                    boards, move_features, move_counts)
+                            else:
+                                scores = _run_model_operation(
+                                    _model, boards, move_features, move_counts)
+                                value_preds = None
+                except RuntimeError as _compile_err:
+                    if "device kernel image is invalid" in str(_compile_err) and first_batch:
+                        # torch.compile generated incompatible CUDA kernels —
+                        # unwrap to eager model and retry this batch
+                        _diagnostic_print(f"torch.compile runtime failure: {_compile_err}")
+                        _diagnostic_print("Falling back to eager mode for remaining training...", flush=True)
+                        _orig = getattr(_model, '_orig_mod', None)
+                        if _orig is not None:
+                            self.model = _orig
+                            _model = _orig
+                        torch._dynamo.reset()
+                        with autocast(device_type=_autocast_type, dtype=_amp_dtype,
+                                      enabled=_autocast_on):
+                            if _use_padded:
+                                if _value_head_enabled:
+                                    scores, value_preds = _run_model_operation(
+                                        _model.forward_padded_with_value,
+                                        boards, move_features, move_counts)
+                                else:
+                                    scores = _run_model_operation(
+                                        _model.forward_padded,
+                                        boards, move_features, move_counts)
+                                    value_preds = None
+                            else:
+                                if _value_head_enabled:
+                                    scores, value_preds = _run_model_operation(
+                                        _model.forward_with_value,
+                                        boards, move_features, move_counts)
+                                else:
+                                    scores = _run_model_operation(
+                                        _model, boards, move_features,
+                                        move_counts)
+                                    value_preds = None
+                    else:
+                        raise
+                if _do_sanity:
+                    if _use_padded:
+                        # Padded path uses -inf for padding slots — only NaN is a real problem
+                        _bad = torch.isnan(scores).any()
+                    else:
+                        _bad = not torch.isfinite(scores).all()
+                    if _bad:
+                        _diagnostic_print("  Warning: non-finite scores detected; skipping batch")
+                        if self._repair_batchnorm_stats():
+                            _diagnostic_print("  Repaired corrupted BatchNorm running stats")
+                        if _stats_collector:
+                            _stats_collector.record_non_finite_event(
+                                self.step, 'model_scores', 'Non-finite output scores')
+                        continue
+                _current_scores = scores.detach()
+                if _soft_targets_enabled:
+                    if teacher_probabilities is None:
+                        raise RuntimeError(
+                            "Enhanced stage batch is missing teacher probabilities")
+                    policy_loss = soft_target_cross_entropy(
+                        scores, move_counts, teacher_probabilities, reward_weights)
+                elif _use_padded:
+                    policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
+                else:
+                    policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
+
+                if value_preds is not None and value_targets is not None:
+                    if _value_loss_fp32:
+                        value_loss = nn.functional.mse_loss(
+                            value_preds.float(), value_targets.float())
+                    else:
+                        value_loss = nn.functional.mse_loss(value_preds, value_targets)
+                    loss = policy_loss + _value_weight * value_loss
+                else:
+                    loss = policy_loss
+
+                if _loss_scale is not None:
+                    loss = loss * _loss_scale
+
+                # Retain the original scalar for diagnostics before replacing
+                # nonfinite loss. This does not guarantee finite gradients;
+                # GradScaler, when enabled, separately checks them at step().
+                _raw_loss = loss.detach()
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+                if _scaler is not None:
+                    _scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            else:
+                # ── No-AMP path ──
+                if _use_padded:
+                    if _value_head_enabled:
+                        scores, value_preds = _run_model_operation(
+                            _model.forward_padded_with_value,
+                            boards, move_features, move_counts)
+                    else:
+                        scores = _run_model_operation(
+                            _model.forward_padded,
+                            boards, move_features, move_counts)
+                        value_preds = None
+                else:
+                    if _value_head_enabled:
+                        scores, value_preds = _run_model_operation(
+                            _model.forward_with_value,
+                            boards, move_features, move_counts)
+                    else:
+                        scores = _run_model_operation(
+                            _model, boards, move_features, move_counts)
+                        value_preds = None
+                if _do_sanity:
+                    if _use_padded:
+                        # Padded path uses -inf for padding slots — only NaN is a real problem
+                        _bad = torch.isnan(scores).any()
+                    else:
+                        _bad = not torch.isfinite(scores).all()
+                    if _bad:
+                        _diagnostic_print("  Warning: non-finite scores detected; skipping batch")
+                        if self._repair_batchnorm_stats():
+                            _diagnostic_print("  Repaired corrupted BatchNorm running stats")
+                        if _stats_collector:
+                            _stats_collector.record_non_finite_event(
+                                self.step, 'model_scores', 'Non-finite output scores (FP32)')
+                        continue
+                _current_scores = scores.detach()
+                if _soft_targets_enabled:
+                    if teacher_probabilities is None:
+                        raise RuntimeError(
+                            "Enhanced stage batch is missing teacher probabilities")
+                    policy_loss = soft_target_cross_entropy(
+                        scores, move_counts, teacher_probabilities, reward_weights)
+                elif _use_padded:
+                    policy_loss = self._compute_loss_padded(scores, move_counts, targets, reward_weights)
+                else:
+                    policy_loss = self._compute_loss(scores, move_counts, targets, reward_weights)
+                if value_preds is not None and value_targets is not None:
+                    value_loss = nn.functional.mse_loss(value_preds, value_targets)
+                    loss = policy_loss + _value_weight * value_loss
+                else:
+                    loss = policy_loss
+
+                if _loss_scale is not None:
+                    loss = loss * _loss_scale
+
+                # Preserve pre-sanitization evidence, as in the AMP path.
+                _raw_loss = loss.detach()
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+                loss.backward()
+
+            _micro_step += 1
+            if _will_record:
+                # Match sample throughput to the complete timed optimizer
+                # window, including smaller final microbatches.
+                _step_samples += boards.shape[0]
+            first_batch = False
+
+            # Accumulate the epoch loss once per successful backward.
+            total_loss_acc.add_(loss.detach(), alpha=accum_steps)
+            num_batches += 1
+            if _micro_step < accum_steps:
+                # Independent scalars survive a later compiled forward or a
+                # rejected batch without retaining its autograd graph. These
+                # copies occur only when gradient accumulation is enabled.
+                _pending_loss = loss.detach().clone()
+                _pending_raw_loss = _raw_loss.detach().clone()
+                if (_will_record
+                        and (self.step + 1) % _stats_score_dist_every == 0):
+                    # Preserve the last successful sample across trailing
+                    # rejects without retaining compiled graph output storage.
+                    _pending_scores = _current_scores.clone()
+                    _pending_move_counts = move_counts.clone()
+                continue
+
+            _micro_step = 0
+            _pending_loss = _pending_raw_loss = None
+            _pending_scores = _pending_move_counts = None
+
+            if _finish_optimizer_step(
+                loss, _raw_loss, _current_scores, move_counts, accum_steps,
+            ):
+                break
+
+        # Natural exhaustion still owns the last successful microbatches,
+        # even when trailing batches failed a sanity check. STOP or duration
+        # expiry discards pending work, matching per-batch cancellation.
+        if _micro_step and _wait_for_training_controls():
+            _finish_optimizer_step(
+                _pending_loss, _pending_raw_loss, _pending_scores,
+                _pending_move_counts, _micro_step,
+            )
+
+        epoch_time = time.time() - epoch_start_time
+
+        # Expose to caller for dead-epoch detection
+        self._last_epoch_batches = num_batches
+
+        # Single .item() CUDA sync for the epoch average — reuse for both
+        # stats recording and return value.
+        _avg_loss = (total_loss_acc / max(num_batches, 1)).item()
+        if _stats_collector:
+            # [Pass 86] Report whether this epoch ran on freshly-refreshed data.
+            # The outer train() loop refreshes the dataloader at the end of the
+            # previous iteration and sets _data_refreshed_pending; consume it here.
+            _data_refreshed = getattr(self, '_data_refreshed_pending', False)
+            self._data_refreshed_pending = False
+            _stats_collector.record_epoch(
+                epoch=self.epoch + 1,  # will be incremented by caller
+                step=self.step,
+                avg_loss=_avg_loss,
+                num_batches=num_batches,
+                epoch_time_sec=epoch_time,
+                data_refresh=_data_refreshed,
+            )
+
+        # Per-epoch heartbeat: prints regardless of stats_record_every so the
+        # console isn't silent when steps accumulate slowly (simultaneous mode
+        # with small per-cycle batch counts). Reads LR from scheduler if present.
+        _hb_lr = (_scheduler.get_last_lr()[0]
+                  if _scheduler is not None else _cfg.learning_rate)
+        _diagnostic_print(
+            f"  [epoch end] step={self.step} loss={_avg_loss:.4f} "
+            f"lr={_hb_lr:.2e} batches={num_batches} time={epoch_time:.1f}s",
+            flush=True)
+
+        return _avg_loss
+
+    def _compute_loss(
+        self,
+        scores: torch.Tensor,
+        move_counts: torch.Tensor,
+        targets: torch.Tensor,
+        reward_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute reward-weighted cross-entropy loss for move selection.
+
+        The model outputs one score per move. For each position,
+        we want to maximize the score of the chosen move.
+
+        Fully vectorized — no Python loop over batch positions.
+        Uses scatter to build a padded (batch_size, max_moves) matrix,
+        then applies log_softmax in one GPU call.
+        """
+        batch_size = move_counts.shape[0]
+
+        # Use config pad size to avoid counts.max().item() CUDA sync every step.
+        # -inf padding slots get zero probability from log_softmax, so over-padding
+        # is harmless (just a small allocation overhead).
+        max_moves = self.config.max_moves_per_sample
+
+        # Fast check: if total moves is zero, return zero loss (no sync needed —
+        # scores.shape[0] is determined before the GPU kernel, by the collate).
+        if scores.shape[0] == 0:
+            return scores.sum() * 0
+
+        # move_counts/targets are int32; use directly for comparisons.
+        # Cast to int64 only where required (cumsum for indexing, gather).
+        counts_l = move_counts.long()
+
+        # Build scatter indices without a Python loop.
+        # exclusive_cumsum[i] = start offset of position i inside the flat scores tensor.
+        exclusive_cumsum = counts_l.cumsum(0) - counts_l      # (batch_size,)
+        row_idx = torch.repeat_interleave(
+            torch.arange(batch_size, device=scores.device), counts_l
+        )                                                      # (total_moves,)
+        col_idx = (
+            torch.arange(scores.shape[0], device=scores.device, dtype=torch.long)
+            - exclusive_cumsum[row_idx]
+        )                                                      # (total_moves,)
+
+        # Clamp col_idx to pad size (safety — should never trigger in practice)
+        col_idx = col_idx.clamp(max=max_moves - 1)
+
+        # Scatter scores into a padded matrix; -inf for unused (padding) slots.
+        # float32 for numerical stability regardless of AMP dtype.
+        padded = torch.full(
+            (batch_size, max_moves), float('-inf'),
+            device=scores.device, dtype=torch.float32,
+        )
+        padded[row_idx, col_idx] = scores.float()
+
+        # Positions with zero moves have an all-inf row: log_softmax(-inf,...) = nan.
+        # Set those rows to 0 so softmax gives uniform output — their weight (w=0)
+        # ensures they never contribute to the loss regardless.
+        no_moves = move_counts == 0
+        padded = torch.where(
+            no_moves.unsqueeze(1).expand_as(padded), torch.zeros_like(padded), padded
+        )
+
+        # log_softmax handles numerical stability internally; -inf pads → 0 prob.
+        log_probs = torch.nn.functional.log_softmax(padded, dim=1)  # (batch_size, max_moves)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+
+        # Gather the log prob of the chosen move for each position.
+        safe_targets = targets.long().clamp(0, max_moves - 1).unsqueeze(1)  # (batch_size, 1)
+        chosen_log_probs = log_probs.gather(1, safe_targets).squeeze(1)     # (batch_size,)
+
+        # Mask entries with zero moves or out-of-range target index (int32 comparisons).
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
+
+        # Build per-sample weights (zero for invalid entries).
+        if reward_weights is not None:
+            w = reward_weights.float() * valid.float()
+        else:
+            w = valid.float()
+
+        # Avoid sync from `if total_weight == 0` — use max(sum, 1) instead.
+        # When all weights are zero the numerator is also zero, so result = 0.
+        total_weight = w.sum().clamp(min=1.0)
+
+        return -(chosen_log_probs * w).sum() / total_weight
+
+    def _compute_loss_padded(
+        self,
+        scores: torch.Tensor,
+        move_counts: torch.Tensor,
+        targets: torch.Tensor,
+        reward_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute loss from padded score matrix (training-optimized path).
+
+        Scores arrive as (batch, max_moves) with -inf for invalid positions
+        from forward_padded — no scatter/gather needed.
+        """
+        batch_size = scores.shape[0]
+        if batch_size == 0:
+            return scores.sum() * 0
+
+        # move_counts/targets are int32; use directly for comparisons,
+        # cast to int64 only for gather (which requires LongTensor).
+        # Zero-move rows are all-inf → replace with 0 for stable softmax
+        no_moves = move_counts == 0
+        scores = scores.masked_fill(no_moves.unsqueeze(1), 0.0)
+
+        log_probs = torch.nn.functional.log_softmax(scores, dim=1, dtype=torch.float32)
+        log_probs = torch.clamp(log_probs, min=-100.0)
+
+        max_moves = scores.shape[1]
+        safe_targets = targets.long().clamp(0, max_moves - 1).unsqueeze(1)
+        chosen_log_probs = log_probs.gather(1, safe_targets).squeeze(1)
+
+        valid = (move_counts > 0) & (targets >= 0) & (targets < move_counts)
+
+        if reward_weights is not None:
+            w = reward_weights.float() * valid.float()
+        else:
+            w = valid.float()
+
+        total_weight = w.sum().clamp(min=1.0)
+        return -(chosen_log_probs * w).sum() / total_weight
+
+    def _install_termination_handler(self, log_dir: str) -> None:
+        """Close the run marker on SIGTERM/SIGHUP instead of dying silently.
+
+        Python's default disposition for SIGTERM terminates the interpreter
+        without unwinding the stack, so the ``finally`` in train() never runs.
+        ``stop_training.sh`` -- the project's own stop path -- sends exactly
+        that signal, which left the marker in ``running``: the state reserved
+        for a process killed outright, with the OOM killer named as the prime
+        suspect. An ordinary operator stop therefore manufactured the precise
+        false diagnosis the marker exists to prevent. SIGHUP is covered too: a
+        closed terminal is the other way this run ends without a keystroke.
+
+        The reason is recorded from inside the handler rather than left to the
+        cooperative stop below, because a signal that lands mid-self-play would
+        otherwise wait minutes for the flag to be noticed -- longer than the
+        three seconds stop_training.sh allows before SIGKILL. Setting the flag
+        as well lets a run that is between epochs still shut down cleanly, and
+        the second write from ``finally`` records the same reason.
+        """
+        owner_pid = os.getpid()
+
+        def _handle(signum, _frame):
+            # Forked self-play workers (the Linux default) inherit both this
+            # handler and the process title stop_training.sh matches on.
+            # Only the trainer owns the marker; a worker must simply die the
+            # way it would have without a handler installed.  Spawned workers
+            # (macOS, Windows) start a fresh interpreter with the default
+            # SIGTERM/SIGHUP disposition and neither the handler nor the
+            # title, so this guard never fires for them; stop_training_mac.sh
+            # finds them as the trainer's child processes instead.
+            if os.getpid() != owner_pid:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+                return
+            self._stopped = True
+            try:
+                run_status.record_terminal_reason(
+                    log_dir,
+                    run_status.REASON_STOP_REQUESTED,
+                    detail=f"received {signal.Signals(signum).name}",
+                    context={'step': int(self.step), 'epoch': int(self.epoch)},
+                )
+            except (OSError, ValueError):
+                pass
+
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(_sig, _handle)
+            except (OSError, ValueError, AttributeError):
+                # Not the main thread (the GUI spawns the trainer as a
+                # process, but a future embedding might not), or a platform
+                # without this signal. Never block training on it.
+                pass
+
+    def _capture_run_identity(self, log_dir: str) -> None:
+        """Record which run this is, from the marker that was just opened.
+
+        Audit Suggestion 8.  ``dataset_fingerprint`` already distinguishes
+        corpora, but two runs sharing a corpus are indistinguishable by it, so
+        it cannot answer "which session wrote this file?".  The marker's
+        ``pid`` + ``started_at`` pair is already generated, already unique on
+        this host, and already durable, so it is the identity rather than a
+        second scheme invented alongside it.
+        """
+        try:
+            record = run_status.read_run_status(log_dir) or {}
+            pid = record.get('pid', os.getpid())
+            started_at = record.get('started_at')
+            pid = int(pid) if pid is not None else None
+        except (OSError, TypeError, ValueError):
+            # A corrupt or hand-edited marker is diagnostics input, not a
+            # startup gate: fall back to the live process identity rather
+            # than crash before the termination handler is installed.
+            pid = os.getpid()
+            started_at = None
+        self._run_identity = {
+            'pid': pid,
+            'started_at': started_at,
+            'run_id': f"{pid}@{started_at}" if started_at else str(pid),
+            'resume': str(self.config.resume or ''),
+            'resume_step': int(self.step),
+        }
+
+    def _free_entry_lists_after_tensorize(self, *entry_lists):
+        """Drop parsed entry lists once tensors hold the data (Pass 117).
+
+        ``CachedTensorDataset.from_entries`` copies every field of every entry
+        into contiguous tensors; afterwards the ``ReplayEntry`` objects are
+        unreachable dead weight worth roughly the size of the corpus (~5-6 GB
+        locally).  Callers rebind their locals to the returned handles (all
+        ``None``), which releases the lists by refcount; the explicit
+        ``gc.collect()`` stays at the call site so it runs AFTER the rebind.
+        Also clears ``self._validation_entries``, which mirrors one of the
+        released lists purely for logging and is never read again.
+        """
+        self._validation_entries = []
+        return tuple(None for _ in entry_lists)
+
+    def _capture_prelaunch_free_ram(self) -> None:
+        """Snapshot free RAM before the corpus loads into entry objects.
+
+        Journal Pass 117.  ``create_dataloader``'s RAM-cache gate measures free
+        RAM *after* every replay file has been parsed into Python entry
+        objects, which on this box inflates trainer RSS by roughly the size of
+        the whole corpus (~5-6 GB at the 60-file steady state).  A gate sized
+        when the rolling window was still filling therefore starts declining
+        the cache purely through corpus growth, silently demoting every later
+        launch to the slow standard batch path.  The pre-load reading is what
+        the operator's headroom budget was written against, so it is captured
+        here and used as the fallback comparison by that gate.
+        """
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            self._prelaunch_free_ram_gb = memory.available / (1024 ** 3)
+        except Exception:
+            return
+        print(
+            f"Pre-launch free RAM captured: "
+            f"{self._prelaunch_free_ram_gb:.1f}GB available before replay load."
+        )
+
+    def _warn_about_memory_headroom(self) -> None:
+        """Report a RAM-cache threshold this host cannot satisfy.
+
+        Audit Suggestion 11.  ``ram_cache.threshold_gb`` is a *minimum free
+        RAM* gate, not a budget, so setting it above what the box ever has free
+        silently disables caching -- and setting it just under makes caching
+        fire exactly when headroom is thinnest.  Neither is visible from the
+        config.  This reports the relationship and does not clamp: quietly
+        enabling a cache the operator's threshold declined would be worse than
+        saying so.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return
+        try:
+            memory = psutil.virtual_memory()
+            total_gb = memory.total / (1024 ** 3)
+            available_gb = memory.available / (1024 ** 3)
+            rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+        except Exception:
+            return
+        threshold_gb = float(getattr(self.config, 'ram_cache_threshold_gb', 0.0) or 0.0)
+        if threshold_gb <= 0.0:
+            return
+        if threshold_gb < available_gb and threshold_gb < total_gb * 0.5:
+            return
+        # Not a defect either way: a threshold above free RAM declines the
+        # cache, which is the conservative outcome on a small box.  It is
+        # reported because the config alone does not reveal which way it fell.
+        print("")
+        print("=" * 72)
+        print(
+            f"Memory headroom: ram_cache.threshold_gb is {threshold_gb:.1f}GB; "
+            f"this host has {total_gb:.1f}GB total, {available_gb:.1f}GB "
+            f"available, trainer RSS {rss_gb:.1f}GB."
+        )
+        if threshold_gb >= available_gb:
+            print(
+                "  The threshold is at or above free RAM, so the RAM cache "
+                "will not engage on this launch. That is the conservative "
+                "outcome; lowering the threshold would engage the cache when "
+                "headroom is thinnest."
+            )
+        else:
+            print(
+                "  The threshold is above half of total RAM, so the cache "
+                "engages only when headroom is already thin."
+            )
+        print(
+            "  Peak trainer RSS is recorded as process_rss_gb in "
+            "logs/.../stats/system_metrics_*.csv; size this from that "
+            "measurement rather than from the default."
+        )
+        print("=" * 72)
+        print("")
+        sys.stdout.flush()
+
+    def _warn_about_checkpoints_above_resume_point(self) -> None:
+        """Report checkpoints that this run is about to re-walk past.
+
+        Audit Suggestion 8.  The occupied-step guard already refuses to
+        overwrite them, which is correct -- but the resulting numbered range
+        then asserts a continuous trajectory it does not have: a checkpoint
+        written by an earlier run is not the ancestor of the one this run
+        writes two steps later.  The collision is only reported when the
+        trainer reaches that step, which can be hours in.  Say it at startup,
+        while the operator can still choose a different resume target.
+        """
+        try:
+            directory = Path(self.config.checkpoint_dir)
+            if not directory.is_dir():
+                return
+            ahead = sorted(
+                (
+                    _checkpoint_step_number(path)
+                    for path in directory.glob('model_step_*.pt')
+                ),
+            )
+            ahead = [step for step in ahead if step > self.step]
+        except OSError:
+            return
+        if not ahead:
+            return
+        print("")
+        print("=" * 72)
+        print(
+            f"Note: {len(ahead)} checkpoint(s) in {directory} are above this "
+            f"run's resume point (step {self.step}): "
+            f"{ahead[0]} .. {ahead[-1]}."
+        )
+        print(
+            "  They were written by an earlier run and will not be "
+            "overwritten. The numbered sequence across that range therefore "
+            "spans more than one lineage."
+        )
+        print("=" * 72)
+        print("")
+        sys.stdout.flush()
+
+    def train(self) -> None:
+        """Run training and record exactly one durable terminal reason.
+
+        Audit Suggestion 5: two WSL logs and one Windows log simply stopped,
+        with no recorded reason and no way to recover one after the fact.  The
+        marker is opened before any training work and closed on every in-process
+        exit path; a run that is killed outright leaves it open, which the next
+        start reports rather than silently overwriting.
+        """
+        log_dir = self.config.log_dir
+        try:
+            unterminated = run_status.begin_run(
+                log_dir,
+                pid=os.getpid(),
+                context={
+                    'checkpoint_dir': str(self.config.checkpoint_dir),
+                    'training_stage': str(self.config.policy_stage),
+                    'resume': str(self.config.resume or ''),
+                },
+            )
+        except OSError as exc:
+            # Never let bookkeeping prevent training from starting.
+            print(f"Warning: could not open run status marker: {exc}")
+            unterminated = None
+        self._capture_run_identity(log_dir)
+        self._warn_about_checkpoints_above_resume_point()
+        self._capture_prelaunch_free_ram()
+        self._warn_about_memory_headroom()
+        self._install_termination_handler(log_dir)
+        if unterminated is not None:
+            print("")
+            print("=" * 72)
+            print(run_status.describe_unterminated(unterminated))
+            print(f"  Preserved as: {unterminated.get('preserved_path')}")
+            print("=" * 72)
+            print("")
+            sys.stdout.flush()
+
+        reason = run_status.REASON_COMPLETED
+        detail = None
+        traceback_text = None
+        try:
+            self._run_training()
+        except KeyboardInterrupt:
+            reason = run_status.REASON_INTERRUPTED
+            raise
+        except BaseException as exc:
+            # A stop signal reaches the forked self-play workers too -- they
+            # carry the same process title stop_training.sh matches on -- so an
+            # operator stop routinely surfaces here as a BrokenProcessPool from
+            # the pool dying first. Reporting that as "exception" would file an
+            # ordinary stop under the crash bucket, complete with a traceback
+            # that looks like a defect. The request is the reason; the raised
+            # error is still recorded as the detail.
+            reason = (run_status.REASON_STOP_REQUESTED if self._stopped
+                      else run_status.REASON_EXCEPTION)
+            detail = f"{type(exc).__name__}: {exc}"
+            traceback_text = traceback.format_exc()
+            raise
+        else:
+            if self._stopped:
+                reason = run_status.REASON_STOP_REQUESTED
+            elif (self.config.stop_time
+                    and datetime.now() >= self.config.stop_time):
+                reason = run_status.REASON_TIME_LIMIT
+        finally:
+            try:
+                run_status.record_terminal_reason(
+                    log_dir,
+                    reason,
+                    detail=detail,
+                    traceback_text=traceback_text,
+                    context={'step': int(self.step), 'epoch': int(self.epoch)},
+                )
+                _diagnostic_print(f"Trainer terminal reason recorded: {reason}"
+                                  + (f" ({detail})" if detail else ""),
+                                  flush=True)
+            except (OSError, ValueError) as exc:
+                _diagnostic_print(
+                    f"Warning: could not record terminal reason: {exc}")
+
+    def _run_training(self) -> None:
+        """Run the full training loop."""
+        def _startup_shutdown_requested() -> bool:
+            # Startup phases can be long even before the first epoch. Finish
+            # the active phase, then stop before dispatching another one.
+            self._service_control_queue()
+            if self._stopped:
+                print("Stop requested during startup; exiting before training")
+                return True
+            if self._training_time_limit_reached():
+                print("Time limit reached during startup; exiting before training")
+                # Construction may have recovered durable acceptance tasks.
+                # Preserve their normal finalization before the run marker
+                # records expiry, even when no training batch has started.
+                self._finish_checkpoint_acceptance()
+                return True
+            return False
+
+        if _startup_shutdown_requested():
+            return
+
+        print("\n" + "=" * 50)
+        print("Filipino Dama - ML Training")
+        print("=" * 50)
+        # Print model architecture
+        total_params = sum(p.numel() for p in self.model.parameters())
+        model_mb = total_params * 4 / 1e6  # FP32 size
+        value_str = f", value_head={self.config.value_head_hidden}h" if self.config.value_head_enabled else ""
+        print(f"Model: {self.config.model_channels}ch, {self.config.model_blocks} blocks, "
+              f"{self.config.model_embedding} emb, {self.config.model_hidden} hidden{value_str} "
+              f"({total_params:,} params, ~{model_mb:.1f}MB FP32)")
+        print(f"Reward mode: {self.config.reward_mode}")
+        if self.config.reward_mode == 'cycle':
+            print("  (Odd epochs use scoring, even epochs use uniform weights)")
+        accum = self.config.gradient_accumulation_steps
+        if accum > 1:
+            effective_bs = self.config.batch_size * accum
+            print(f"Gradient accumulation: {accum} steps (effective batch size: {effective_bs})")
+        if self.config.thermal_enabled:
+            rest_min = self.config.thermal_rest_seconds / 60
+            print(f"Thermal protection: ON (limit={self.config.thermal_temp_limit_c}°C, "
+                  f"rest={rest_min:.0f}m, check every {self.config.thermal_check_every}s)")
+            if platform.system() == 'Darwin':
+                print("  Note: macOS exposes no CPU/GPU temperature sensor to "
+                      "psutil or nvidia-smi, so thermal pauses will not trigger "
+                      "(the OS throttles clocks itself when hot).")
+        _simultaneous = self.config.pipeline_mode == 'simultaneous'
+        print(f"Pipeline mode: {self.config.pipeline_mode} "
+              f"({'CPU self-play overlaps GPU training' if _simultaneous else 'generate data first, then train'})")
+
+        # Set start time for stats
+        if not self.stats.start_time:
+            self.stats.start_time = datetime.now().isoformat()
+
+        # Generate initial self-play data if needed. Snapshot recovery needs at
+        # least two repaired files so one whole file can be frozen for
+        # validation while at least one remains for training.
+        if _startup_shutdown_requested():
+            return
+        if self._snapshot_manager is not None:
+            eligible_files, rejected_files = (
+                self._snapshot_manager.eligible_replay_files())
+            if _startup_shutdown_requested():
+                return
+            eligible_metrics, _ = analyze_replay_files(eligible_files)
+            if _startup_shutdown_requested():
+                return
+            entry_count = int(eligible_metrics.get('records', 0))
+            if rejected_files:
+                print(
+                    f"Excluded {len(rejected_files)} legacy or invalid replay "
+                    "file(s) from recovery training"
+                )
+            minimum_entries = self.config.batch_size * 10
+            while len(eligible_files) < 2 or entry_count < minimum_entries:
+                if _startup_shutdown_requested():
+                    return
+                print(
+                    "\nInsufficient repaired snapshot data "
+                    f"({len(eligible_files)} files, {entry_count} entries)"
+                )
+                before_files = len(eligible_files)
+                before_entries = entry_count
+                self.run_selfplay(self.config.selfplay_games)
+                if _startup_shutdown_requested():
+                    return
+                eligible_files, _ = self._snapshot_manager.eligible_replay_files()
+                if _startup_shutdown_requested():
+                    return
+                eligible_metrics, _ = analyze_replay_files(eligible_files)
+                if _startup_shutdown_requested():
+                    return
+                entry_count = int(eligible_metrics.get('records', 0))
+                if (len(eligible_files) <= before_files and
+                        entry_count <= before_entries):
+                    raise RuntimeError(
+                        "Self-play produced no eligible repaired replay data"
+                    )
+        else:
+            entry_count = self.replay_buffer.count_entries()
+        if _startup_shutdown_requested():
+            return
+        if (self._snapshot_manager is None and
+                entry_count < self.config.batch_size * 10):
+            print(f"\nInsufficient training data ({entry_count} entries)")
+            self.run_selfplay(self.config.selfplay_games)
+
+        if _startup_shutdown_requested():
+            return
+
+        # Prepare data
+        print("\nPreparing training data...")
+        self._ensure_frozen_teacher_suite()
+        if _startup_shutdown_requested():
+            return
+        train_entries, validation_entries = self._prepare_training_split()
+        preloaded_dataset = self._preloaded_snapshot_dataset
+        preloaded_cache_metadata = self._preloaded_snapshot_cache_metadata
+        preloaded_cache_checked = self._preloaded_snapshot_cache_checked
+        preloaded_validation_dataset = self._preloaded_validation_dataset
+        preloaded_validation_cache_metadata = (
+            self._preloaded_validation_cache_metadata)
+        # The cache belongs only to this initial window.  Clear the hand-off so
+        # alternate/background refresh paths cannot accidentally reuse it.
+        self._preloaded_snapshot_dataset = None
+        self._preloaded_snapshot_cache_metadata = None
+        self._preloaded_snapshot_cache_checked = False
+        self._preloaded_validation_dataset = None
+        self._preloaded_validation_cache_metadata = None
+        if _startup_shutdown_requested():
+            return
+        self._set_validation_entries(
+            validation_entries,
+            preloaded_dataset=preloaded_validation_dataset,
+            cache_metadata=preloaded_validation_cache_metadata,
+        )
+        self._commit_validation_tensor_identity(
+            getattr(self, "_pending_validation_reuse_identity", None))
+        self._pending_validation_reuse_identity = None
+        # Validation now owns the cache. This startup local must not keep
+        # its tensors alive after a later snapshot replaces validation.
+        preloaded_validation_dataset = None
+        if _startup_shutdown_requested():
+            return
+        train_entry_count = (
+            len(preloaded_dataset)
+            if preloaded_dataset is not None else len(train_entries)
+        )
+        print(f"Training entries: {train_entry_count}")
+        train_balance = (
+            preloaded_dataset.metadata.get("side_weight_balance")
+            if preloaded_dataset is not None
+            else self._balance_side_sample_weights(train_entries)
+        )
+        _balance_fields = (
+            "p1_weight_before", "p1_weight_after",
+            "p2_weight_before", "p2_weight_after",
+        )
+        if (
+            isinstance(train_balance, Mapping)
+            and all(field in train_balance for field in _balance_fields)
+        ):
+            print(
+                "Training side weight balance: "
+                f"P1 {train_balance['p1_weight_before']:.1f} to "
+                f"{train_balance['p1_weight_after']:.1f}, "
+                f"P2 {train_balance['p2_weight_before']:.1f} to "
+                f"{train_balance['p2_weight_after']:.1f}"
+            )
+        elif train_balance is not None:
+            print("Warning: ignored malformed cached side-weight metadata")
+            train_balance = None
+
+        if _startup_shutdown_requested():
+            return
+        if self.config.clear_replay_after_load:
+            deleted = self.replay_buffer.clear_files()
+            if deleted:
+                print(f"Cleared {deleted} replay files after loading")
+
+        if preloaded_dataset is None and not train_entries:
+            print("ERROR: No training data available")
+            return
+
+        # Create dataloader
+        if _startup_shutdown_requested():
+            return
+        effective_workers = self.config.dataloader_workers
+        
+        print(f"Creating DataLoader with {effective_workers} workers...")
+        sys.stdout.flush()
+        if preloaded_dataset is not None:
+            print("Using manifest-matched RAM cache for training entries.")
+            dataloader = create_dataloader_from_dataset(
+                preloaded_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=effective_workers,
+                pin_memory=self.config.pin_memory,
+                device=self.device,
+                capacity=self.config.replay_max_entries if _simultaneous else 0,
+                amp_enabled=self.config.amp,
+            )
+        elif self.config.policy_stage == 'enhanced':
+            dataloader = create_enhanced_dataloader(
+                train_entries,
+                batch_size=self.config.batch_size,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                teacher_depth=self.config.teacher_score_depth,
+                temperature=self.config.teacher_soft_temperature,
+                value_scale=self.config.teacher_value_scale,
+                hard_label_blend=self.config.teacher_hard_label_blend,
+                shuffle=True,
+                show_progress=True,
+            )
+        else:
+            cache_metadata = dict(preloaded_cache_metadata or {})
+            if cache_metadata:
+                cache_metadata["side_weight_balance"] = train_balance
+            dataloader = create_dataloader(
+                train_entries,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=effective_workers,
+                pin_memory=self.config.pin_memory,
+                use_ram_cache=self.config.ram_cache_enabled,
+                ram_threshold_gb=self.config.ram_cache_threshold_gb,
+                cache_file=self.config.ram_cache_file,
+                compress_cache=getattr(self.config, 'ram_cache_compress', False),
+                device=self.device,
+                capacity=self.config.replay_max_entries if _simultaneous else 0,
+                max_moves_per_sample=self.config.max_moves_per_sample,
+                amp_enabled=self.config.amp,
+                prelaunch_free_ram_gb=getattr(
+                    self, '_prelaunch_free_ram_gb', None),
+                cache_metadata=cache_metadata or None,
+                load_existing_cache=not preloaded_cache_checked,
+            )
+        # The loader owns the startup data or its uploaded copy. Retaining
+        # this cache local would pin the initial window for the whole run.
+        preloaded_dataset = None
+        # Journal Pass 117: on every FastBatchIterator path the parsed entries
+        # have already been copied into tensors, so retaining even the held-out
+        # list would spend the RAM headroom this cache path is meant to recover.
+        # The manifest-cache hit has no train list, but it still needs this to
+        # release validation ReplayEntry objects after _set_validation_entries.
+        if isinstance(dataloader, FastBatchIterator):
+            train_entries, validation_entries, train_balance = (
+                self._free_entry_lists_after_tensorize(
+                    train_entries, validation_entries, train_balance))
+            gc.collect()
+        _is_fast = isinstance(dataloader, FastBatchIterator)
+        self._use_padded = (
+            _is_fast
+            or isinstance(dataloader, EnhancedBatchIterator)
+            or isinstance(getattr(dataloader, 'dataset', None), CachedTensorDataset)
+        )
+        # Track dataset for incremental updates in background self-play
+        if _is_fast:
+            self._current_dataset = dataloader.dataset
+        else:
+            self._current_dataset = None
+        _gpu_resident = getattr(dataloader, 'on_gpu', False)
+        if _is_fast and _gpu_resident and self._snapshot_manager is not None:
+            # Snapshot self-play prepares complete replacements and never
+            # concatenates with this CPU source. The completed GPU upload
+            # owns every training tensor, so release both startup references
+            # before the first epoch and worker fork.
+            self._current_dataset = None
+            dataloader.dataset = None
+        _path_label = " (GPU-resident)" if _gpu_resident else (" (fast tensor indexing)" if _is_fast else (" (padded training path)" if self._use_padded else ""))
+        print(f"DataLoader ready with {len(dataloader)} batches{_path_label}.")
+        sys.stdout.flush()
+
+        if _startup_shutdown_requested():
+            return
+
+        # Training loop
+        print(f"\nStarting training from step {self.step}...")
+        print("(First batch may take a moment to load...)")
+        sys.stdout.flush()
+        start_time = time.time()
+
+        # Set training mode once — stays in effect for the entire loop.
+        # train_epoch() no longer calls model.train() per epoch, saving
+        # ~50 module traversals × 650 epochs/cycle = ~32,500 method calls.
+        self.model.train()
+
+        # Track last test step (init to current step so resumed runs don't
+        # immediately trigger a test before the first test_every interval)
+        last_test_step = self.step
+        loss = 0.0  # Initialize loss in case loop doesn't run
+        # Persistent GPU scalar for loss accumulation — created once, zeroed per
+        # epoch via .zero_().  Eliminates ~650 torch.tensor() GPU allocations per
+        # self-play cycle (one per epoch) that each go through CUDA caching allocator.
+        _total_loss_acc = torch.tensor(0.0, device=self.device)
+        _consecutive_dead_epochs = 0  # rejected inputs or an unusable gradient scale
+        _DEAD_EPOCH_RECOVERY_THRESHOLD = 3  # trigger checkpoint rollback after this many
+        _stale_epochs = 0  # epochs since last data refresh
+        _max_stale = self.config.max_stale_epochs  # 0 = unlimited
+
+        # Async testing: run model evaluation on CPU in a background thread
+        # so GPU training continues uninterrupted.  Testing uses CPU workers
+        # (ProcessPoolExecutor) and never touches the GPU, so the only sync
+        # cost is the ~2ms model save before spawning the thread.
+        _async_test_thread = None
+        _async_test_result = [None]   # mutable container for thread result
+        _async_test_step = [0]
+        _async_test_epoch = [0]
+
+        def _start_async_test():
+            nonlocal _async_test_thread
+            # Save model with non_blocking D2H copies (same pattern as
+            # _save_checkpoint) — avoids per-tensor CUDA sync overhead.
+            _test_path = self._runtime_model_path("temp_async_test.pt")
+            _test_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.device.type == 'cuda':
+                _sd = {k: v.to('cpu', non_blocking=True)
+                       for k, v in self.model.state_dict().items()}
+                torch.cuda.current_stream().synchronize()
+            else:
+                _sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            torch.save({
+                'model_state_dict': _sd,
+                'arch_params': getattr(self.model, 'arch_params', {}),
+                'encoding_version': ENCODING_VERSION,
+                'step': self.step,
+            }, _test_path)
+            _async_test_step[0] = self.step
+            _async_test_epoch[0] = self.epoch
+            _async_test_result[0] = None
+
+            _test_path_str = str(_test_path)
+            _n_games = self.config.test_games
+            _diff = self.config.test_difficulty
+            _max_mv = self.config.selfplay_max_moves
+            # [Pass 67] Reduced from 4 to 2 for async tests during simultaneous
+            # mode.  Background self-play uses cpu_workers (11) processes; adding
+            # 4 more test workers = 15 processes on 12 cores = oversubscription.
+            # 2 test workers keeps total at 13, near core count. Sync tests
+            # (run_test_vs_algo) keep 4 workers since self-play isn't running.
+            _n_wk = min(self.config.cpu_workers, 2)
+
+            def _worker():
+                try:
+                    _async_test_result[0] = self._run_test_cpu_only(
+                        _test_path_str, _n_games, _diff, _max_mv, _n_wk)
+                except Exception as e:
+                    _diagnostic_print(f"  [async test] error: {e}")
+                finally:
+                    self._cleanup_runtime_model_file(_test_path_str)
+                    self._cleanup_runtime_models_dir()
+
+            _async_test_thread = threading.Thread(target=_worker, daemon=True)
+            _async_test_thread.start()
+            _diagnostic_print(f"  [async test] started ({_n_games} games vs {_diff})")
+
+        def _collect_async_test():
+            nonlocal _async_test_thread
+            if _async_test_thread is None:
+                return
+            if _async_test_thread.is_alive():
+                return  # still running
+            result = _async_test_result[0]
+            if result is not None:
+                self._record_test_result(
+                    result, _async_test_step[0], _async_test_epoch[0])
+            _async_test_thread = None
+            _async_test_result[0] = None
+
+        # Start continuous background self-play immediately so CPU is never idle.
+        # Full game count (not half) — GPU epochs are ~100x faster than self-play,
+        # so generating more data per cycle improves data freshness.
+        if _startup_shutdown_requested():
+            return
+        if _simultaneous:
+            self._start_background_selfplay(self.config.selfplay_games)
+
+        while self.step < self.config.train_steps:
+            self._service_control_queue()
+            if self._stopped:
+                break
+
+            # Check if stop time has been reached
+            if self._training_time_limit_reached():
+                _diagnostic_print(f"\nStop time reached ({self.config.stop_time.strftime('%Y-%m-%d %H:%M')}). Saving and exiting...")
+                break
+
+            loss = self.train_epoch(dataloader, use_scoring=self._should_use_scoring(),
+                                   _loss_acc=_total_loss_acc)
+            if _simultaneous and self.device.type == 'mps':
+                self._publish_selfplay_model_state()
+            self.epoch += 1
+            self.stats.epochs_completed = self.epoch
+            self._record_epoch_loss(loss)
+            self._save_progress_report_if_due()
+            # A deadline can expire inside an epoch or a control wait. Begin
+            # finalization before recovery, data refresh or new evaluations.
+            if self._stopped or self._training_time_limit_reached():
+                break
+            # Throttle epoch prints: with ~245 epochs per 60s self-play cycle,
+            # per-epoch prints add ~735ms of terminal I/O overhead on WSL2
+            # (~3ms per print call with stdout flush).  Print every 50 epochs
+            # to give periodic progress while keeping overhead at ~15 prints/cycle.
+            if self.epoch % 50 == 0 or self.epoch == 1:
+                # This and the loop's other steady-state diagnostics (data
+                # refresh, dead epochs, async tests, alternate self-play) now
+                # go through _diagnostic_print, so a dead console retires the
+                # stream instead of ending training before its final
+                # checkpoint (the Pass 553 incident's failure mode, extended
+                # here in Journal Pass 558). REMAINING LIMITATION: a dead
+                # producer is still noticed only at _max_stale and never
+                # restarted; that is a supervision gap, not a console one.
+                scoring_label = "scoring" if self._should_use_scoring_for_epoch(self.epoch) else "no-scoring"
+                current_lr = (self.scheduler.get_last_lr()[0]
+                              if self.scheduler is not None
+                              else self.config.learning_rate)
+                _diagnostic_print(
+                    f"\nEpoch {self.epoch} complete. Avg Loss: {loss:.4f}  "
+                    f"[reward_mode={self.config.reward_mode}, this_epoch={scoring_label}, lr={current_lr:.2e}]")
+
+            # --- Dead-epoch recovery: detect & recover from stuck non-finite state ---
+            # Successful backward calls can still end in rejected AMP updates.
+            # A finite positive scale may need several warm-up reductions, but
+            # zero/NaN/Inf cannot recover through GradScaler's multiplicative update.
+            _epoch_scaler = getattr(self, 'scaler', None)
+            _epoch_scale = (_epoch_scaler.get_scale()
+                            if _epoch_scaler is not None else 1.0)
+            _unusable_scale = not (0.0 < _epoch_scale < math.inf)
+            if getattr(self, '_last_epoch_batches', -1) == 0 or _unusable_scale:
+                _consecutive_dead_epochs += 1
+                if _consecutive_dead_epochs >= _DEAD_EPOCH_RECOVERY_THRESHOLD:
+                    _diagnostic_print(f"\n{'='*60}")
+                    _diagnostic_print(
+                        f"WARNING: {_consecutive_dead_epochs} consecutive epochs with "
+                        f"unusable training progress.")
+                    if _unusable_scale:
+                        _diagnostic_print(f"  Cause: GradScaler scale is unusable ({_epoch_scale!r})")
+                    elif self._has_non_finite_tensors():
+                        _diagnostic_print("  Cause: model weights contain NaN/Inf")
+                    else:
+                        _diagnostic_print("  Cause: FP16 overflow (weights finite in FP32, "
+                                          "but intermediate values overflow float16)")
+                    self._rollback_after_dead_epoch(
+                        reason=f"{_consecutive_dead_epochs} consecutive dead epochs")
+                    _diagnostic_print(f"{'='*60}\n", flush=True)
+                    _consecutive_dead_epochs = 0
+            else:
+                _consecutive_dead_epochs = 0
+
+            _stale_epochs += 1
+
+            if _simultaneous:
+                # Continuous background self-play: check if new data is ready.
+                # bg_dataset may be None when concat was skipped (GPU-resident
+                # incremental-only path); bg_incremental carries the new data.
+                bg_dataset, bg_incremental = self._collect_background_selfplay()
+                _has_new_data = bg_dataset is not None or bg_incremental is not None
+                if _has_new_data:
+                    _desc = (f"{len(bg_dataset)} entries"
+                             if bg_dataset is not None
+                             else f"+{len(bg_incremental)} incremental")
+                    _diagnostic_print(f"Background self-play complete — refreshing DataLoader "
+                                      f"({_desc})...")
+                    dataloader, _gpu_resident = self._refresh_dataloader(
+                        dataloader, bg_dataset, bg_incremental, effective_workers)
+                    # The loader owns CPU fallback data or has copied it to
+                    # GPU. Do not retain the upload sources for another epoch.
+                    bg_dataset = bg_incremental = None
+                    _stale_epochs = 0  # Fresh data arrived — reset counter
+                    # Background thread is continuous — no need to restart
+                elif _max_stale > 0 and _stale_epochs >= _max_stale:
+                    # GPU has exhausted the current data — yield until fresh data
+                    # arrives.  This saves thermal budget and prevents overfitting
+                    # on memorized data (GPU trains ~100-144x faster than self-play).
+                    # Use _data_ready_event for zero-latency wakeup instead of
+                    # time.sleep(0.5) polling (saves up to 500ms per data arrival).
+                    # Time the GPU-idle wait so the session report aggregates
+                    # self-play starvation (the server cpu_workers signal).
+                    _wait_start = time.monotonic()
+                    _wait_stale = _stale_epochs
+                    while not self._stopped:
+                        self._service_control_queue()
+                        # Respect pause commands while waiting
+                        while self._paused and not self._stopped:
+                            self._service_control_queue()
+                            if self._stopped or self._training_time_limit_reached():
+                                break
+                            time.sleep(0.1)
+                        if self._stopped or self._training_time_limit_reached():
+                            break
+                        # If background thread died, resume training on stale data
+                        # rather than spinning forever.
+                        if (self._bg_selfplay_thread is not None
+                                and not self._bg_selfplay_thread.is_alive()):
+                            _diagnostic_print(
+                                "Warning: background self-play thread died "
+                                "— resuming training on existing data")
+                            _stale_epochs = 0
+                            break
+                        # Clear event BEFORE checking for data so that any
+                        # signal set by the bg thread after our check is
+                        # preserved for the wait() call.  Previous pattern
+                        # (check → clear → wait) lost signals that arrived
+                        # between check and clear, adding up to 2s latency.
+                        self._data_ready_event.clear()
+                        bg_dataset, bg_incremental = self._collect_background_selfplay()
+                        _has_fresh = bg_dataset is not None or bg_incremental is not None
+                        if _has_fresh:
+                            _desc = (f"{len(bg_dataset)} entries"
+                                     if bg_dataset is not None
+                                     else f"+{len(bg_incremental)} incremental")
+                            _diagnostic_print(f"Fresh data arrived after {_stale_epochs} stale epochs "
+                                              f"— refreshing ({_desc})...")
+                            dataloader, _gpu_resident = self._refresh_dataloader(
+                                dataloader, bg_dataset, bg_incremental, effective_workers)
+                            # Match the non-waiting refresh ownership boundary.
+                            bg_dataset = bg_incremental = None
+                            _stale_epochs = 0
+                            break
+                        # No data yet — block until the bg thread signals or
+                        # 2s timeout for stop/pause/thermal checks.
+                        self._data_ready_event.wait(timeout=2.0)
+                        # Check stop conditions while waiting
+                        if self._training_time_limit_reached():
+                            break
+                    # Wait loop exited. Record how long the GPU sat idle so the
+                    # session report's summary.gpu_idle_wait_* aggregates it.
+                    # This branch DOES fire on local: the 2026-09-20 c174k run
+                    # (PID 612672) recorded 98 waits, 27.1% of the session (per-
+                    # admission overhead decomposition in Journal Pass 560).
+                    # CAVEAT: this elapsed span includes any GUI-pause time spent
+                    # in the inner _paused loop above, so a PAUSE during this
+                    # branch would over-count starvation. Harmless on headless
+                    # local_train.sh, where _paused is never set here (thermal
+                    # cooldown runs in the batch loop, not this wait); correct for
+                    # paused time only if _max_stale>0 is ever run under the GUI.
+                    if self.stats_collector is not None:
+                        self.stats_collector.record_gpu_idle_wait(
+                            time.monotonic() - _wait_start, _wait_stale)
+            else:
+                # Alternate mode: generate data synchronously, then rebuild dataloader
+                _diagnostic_print("Running self-play (alternate mode)...")
+                self.run_selfplay(self.config.selfplay_games)
+                train_entries, validation_entries = self._prepare_training_split(
+                    use_train_cache=False)
+                self._set_validation_entries(validation_entries)
+                self._commit_validation_tensor_identity(
+                    getattr(self, "_pending_validation_reuse_identity", None))
+                self._pending_validation_reuse_identity = None
+                train_balance = self._balance_side_sample_weights(train_entries)
+                if train_balance is not None:
+                    _diagnostic_print(
+                        "Training side weight balance: "
+                        f"P1 {train_balance['p1_weight_before']:.1f} to "
+                        f"{train_balance['p1_weight_after']:.1f}, "
+                        f"P2 {train_balance['p2_weight_before']:.1f} to "
+                        f"{train_balance['p2_weight_after']:.1f}"
+                    )
+                if self.config.clear_replay_after_load:
+                    deleted = self.replay_buffer.clear_files()
+                    if deleted:
+                        _diagnostic_print(f"Cleared {deleted} replay files after loading")
+                if train_entries:
+                    if self.config.policy_stage == 'enhanced':
+                        dataloader = create_enhanced_dataloader(
+                            train_entries,
+                            batch_size=self.config.batch_size,
+                            max_moves_per_sample=self.config.max_moves_per_sample,
+                            teacher_depth=self.config.teacher_score_depth,
+                            temperature=self.config.teacher_soft_temperature,
+                            value_scale=self.config.teacher_value_scale,
+                            hard_label_blend=self.config.teacher_hard_label_blend,
+                            shuffle=True,
+                            show_progress=True,
+                        )
+                        self._use_padded = True
+                        _gpu_resident = False
+                        continue
+                    dataset = CachedTensorDataset.from_entries(
+                        train_entries,
+                        max_moves_per_sample=self.config.max_moves_per_sample,
+                        show_progress=True,
+                    )
+                    # Journal Pass 117: entries are fully copied into tensors
+                    # here too; free them so the next cycle's preprocessing has
+                    # the headroom (measured mid-run lows were 3.4-4.1 GB on
+                    # this box).  Standard-Dataset paths keep lazy access.
+                    if isinstance(dataloader, FastBatchIterator):
+                        train_entries, = (
+                            self._free_entry_lists_after_tensorize(
+                                train_entries))
+                        gc.collect()
+                    # Free old GPU tensors before allocating new ones
+                    _was_gpu = getattr(dataloader, 'on_gpu', False)
+                    if _was_gpu:
+                        dataloader = None
+                        ml_device.empty_cache(self.device)
+                    dataloader = create_dataloader_from_dataset(
+                        dataset,
+                        batch_size=self.config.batch_size,
+                        num_workers=effective_workers,
+                        pin_memory=self.config.pin_memory,
+                        device=self.device,
+                        amp_enabled=self.config.amp,
+                    )
+                    self._use_padded = True
+                    _gpu_resident = getattr(dataloader, 'on_gpu', False)
+
+            # A data/GUI wait may have reached the deadline after the epoch.
+            if self._stopped or self._training_time_limit_reached():
+                break
+
+            # Collect completed async test (non-blocking)
+            _collect_async_test()
+
+            # Start async test if due and no test currently running
+            if (self.config.test_vs_algo and
+                not self.config.test_promoted_only and
+                self.step > 0 and
+                self.step - last_test_step >= self.config.test_every and
+                (_async_test_thread is None or not _async_test_thread.is_alive())):
+                try:
+                    _start_async_test()
+                    last_test_step = self.step
+                except Exception as e:
+                    _diagnostic_print(f"  [async test] failed to start: {e}")
+
+        # Collect any in-flight async test before exit
+        if _async_test_thread is not None and _async_test_thread.is_alive():
+            _diagnostic_print("Waiting for async test to complete...")
+            _async_test_thread.join(timeout=30)
+        _collect_async_test()
+
+        # Stop the continuous producer before the final checkpoint and before
+        # train() is allowed to publish a terminal run-status record.
+        if _simultaneous:
+            self._stop_background_selfplay()
+
+        # Checkpoint diagnostics are best-effort, including retention and
+        # acceptance publication, so a closed console cannot reject the save.
+        self._save_checkpoint(loss)
+        self._wait_for_checkpoint_writer()
+        self._finish_checkpoint_acceptance()
+
+        # Final test vs algorithm (synchronous — training is done).
+        # Skipped when training was explicitly stopped: a Stop request from
+        # the GUI should not block on a 100-game evaluation.
+        if (self.config.test_vs_algo and not self.config.test_promoted_only
+                and not self._stopped):
+            try:
+                _diagnostic_print("\nRunning final model evaluation...")
+                self.run_test_vs_algo(num_games=self.config.test_games * 2)
+            except Exception as e:
+                _diagnostic_print(f"Final test failed: {e}")
+
+        elapsed = time.time() - start_time
+        _diagnostic_print("\nTraining complete!")
+        _diagnostic_print(f"  Total steps: {self.step}")
+        _diagnostic_print(f"  Epochs: {self.epoch}")
+        _diagnostic_print(f"  Time: {elapsed:.1f}s")
+        _diagnostic_print(f"  Final model: {self.config.latest_path}")
+        
+        # Print test summary
+        if self.stats.test_history:
+            latest_test = self.stats.test_history[-1]
+            _diagnostic_print(f"  Final ML Win Rate: {latest_test.get('ml_win_rate', 0)*100:.1f}%")
+
+        # Export comprehensive statistics
+        if self.stats_collector:
+            try:
+                self.stats_collector.set_training_end_step(self.step)
+                self.stats_collector.print_session_summary()
+                exports = self.stats_collector.export_all()
+                _diagnostic_print(f"\n  Statistics exported to: {self.config.stats_output_dir}/")
+                for name, path in exports.items():
+                    _diagnostic_print(f"    {name}: {path}")
+            except Exception as e:
+                _diagnostic_print(f"  Warning: Failed to export statistics: {e}")
+
+    def pause(self) -> None:
+        """Pause training."""
+        self._paused = True
+
+    def resume(self) -> None:
+        """Resume training."""
+        self._paused = False
+
+    def stop(self) -> None:
+        """Stop training."""
+        self._stopped = True
+        self._paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def is_stopped(self) -> bool:
+        return self._stopped
+
+    # Control-queue servicing intervals (seconds).  Polling is time-throttled
+    # so the per-batch cost in train_epoch stays negligible.
+    _CONTROL_POLL_INTERVAL = 0.25
+    _STATUS_PUSH_INTERVAL = 2.0
+
+    def set_control_queues(self, control_queue, status_queue) -> None:
+        """Attach the GUI IPC queues (protocol in ui/training_panel.py).
+
+        Once attached, train() drains PAUSE/RESUME/STOP/STATUS requests from
+        control_queue while running, and pushes STATUS_REPLY heartbeats plus
+        CHECKPOINT notifications onto status_queue.
+        """
+        self._control_queue = control_queue
+        self._status_queue = status_queue
+
+    def _put_status(self, payload: Dict[str, Any]) -> None:
+        """Push a message onto the GUI status queue. Never blocks or raises."""
+        if self._status_queue is None:
+            return
+        try:
+            self._status_queue.put_nowait(payload)
+        except Exception:
+            pass
+
+    def _push_status_reply(self) -> None:
+        self._next_status_push = time.monotonic() + self._STATUS_PUSH_INTERVAL
+        self._put_status({'type': MSG_STATUS_REPLY, **self.get_status()})
+
+    def _service_control_queue(self) -> None:
+        """Drain pending GUI control messages and heartbeat a status update.
+
+        No-op when no control queue is attached (CLI training).  Called from
+        the train()/train_epoch() loops, the pause busy-waits, and the
+        self-play loop; safe to call from any thread (handlers only set
+        flags and put onto a process-safe queue).
+        """
+        q = self._control_queue
+        if q is None:
+            return
+        now = time.monotonic()
+        if now < self._next_control_poll:
+            return
+        # Serialize draining: the main training thread and the background
+        # self-play thread can both call this; a single drainer at a time
+        # guarantees messages are applied in the order they were sent.
+        if not self._control_lock.acquire(blocking=False):
+            return
+        try:
+            self._next_control_poll = now + self._CONTROL_POLL_INTERVAL
+            replied = False
+            while True:
+                try:
+                    msg = q.get_nowait()
+                except Empty:
+                    break
+                except (EOFError, OSError):
+                    # The GUI end of the queue is gone; stop servicing.
+                    self._control_queue = None
+                    return
+                msg_type = msg.get('type') if isinstance(msg, dict) else None
+                if msg_type == MSG_PAUSE:
+                    self.pause()
+                elif msg_type == MSG_RESUME:
+                    self.resume()
+                elif msg_type == MSG_STOP:
+                    self.stop()
+                if msg_type in (MSG_PAUSE, MSG_RESUME, MSG_STOP, MSG_STATUS):
+                    self._push_status_reply()
+                    replied = True
+            if not replied and now >= self._next_status_push:
+                self._push_status_reply()
+        finally:
+            self._control_lock.release()
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current training status."""
+        gpu_mem = _gpu_memory_allocated_mb(getattr(self, 'device', None))
+        
+        # Get recent loss from history
+        recent_loss = None
+        if self.stats.loss_history:
+            recent_loss = self.stats.loss_history[-1].get('loss')
+        latest_teacher = (
+            self.stats.teacher_agreement_history[-1]
+            if self.stats.teacher_agreement_history else None)
+        latest_acceptance = (
+            self.stats.acceptance_history[-1]
+            if self.stats.acceptance_history else None)
+        
+        return {
+            'step': self.step,
+            'epoch': self.epoch,
+            'paused': self._paused,
+            'device': str(self.device),
+            'gpu_mem_mb': gpu_mem,
+            'recent_loss': recent_loss,
+            'current_train_loss': self.stats.current_train_loss,
+            'current_dataset_best_train_loss': (
+                self.stats.current_dataset_best_train_loss
+                if math.isfinite(self.stats.current_dataset_best_train_loss) else None
+            ),
+            'historical_best_train_loss': (
+                self.stats.historical_best_train_loss
+                if math.isfinite(self.stats.historical_best_train_loss) else None
+            ),
+            'best_loss': (
+                self.stats.historical_best_train_loss
+                if math.isfinite(self.stats.historical_best_train_loss) else None
+            ),
+            'dataset_fingerprint': self.stats.dataset_fingerprint,
+            'best_teacher_agreement': self.stats.best_teacher_agreement,
+            'validation_teacher_agreement': (
+                latest_teacher.get('top1_teacher_agreement')
+                if latest_teacher else None),
+            'latest_promotion': (
+                self.stats.promotion_history[-1]
+                if self.stats.promotion_history else None
+            ),
+            'acceptance': latest_acceptance,
+            'latest_acceptance': latest_acceptance,
+            'dataset_metadata': dict(self.stats.dataset_metadata),
+        }
+
+    def get_stats(self) -> TrainingStats:
+        """Get the full training statistics."""
+        return self.stats
+
+
+def list_checkpoints(checkpoint_dir: str = 'models/checkpoints') -> list:
+    """List available checkpoints sorted by step."""
+    checkpoint_path = Path(checkpoint_dir)
+    if not checkpoint_path.exists():
+        return []
+    
+    checkpoints = []
+    for f in checkpoint_path.glob('model_step_*.pt'):
+        step = _checkpoint_step_number(f)
+        if step < 0:
+            continue
+        checkpoints.append({
+            'path': str(f),
+            'step': step,
+            'name': f.name,
+        })
+    
+    # Sort by step
+    checkpoints.sort(key=lambda x: x['step'])
+    return checkpoints
+
+
+def load_training_stats(stats_file: str = 'models/training_stats.json') -> Optional[TrainingStats]:
+    """Load training statistics from file."""
+    stats_path = Path(stats_file)
+    if not stats_path.exists():
+        return None
+    
+    try:
+        with open(stats_path, 'r') as f:
+            data = json.load(f)
+        return TrainingStats.from_dict(data)
+    except Exception:
+        return None
+
+
+def load_config_from_yaml(config_path: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load training configuration from a YAML file.
+    
+    Args:
+        config_path: Path to the YAML config file
+        profile: Optional profile name to apply (e.g., 'server', 'local', 'cpu')
+    
+    Returns:
+        Dictionary of configuration values
+    """
+    import yaml
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Apply profile if specified
+    if profile and 'profiles' in config:
+        if profile in config['profiles']:
+            profile_config = config['profiles'][profile]
+            # Deep merge profile into config
+            def deep_merge(base: dict, override: dict) -> dict:
+                result = base.copy()
+                for key, value in override.items():
+                    if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                        result[key] = deep_merge(result[key], value)
+                    else:
+                        result[key] = value
+                return result
+            config = deep_merge(config, profile_config)
+            print(f"Applied profile: {profile}")
+        else:
+            print(f"Warning: Profile '{profile}' not found. Available: {list(config['profiles'].keys())}")
+    
+    return config
+
+
+def _auto_detect_resume(resume_cfg: dict, paths_cfg: dict) -> Optional[str]:
+    """Resolve the resume checkpoint path from YAML config.
+
+    When ``resume.enabled`` is True and ``checkpoint_path`` is null (None),
+    auto-detects the latest valid checkpoint in the checkpoint directory.
+    Skips checkpoints whose model weights contain NaN/Inf when
+    ``skip_corrupted`` is True (default).
+    """
+    if not resume_cfg.get('enabled', False):
+        return None
+
+    explicit = resume_cfg.get('checkpoint_path')
+    if explicit:
+        return str(explicit)
+
+    # Auto-detect: find the latest checkpoint by step number.
+    ckpt_dir = Path(paths_cfg.get('checkpoint_dir', 'models/checkpoints'))
+    if not ckpt_dir.exists():
+        return None
+
+    import re as _re
+    checkpoints = sorted(
+        ckpt_dir.glob('model_step_*.pt'),
+        key=lambda p: int(_re.search(r'(\d+)', p.stem).group(1))
+        if _re.search(r'(\d+)', p.stem) else 0,
+        reverse=True,
+    )
+    if not checkpoints:
+        return None
+
+    skip_corrupted = resume_cfg.get('skip_corrupted', True)
+    if not skip_corrupted:
+        # Take the latest without validation
+        print(f"Auto-detected checkpoint: {checkpoints[0]}")
+        return str(checkpoints[0])
+
+    # Validate checkpoints (newest first), skip corrupted ones
+    for ckpt in checkpoints:
+        try:
+            c = torch.load(ckpt, map_location='cpu', weights_only=True)
+            checkpoint_encoding = c.get('encoding_version', 1)
+            if checkpoint_encoding != ENCODING_VERSION:
+                print(
+                    f"  Auto-detected migratable checkpoint: {ckpt} "
+                    f"(encoding v{checkpoint_encoding} -> v{ENCODING_VERSION})"
+                )
+            sd = c.get('model_state_dict', c)
+            if all(torch.isfinite(v).all() for v in sd.values()
+                   if isinstance(v, torch.Tensor)):
+                print(f"Auto-detected checkpoint: {ckpt}")
+                return str(ckpt)
+            print(f"  Skipping corrupted checkpoint: {ckpt}")
+        except Exception as e:
+            print(f"  Skipping unreadable checkpoint {ckpt}: {e}")
+    return None
+
+
+def config_from_yaml(yaml_config: Dict[str, Any]) -> TrainingConfig:
+    """
+    Convert YAML config dictionary to TrainingConfig dataclass.
+    
+    Args:
+        yaml_config: Dictionary loaded from YAML file
+    
+    Returns:
+        TrainingConfig instance
+    """
+    # Evaluate arithmetic expressions in all scalar values (e.g. 8192*2 → 16384).
+    def _resolve(d: dict) -> dict:
+        return {k: (_resolve(v) if isinstance(v, dict) else
+                    [_eval_expr(i) for i in v] if isinstance(v, list) else
+                    _eval_expr(v))
+                for k, v in d.items()}
+    yaml_config = _resolve(yaml_config)
+
+    device_cfg = yaml_config.get('device', {})
+    selfplay_cfg = yaml_config.get('selfplay', {})
+    algo_vs_algo_cfg = selfplay_cfg.get('algo_vs_algo', {})
+    training_cfg = yaml_config.get('training', {})
+    dataloader_cfg = yaml_config.get('dataloader', {})
+    testing_cfg = yaml_config.get('testing', {})
+    paths_cfg = yaml_config.get('paths', {})
+    resume_cfg = yaml_config.get('resume', {})
+    time_cfg = yaml_config.get('time_limit', {})
+    stats_cfg = yaml_config.get('statistics', {})
+    model_cfg = yaml_config.get('model', {})
+    lr_sched_cfg = training_cfg.get('lr_scheduler', {})
+    value_head_cfg = yaml_config.get('value_head', {})
+    thermal_cfg = yaml_config.get('thermal_protection', {})
+    validation_cfg = yaml_config.get('validation', {})
+    snapshot_cfg = yaml_config.get('corpus_snapshots', {})
+    _snapshot_lineage_cfg = snapshot_cfg.get('lineage') or {}
+    _snapshot_ledger_cfg = snapshot_cfg.get('trained_ledger') or {}
+    teacher_policy_cfg = yaml_config.get('teacher_policy', {})
+    recovery_cfg = yaml_config.get('recovery_experiment', {})
+    generation_mix_cfg = selfplay_cfg.get('generation_mix', {})
+    augmentation_cfg = yaml_config.get('augmentation', {})
+
+    minimum_free_disk_gb = selfplay_cfg.get('minimum_free_disk_gb', 0.0)
+    if (
+        isinstance(minimum_free_disk_gb, bool)
+        or not isinstance(minimum_free_disk_gb, (int, float))
+        or not math.isfinite(float(minimum_free_disk_gb))
+        or float(minimum_free_disk_gb) < 0
+    ):
+        raise ValueError(
+            "selfplay.minimum_free_disk_gb must be a finite non-negative number"
+        )
+    
+    # Parse stop time if duration is set
+    stop_time = None
+    if time_cfg.get('enabled') and time_cfg.get('duration'):
+        stop_time = parse_duration(time_cfg['duration'])
+    
+    return TrainingConfig(
+        # Device settings
+        device=device_cfg.get('type', 'cuda'),
+        amp=device_cfg.get('amp', {}).get('enabled', True),
+        amp_dtype=device_cfg.get('amp', {}).get('dtype', 'float16'),
+        compile_model=device_cfg.get('compile', {}).get('enabled', True),
+        compile_mode=device_cfg.get('compile', {}).get('mode', 'reduce-overhead'),
+        matmul_precision=device_cfg.get('matmul_precision', 'medium'),
+        # Model architecture
+        model_channels=model_cfg.get('channels', 64),
+        model_blocks=model_cfg.get('num_blocks', 4),
+        model_embedding=model_cfg.get('embedding_size', 128),
+        model_hidden=model_cfg.get('hidden_size', 64),
+        # Self-play settings
+        cpu_workers=selfplay_cfg.get('cpu_workers', max(2, os.cpu_count() or 2)),
+        selfplay_games=selfplay_cfg.get('games_per_epoch', 500),
+        selfplay_focus_side=selfplay_cfg.get('focus_side', 'both'),
+        selfplay_opponent_focus=selfplay_cfg.get('opponent_focus', 'both'),
+        selfplay_difficulties=selfplay_cfg.get('difficulties', ['medium']),
+        selfplay_noise_prob=selfplay_cfg.get('noise_prob', 0.1),
+        selfplay_max_moves=selfplay_cfg.get('max_moves_per_game', 200),
+        selfplay_opening_plies=tuple(
+            selfplay_cfg.get('opening_plies', (0, 2, 4, 6, 8)) or (0,)),
+        selfplay_opening_seed=int(selfplay_cfg.get('opening_seed', 20260819)),
+        symmetry_augmentation=str(
+            augmentation_cfg.get('symmetry', 'none')).strip().lower(),
+        trajectory_algorithm_fraction=float(
+            generation_mix_cfg.get('algorithm_fraction', 0.70)),
+        trajectory_model_fraction=float(
+            generation_mix_cfg.get('model_fraction', 0.30)),
+        teacher_difficulty=str(selfplay_cfg.get('teacher_difficulty', 'hard')),
+        pipeline_mode=selfplay_cfg.get('pipeline_mode', 'simultaneous'),
+        max_stale_epochs=selfplay_cfg.get('max_stale_epochs', 0),
+        selfplay_min_free_disk_gb=float(minimum_free_disk_gb),
+        # Algo-vs-algo settings
+        algo_vs_algo_enabled=algo_vs_algo_cfg.get('enabled', False),
+        algo_vs_algo_games=algo_vs_algo_cfg.get('games_per_epoch', 100),
+        algo_vs_algo_difficulties=algo_vs_algo_cfg.get('difficulties', ['easy', 'medium', 'hard']),
+        # Training settings
+        batch_size=training_cfg.get('batch_size', 256),
+        learning_rate=training_cfg.get('learning_rate', 3e-4),
+        weight_decay=training_cfg.get('weight_decay', 1e-5),
+        grad_clip_norm=training_cfg.get('grad_clip_norm'),
+        gradient_accumulation_steps=training_cfg.get('gradient_accumulation_steps', 1),
+        train_steps=training_cfg.get('train_steps', 999999999),
+        checkpoint_every=training_cfg.get('checkpoint_every', 1000),
+        max_retained_checkpoints=int(
+            training_cfg.get('max_retained_checkpoints', 0) or 0),
+        reward_mode=training_cfg.get('reward_mode', 'cycle'),
+        # LR scheduler settings
+        lr_scheduler_enabled=lr_sched_cfg.get('enabled', False),
+        lr_scheduler_type=lr_sched_cfg.get('type', 'cosine_warm_restarts'),
+        lr_scheduler_T0=lr_sched_cfg.get('T_0', 500),
+        lr_scheduler_T_mult=lr_sched_cfg.get('T_mult', 2),
+        lr_scheduler_eta_min=lr_sched_cfg.get('eta_min', 1e-5),
+        lr_warmup_steps=lr_sched_cfg.get('warmup_steps', 0),
+        # Value head / TD learning
+        value_head_enabled=value_head_cfg.get('enabled', False),
+        value_head_hidden=value_head_cfg.get('hidden_size', 128),
+        value_weight=value_head_cfg.get('value_weight', 0.15),
+        policy_stage=str(training_cfg.get('stage', 'policy_only')),
+        teacher_target_type=str(teacher_policy_cfg.get('target_type', 'hard')),
+        teacher_soft_temperature=float(teacher_policy_cfg.get('temperature', 1.0)),
+        teacher_value_scale=float(teacher_policy_cfg.get('value_scale', 1000.0)),
+        teacher_score_depth=int(teacher_policy_cfg.get('score_depth', 3)),
+        teacher_hard_label_blend=float(
+            teacher_policy_cfg.get('hard_label_blend', 0.25)),
+        require_policy_gate_for_enhanced=bool(
+            teacher_policy_cfg.get('require_policy_gate', True)),
+        # DataLoader settings
+        dataloader_workers=dataloader_cfg.get('num_workers', 0),
+        pin_memory=dataloader_cfg.get('pin_memory', True),
+        ram_cache_enabled=dataloader_cfg.get('ram_cache', {}).get('enabled', True),
+        ram_cache_threshold_gb=dataloader_cfg.get('ram_cache', {}).get('threshold_gb', 8.0),
+        ram_cache_file=dataloader_cfg.get('ram_cache', {}).get('cache_file'),
+        ram_cache_compress=bool(
+            dataloader_cfg.get('ram_cache', {}).get('compress', False)),
+        replay_max_entries=dataloader_cfg.get('replay_max_entries', 100000),
+        clear_replay_after_load=dataloader_cfg.get('clear_replay_after_load', False),
+        max_moves_per_sample=dataloader_cfg.get('max_moves_per_sample', 32),
+        # Validation and immutable corpus windows
+        validation_enabled=bool(validation_cfg.get('enabled', False)),
+        validation_fraction=float(validation_cfg.get('split_fraction', 0.15)),
+        validation_split_seed=int(validation_cfg.get('split_seed', 20260819)),
+        validation_every_checkpoints=int(
+            validation_cfg.get('every_checkpoints', 1)),
+        frozen_suite_path=str(validation_cfg.get(
+            'frozen_suite_path', 'data/validation/frozen_hard_5000.jsonl')),
+        frozen_suite_size=int(validation_cfg.get('frozen_suite_size', 5000)),
+        frozen_suite_seed=int(validation_cfg.get('frozen_suite_seed', 20260819)),
+        frozen_suite_auto_create=bool(validation_cfg.get('auto_create_suite', False)),
+        validation_tensor_cache_file=validation_cfg.get('tensor_cache_file'),
+        validation_tensor_cache_compress=bool(
+            validation_cfg.get('tensor_cache_compress', False)),
+        teacher_agreement_threshold=float(
+            validation_cfg.get('teacher_agreement_threshold', 0.50)),
+        snapshot_enabled=bool(snapshot_cfg.get('enabled', False)),
+        snapshot_root=str(snapshot_cfg.get('root', 'data/corpus_snapshots')),
+        snapshot_min_fresh_fraction=float(
+            snapshot_cfg.get('minimum_fresh_state_fraction', 0.50)),
+        snapshot_max_retained=int(
+            snapshot_cfg.get('max_retained_snapshots', 0) or 0),
+        snapshot_reuse_previous_shards=bool(
+            snapshot_cfg.get('reuse_previous_shards', True)),
+        validation_grow_holdout=bool(
+            validation_cfg.get('grow_holdout', True)),
+        validation_split_version=int(
+            validation_cfg.get('split_version', 1)),
+        snapshot_lineage_base_manifest=(
+            str(_snapshot_lineage_cfg['base_manifest'])
+            if _snapshot_lineage_cfg.get('base_manifest') else None),
+        snapshot_lineage_base_fingerprint=(
+            str(_snapshot_lineage_cfg['base_fingerprint'])
+            if _snapshot_lineage_cfg.get('base_fingerprint') else None),
+        snapshot_lineage_excluded_fingerprints=tuple(
+            str(value) for value in
+            (_snapshot_lineage_cfg.get('excluded_fingerprints') or ())),
+        snapshot_trained_ledger_enabled=bool(
+            _snapshot_ledger_cfg.get('enabled', False)),
+        snapshot_trained_ledger_seed_roots=tuple(
+            str(value) for value in
+            (_snapshot_ledger_cfg.get('seed_from_roots') or ())),
+        # Testing settings
+        test_vs_algo=testing_cfg.get('enabled', False),
+        test_promoted_only=bool(testing_cfg.get('promoted_only', False)),
+        test_every=testing_cfg.get('every_n_steps', 5000),
+        test_games=testing_cfg.get('num_games', 50),
+        test_difficulty=testing_cfg.get('difficulty', 'medium'),
+        persist_selfplay=selfplay_cfg.get('persist_selfplay', True),
+        replay_max_files=dataloader_cfg.get('replay_max_files', 60),
+        test_opening_plies=tuple(
+            testing_cfg.get('opening_plies', (0, 2, 4, 6, 8)) or (0,)),
+        test_opening_seed=int(testing_cfg.get('opening_seed', 20260819)),
+        test_opponents=tuple(testing_cfg.get('opponents', ('random', 'easy'))),
+        test_confidence_method=str(testing_cfg.get('confidence_method', 'wilson_score')),
+        test_confidence_level=float(testing_cfg.get('confidence_level', 0.95)),
+        random_match_score_threshold=float(
+            testing_cfg.get('random_match_score_threshold', 0.80)),
+        random_match_score_lower_bound=float(
+            testing_cfg.get('random_lower_confidence_bound', 0.70)),
+        easy_match_score_lower_bound=float(
+            testing_cfg.get('easy_lower_confidence_bound', 0.50)),
+        easy_side_score_floor=float(testing_cfg.get('easy_side_score_floor', 0.50)),
+        inference_depth=int(testing_cfg.get('inference_depth', 1)),
+        # Statistics collection settings
+        stats_enabled=stats_cfg.get('enabled', True),
+        stats_record_every=stats_cfg.get('record_every', 10),
+        stats_system_every=stats_cfg.get('system_every', 500),
+        stats_model_health_every=stats_cfg.get('model_health_every', 2000),
+        stats_score_dist_every=stats_cfg.get('score_dist_every', 50),
+        stats_buffer_size=stats_cfg.get('buffer_size', 50000),
+        stats_flush_every=stats_cfg.get('flush_every', 5000),
+        progress_report_every_seconds=stats_cfg.get(
+            'progress_report_every_seconds',
+            stats_cfg.get('progress_report_every_sec', 30.0),
+        ),
+        stats_output_dir=stats_cfg.get('output_dir', paths_cfg.get('log_dir', 'logs') + '/stats'),
+        # Paths
+        checkpoint_dir=paths_cfg.get('checkpoint_dir', 'models/checkpoints'),
+        runtime_model_root=(
+            paths_cfg.get('runtime_model_root', 'logs/runtime_models')
+        ),
+        latest_path=paths_cfg.get('latest_model', 'models/latest.pt'),
+        promoted_path=paths_cfg.get('promoted_model', 'models/promoted.pt'),
+        accepted_path=paths_cfg.get('accepted_model', 'models/accepted.pt'),
+        replay_dir=paths_cfg.get('replay_dir', 'data/replay'),
+        log_dir=paths_cfg.get('log_dir', 'logs'),
+        stats_file=paths_cfg.get('stats_file', 'models/training_stats.json'),
+        stats_seed_file=paths_cfg.get('seed_stats_from'),
+        promotion_registry=paths_cfg.get(
+            'promotion_registry', 'logs/policy_distillation/promotions.jsonl'),
+        acceptance_dir=paths_cfg.get(
+            'acceptance_dir', 'logs/policy_distillation/acceptance'),
+        policy_output_namespace=paths_cfg.get('policy_output_namespace'),
+        enhanced_output_namespace=paths_cfg.get('enhanced_output_namespace'),
+        # Thermal protection
+        thermal_enabled=thermal_cfg.get('enabled', False),
+        thermal_temp_limit_c=thermal_cfg.get('temp_limit_c', 90),
+        thermal_rest_seconds=_parse_rest_duration(thermal_cfg.get('rest_duration', '5m')),
+        thermal_check_every=thermal_cfg.get('check_every', 30),
+        # Resume: when enabled with no specific path, auto-detect the latest checkpoint.
+        # This matches the documented behavior ("null = auto-detect latest") in all
+        # YAML configs.  Without this, resume.enabled=True + checkpoint_path=null
+        # silently starts fresh instead of resuming.
+        resume=_auto_detect_resume(resume_cfg, paths_cfg),
+        recovery_enforced=bool(recovery_cfg.get('enabled', False)),
+        recovery_baseline_path=recovery_cfg.get('baseline_checkpoint'),
+        recovery_baseline_sha256=recovery_cfg.get('baseline_sha256'),
+        stop_time=stop_time,
+    )
+
+
+def _is_verified_continuation_resume(
+    config: TrainingConfig,
+    resume: Optional[Path],
+    baseline: Path,
+) -> bool:
+    """True when ``resume`` is this namespace's own verified continuation point.
+
+    Audit Suggestion 7.  P4 forbids a *fresh-weight* arm, not a second session:
+    a checkpoint this experiment itself wrote is a descendant of the pinned
+    anchor and says so in its own metadata.  Without this, every relaunch
+    re-walked from the anchor and the frozen-suite series restarted, so the
+    experiment's practical ceiling was one uninterrupted session.
+
+    Three conditions, all required:
+
+    * the file is an immutable *numbered* checkpoint -- never an alias such as
+      latest/promoted/accepted, which are republished in place;
+    * it lives in this run's own ``checkpoint_dir`` -- a stamped checkpoint in
+      a foreign namespace is still refused, because output isolation is what
+      the continuation namespace exists to provide;
+    * it carries the pinned ``baseline_sha256`` for the active training stage
+      and holds finite weights.
+    """
+    if resume is None or not resume.is_file():
+        return False
+    if resume == baseline:
+        return False
+    if not _RECOVERY_ANCHOR_NAME_RE.match(resume.name):
+        return False
+    checkpoint_dir = Path(config.checkpoint_dir)
+    if not checkpoint_dir.is_dir():
+        return False
+    try:
+        if not os.path.samefile(resume.parent, checkpoint_dir):
+            return False
+    except OSError:
+        return False
+    return recovery_checkpoint_continues_lineage(
+        resume,
+        str(config.recovery_baseline_sha256 or ''),
+        config.policy_stage,
+    )
+
+
+def resolve_recovery_continuation_resume(config: TrainingConfig) -> Optional[Path]:
+    """Newest verified continuation checkpoint for ``config``, or ``None``.
+
+    Audit Suggestion 7.  ``None`` means "no verified checkpoint exists yet",
+    which is the normal state of a namespace on its first launch; the caller
+    keeps the pinned anchor in that case.  This never falls back to an
+    unverified file, so it cannot become a back door around the anchor pin the
+    way ``--resume-latest`` would.
+    """
+    if not config.recovery_enforced:
+        raise ValueError(
+            "--resume-continuation requires a recovery_experiment config")
+    if not config.recovery_baseline_sha256:
+        raise ValueError(
+            "--resume-continuation requires a pinned recovery baseline SHA-256")
+    return newest_verified_recovery_continuation(
+        config.checkpoint_dir,
+        str(config.recovery_baseline_sha256),
+        config.policy_stage,
+    )
+
+
+def validate_recovery_experiment_config(
+    config: TrainingConfig,
+    *,
+    resume_latest_requested: bool = False,
+) -> None:
+    """Fail closed unless the approved resume-only recovery controls are active."""
+
+    if not config.recovery_enforced:
+        return
+    if resume_latest_requested:
+        raise ValueError("The recovery experiment forbids --resume-latest")
+    if not config.recovery_baseline_path or not config.recovery_baseline_sha256:
+        raise ValueError("Recovery baseline path and SHA-256 are required")
+
+    baseline = Path(config.recovery_baseline_path).resolve()
+    # The anchor used to be pinned by filename to model_step_134000.pt.  The
+    # approved 2026-08-24 continuation resumes the verified step-174000
+    # checkpoint in a new isolated namespace, so the filename pin would now
+    # reject the approved anchor.  Identity is still enforced -- and enforced
+    # by the stronger control: the anchor must be a preserved *numbered*
+    # checkpoint (never an alias such as latest/promoted/accepted, which move)
+    # and its SHA-256 must equal the configured pin, checked below.
+    if not _RECOVERY_ANCHOR_NAME_RE.match(baseline.name):
+        raise ValueError(
+            "Recovery baseline must be a preserved numbered checkpoint named "
+            f"model_step_<step>.pt; received {baseline.name}")
+    if not baseline.is_file():
+        raise FileNotFoundError(f"Recovery baseline checkpoint not found: {baseline}")
+    resume = Path(config.resume).resolve() if config.resume else None
+    if config.policy_stage == 'policy_only':
+        # Windows/WSL case-insensitive mounts can expose the same inode through
+        # differently-cased absolute paths (for example PIPELINE/DAMA versus
+        # pipeline/dama).  Enforce exact file identity, then verify the pinned
+        # digest below; lexical Path equality would reject the valid launcher.
+        try:
+            resume_is_baseline = (
+                resume is not None
+                and resume.is_file()
+                and os.path.samefile(resume, baseline)
+            )
+        except OSError:
+            resume_is_baseline = False
+        if not resume_is_baseline and not _is_verified_continuation_resume(
+            config, resume, baseline
+        ):
+            raise ValueError(
+                f"Recovery must resume from {baseline}, or from a numbered "
+                f"checkpoint in {Path(config.checkpoint_dir)} that carries the "
+                f"pinned lineage stamp; received {resume}"
+            )
+    elif config.policy_stage == 'enhanced':
+        isolation_failures = _enhanced_output_isolation_failures(config)
+        if isolation_failures:
+            raise ValueError(
+                "Unsafe enhanced-stage output isolation: "
+                + "; ".join(isolation_failures)
+            )
+
+    # Recovery artifacts must never be allowed to target the preserved anchor
+    # or any numbered checkpoint.  The normal alias publisher is intentionally
+    # atomic, but ``os.replace`` would still replace a protected path if a
+    # malformed programmatic config pointed an alias there.  Keep all three
+    # aliases outside the checkpoint directory and pairwise distinct.
+    checkpoint_dir = Path(config.checkpoint_dir).resolve()
+    alias_paths = {
+        'latest': Path(config.latest_path).resolve(),
+        'promoted': Path(config.promoted_path).resolve(),
+        'accepted': Path(config.accepted_path).resolve(),
+    }
+    collisions = []
+    if checkpoint_dir == baseline.parent:
+        collisions.append(
+            "checkpoint output directory contains the recovery baseline")
+    for alias_name, alias_path in alias_paths.items():
+        if alias_path == baseline:
+            collisions.append(f"{alias_name} alias targets the recovery baseline")
+        elif checkpoint_dir == alias_path or checkpoint_dir in alias_path.parents:
+            collisions.append(
+                f"{alias_name} alias must remain outside checkpoint directory")
+        elif alias_path.name.startswith('model_step_') and alias_path.suffix == '.pt':
+            collisions.append(
+                f"{alias_name} alias cannot use a numbered checkpoint filename")
+    for left_name, left_path in alias_paths.items():
+        for right_name, right_path in alias_paths.items():
+            if left_name < right_name and left_path == right_path:
+                collisions.append(
+                    f"{left_name} and {right_name} aliases must be distinct")
+    numbered_paths = set(checkpoint_dir.glob('model_step_*.pt')) if checkpoint_dir.is_dir() else set()
+    for alias_name, alias_path in alias_paths.items():
+        if alias_path in numbered_paths:
+            collisions.append(
+                f"{alias_name} alias targets an existing numbered checkpoint")
+    if collisions:
+        raise ValueError("Unsafe recovery model paths: " + "; ".join(collisions))
+
+    digest = hashlib.sha256()
+    with baseline.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    actual = digest.hexdigest().upper()
+    expected = str(config.recovery_baseline_sha256).upper()
+    if actual != expected:
+        raise RuntimeError(
+            f"Recovery baseline SHA-256 mismatch: expected {expected}, got {actual}"
+        )
+
+    failures = []
+    try:
+        teacher_agreement_threshold = float(
+            config.teacher_agreement_threshold)
+    except (TypeError, ValueError, OverflowError):
+        teacher_agreement_threshold = float('nan')
+    if (
+        isinstance(config.teacher_agreement_threshold, bool)
+        or not math.isfinite(teacher_agreement_threshold)
+        or not 0.50 <= teacher_agreement_threshold <= 1.0
+    ):
+        failures.append(
+            "teacher agreement promotion threshold must be finite and within "
+            "[0.50, 1.0]"
+        )
+    if not config.validation_enabled or abs(config.validation_fraction - 0.15) > 1e-12:
+        failures.append("validation must reserve 15% by whole replay file")
+    if config.frozen_suite_size != 5000:
+        failures.append("frozen teacher suite must contain exactly 5000 states")
+    if not config.snapshot_enabled:
+        failures.append("versioned corpus snapshots must be enabled")
+    if config.snapshot_min_fresh_fraction < 0.50:
+        failures.append("new snapshots must require at least 50% fresh canonical states")
+    if config.teacher_difficulty != 'hard':
+        failures.append("all recovery labels must use the hard teacher")
+    if abs(config.selfplay_noise_prob - 0.10) > 1e-12:
+        failures.append("played-action exploration must remain 0.10")
+    if abs(config.trajectory_algorithm_fraction - 0.70) > 1e-12:
+        failures.append("algorithm trajectory fraction must be 0.70")
+    if abs(config.trajectory_model_fraction - 0.30) > 1e-12:
+        failures.append("model trajectory fraction must be 0.30")
+    if abs(
+        config.trajectory_algorithm_fraction + config.trajectory_model_fraction - 1.0
+    ) > 1e-12:
+        failures.append("trajectory fractions must sum to 1.0")
+    configured_total_games = config.selfplay_games + (
+        config.algo_vs_algo_games if config.algo_vs_algo_enabled else 0)
+    try:
+        expected_algorithm_games, expected_model_games = (
+            allocate_policy_distillation_games(configured_total_games))
+    except (TypeError, ValueError) as exc:
+        failures.append(f"generation game allocation is invalid: {exc}")
+    else:
+        if config.algo_vs_algo_games != expected_algorithm_games:
+            failures.append(
+                f"algorithm trajectories must be exactly {expected_algorithm_games} "
+                f"of {configured_total_games} games")
+        if config.selfplay_games != expected_model_games:
+            failures.append(
+                f"current-model trajectories must be exactly {expected_model_games} "
+                f"of {configured_total_games} games")
+    if config.selfplay_opponent_focus != 'algorithm':
+        failures.append("current-model trajectories must use the model-vs-algorithm path")
+    if len(set(config.algo_vs_algo_difficulties)) < 2:
+        failures.append("algorithm trajectories must use diverse behavior difficulties")
+    if not any(value > 0 for value in config.selfplay_opening_plies):
+        failures.append("training openings must include positive random plies")
+    if config.symmetry_augmentation != 'none':
+        failures.append(
+            "symmetry augmentation must remain disabled because the only "
+            "rules-valid transform is encoding-identical")
+    if config.test_games != 100:
+        failures.append("promoted checkpoints require 100 games per opponent")
+    if not config.test_vs_algo or not config.test_promoted_only:
+        failures.append("game-strength testing must run only for promoted checkpoints")
+    if set(config.test_opponents) != {'random', 'easy'}:
+        failures.append("acceptance opponents must be random and easy")
+    if not config.test_opening_plies or any(
+        value <= 0 for value in config.test_opening_plies
+    ):
+        failures.append(
+            "every acceptance game must use a positive randomized opening")
+    if config.test_confidence_method != 'wilson_score':
+        failures.append("confidence method must be predeclared as wilson_score")
+    if abs(config.test_confidence_level - 0.95) > 1e-12:
+        failures.append("acceptance confidence level must be 0.95")
+    if abs(config.random_match_score_threshold - 0.80) > 1e-12:
+        failures.append("random acceptance match score must be at least 0.80")
+    if abs(config.random_match_score_lower_bound - 0.70) > 1e-12:
+        failures.append("random lower confidence bound must be above 0.70")
+    if abs(config.easy_match_score_lower_bound - 0.50) > 1e-12:
+        failures.append("easy lower confidence bound must be above 0.50")
+    if abs(config.easy_side_score_floor - 0.50) > 1e-12:
+        failures.append("easy score floor for each player side must be 0.50")
+    if config.policy_stage == 'policy_only':
+        if config.value_head_enabled:
+            failures.append("value head must remain disabled during the policy-only gate")
+        if config.inference_depth != 1:
+            failures.append("inference depth must remain 1 during the policy-only gate")
+        if config.teacher_target_type != 'hard':
+            failures.append("policy-only stage must use hard teacher targets")
+    elif config.policy_stage == 'enhanced':
+        if not config.require_policy_gate_for_enhanced:
+            failures.append("enhanced stage must require the policy gate")
+        else:
+            registry_path = Path(str(config.policy_gate_promotion_registry or ''))
+            gate_record: Optional[dict] = None
+            suite_path = Path(config.frozen_suite_path)
+            suite_manifest_path = suite_path.with_suffix(
+                suite_path.suffix + '.manifest.json'
+            )
+            expected_suite_fingerprint = ''
+            if suite_path.is_file() and suite_manifest_path.is_file():
+                try:
+                    with suite_manifest_path.open('r', encoding='utf-8') as handle:
+                        expected_suite_fingerprint = str(
+                            json.load(handle).get('suite_sha256', '')
+                        )
+                except (OSError, ValueError, TypeError):
+                    expected_suite_fingerprint = ''
+            resume_sha256 = ''
+            resume_name_match = (
+                re.fullmatch(r'model_step_(\d+)\.pt', resume.name)
+                if resume is not None else None
+            )
+            resume_numbered_step = (
+                int(resume_name_match.group(1))
+                if resume_name_match is not None else -1
+            )
+            if resume is not None and resume.is_file():
+                promoted_digest = hashlib.sha256()
+                with resume.open('rb') as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                        promoted_digest.update(chunk)
+                resume_sha256 = promoted_digest.hexdigest().upper()
+            if registry_path.is_file():
+                try:
+                    with registry_path.open('r', encoding='utf-8') as handle:
+                        for line in handle:
+                            if not line.strip():
+                                continue
+                            record = json.loads(line)
+                            if not isinstance(record, dict):
+                                raise ValueError(
+                                    "promotion registry record must be an object"
+                                )
+                            raw_step = record.get('step', -1)
+                            record_step = (
+                                raw_step
+                                if isinstance(raw_step, int)
+                                and not isinstance(raw_step, bool)
+                                else -1
+                            )
+                            try:
+                                raw_agreement = record.get('teacher_agreement')
+                                if type(raw_agreement) not in (int, float):
+                                    raise TypeError(
+                                        "teacher agreement must be numeric")
+                                record_agreement = float(raw_agreement)
+                                record_threshold = float(
+                                    record.get('teacher_agreement_threshold'))
+                            except (TypeError, ValueError, OverflowError):
+                                record_agreement = float('nan')
+                                record_threshold = float('nan')
+                            threshold_matches = (
+                                math.isfinite(record_threshold)
+                                and record_threshold
+                                == teacher_agreement_threshold
+                            )
+                            agreement_is_valid = (
+                                math.isfinite(record_agreement)
+                                and 0.0 <= record_agreement <= 1.0
+                            )
+                            promoted_checkpoint = record.get('checkpoint_path')
+                            checkpoint_matches = (
+                                isinstance(promoted_checkpoint, str)
+                                and bool(promoted_checkpoint)
+                                and resume is not None
+                                and Path(promoted_checkpoint).resolve() == resume
+                                and resume.is_file()
+                            )
+                            checkpoint_hash_matches = (
+                                bool(resume_sha256)
+                                and str(record.get('checkpoint_sha256', '')).upper()
+                                == resume_sha256
+                            )
+                            suite_matches = (
+                                bool(expected_suite_fingerprint)
+                                and record.get('suite_fingerprint')
+                                == expected_suite_fingerprint
+                            )
+                            if (record.get('promoted') is True and
+                                    record.get('training_stage') == 'policy_only' and
+                                    threshold_matches and
+                                    agreement_is_valid and
+                                    record_agreement >=
+                                    teacher_agreement_threshold and
+                                    checkpoint_matches and
+                                    record_step == resume_numbered_step and
+                                    checkpoint_hash_matches and
+                                    suite_matches):
+                                gate_record = record
+                                break
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    failures.append(
+                        f"policy promotion registry is unreadable: {exc}"
+                    )
+            if gate_record is None:
+                failures.append(
+                    "enhanced stage must resume from a recorded promoted "
+                    "policy-only checkpoint"
+                )
+            else:
+                policy_paths = dict(config.policy_output_paths)
+                policy_checkpoint_dir = Path(
+                    policy_paths['checkpoint_dir']).resolve()
+                if (
+                    resume is None
+                    or policy_checkpoint_dir not in resume.parents
+                    or re.fullmatch(r'model_step_\d+\.pt', resume.name) is None
+                ):
+                    failures.append(
+                        "enhanced stage must resume from the exact numbered "
+                        "policy checkpoint, not an alias"
+                    )
+
+                gate_step = int(gate_record['step'])
+                acceptance_root = Path(policy_paths['acceptance_dir'])
+                acceptance_report_path = (
+                    acceptance_root / f"acceptance_step_{gate_step:06d}.json")
+                acceptance_report: Optional[dict] = None
+                if acceptance_report_path.is_file():
+                    try:
+                        with acceptance_report_path.open(
+                            'r', encoding='utf-8'
+                        ) as handle:
+                            acceptance_report = json.load(handle)
+                    except (OSError, ValueError, TypeError) as exc:
+                        failures.append(
+                            f"policy acceptance report is unreadable: {exc}"
+                        )
+                else:
+                    failures.append(
+                        "enhanced stage requires a terminal passing policy "
+                        f"acceptance report: {acceptance_report_path}"
+                    )
+
+                if acceptance_report is not None:
+                    report_checkpoint = acceptance_report.get('checkpoint_path')
+                    report_matches = (
+                        isinstance(report_checkpoint, str)
+                        and bool(report_checkpoint)
+                        and resume is not None
+                        and Path(report_checkpoint).resolve() == resume
+                    )
+                    report_valid = (
+                        acceptance_report.get('passed') is True
+                        and int(acceptance_report.get('step', -1)) == gate_step
+                        and acceptance_report.get('training_stage') == 'policy_only'
+                        and report_matches
+                        and str(acceptance_report.get(
+                            'checkpoint_sha256', '')).upper() == resume_sha256
+                        and acceptance_report.get('frozen_suite_fingerprint')
+                        == expected_suite_fingerprint
+                    )
+                    if not report_valid:
+                        failures.append(
+                            "enhanced stage requires the matching passing policy "
+                            "acceptance result"
+                        )
+                    else:
+                        # A passing bit plus checkpoint/hash fields is not
+                        # enough provenance.  Reconstruct the exact durable
+                        # task that the policy promotion would have queued and
+                        # require every protocol input in the report to match
+                        # it.  This rejects stale reports from another opening
+                        # suite, inference depth, worker count, or task.
+                        try:
+                            expected_task = (
+                                checkpoint_acceptance_tasks
+                                .make_pending_acceptance_task(
+                                    str(resume),
+                                    step=gate_step,
+                                    teacher_agreement=gate_record[
+                                        'teacher_agreement'],
+                                    opening_plies=config.test_opening_plies,
+                                    opening_seed=config.test_opening_seed,
+                                    # This report belongs to the policy-only
+                                    # acceptance gate. Enhanced inference
+                                    # depth must not become evidence for that
+                                    # earlier gate.
+                                    inference_depth=1,
+                                    max_moves=config.selfplay_max_moves,
+                                    num_workers=min(config.cpu_workers, 4),
+                                    training_stage='policy_only',
+                                    checkpoint_sha256=resume_sha256,
+                                    suite_fingerprint=(
+                                        expected_suite_fingerprint),
+                                    teacher_correct_states=gate_record.get(
+                                        'teacher_correct_states'),
+                                    teacher_total_states=gate_record.get(
+                                        'teacher_total_states'),
+                                )
+                            )
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            failures.append(
+                                "enhanced stage policy acceptance provenance is "
+                                f"invalid: {exc}"
+                            )
+                            expected_task = None
+
+                        if expected_task is not None:
+                            # Enhanced-stage activation must accept exactly the
+                            # same terminal evidence as startup recovery.  The
+                            # field-by-field checks below retain their specific
+                            # diagnostics and frozen-suite requirements, while
+                            # the shared loader additionally reconstructs all
+                            # 200 paired game records and their aggregates.
+                            # Without this shared check, a hand-written report
+                            # containing only passing W/D/L totals could unlock
+                            # the value-head stage even though normal acceptance
+                            # recovery correctly rejected it as incomplete.
+                            validated_report = (
+                                checkpoint_acceptance_tasks
+                                .load_completed_acceptance_report(
+                                    acceptance_root, expected_task)
+                            )
+                            if validated_report is None:
+                                failures.append(
+                                    "enhanced stage acceptance report does not "
+                                    "prove the complete paired-game protocol"
+                                )
+
+                            report_provenance = {
+                                'task_id': expected_task['task_id'],
+                                'step': expected_task['step'],
+                                'training_stage': expected_task[
+                                    'training_stage'],
+                                'checkpoint_sha256': resume_sha256,
+                                'frozen_suite_fingerprint': (
+                                    expected_suite_fingerprint),
+                                'opening_seed': expected_task['opening_seed'],
+                                'opening_plies': expected_task['opening_plies'],
+                                'inference_depth': expected_task[
+                                    'inference_depth'],
+                                'max_moves': expected_task['max_moves'],
+                                'num_workers': expected_task['num_workers'],
+                            }
+                            for key, expected_value in report_provenance.items():
+                                actual_value = acceptance_report.get(key)
+                                if key == 'checkpoint_sha256':
+                                    actual_value = str(actual_value or '').upper()
+                                if actual_value != expected_value:
+                                    failures.append(
+                                        "enhanced stage acceptance report has "
+                                        f"unmatched provenance: {key}"
+                                    )
+
+                            report_counts = acceptance_report.get(
+                                'teacher_agreement_counts')
+                            expected_counts = {
+                                'correct_states': expected_task.get(
+                                    'teacher_correct_states'),
+                                'total_states': expected_task.get(
+                                    'teacher_total_states'),
+                            }
+                            if report_counts != expected_counts:
+                                failures.append(
+                                    "enhanced stage acceptance report has "
+                                    "unmatched teacher-agreement counts"
+                                )
+
+                            # Agreeing with the pending task is not enough: the
+                            # task's own counts were previously accepted
+                            # unchecked, so a 55/100 measurement -- a suite 50x
+                            # smaller than the approved one -- satisfied every
+                            # provenance comparison.  Require the declared suite
+                            # size exactly, and require the recorded agreement
+                            # to be the quotient of the recorded counts.
+                            expected_total_states = int(
+                                config.frozen_suite_size)
+                            correct_states = expected_counts['correct_states']
+                            total_states = expected_counts['total_states']
+                            if (
+                                not isinstance(correct_states, int)
+                                or not isinstance(total_states, int)
+                                or isinstance(correct_states, bool)
+                                or isinstance(total_states, bool)
+                            ):
+                                failures.append(
+                                    "enhanced stage acceptance provenance has no "
+                                    "held-out teacher-agreement counts"
+                                )
+                            elif total_states != expected_total_states:
+                                failures.append(
+                                    "enhanced stage acceptance provenance was "
+                                    f"measured on {total_states} held-out "
+                                    f"state(s), not the required "
+                                    f"{expected_total_states}"
+                                )
+                            elif not 0 <= correct_states <= total_states:
+                                failures.append(
+                                    "enhanced stage acceptance provenance has "
+                                    "impossible teacher-agreement counts"
+                                )
+                            elif (
+                                correct_states / total_states
+                                != float(gate_record['teacher_agreement'])
+                            ):
+                                failures.append(
+                                    "enhanced stage acceptance provenance "
+                                    "teacher agreement is not the quotient of "
+                                    "its recorded counts"
+                                )
+
+                            # Recompute the opening-suite identity instead of
+                            # trusting the field.  Comparing the two reports
+                            # against each other only proves they agree; a
+                            # hand-written pair sharing one invented id passed.
+                            try:
+                                from .model_vs_algo import (
+                                    opening_suite_identity,
+                                )
+                                expected_suite_id = opening_suite_identity(
+                                    expected_task['opening_seed'],
+                                    expected_task['opening_plies'],
+                                    _ACCEPTANCE_OPENING_SUITE_SIZE,
+                                )
+                            except (ImportError, TypeError, ValueError):
+                                expected_suite_id = None
+                                failures.append(
+                                    "enhanced stage acceptance opening suite "
+                                    "identity could not be recomputed"
+                                )
+                            if expected_suite_id is not None:
+                                observed_suite_ids = [
+                                    acceptance_report.get('opening_suite_id')
+                                ]
+                                for key in ('random', 'easy'):
+                                    record = acceptance_report.get(key)
+                                    observed_suite_ids.append(
+                                        record.get('opening_suite_id')
+                                        if isinstance(record, dict) else None
+                                    )
+                                if any(value != expected_suite_id
+                                       for value in observed_suite_ids):
+                                    failures.append(
+                                        "enhanced stage acceptance report was "
+                                        "not produced by the declared opening "
+                                        "suite"
+                                    )
+
+                            metrics = acceptance_report.get('metrics')
+                            try:
+                                raw_report_agreement = metrics[
+                                    'teacher_agreement']
+                                if type(raw_report_agreement) not in (int, float):
+                                    raise TypeError(
+                                        "teacher agreement must be numeric")
+                                report_agreement = float(raw_report_agreement)
+                            except (KeyError, TypeError, ValueError, OverflowError):
+                                report_agreement = float('nan')
+                            if (
+                                not math.isfinite(report_agreement)
+                                or report_agreement != float(
+                                    gate_record['teacher_agreement'])
+                            ):
+                                failures.append(
+                                    "enhanced stage acceptance report teacher "
+                                    "agreement provenance does not match promotion"
+                                )
+
+                            if acceptance_report.get('selection_sequence') != [
+                                'held_out_teacher_agreement',
+                                'random_game_strength',
+                                'easy_game_strength',
+                            ]:
+                                failures.append(
+                                    "enhanced stage acceptance report has an "
+                                    "invalid selection sequence"
+                                )
+
+                            random_record = acceptance_report.get('random')
+                            easy_record = acceptance_report.get('easy')
+                            protocol_metadata_valid = all((
+                                isinstance(random_record, dict),
+                                isinstance(easy_record, dict),
+                                random_record.get('model_path') == str(resume)
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('model_path') == str(resume)
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opponent_type') == 'random'
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opponent_type') == 'algorithm'
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('algo_difficulty') == 'easy'
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('algo_difficulty') == 'easy'
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opening_suite_id')
+                                and random_record.get('opening_suite_id')
+                                == easy_record.get('opening_suite_id')
+                                if (isinstance(random_record, dict)
+                                    and isinstance(easy_record, dict)) else False,
+                                random_record.get('opening_suite_size')
+                                == _ACCEPTANCE_OPENING_SUITE_SIZE
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opening_suite_size')
+                                == _ACCEPTANCE_OPENING_SUITE_SIZE
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opening_seed')
+                                == expected_task['opening_seed']
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opening_seed')
+                                == expected_task['opening_seed']
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('opening_plies')
+                                == expected_task['opening_plies']
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('opening_plies')
+                                == expected_task['opening_plies']
+                                if isinstance(easy_record, dict) else False,
+                                random_record.get('ml_inference_depth')
+                                == expected_task['inference_depth']
+                                if isinstance(random_record, dict) else False,
+                                easy_record.get('ml_inference_depth')
+                                == expected_task['inference_depth']
+                                if isinstance(easy_record, dict) else False,
+                            ))
+                            if not protocol_metadata_valid:
+                                failures.append(
+                                    "enhanced stage acceptance report game "
+                                    "protocol provenance is invalid"
+                                )
+
+                            # Recompute the acceptance decision from the raw
+                            # W/D/L records.  A forged ``passed: true`` or a
+                            # stale checks mapping must never unlock P5.
+                            try:
+                                recomputed = (
+                                    checkpoint_acceptance_tasks
+                                    .evaluate_acceptance_gates(
+                                        float(gate_record['teacher_agreement']),
+                                        random_record,
+                                        easy_record,
+                                    )
+                                )
+                                report_checks = acceptance_report.get('checks')
+                                if (
+                                    recomputed.passed is not True
+                                    or acceptance_report.get('passed') is not True
+                                    or report_checks != recomputed.checks
+                                    or acceptance_report.get('ci_method')
+                                    != recomputed.to_dict()['ci_method']
+                                    or acceptance_report.get('thresholds')
+                                    != recomputed.thresholds
+                                ):
+                                    raise ValueError(
+                                        "durable acceptance decision does not "
+                                        "match its raw game results"
+                                    )
+                            except (TypeError, ValueError, KeyError):
+                                failures.append(
+                                    "enhanced stage acceptance report does not "
+                                    "prove the required game-strength gates"
+                                )
+
+                accepted_alias = Path(policy_paths['accepted_path'])
+                if not accepted_alias.is_file():
+                    failures.append(
+                        f"accepted policy alias is missing: {accepted_alias}"
+                    )
+                elif resume_sha256:
+                    accepted_digest = hashlib.sha256()
+                    with accepted_alias.open('rb') as handle:
+                        for chunk in iter(
+                            lambda: handle.read(1024 * 1024), b''
+                        ):
+                            accepted_digest.update(chunk)
+                    if accepted_digest.hexdigest().upper() != resume_sha256:
+                        failures.append(
+                            "accepted policy alias does not identify the exact "
+                            "promoted checkpoint"
+                        )
+
+                for pending_path in acceptance_root.glob(
+                    'pending_acceptance_*.json'
+                ):
+                    try:
+                        with pending_path.open('r', encoding='utf-8') as handle:
+                            pending = json.load(handle)
+                        pending_checkpoint = pending.get('checkpoint_path')
+                        matches_checkpoint = (
+                            isinstance(pending_checkpoint, str)
+                            and resume is not None
+                            and Path(pending_checkpoint).resolve() == resume
+                        )
+                        if (
+                            int(pending.get('step', -1)) == gate_step
+                            or matches_checkpoint
+                        ):
+                            failures.append(
+                                "matching policy acceptance task is still pending: "
+                                f"{pending_path}"
+                            )
+                    except (OSError, ValueError, TypeError):
+                        failures.append(
+                            f"pending policy acceptance task is unreadable: "
+                            f"{pending_path}"
+                        )
+        if config.teacher_target_type != 'distribution':
+            failures.append("enhanced stage requires soft distribution targets")
+        if not config.value_head_enabled:
+            failures.append("enhanced stage requires the teacher-evaluation value head")
+        if config.pipeline_mode != 'alternate':
+            failures.append("enhanced stage currently requires alternate pipeline mode")
+        if config.teacher_score_depth < 1:
+            failures.append("enhanced teacher score depth must be positive")
+        if config.teacher_soft_temperature <= 0:
+            failures.append("enhanced teacher temperature must be positive")
+        if config.teacher_value_scale <= 0:
+            failures.append("enhanced teacher value scale must be positive")
+        if not 0.0 <= config.teacher_hard_label_blend < 1.0:
+            failures.append("enhanced hard-label blend must be within [0, 1)")
+        if config.inference_depth not in {2, 3}:
+            failures.append("enhanced inference depth must be 2 or 3")
+    else:
+        failures.append("training stage must be policy_only or enhanced")
+
+    if failures:
+        raise ValueError("Recovery readiness gate failed: " + "; ".join(failures))
+
+
+def activate_enhanced_stage(
+    config: TrainingConfig,
+    inference_depth: int = 2,
+) -> None:
+    """Apply the complete gated P5 runtime profile to a loaded config."""
+    if isinstance(inference_depth, bool) or inference_depth not in {2, 3}:
+        raise ValueError("Enhanced inference depth must be 2 or 3")
+    if config.policy_stage != 'policy_only':
+        raise ValueError("Enhanced stage can activate only from policy_only config")
+    _derive_enhanced_output_paths(config)
+    config.policy_stage = 'enhanced'
+    config.teacher_target_type = 'distribution'
+    config.value_head_enabled = True
+    config.pipeline_mode = 'alternate'
+    config.inference_depth = int(inference_depth)
+
+
+def _record_startup_failure(
+    config: 'TrainingConfig',
+    reason: str,
+    *,
+    detail: Optional[str] = None,
+    traceback_text: Optional[str] = None,
+) -> None:
+    """Record a terminal reason for a failure that predates Trainer.train()."""
+    try:
+        run_status.record_terminal_reason(
+            config.log_dir,
+            reason,
+            detail=detail,
+            traceback_text=traceback_text,
+            context={'phase': 'startup', 'resume': str(config.resume or '')},
+        )
+        print(f"Trainer terminal reason recorded: {reason}"
+              + (f" ({detail})" if detail else ""))
+        sys.stdout.flush()
+    except (OSError, ValueError) as exc:
+        print(f"Warning: could not record terminal reason: {exc}")
+
+
+def main():
+    """Main entry point for command-line training."""
+    proc_title = os.environ.get('PROCESS_TITLE')
+    if proc_title:
+        try:
+            import setproctitle
+            setproctitle.setproctitle(proc_title)
+            print(f"Process title set to '{proc_title}' (visible in htop/btop).")
+        except ImportError:
+            print(
+                f"[warn] PROCESS_TITLE='{proc_title}' set but 'setproctitle' is not installed; "
+                "process will show as 'python3' in htop. Install with: pip install setproctitle",
+                flush=True,
+            )
+
+    parser = argparse.ArgumentParser(description='Train Filipino Dama ML model')
+
+    # Config file support
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to YAML config file (e.g., config/training_config.yaml)')
+    parser.add_argument('--profile', type=str, default=None,
+                       help='Config profile to use (e.g., server, local, cpu)')
+
+    # Device settings
+    parser.add_argument('--device', default='cuda', choices=list(ml_device.DEVICE_CHOICES),
+                       help="Device to train on: cuda, mps (Apple GPU), cpu, or auto "
+                            "(CUDA, then MPS, then CPU)")
+    parser.add_argument('--no-amp', action='store_true',
+                       help='Disable mixed precision training')
+    parser.add_argument('--amp-dtype', type=str, default='float16',
+                       choices=['float16', 'bfloat16'],
+                       help='AMP dtype: float16 (default) or bfloat16 (recommended for the server GPU)')
+    parser.add_argument('--compile-model', action='store_true',
+                       help='Use torch.compile for faster training')
+    parser.add_argument('--compile-mode', type=str, default='reduce-overhead', 
+                       choices=['default', 'reduce-overhead', 'max-autotune'],
+                       help='Compilation mode: default (fast compile), reduce-overhead (fast run)')
+
+    # Self-play settings
+    parser.add_argument('--cpu-workers', type=int, default=10,
+                       help='Number of parallel self-play workers')
+    parser.add_argument('--selfplay-games', type=int, default=500,
+                       help='Number of self-play games per iteration')
+    parser.add_argument('--focus-side', type=str, default='both',
+                       choices=['white', 'black', 'both'],
+                       help='Which side to focus on during self-play vs algorithm')
+    parser.add_argument('--opponent-focus', type=str, default='both',
+                       choices=['ml', 'algorithm', 'both'],
+                       help='Opponent type to focus on during self-play')
+    parser.add_argument('--selfplay-difficulties', type=str, default='medium',
+                       help='Comma-separated difficulties to cycle: easy,medium,hard,self')
+    parser.add_argument('--noise-prob', type=float, default=0.1,
+                       help='Probability of random move for exploration (0.0 to 1.0)')
+    parser.add_argument('--max-moves', type=int, default=200,
+                       help='Maximum moves per game before declaring draw')
+    parser.add_argument('--pipeline-mode', type=str, default='simultaneous',
+                       choices=['simultaneous', 'alternate'],
+                       help='Pipeline mode: simultaneous (overlap CPU/GPU) or alternate (sequential)')
+
+    # Algo-vs-algo settings
+    parser.add_argument('--algo-vs-algo', action='store_true', default=False,
+                       help='Enable algo-vs-algo games as additional training data')
+    parser.add_argument('--algo-vs-algo-games', type=int, default=100,
+                       help='Number of algo-vs-algo games per self-play epoch')
+    parser.add_argument('--algo-vs-algo-difficulties', type=str, default='easy,medium,hard',
+                       help='Comma-separated difficulties for algo-vs-algo matchups')
+
+    # Training settings
+    parser.add_argument('--batch-size', type=int, default=256,
+                       help='Training batch size')
+    parser.add_argument('--learning-rate', type=float, default=3e-4,
+                       help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-5,
+                       help='Weight decay for regularization (0 to disable)')
+    parser.add_argument('--grad-clip-norm', type=float, default=1.0,
+                       help='Gradient clipping norm (0 to disable)')
+    parser.add_argument('--train-steps', type=int, default=10000,
+                       help='Total training steps')
+    parser.add_argument('--checkpoint-every', type=int, default=1000,
+                       help='Steps between checkpoints')
+    parser.add_argument('--reward-mode', type=str, default='cycle',
+                       choices=['scoring', 'none', 'cycle'],
+                       help='Reward scoring mode: scoring (always use), none (never use), cycle (alternate epochs)')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
+                       help='Gradient accumulation steps (effective batch = batch_size * N)')
+
+    # DataLoader settings
+    parser.add_argument('--dataloader-workers', type=int, default=4,
+                       help='Number of dataloader workers')
+    parser.add_argument('--pin-memory', action='store_true',
+                       help='Pin memory for faster GPU transfer')
+
+    # Model testing settings
+    parser.add_argument('--test-vs-algo', action='store_true',
+                       help='Enable periodic testing against algorithm')
+    parser.add_argument('--test-every', type=int, default=5000,
+                       help='Steps between model tests')
+    parser.add_argument('--test-games', type=int, default=50,
+                       help='Number of test games per evaluation')
+    parser.add_argument('--test-difficulty', type=str, default='medium',
+                       choices=['easy', 'medium', 'hard', 'super_hard'],
+                       help='Algorithm difficulty for testing')
+
+    # Resume settings
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from')
+    parser.add_argument('--resume-latest', action='store_true',
+                       help='Resume from the latest checkpoint in models/checkpoints/')
+    parser.add_argument('--resume-continuation', action='store_true',
+                       help='Recovery experiment only: resume the newest checkpoint '
+                            'in this run\'s own checkpoint_dir that carries the pinned '
+                            'lineage stamp, falling back to the anchor when none exists')
+    parser.add_argument('--train-duration', type=str, default=None,
+                       help='Train for this duration (e.g., 2d, 4h, 30m, 1d12h)')
+    parser.add_argument('--enhanced-stage', action='store_true',
+                       help='Activate the gated P5 soft-policy, value-head, and shallow-search stage')
+    parser.add_argument('--inference-depth', type=int, choices=[2, 3], default=None,
+                       help='Enhanced-stage inference depth (2 or 3; default: 2)')
+
+    args = parser.parse_args()
+
+    # If config file provided, load it and use as base
+    if args.config:
+        print(f"Loading config from: {args.config}")
+        yaml_config = load_config_from_yaml(args.config, args.profile)
+        config = config_from_yaml(yaml_config)
+        
+        # Override with any CLI arguments that were explicitly provided
+        # (detect via comparison with parser defaults)
+        defaults = parser.parse_args([])
+        explicit = {k for k, v in vars(args).items()
+                     if v != getattr(defaults, k, None)}
+
+        cli_map = {
+            'device': 'device',
+            'batch_size': 'batch_size',
+            'learning_rate': 'learning_rate',
+            'weight_decay': 'weight_decay',
+            'grad_clip_norm': 'grad_clip_norm',
+            'gradient_accumulation_steps': 'gradient_accumulation_steps',
+            'train_steps': 'train_steps',
+            'checkpoint_every': 'checkpoint_every',
+            'reward_mode': 'reward_mode',
+            'cpu_workers': 'cpu_workers',
+            'selfplay_games': 'selfplay_games',
+            'focus_side': 'selfplay_focus_side',
+            'opponent_focus': 'selfplay_opponent_focus',
+            'noise_prob': 'selfplay_noise_prob',
+            'max_moves': 'selfplay_max_moves',
+            'pipeline_mode': 'pipeline_mode',
+            'dataloader_workers': 'dataloader_workers',
+            'test_every': 'test_every',
+            'test_games': 'test_games',
+            'test_difficulty': 'test_difficulty',
+            'amp_dtype': 'amp_dtype',
+            'compile_mode': 'compile_mode',
+        }
+        for arg_name, config_attr in cli_map.items():
+            if arg_name in explicit:
+                setattr(config, config_attr, getattr(args, arg_name))
+        # Handle special cases
+        if 'no_amp' in explicit:
+            config.amp = not args.no_amp
+        if 'compile_model' in explicit:
+            config.compile_model = args.compile_model
+        if 'pin_memory' in explicit:
+            config.pin_memory = args.pin_memory
+        if 'test_vs_algo' in explicit:
+            config.test_vs_algo = args.test_vs_algo
+        if 'selfplay_difficulties' in explicit:
+            config.selfplay_difficulties = [d.strip() for d in args.selfplay_difficulties.split(',')]
+        if 'algo_vs_algo' in explicit:
+            config.algo_vs_algo_enabled = args.algo_vs_algo
+        if 'algo_vs_algo_games' in explicit:
+            config.algo_vs_algo_games = args.algo_vs_algo_games
+        if 'algo_vs_algo_difficulties' in explicit:
+            config.algo_vs_algo_difficulties = [d.strip() for d in args.algo_vs_algo_difficulties.split(',')]
+        if 'grad_clip_norm' in explicit:
+            config.grad_clip_norm = args.grad_clip_norm if args.grad_clip_norm > 0 else None
+
+        # Resume handling
+        if args.resume:
+            config.resume = args.resume
+        elif args.resume_latest:
+            import glob
+            import re
+            pattern = os.path.join(config.checkpoint_dir, 'model_step_*.pt')
+            checkpoints = glob.glob(pattern)
+            if checkpoints:
+                def get_step(path):
+                    match = re.search(r'model_step_(\d+)\.pt$', path)
+                    return int(match.group(1)) if match else 0
+                checkpoints.sort(key=get_step)
+                config.resume = checkpoints[-1]
+                print(f'Resuming from latest checkpoint: {config.resume}')
+
+        if args.train_duration:
+            config.stop_time = parse_duration(args.train_duration)
+
+        if explicit:
+            print(f"CLI overrides: {', '.join(sorted(explicit - {'config', 'profile', 'resume', 'resume_latest', 'resume_continuation', 'train_duration'}))}")
+
+        # Print loaded config summary
+        print(f"Config loaded: batch_size={config.batch_size}, lr={config.learning_rate}, "
+              f"workers={config.dataloader_workers}, amp={config.amp}")
+    else:
+        # Use command line arguments only
+        # Handle --resume-latest
+        resume_path = args.resume
+        if args.resume_latest:
+            import glob
+            import re
+            checkpoint_dir = 'models/checkpoints'
+            pattern = os.path.join(checkpoint_dir, 'model_step_*.pt')
+            checkpoints = glob.glob(pattern)
+            if checkpoints:
+                # Sort by step number to find the latest
+                def get_step(path):
+                    match = re.search(r'model_step_(\d+)\.pt$', path)
+                    return int(match.group(1)) if match else 0
+                checkpoints.sort(key=get_step)
+                resume_path = checkpoints[-1]
+                print(f'Resuming from latest checkpoint: {resume_path}')
+            else:
+                print('No checkpoints found in models/checkpoints/, starting fresh.')
+                resume_path = None
+
+        # Parse train duration
+        stop_time = parse_duration(args.train_duration) if args.train_duration else None
+        if stop_time:
+            print(f'Training duration: {args.train_duration}')
+            print(f'Training will stop at: {stop_time.strftime("%Y-%m-%d %H:%M:%S")}')
+
+        config = TrainingConfig(
+            # Device settings
+            compile_mode=args.compile_mode,
+            device=args.device,
+            amp=not args.no_amp,
+            amp_dtype=args.amp_dtype,
+            compile_model=args.compile_model,
+            # Self-play settings
+            cpu_workers=args.cpu_workers,
+            selfplay_games=args.selfplay_games,
+            selfplay_focus_side=args.focus_side,
+            selfplay_opponent_focus=args.opponent_focus,
+            selfplay_difficulties=[d.strip() for d in args.selfplay_difficulties.split(',')],
+            selfplay_noise_prob=args.noise_prob,
+            selfplay_max_moves=args.max_moves,
+            # Algo-vs-algo settings
+            algo_vs_algo_enabled=args.algo_vs_algo,
+            algo_vs_algo_games=args.algo_vs_algo_games,
+            algo_vs_algo_difficulties=[d.strip() for d in args.algo_vs_algo_difficulties.split(',')],
+            # Training settings
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            train_steps=args.train_steps,
+            checkpoint_every=args.checkpoint_every,
+            reward_mode=args.reward_mode,
+            # DataLoader settings
+            dataloader_workers=args.dataloader_workers,
+            pin_memory=args.pin_memory,
+            # Model testing settings
+            test_vs_algo=args.test_vs_algo,
+            test_every=args.test_every,
+            test_games=args.test_games,
+            test_difficulty=args.test_difficulty,
+            # Resume settings
+            resume=resume_path,
+            stop_time=stop_time,
+        )
+
+    if args.enhanced_stage:
+        activate_enhanced_stage(config, args.inference_depth or 2)
+    elif args.inference_depth is not None:
+        config.inference_depth = args.inference_depth
+
+    # Audit Suggestion 7.  Resolved after every other resume path has settled
+    # and before the gate runs, so the gate still validates whatever will
+    # actually be loaded.  --resume-latest stays forbidden under recovery: it
+    # would also match aliases and foreign namespaces, which is exactly the
+    # looseness the lineage stamp replaces.
+    if args.resume_continuation:
+        if args.resume_latest:
+            raise ValueError(
+                "--resume-continuation and --resume-latest are mutually exclusive")
+        if args.resume:
+            raise ValueError(
+                "--resume-continuation and an explicit --resume are mutually "
+                "exclusive")
+        continuation = resolve_recovery_continuation_resume(config)
+        if continuation is None:
+            print(
+                "No verified continuation checkpoint in "
+                f"{config.checkpoint_dir}; resuming the pinned anchor "
+                f"{config.resume}"
+            )
+        else:
+            print(f"Resuming verified continuation checkpoint: {continuation}")
+            config.resume = str(continuation)
+
+    validate_recovery_experiment_config(
+        config,
+        resume_latest_requested=bool(args.resume_latest),
+    )
+    # Refuse to start beside a live run of this namespace BEFORE construction:
+    # constructing the Trainer already loads the resume checkpoint, claims
+    # VRAM, and can run foreground corpus repair, and begin_run() would stomp
+    # the live run's marker. The process title is dynamic ("micro-trainer |
+    # step=N loss=L"), so casual pgrep -x checks false-negative; this check
+    # reads the marker's pid from procfs instead. Exits without writing any
+    # terminal record: the marker belongs to the live run, not to us.
+    try:
+        run_status.check_no_active_run(config.log_dir)
+    except run_status.ActiveRunError as exc:
+        print("=" * 72)
+        print(f"REFUSED: {exc}")
+        print("=" * 72)
+        sys.stdout.flush()
+        raise SystemExit(2)
+
+    # Trainer.train() opens the run marker, so until here nothing records an
+    # exit. A failure while constructing the Trainer -- loading the resume
+    # checkpoint, opening the corpus, reaching the GPU -- therefore left no
+    # run_status.json at all, which reads exactly like a launch that never
+    # happened. That is the "it just stopped with no reason" case the marker
+    # exists to eliminate, so cover startup with the same declared reasons.
+    try:
+        trainer = Trainer(config)
+    except KeyboardInterrupt:
+        _record_startup_failure(config, run_status.REASON_INTERRUPTED)
+        raise
+    except BaseException as exc:
+        _record_startup_failure(
+            config,
+            run_status.REASON_EXCEPTION,
+            detail=f"{type(exc).__name__}: {exc}",
+            traceback_text=traceback.format_exc(),
+        )
+        raise
+    trainer.train()
+
+
+if __name__ == '__main__':
+    main()

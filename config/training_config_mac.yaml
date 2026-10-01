@@ -1,0 +1,191 @@
+# =============================================================================
+# Mac Training Configuration (Apple M4 Max: 10P+4E cores, 36GB unified memory, MPS)
+# =============================================================================
+# Training on Apple Silicon, seeded from the Linux c174k checkpoint at step
+# 896000 (see resume: below). Derived from
+# training_config_local_retrain.yaml: the model architecture and the training
+# recipe (batch size, LR, teachers, rewards) are unchanged, so checkpoints stay
+# interchangeable with the other local configs. Only the device, the worker
+# count, memory sizing, and output paths are adapted to this Mac.
+#
+# Usage: bash local_train_mac.sh
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Device Settings
+# -----------------------------------------------------------------------------
+device:
+  type: "mps"                           # Apple GPU via Metal. "auto" also works (cuda > mps > cpu).
+  amp:
+    enabled: true
+    dtype: "bfloat16"                   # Verified on M4 / macOS 26 / torch 2.14: no GradScaler needed.
+                                        # MPS bf16 needs macOS 14+; the trainer falls back to float16 otherwise.
+  compile:
+    enabled: false                      # Inductor on MPS is experimental; the trainer only compiles on CUDA anyway.
+  matmul_precision: "medium"            # Kept from the CUDA configs; autocast runs the matmuls in bf16 regardless.
+
+# -----------------------------------------------------------------------------
+# Model Architecture (128/8/256/128 - must match any resumed checkpoint)
+# -----------------------------------------------------------------------------
+model:
+  channels: 128                         # Same as every local config, so checkpoints move between machines.
+  num_blocks: 8
+  embedding_size: 256
+  hidden_size: 128
+
+# -----------------------------------------------------------------------------
+# Self-Play Settings
+# -----------------------------------------------------------------------------
+# 100% algorithmic teachers while the model is weak, as in local_retrain.
+# -----------------------------------------------------------------------------
+selfplay:
+  cpu_workers: 12                        # 10 P-cores minus one for the trainer process (training loop,
+                                        # MPS command submission, replay loading). Workers beyond the
+                                        # P-cores land on E-cores, which run the same search markedly slower.
+  games_per_epoch: 500*4                # =2000 (eval'd by _eval_expr); same as local_retrain.
+  difficulties:
+    - "easy"
+    - "medium"
+    - "hard"
+  focus_side: "both"                    # Equal P1/P2 exposure (encoding flips for P2).
+  opponent_focus: "algorithm"           # ML self-play at low WR mostly teaches losing patterns.
+  noise_prob: 0.20
+  max_moves_per_game: 150               # Allow endgame play (avg game ~42 moves).
+  pipeline_mode: "simultaneous"         # CPU self-play overlaps GPU training.
+  max_stale_epochs: 100                 # Limits overfitting while the buffer is small.
+
+  # Disabled as in every local config: algo-vs-algo games carry a strong P1 bias.
+  algo_vs_algo:
+    enabled: false
+    games_per_epoch: 1000*2             # (Inactive - kept for re-enable reference)
+    difficulties:
+      - "hard"
+
+# -----------------------------------------------------------------------------
+# Training Hyperparameters
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 8192                      # Same as local_retrain so its tuned LR carries over. Holds ~13GB of
+                                        # Metal memory (driver-allocated), ~45% of the ~30GB working set,
+                                        # all of it taken from the same pool the CPU side uses.
+  learning_rate: 2.0e-4                 # Base LR tuned for batch 8192; change the two together.
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  train_steps: 100000000000             # Unlimited - time_limit controls stopping
+  checkpoint_every: 1000
+  gradient_accumulation_steps: 1
+
+  # Disabled as in every local config: cosine restarts caused a WR collapse.
+  lr_scheduler:
+    enabled: false
+    type: "cosine_warm_restarts"        # (Inactive - kept for reference)
+    T_0: 5000
+    T_mult: 2
+    eta_min: 5.0e-5
+    warmup_steps: 200
+
+  reward_mode: "scoring"
+
+# -----------------------------------------------------------------------------
+# Value Head / TD Learning Settings
+# -----------------------------------------------------------------------------
+value_head:
+  enabled: false                        # Off until the policy head is competitive, as in local_retrain.
+  hidden_size: 128
+  value_weight: 0.15
+
+# -----------------------------------------------------------------------------
+# DataLoader Settings
+# -----------------------------------------------------------------------------
+# The CPU and the GPU draw from the same 36GB here: macOS, 9 self-play
+# workers (~0.5GB each), the trainer, the RAM cache, and every MPS tensor.
+# -----------------------------------------------------------------------------
+dataloader:
+  num_workers: 0                        # FastBatchIterator bypasses DataLoader
+  pin_memory: false                     # Page-locked staging is a CUDA transfer path; MPS shares memory with the CPU.
+  replay_max_entries: 500000            # Same as local_retrain: ~1GB as the fp32 RAM cache, ~0.6GB on the GPU.
+  replay_max_files: 6                   # Every self-play cycle persists one file (~100k entries), and the trainer
+                                        # keeps each one parsed in RAM (~0.5GB) until it is pruned. The default
+                                        # of 60 grows the trainer past 36GB within about an hour here; the
+                                        # newest 6 (~600k entries) still cover replay_max_entries on a resume.
+  max_moves_per_sample: 32              # Max legal moves in Dama is ~20; saves 50% memory
+  clear_replay_after_load: true         # Prevent stale-data accumulation on disk.
+
+  ram_cache:
+    enabled: true
+    threshold_gb: 12.0                  # Free RAM required before caching. Below half of 36GB so the cache
+                                        # engages on a normal launch (~20GB free with workers running), but
+                                        # declines when other apps have already squeezed unified memory.
+    cache_file: "data/replay_cache/mac_cache.pt"
+
+# -----------------------------------------------------------------------------
+# Model Testing Settings (ML vs Algorithm)
+# -----------------------------------------------------------------------------
+testing:
+  enabled: true
+  every_n_steps: 750
+  num_games: 50
+  difficulty: "easy"                    # Start easy - 0% vs medium gives no signal
+
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
+# Namespaced so a Mac run never resumes from, or overwrites, a WSL/server run
+# when models/ is copied between machines. checkpoints_mac/ and latest_mac.pt
+# sit where the game's model list looks (models/*.pt, models/checkpoints*/).
+# -----------------------------------------------------------------------------
+paths:
+  checkpoint_dir: "models/checkpoints_mac"
+  latest_model: "models/latest_mac.pt"
+  promoted_model: "models/promoted_mac.pt"
+  accepted_model: "models/accepted_mac.pt"
+  replay_dir: "data/replay_mac"
+  log_dir: "logs/mac"
+  runtime_model_root: "logs/mac/runtime_models"
+  promotion_registry: "logs/mac/promotions.jsonl"
+  acceptance_dir: "logs/mac/acceptance"
+  stats_file: "models/training_stats_mac.json"
+
+# -----------------------------------------------------------------------------
+# Statistics Collection
+# -----------------------------------------------------------------------------
+statistics:
+  enabled: true
+  record_every: 200
+  system_every: 5000
+  model_health_every: 5000
+  score_dist_every: 500
+  buffer_size: 50000
+  flush_every: 500                      # Write stats frequently
+  output_dir: "logs/mac/stats"
+
+# -----------------------------------------------------------------------------
+# Thermal Protection
+# -----------------------------------------------------------------------------
+thermal_protection:
+  enabled: false                        # macOS exposes no temperature sensors to psutil and there is no
+                                        # nvidia-smi, so the check would never fire. Apple Silicon throttles
+                                        # itself instead.
+  temp_limit_c: 90
+  rest_duration: "30m"
+  check_every: 30
+
+# -----------------------------------------------------------------------------
+# Resume Settings
+# -----------------------------------------------------------------------------
+resume:
+  enabled: true
+  # Seed for the first Mac launch only: the promoted Linux policy-distillation
+  # checkpoint (step 896000, 58.8% held-out teacher agreement). The launcher's
+  # --resume-latest overrides this as soon as checkpoints_mac/ holds a
+  # checkpoint, so later launches continue the Mac run instead of re-seeding.
+  # Set back to null to start from random weights.
+  checkpoint_path: "models/checkpoints_policy_distillation_recovery_c174k/model_step_896000.pt"
+  skip_corrupted: true
+
+# -----------------------------------------------------------------------------
+# Time-based Stopping
+# -----------------------------------------------------------------------------
+time_limit:
+  enabled: true
+  duration: "10h"

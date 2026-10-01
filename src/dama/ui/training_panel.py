@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing as mp
+import sys
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 from queue import Empty
@@ -278,6 +279,10 @@ def _training_preset_paths() -> list[Path]:
     if not config_dir.exists():
         return []
     paths = list(config_dir.glob('training_config*.yaml'))
+    # The Mac preset trains on MPS, which only macOS has; anywhere else it
+    # could only stop with "MPS requested but not available".
+    if sys.platform != 'darwin':
+        paths = [path for path in paths if path.name != 'training_config_mac.yaml']
     return sorted(
         paths, key=lambda path: (_training_preset_rank(path.name), path.name))
 
@@ -285,6 +290,51 @@ def _training_preset_paths() -> list[Path]:
 def _training_preset_label(path: Path) -> str:
     name = path.stem.removeprefix('training_config').strip('_') or 'default'
     return name.replace('_', ' ').title()
+
+
+def _training_device_choices() -> tuple[list[str], str]:
+    """Device names for the manual-settings combo, and which to preselect.
+
+    Linux/WSL/Windows keep the historical ['cuda', 'cpu'] list with 'cuda'
+    preselected, and keep torch out of the GUI process (the trainer runs in a
+    spawned process partly for that). A Mac has no CUDA, so that list would
+    send every run into the trainer's "CUDA requested but not available"
+    exit; there the shared device helper reports what the machine really has:
+    MPS on Apple Silicon (preselected) and always the CPU. Concrete names
+    only, so the run never depends on how the trainer resolves 'auto'.
+    """
+    if sys.platform != 'darwin':
+        return ['cuda', 'cpu'], 'cuda'
+    try:
+        from ..ai.ml import device as _device
+        choices = [name for name in _device.DEVICE_CHOICES
+                   if name != 'auto' and _device.is_available(name)]
+        preferred = _device.default_device_type()
+    except Exception:
+        # torch missing or broken: the CPU is the only honest offer, and the
+        # trainer process reports the real import error once started.
+        return ['cpu'], 'cpu'
+    choices = choices or ['cpu']
+    return choices, preferred if preferred in choices else choices[0]
+
+
+def _chart_font(point_size: int) -> QFont:
+    """Font for the text the statistics charts paint themselves.
+
+    The charts' fixed pixel offsets were laid out around Arial at 96 dpi,
+    where Linux/WSL/Windows render 8-10pt as 11-13px; those platforms keep
+    the exact historical QFont. macOS maps 1pt to one logical pixel (72 dpi),
+    so the same point size paints a quarter smaller and the 8pt axis labels
+    turn unreadable. There, ask for the 96-dpi pixel size directly, with the
+    native sans-serif faces as fallback should Arial be absent.
+    """
+    if sys.platform != 'darwin':
+        return QFont("Arial", point_size)
+    font = QFont()
+    font.setFamilies(["Arial", "Helvetica Neue", "Helvetica"])
+    font.setStyleHint(QFont.StyleHint.SansSerif)
+    font.setPixelSize(round(point_size * 96 / 72))
+    return font
 
 
 # Use 'spawn' start method for CUDA compatibility
@@ -333,7 +383,7 @@ def _trainer_process(control_queue: mp.Queue, status_queue: mp.Queue, args: dict
                 config.resume = selected_resume
         else:
             config = TrainingConfig(
-                device=args.get('device', 'cuda'),
+                device=args.get('device', _training_device_choices()[1]),
                 amp=args.get('amp', True),
                 cpu_workers=args.get('cpu_workers', 10),
                 selfplay_games=args.get('selfplay_games', 500),
@@ -619,7 +669,7 @@ class WinRateChartWidget(QWidget):
         legend_x = pie_x + pie_size + 20
         legend_y = pie_y + 20
         
-        painter.setFont(QFont("Arial", 10))
+        painter.setFont(_chart_font(10))
         
         painter.setBrush(QBrush(ml_color))
         painter.drawRect(legend_x, legend_y, 15, 15)
@@ -649,7 +699,7 @@ class WinRateChartWidget(QWidget):
         max_bar_height = self.height() - 80
         
         painter.setPen(QColor(200, 200, 200))
-        painter.setFont(QFont("Arial", 9))
+        painter.setFont(_chart_font(9))
         painter.drawText(bar_x, 20, "Win Rate by Starting Position")
         
         # P1 bar
@@ -725,14 +775,14 @@ class WinRateHistoryChart(QWidget):
         painter.drawLine(margin, self.height() - margin, self.width() - margin, self.height() - margin)
         
         # Axis labels
-        painter.setFont(QFont("Arial", 8))
+        painter.setFont(_chart_font(8))
         painter.setPen(QColor(200, 200, 200))
         painter.drawText(5, margin + 4, "100%")
         painter.drawText(5, mid_y + 4, "50%")
         painter.drawText(5, self.height() - margin + 4, "0%")
         
         # Title
-        painter.setFont(QFont("Arial", 10))
+        painter.setFont(_chart_font(10))
         painter.drawText(margin + 10, margin - 5, "ML Win Rate vs Algorithm")
         
         # Draw win rate line
@@ -840,7 +890,7 @@ class LossChartWidget(QWidget):
         painter.drawLine(margin, self.height() - margin, self.width() - margin, self.height() - margin)
         
         # Draw axis labels
-        painter.setFont(QFont("Arial", 8))
+        painter.setFont(_chart_font(8))
         painter.setPen(QColor(200, 200, 200))
         for i in range(5):
             y = margin + i * chart_height // 4
@@ -888,7 +938,7 @@ class LossChartWidget(QWidget):
                 prev_x, prev_y = x, y
         
         # Legend
-        painter.setFont(QFont("Arial", 9))
+        painter.setFont(_chart_font(9))
         painter.setPen(QColor(0, 150, 255))
         painter.drawText(margin + 10, margin + 15, "Training Loss")
         if self.val_loss_data:
@@ -1523,7 +1573,9 @@ class TrainingPanel(QWidget):
         config_layout.addRow("Training Preset:", self.training_config_combo)
 
         self.device_combo = QComboBox()
-        self.device_combo.addItems(['cuda', 'cpu'])
+        device_choices, default_device = _training_device_choices()
+        self.device_combo.addItems(device_choices)
+        self.device_combo.setCurrentText(default_device)
         config_layout.addRow("Device:", self.device_combo)
 
         self.workers_spin = QSpinBox()

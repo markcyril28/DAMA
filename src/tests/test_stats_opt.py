@@ -137,9 +137,9 @@ def test_compute_gradient_stats_batched():
         assert isinstance(v, float)
 
 
-def test_record_model_health_batched():
+def test_record_model_health_batched(tmp_path):
     model = _make_model_with_grads()
-    collector = StatsCollector()
+    collector = StatsCollector(output_dir=str(tmp_path))
 
     summary = collector.record_model_health(model, step=100)
     assert summary['layer_count'] > 0

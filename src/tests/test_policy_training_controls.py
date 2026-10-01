@@ -9,6 +9,7 @@ import pytest
 
 import dama.ai.ml.trainer as trainer_module
 from dama.ai.ml import checkpoint_acceptance
+from dama.ai.ml import device as ml_device
 from dama.ai.ml.corpus import SnapshotDecision, canonical_state_key
 from dama.ai.ml.model_vs_algo import opening_suite_identity
 from dama.ai.ml.trainer import (
@@ -277,7 +278,7 @@ def test_checkpoint_load_restores_loss_baselines_monotonically(
             return [], []
 
     class _Optimizer:
-        param_groups = [{"lr": 1e-3}]
+        param_groups = [{"lr": 1e-3, "params": []}]
 
         def load_state_dict(self, _state):
             return None
@@ -375,6 +376,95 @@ def test_checkpoint_load_resets_optimizer_param_groups_to_config(
         assert group["lr"] == pytest.approx(holder.config.learning_rate)
         assert group["weight_decay"] == pytest.approx(
             holder.config.weight_decay)
+
+
+def _cross_backend_checkpoint_holder(
+    tmp_path: Path,
+    source_format,
+    target_format,
+    device: str = "cpu",
+    fused: bool = False,
+):
+    import torch
+
+    # A conv weight trained under one memory format (CUDA: channels_last;
+    # MPS/CPU: contiguous) and resumed under the other.
+    source_parameter = torch.nn.Parameter(
+        torch.randn(4, 3, 3, 3).contiguous(memory_format=source_format))
+    source_parameter.grad = torch.randn_like(source_parameter)
+    source_optimizer = torch.optim.AdamW([source_parameter], lr=1e-3)
+    source_optimizer.step()
+    optimizer_state = source_optimizer.state_dict()
+    # load_state_dict() adopts the saved groups' flags, so the checkpoint
+    # must record the fused run that wrote it for the target to stay fused.
+    optimizer_state["param_groups"][0]["fused"] = fused
+    checkpoint = tmp_path / "model_step_12.pt"
+    torch.save({
+        "model_state_dict": {},
+        "optimizer_state_dict": optimizer_state,
+        "step": 12,
+    }, checkpoint)
+
+    class _Model:
+        def load_state_dict(self, *_args, **_kwargs):
+            return [], []
+
+    target_parameter = torch.nn.Parameter(
+        torch.randn(4, 3, 3, 3, device=device).contiguous(
+            memory_format=target_format))
+    holder = object.__new__(Trainer)
+    holder.device = torch.device(device)
+    holder.config = TrainingConfig(learning_rate=2e-4, weight_decay=1e-4)
+    holder.model = _Model()
+    holder.optimizer = torch.optim.AdamW([target_parameter], fused=fused)
+    holder.scheduler = None
+    holder.scaler = None
+    holder.stats = TrainingStats()
+    holder.step = 0
+    holder.epoch = 0
+    holder.best_loss = float("inf")
+    holder._has_non_finite_tensors = lambda: False
+    return holder, source_optimizer, target_parameter, checkpoint
+
+
+@pytest.mark.parametrize("direction", ["cuda_to_mac", "mac_to_cuda"])
+def test_checkpoint_load_lays_optimizer_moments_out_like_parameters(
+    tmp_path: Path,
+    direction: str,
+) -> None:
+    import torch
+
+    formats = (torch.channels_last, torch.contiguous_format)
+    if direction == "mac_to_cuda":
+        formats = formats[::-1]
+    holder, source_optimizer, target_parameter, checkpoint = (
+        _cross_backend_checkpoint_holder(tmp_path, *formats))
+
+    Trainer._load_checkpoint(holder, str(checkpoint))
+
+    source_state = next(iter(source_optimizer.state.values()))
+    loaded_state = holder.optimizer.state[target_parameter]
+    for key in ("exp_avg", "exp_avg_sq"):
+        assert loaded_state[key].stride() == target_parameter.stride()
+        assert torch.equal(loaded_state[key], source_state[key])
+
+
+@pytest.mark.skipif(
+    not ml_device.mps_available(), reason="needs an Apple GPU (MPS)")
+def test_cuda_checkpoint_resumes_fused_adamw_on_mps(tmp_path: Path) -> None:
+    import torch
+
+    holder, _source_optimizer, target_parameter, checkpoint = (
+        _cross_backend_checkpoint_holder(
+            tmp_path, torch.channels_last, torch.contiguous_format,
+            device="mps", fused=True))
+
+    Trainer._load_checkpoint(holder, str(checkpoint))
+    target_parameter.grad = torch.randn_like(target_parameter)
+    holder.optimizer.step()
+    torch.mps.synchronize()
+
+    assert torch.isfinite(target_parameter.detach().cpu()).all()
 
 
 def test_promotion_metadata_records_live_optimizer_context(
@@ -1185,7 +1275,7 @@ def test_checkpoint_load_rewinds_newer_sidecar_histories(
             return [], []
 
     class _Optimizer:
-        param_groups = [{"lr": 1e-3}]
+        param_groups = [{"lr": 1e-3, "params": []}]
 
         def load_state_dict(self, _state):
             return None
@@ -4209,7 +4299,7 @@ def test_a_bad_rng_state_warns_instead_of_losing_the_resume(
             return [], []
 
     class _Optimizer:
-        param_groups = [{"lr": 1e-3}]
+        param_groups = [{"lr": 1e-3, "params": []}]
 
         def load_state_dict(self, _state):
             return None

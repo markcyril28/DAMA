@@ -1,0 +1,2267 @@
+"""
+Comprehensive training statistics collector for optimization analysis.
+
+Collects granular metrics across all phases of the training pipeline:
+- Training loop: loss, gradients, throughput, convergence
+- Self-play: game generation throughput, result distribution, move diversity
+- Model health: parameter norms, gradient flow, score distributions
+- System: GPU memory, utilization, throughput efficiency
+- Evaluation: win rates over time, ELO estimation, confidence metrics
+
+All metrics are stored in-memory with periodic flush to disk, and exported
+as JSON + CSV for easy analysis. Designed to be non-intrusive to the
+training loop with minimal overhead.
+
+Usage:
+    collector = StatsCollector(config)
+    collector.record_training_step(step, loss, lr, grad_norm=..., ...)
+    collector.record_selfplay_epoch(...)
+    collector.record_model_health(model, step)
+    report = collector.generate_session_report()
+    collector.export_all(output_dir)
+"""
+
+import os
+import csv
+import errno
+import io
+import json
+import math
+import time
+import platform
+import statistics
+import threading
+from collections import deque, defaultdict
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple, Deque, Iterator, TextIO
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+import torch
+
+from .fork_writers import fork_safe_mkstemp, fork_safe_open
+from .run_status import _fsync_directory
+from . import device as _device
+
+
+# Per-cycle self-play phase and resource fields recorded by the trainer
+# (Journal Pass 570). Receipt times are seconds from pool start; child fields
+# cover the pool's workers reaped at shutdown plus any other trainer child
+# reaped in that window; host percentages cover every CPU over the pool
+# window. Absent fields were unavailable on the host.
+SELFPLAY_PHASE_FIELDS = (
+    'setup_sec', 'model_capture_sec', 'pool_submit_sec', 'first_result_sec',
+    'ml_last_result_sec', 'algo_last_result_sec', 'consume_sec',
+    'shutdown_sec', 'close_sec', 'child_cpu_sec', 'child_minflt',
+    'child_majflt', 'parent_cpu_sec', 'host_cpu_busy_pct',
+    'host_cpu_iowait_pct', 'host_cpu_steal_pct', 'parent_rss_gb',
+    # Parent-side faults, blocking and preemption, full collections, and
+    # thread/descriptor counts (Journal Pass 572).
+    'parent_minflt', 'parent_majflt', 'parent_nvcsw', 'parent_nivcsw',
+    'parent_gc_gen2_collections', 'parent_threads', 'parent_fds',
+    # Seconds inside the trainer's own collections, all and full ones, over
+    # the same window (Journal Pass 575).
+    'parent_gc_pause_sec', 'parent_gc_full_pause_sec',
+    # Seconds this cycle waited, after its pool was gone, for the previous
+    # cycle's overlapped corpus check to finish (Journal Pass 578).
+    'overlap_wait_sec',
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _prepare_stats_output_directory(path: str | Path) -> Path:
+    """Create and commit the telemetry namespace before its first flush."""
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    # A later atomic report write commits its public name inside this
+    # directory, but directory fsync is not recursive. Commit the namespace
+    # itself in its parent first, and retry this boundary on every collector
+    # construction after a prior sync failure. See Journal Pass 429.
+    _fsync_directory(directory.parent)
+    return directory
+
+
+@contextmanager
+def _atomic_text_writer(
+    path: Path,
+    *,
+    newline: Optional[str] = None,
+) -> Iterator[TextIO]:
+    """Publish one text artifact only after its file and name are durable."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with fork_safe_mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent,
+        ) as (fd, temp_name):
+            # The raw owner protects the complete lifetime against forks.
+            # Partial wrapper construction must not release its fd early.
+            handle = os.fdopen(
+                fd, "w", encoding="utf-8", newline=newline, closefd=False,
+            )
+            try:
+                yield handle
+                handle.flush()
+                os.fsync(handle.fileno())
+            except BaseException:
+                # Closing buffered output can fail too. Preserve the write or
+                # interruption error while still releasing the stream.
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+                raise
+            else:
+                handle.close()
+        os.replace(temp_name, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temp_name is not None:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                # Cleanup must not hide the originating publication failure.
+                pass
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    """Write every byte of ``payload``, continuing after short writes."""
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "append wrote no bytes")
+        view = view[written:]
+
+
+def _append_jsonl_atomic(path: Path, row: Dict[str, Any]) -> None:
+    """Append one complete JSONL row in time proportional to that row.
+
+    Republishing the whole stream on every flush made each flush O(stream):
+    on the 2026-09-18 c174k session the file reached 222 MB and a flush cost
+    0.27 s at 6 MB but 4.69 s at 208 MB (Journal Pass 571). The row is now
+    serialized in memory, the stream must already end in a newline, and only
+    the row is written and fsynced. A failed append truncates back to the
+    previous length, so this process never keeps or extends a partial row.
+    A host crash mid-append can still leave one torn final row, which the
+    analyzer ignores (Journal Pass 270).
+    """
+    buffer = io.StringIO()
+    json.dump(row, buffer)
+    buffer.write("\n")
+    payload = buffer.getvalue().encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    with fork_safe_open(path, flags) as descriptor:
+        size = os.fstat(descriptor).st_size
+        if size:
+            os.lseek(descriptor, size - 1, os.SEEK_SET)
+            if os.read(descriptor, 1) != b"\n":
+                raise RuntimeError(
+                    f"Incremental statistics stream has an incomplete final row: {path}"
+                )
+        else:
+            # Commit the name before its first row. A failed commit leaves an
+            # empty stream, and the next flush retries it.
+            _fsync_directory(path.parent)
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        except BaseException:
+            try:
+                os.ftruncate(descriptor, size)
+            except BaseException:
+                # Keep the write or interruption error. A partial row that
+                # survives is refused by the next append's newline check.
+                pass
+            raise
+
+
+def _safe_mean(values: list) -> float:
+    """Mean that handles empty lists and non-finite values."""
+    finite = [v for v in values if math.isfinite(v)]
+    return statistics.mean(finite) if finite else 0.0
+
+
+def _safe_stdev(values: list) -> float:
+    """Stdev that handles short lists."""
+    finite = [v for v in values if math.isfinite(v)]
+    return statistics.stdev(finite) if len(finite) >= 2 else 0.0
+
+
+def _safe_median(values: list) -> float:
+    finite = [v for v in values if math.isfinite(v)]
+    return statistics.median(finite) if finite else 0.0
+
+
+def _percentile(sorted_values: list, pct: float) -> float:
+    """Simple percentile on a pre-sorted list."""
+    if not sorted_values:
+        return 0.0
+    k = (len(sorted_values) - 1) * pct / 100.0
+    f = int(k)
+    c = f + 1
+    if c >= len(sorted_values):
+        return sorted_values[-1]
+    return sorted_values[f] + (k - f) * (sorted_values[c] - sorted_values[f])
+
+
+def _elo_from_win_rate(win_rate: float, draw_rate: float = 0.0) -> float:
+    """Estimate ELO difference from win rate (vs 50% baseline).
+    
+    Uses the standard logistic model: ELO_diff = -400 * log10(1/score - 1)
+    where score = win_rate + 0.5 * draw_rate.
+    """
+    score = win_rate + 0.5 * draw_rate
+    if score <= 0.0:
+        return -800.0
+    if score >= 1.0:
+        return 800.0
+    return -400.0 * math.log10(1.0 / score - 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Ring buffer for high-frequency time series
+# ---------------------------------------------------------------------------
+
+class MetricBuffer:
+    """Fixed-size ring buffer for time-series metrics with summary statistics."""
+
+    def __init__(self, maxlen: int = 50000):
+        self._data: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
+        self._total_count: int = 0
+        self._finite_count: int = 0
+        self._running_sum: float = 0.0
+        self._running_min: float = float('inf')
+        self._running_max: float = float('-inf')
+
+    def append(self, value: float, step: int, **extra):
+        entry = {'step': step, 'value': value, **extra}
+        self._data.append(entry)
+        self._total_count += 1
+        if math.isfinite(value):
+            self._finite_count += 1
+            self._running_sum += value
+            self._running_min = min(self._running_min, value)
+            self._running_max = max(self._running_max, value)
+
+    @property
+    def count(self) -> int:
+        return self._total_count
+
+    @property
+    def running_mean(self) -> float:
+        return self._running_sum / self._finite_count if self._finite_count > 0 else 0.0
+
+    @property
+    def running_min(self) -> float:
+        return self._running_min if self._running_min != float('inf') else 0.0
+
+    @property
+    def running_max(self) -> float:
+        return self._running_max if self._running_max != float('-inf') else 0.0
+
+    def last_n(self, n: int = 100) -> List[Dict[str, Any]]:
+        return list(self._data)[-n:]
+
+    def last_n_values(self, n: int = 100) -> List[float]:
+        return [e['value'] for e in list(self._data)[-n:]]
+
+    def all_entries(self) -> List[Dict[str, Any]]:
+        return list(self._data)
+
+    def summary(self, window: int = 100) -> Dict[str, Any]:
+        """Compute summary stats over the last `window` entries."""
+        recent = self.last_n_values(window)
+        recent_finite_count = sum(math.isfinite(value) for value in recent)
+        return {
+            'total_count': self._total_count,
+            # A safe mean of zero is unavailable when no sample is finite.
+            'finite_count': self._finite_count,
+            'nonfinite_count': self._total_count - self._finite_count,
+            'recent_finite_count': recent_finite_count,
+            'recent_nonfinite_count': len(recent) - recent_finite_count,
+            'buffered_count': len(self._data),
+            'running_mean': self.running_mean,
+            'running_min': self.running_min,
+            'running_max': self.running_max,
+            'recent_mean': _safe_mean(recent),
+            'recent_stdev': _safe_stdev(recent),
+            # Extrema keep nonfinite values, and NaN makes min/max order-dependent
+            # (kept only when oldest). Use the recent counts as nonfinite evidence.
+            'recent_min': min(recent) if recent else 0.0,
+            'recent_max': max(recent) if recent else 0.0,
+            'recent_finite_max': max(
+                (value for value in recent if math.isfinite(value)), default=None),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Main collector
+# ---------------------------------------------------------------------------
+
+class StatsCollector:
+    """Centralized statistics collector for ML training optimization.
+    
+    Captures granular metrics across all pipeline phases and generates
+    comprehensive reports for configuration optimization.
+    """
+
+    def __init__(
+        self,
+        output_dir: str = "logs/stats",
+        session_id: Optional[str] = None,
+        buffer_size: int = 50000,
+        flush_every: int = 5000,
+    ):
+        self.output_dir = _prepare_stats_output_directory(output_dir)
+
+        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_start = datetime.now()
+        self.flush_every = flush_every
+
+        # Guards all mutable state below: in simultaneous pipeline mode the
+        # background self-play thread and the training thread share this
+        # collector. RLock because record_* methods flush internally.
+        self._lock = threading.RLock()
+
+        # --- Training step metrics (high-frequency) ---
+        self.loss = MetricBuffer(buffer_size)
+        self.learning_rate = MetricBuffer(buffer_size)
+        self.grad_norm_global = MetricBuffer(buffer_size)
+        self.grad_norm_per_layer: Dict[str, MetricBuffer] = {}
+        self.step_time_sec = MetricBuffer(buffer_size)
+        self.throughput_samples_sec = MetricBuffer(buffer_size)
+        self.batch_size_actual = MetricBuffer(buffer_size)
+
+        # Score distribution
+        self.score_mean = MetricBuffer(buffer_size)
+        self.score_std = MetricBuffer(buffer_size)
+        self.score_entropy = MetricBuffer(buffer_size)
+        self.top1_margin = MetricBuffer(buffer_size)  # score[0] - score[1]
+
+        # Loss decomposition (if result info is available)
+        self.loss_on_wins = MetricBuffer(buffer_size)
+        self.loss_on_losses = MetricBuffer(buffer_size)
+        self.loss_on_draws = MetricBuffer(buffer_size)
+
+        # --- GPU / system metrics ---
+        self.gpu_mem_allocated_mb = MetricBuffer(buffer_size)
+        self.gpu_mem_reserved_mb = MetricBuffer(buffer_size)
+        self.gpu_utilization_pct = MetricBuffer(buffer_size)
+        self.cpu_percent = MetricBuffer(buffer_size)
+        self.ram_used_gb = MetricBuffer(buffer_size)
+        # Audit Suggestion 11.  System-wide used RAM cannot answer "how much
+        # was this trainer holding?", which is the number that decides the
+        # preprocessing fan-out and the RAM-cache threshold.  Recording the
+        # trainer's own RSS makes the peak recoverable from the CSV after the
+        # fact, so the measurement never has to be taken during a live run.
+        self.process_rss_gb = MetricBuffer(buffer_size)
+
+        # --- GPU throttle diagnostics (NVML only) ---
+        # util % alone CANNOT distinguish a power/thermal-capped GPU from a
+        # saturated one: a capped card sits at 100% util while its clocks are
+        # held down.  Project rule: "diagnose thermal throttling by power draw,
+        # not utilization %."  These are the metrics that actually do it.
+        # Absent on ROCm / no-NVML hosts (server) — buffers simply stay empty.
+        # gpu_throttle_reasons is the raw NVML bitmask (decode in _get_gpu_telemetry).
+        self.gpu_power_w = MetricBuffer(buffer_size)
+        self.gpu_sm_clock_mhz = MetricBuffer(buffer_size)
+        self.gpu_temp_c = MetricBuffer(buffer_size)
+        self.gpu_throttle_reasons = MetricBuffer(buffer_size)
+        self._gpu_telemetry_buffers = {
+            'gpu_power_w': self.gpu_power_w,
+            'gpu_sm_clock_mhz': self.gpu_sm_clock_mhz,
+            'gpu_temp_c': self.gpu_temp_c,
+            'gpu_throttle_reasons': self.gpu_throttle_reasons,
+        }
+
+        # --- Model health (lower frequency) ---
+        self.param_norms: Dict[str, MetricBuffer] = {}  # per-layer L2 norms
+        self.param_means: Dict[str, MetricBuffer] = {}
+        self.param_stds: Dict[str, MetricBuffer] = {}
+        self.weight_update_ratios: Dict[str, MetricBuffer] = {}  # |Δw| / |w|
+        self._prev_param_snapshot: Dict[str, torch.Tensor] = {}
+
+        # BatchNorm running stats
+        self.bn_running_mean_norms: Dict[str, MetricBuffer] = {}
+        self.bn_running_var_means: Dict[str, MetricBuffer] = {}
+
+        # --- Self-play metrics ---
+        self.selfplay_records: List[Dict[str, Any]] = []
+
+        # --- Evaluation metrics ---
+        self.eval_records: List[Dict[str, Any]] = []
+
+        # --- Epoch metrics ---
+        self.epoch_records: List[Dict[str, Any]] = []
+
+        # --- Replay buffer metrics ---
+        self.replay_records: List[Dict[str, Any]] = []
+
+        # --- Convergence tracking ---
+        self._loss_ema = None
+        self._loss_ema_alpha = 0.01  # Slow EMA for convergence detection
+        self._loss_plateau_steps = 0
+        self._loss_plateau_observations = 0
+        self._loss_previous_step: Optional[int] = None
+        self._loss_plateau_threshold = 1e-4
+        self._step_since_last_flush = 0
+        # Wall-clock fallback: force flush every N seconds even if record-count
+        # threshold isn't reached. Prevents partial-run data loss when training
+        # advances slowly (simultaneous mode) or the run exits before flush_every.
+        self._last_flush_time = time.time()
+        self._flush_max_seconds = 60.0
+        self._incremental_flush_failures = 0
+
+        # Global checkpoint steps are sparse observations, not a count of
+        # optimizer steps.  Track the resumed session's step range explicitly
+        # so reports do not mistake one metric row every N steps for one step.
+        self._training_start_step: Optional[int] = None
+        self._training_latest_step: Optional[int] = None
+
+        # --- Configuration snapshot (set by caller) ---
+        self.config_snapshot: Dict[str, Any] = {}
+
+        # --- Non-finite event counter ---
+        self.nan_inf_events: List[Dict[str, Any]] = []
+
+        # --- Checkpoint metadata ---
+        self.checkpoint_records: List[Dict[str, Any]] = []
+
+        # --- GPU-idle self-play-starvation diagnostic ---
+        # When self-play cannot refresh the replay buffer within
+        # max_stale_epochs, the trainer BLOCKS the GPU until fresh data arrives
+        # (trainer.py stale-data wait branch). These accumulate how often and
+        # how long the GPU sat idle waiting. Aggregated into the session report
+        # as the single at-a-glance starvation signal: ~0 ⇒ self-play keeps
+        # pace (leave cpu_workers); large ⇒ GPU starved (raise cpu_workers).
+        self.gpu_idle_wait_count: int = 0
+        self.gpu_idle_wait_seconds: float = 0.0
+        self.gpu_idle_wait_max_seconds: float = 0.0
+
+    # ===================================================================
+    # Configuration
+    # ===================================================================
+
+    def set_config_snapshot(self, config: Dict[str, Any]) -> None:
+        """Store a snapshot of the training config for the session report."""
+        with self._lock:
+            self.config_snapshot = config
+
+    def set_training_start_step(self, step: int) -> None:
+        """Set the resumed global step used as this session's zero point."""
+
+        with self._lock:
+            value = int(step)
+            self._training_start_step = value
+            self._training_latest_step = value
+
+    def set_training_end_step(self, step: int) -> None:
+        """Update the latest completed global step before a final report."""
+
+        with self._lock:
+            self._training_latest_step = int(step)
+
+    def _completed_training_steps(self) -> int:
+        if (
+            self._training_start_step is not None
+            and self._training_latest_step is not None
+        ):
+            return max(
+                0, self._training_latest_step - self._training_start_step)
+        # Compatibility for standalone callers that do not declare a resumed
+        # step range.  Their historic behavior counted recorded metric rows.
+        return self.loss.count
+
+    # ===================================================================
+    # Training step recording
+    # ===================================================================
+
+    def record_training_step(
+        self,
+        step: int,
+        loss: float,
+        lr: float,
+        batch_size: int = 0,
+        step_time: Optional[float] = None,
+        grad_norm: Optional[float] = None,
+        grad_norms_per_layer: Optional[Dict[str, float]] = None,
+        score_stats: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """Record metrics for a single training step.
+        
+        Args:
+            step: Global step number.
+            loss: Training loss for this step.
+            lr: Current learning rate.
+            batch_size: Total samples processed during this optimizer step,
+                including every gradient-accumulation microbatch.
+            step_time: Wall-clock time for this step in seconds.
+            grad_norm: Global gradient norm before clipping (clip_grad_norm_ return).
+            grad_norms_per_layer: Per-layer gradient norms.
+            score_stats: Dict with keys 'mean', 'std', 'entropy', 'top1_margin'.
+        """
+        with self._lock:
+            ts = datetime.now().isoformat()
+
+            self.loss.append(loss, step, timestamp=ts)
+            self._training_latest_step = int(step)
+            self.learning_rate.append(lr, step)
+
+            if batch_size > 0:
+                self.batch_size_actual.append(batch_size, step)
+
+            if step_time is not None and (step_time > 0 or not math.isfinite(step_time)):
+                self.step_time_sec.append(step_time, step)
+                if batch_size > 0:
+                    # Preserve invalid timing evidence; division by infinity
+                    # would otherwise invent a measured zero sample rate.
+                    rate = batch_size / step_time if math.isfinite(step_time) else float('nan')
+                    self.throughput_samples_sec.append(rate, step)
+
+            if grad_norm is not None:
+                self.grad_norm_global.append(grad_norm, step)
+
+            if grad_norms_per_layer:
+                for name, norm in grad_norms_per_layer.items():
+                    if name not in self.grad_norm_per_layer:
+                        self.grad_norm_per_layer[name] = MetricBuffer(10000)
+                    self.grad_norm_per_layer[name].append(norm, step)
+
+            if score_stats:
+                if 'mean' in score_stats:
+                    self.score_mean.append(score_stats['mean'], step)
+                if 'std' in score_stats:
+                    self.score_std.append(score_stats['std'], step)
+                if 'entropy' in score_stats:
+                    self.score_entropy.append(score_stats['entropy'], step)
+                if 'top1_margin' in score_stats:
+                    self.top1_margin.append(score_stats['top1_margin'], step)
+
+            # The EMA consumes sampled losses, but durations use their actual
+            # optimizer steps. Missing or non-monotonic evidence starts a new
+            # chain instead of extending a plateau across an unknown interval.
+            if math.isfinite(loss):
+                previous_step = self._loss_previous_step
+                if previous_step is None or step <= previous_step:
+                    self._loss_ema = loss
+                    self._loss_plateau_steps = 0
+                    self._loss_plateau_observations = 1
+                else:
+                    prev_ema = self._loss_ema
+                    self._loss_ema = self._loss_ema_alpha * loss + (1 - self._loss_ema_alpha) * self._loss_ema
+                    if abs(self._loss_ema - prev_ema) < self._loss_plateau_threshold:
+                        self._loss_plateau_steps += step - previous_step
+                        self._loss_plateau_observations += 1
+                    else:
+                        self._loss_plateau_steps = 0
+                        self._loss_plateau_observations = 1
+                self._loss_previous_step = step
+            else:
+                self._loss_ema = None
+                self._loss_previous_step = None
+                self._loss_plateau_steps = 0
+                self._loss_plateau_observations = 0
+
+            # Auto-flush: fire on either record-count threshold OR wall-clock interval.
+            self._step_since_last_flush += 1
+            self._maybe_flush()
+
+    def _maybe_flush(self) -> None:
+        """Flush incrementally if either the record-count or wall-clock
+        threshold has been reached. Safe to call from any record_* method."""
+        with self._lock:
+            _now = time.time()
+            if (self._step_since_last_flush >= self.flush_every
+                    or (_now - self._last_flush_time) >= self._flush_max_seconds):
+                self.flush_incremental()
+                self._step_since_last_flush = 0
+                self._last_flush_time = _now
+
+    def record_non_finite_event(self, step: int, location: str, details: str = "") -> None:
+        """Record a NaN/Inf event for stability analysis."""
+        with self._lock:
+            self.nan_inf_events.append({
+                'step': step,
+                'location': location,
+                'details': details,
+                'timestamp': datetime.now().isoformat(),
+            })
+
+    # ===================================================================
+    # GPU / System metrics
+    # ===================================================================
+
+    def _uses_mps(self, device=None) -> bool:
+        """True when the run being measured trains on Apple's Metal GPU.
+
+        ``device`` is the trainer's device when the caller passes it; otherwise
+        the configured one from the config snapshot ('auto', or nothing
+        configured, resolves to the machine's default backend as the trainer
+        does). Deliberately not inferred by probing ``torch.mps`` allocations:
+        that would initialise Metal inside a run configured for the CPU.
+        """
+        if not _device.mps_available():
+            return False
+        requested = device if device is not None else self.config_snapshot.get('device')
+        try:
+            return _device.resolve_device_type(requested) == 'mps'
+        except Exception:
+            return False
+
+    def record_system_metrics(self, step: int, device=None) -> Dict[str, float]:
+        """Capture current GPU, CPU, and RAM metrics.
+        
+        Returns a dict of the captured values for convenience.
+        """
+        with self._lock:
+            metrics: Dict[str, float] = {}
+
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / 1e6
+                reserved = torch.cuda.memory_reserved() / 1e6
+                self.gpu_mem_allocated_mb.append(alloc, step)
+                self.gpu_mem_reserved_mb.append(reserved, step)
+                metrics['gpu_mem_allocated_mb'] = alloc
+                metrics['gpu_mem_reserved_mb'] = reserved
+
+                # Try to get GPU utilization via rocm-smi / nvidia-smi parsing
+                util = self._get_gpu_utilization()
+                if util is not None:
+                    self.gpu_utilization_pct.append(util, step)
+                    metrics['gpu_utilization_pct'] = util
+
+                # Power / clock / temp / throttle-reason bitmask (NVML).
+                # These — not util % — reveal whether the GPU is power/thermal
+                # capped (the binding limiter on the local laptop card).
+                for _k, _v in self._get_gpu_telemetry().items():
+                    _buf = self._gpu_telemetry_buffers.get(_k)
+                    if _buf is not None:
+                        _buf.append(_v, step)
+                        metrics[_k] = _v
+
+            elif self._uses_mps(device):
+                # Apple Silicon: tensors live in unified memory reached through
+                # Metal. Live-tensor bytes map onto "allocated" and what the
+                # Metal driver has handed this process onto "reserved" (the
+                # nearest analogue of CUDA's caching-allocator pool), so the
+                # same columns stay comparable across machines. Utilization,
+                # power, clocks and temperature have no unprivileged macOS
+                # source (powermetrics needs root), so those buffers stay empty
+                # exactly as on the no-NVML ROCm server, and nothing shells
+                # out to nvidia-smi/rocm-smi per sample.
+                alloc = _device.memory_allocated('mps') / 1e6
+                reserved = _device.memory_reserved('mps') / 1e6
+                self.gpu_mem_allocated_mb.append(alloc, step)
+                self.gpu_mem_reserved_mb.append(reserved, step)
+                metrics['gpu_mem_allocated_mb'] = alloc
+                metrics['gpu_mem_reserved_mb'] = reserved
+
+            if HAS_PSUTIL:
+                cpu_pct = psutil.cpu_percent(interval=None)
+                ram = psutil.virtual_memory()
+                ram_used_gb = ram.used / 1e9
+                self.cpu_percent.append(cpu_pct, step)
+                self.ram_used_gb.append(ram_used_gb, step)
+                metrics['cpu_percent'] = cpu_pct
+                metrics['ram_used_gb'] = ram_used_gb
+                try:
+                    rss_gb = psutil.Process().memory_info().rss / 1e9
+                except Exception:
+                    rss_gb = None
+                if rss_gb is not None:
+                    self.process_rss_gb.append(rss_gb, step)
+                    metrics['process_rss_gb'] = rss_gb
+
+            return metrics
+
+    # Lazily-initialised NVML handle shared across instances
+    _nvml_handle = None
+    _nvml_failed = False
+
+    @classmethod
+    def _ensure_nvml(cls) -> bool:
+        if cls._nvml_handle is not None:
+            return True
+        if cls._nvml_failed:
+            return False
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            cls._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return True
+        except Exception:
+            cls._nvml_failed = True
+            return False
+
+    @classmethod
+    def _get_gpu_utilization(cls) -> Optional[float]:
+        """Read GPU utilization %. Prefers NVML (~0.1 ms) over subprocess."""
+        # Fast path: NVML
+        if cls._ensure_nvml():
+            try:
+                import pynvml
+                rates = pynvml.nvmlDeviceGetUtilizationRates(cls._nvml_handle)
+                return float(rates.gpu)
+            except Exception:
+                pass
+
+        # Fallback: subprocess
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=utilization.gpu',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0:
+                return float(result.stdout.strip().split('\n')[0])
+        except Exception:
+            pass
+
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['rocm-smi', '--showuse', '--json'],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                for card in data.values():
+                    if isinstance(card, dict):
+                        for key in ('GPU use (%)', 'GPU Usage (%)', 'gpu_use_percent'):
+                            if key in card:
+                                return float(str(card[key]).rstrip('%'))
+        except Exception:
+            pass
+
+        return None
+
+    @classmethod
+    def _get_gpu_telemetry(cls) -> Dict[str, float]:
+        """Read GPU power/clock/temp + throttle-reason bitmask via NVML.
+
+        These are the metrics that actually diagnose throttling — a
+        power/thermal-capped GPU can report 100% utilization while its clocks
+        are held down, so util % alone is misleading (project rule: "diagnose
+        thermal throttling by power draw, not utilization %").
+
+        NVML-only and best-effort: returns whatever it can read, or ``{}`` when
+        NVML is unavailable (e.g. the ROCm server), so callers add no columns
+        there.  Each field is guarded independently so one unsupported query
+        doesn't drop the rest.
+
+        ``gpu_throttle_reasons`` is the raw NVML bitmask; decode with:
+          ``& 0x04`` → SW power cap (power-limited)
+          ``& 0x20`` → SW thermal slowdown
+          ``& 0x40`` → HW thermal slowdown (thermal-limited)
+        """
+        if not cls._ensure_nvml():
+            return {}
+        out: Dict[str, float] = {}
+        try:
+            import pynvml
+            h = cls._nvml_handle
+            try:
+                out['gpu_power_w'] = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+            except Exception:
+                pass
+            try:
+                out['gpu_sm_clock_mhz'] = float(
+                    pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+            except Exception:
+                pass
+            try:
+                out['gpu_temp_c'] = float(
+                    pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU))
+            except Exception:
+                pass
+            try:
+                # NVML renamed this across versions (ThrottleReasons →
+                # EventReasons); accept whichever the installed lib exposes.
+                _reasons_fn = (
+                    getattr(pynvml, 'nvmlDeviceGetCurrentClocksThrottleReasons', None)
+                    or getattr(pynvml, 'nvmlDeviceGetCurrentClocksEventReasons', None))
+                if _reasons_fn is not None:
+                    out['gpu_throttle_reasons'] = float(_reasons_fn(h))
+            except Exception:
+                pass
+        except Exception:
+            return out
+        return out
+
+    # ===================================================================
+    # Model health
+    # ===================================================================
+
+    def record_model_health(self, model: torch.nn.Module, step: int) -> Dict[str, Any]:
+        """Snapshot parameter norms, means, stds, and BatchNorm stats.
+
+        Batches GPU→CPU transfers: collects all per-param tensors on device,
+        then does a single .cpu() transfer for norms/means/stds and deltas.
+
+        Also computes weight update ratios if a previous snapshot exists.
+        Returns a summary dict.
+        """
+        with self._lock:
+            summary: Dict[str, Any] = {}
+            layer_summaries: Dict[str, Dict[str, float]] = {}
+
+            # --- Phase 1: compute all stats on GPU without .item() ---
+            names: List[str] = []
+            gpu_norms: List[torch.Tensor] = []
+            gpu_means: List[torch.Tensor] = []
+            gpu_stds: List[torch.Tensor] = []
+            gpu_deltas: List[torch.Tensor] = []
+            has_prev: List[bool] = []
+
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if not param.requires_grad:
+                        continue
+                    names.append(name)
+                    p = param.float()
+                    gpu_norms.append(p.norm())
+                    gpu_means.append(p.mean())
+                    gpu_stds.append(p.std() if p.numel() > 1
+                                    else torch.tensor(0.0, device=param.device))
+
+                    if name in self._prev_param_snapshot:
+                        gpu_deltas.append(
+                            (param - self._prev_param_snapshot[name]).float().norm())
+                        has_prev.append(True)
+                    else:
+                        has_prev.append(False)
+
+                    self._prev_param_snapshot[name] = param.detach().clone()
+
+            if not names:
+                summary['layer_count'] = 0
+                summary['total_params'] = sum(p.numel() for p in model.parameters())
+                summary['trainable_params'] = 0
+                summary['layers'] = {}
+                return summary
+
+            # --- Phase 2: single CPU transfer ---
+            all_tensors = gpu_norms + gpu_means + gpu_stds + gpu_deltas
+            all_cpu = torch.stack(all_tensors).cpu().tolist()
+
+            n = len(names)
+            norms_cpu = all_cpu[:n]
+            means_cpu = all_cpu[n:2 * n]
+            stds_cpu = all_cpu[2 * n:3 * n]
+            deltas_cpu = all_cpu[3 * n:]
+
+            # --- Phase 3: populate buffers (pure Python, no GPU) ---
+            delta_idx = 0
+            for i, name in enumerate(names):
+                norm, mean, std = norms_cpu[i], means_cpu[i], stds_cpu[i]
+
+                if name not in self.param_norms:
+                    self.param_norms[name] = MetricBuffer(5000)
+                    self.param_means[name] = MetricBuffer(5000)
+                    self.param_stds[name] = MetricBuffer(5000)
+                    self.weight_update_ratios[name] = MetricBuffer(5000)
+
+                self.param_norms[name].append(norm, step)
+                self.param_means[name].append(mean, step)
+                self.param_stds[name].append(std, step)
+
+                if has_prev[i]:
+                    delta = deltas_cpu[delta_idx]
+                    delta_idx += 1
+                    ratio = delta / max(norm, 1e-8)
+                    self.weight_update_ratios[name].append(ratio, step)
+                    layer_summaries[name] = {
+                        'norm': norm, 'mean': mean, 'std': std,
+                        'update_ratio': ratio,
+                    }
+                else:
+                    layer_summaries[name] = {
+                        'norm': norm, 'mean': mean, 'std': std,
+                    }
+
+            # BatchNorm running statistics — batch transfer
+            bn_names: List[str] = []
+            bn_tensors: List[torch.Tensor] = []
+            with torch.no_grad():
+                for name, module in model.named_modules():
+                    if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+                        if module.running_mean is not None:
+                            bn_names.append(f"bn_{name}")
+                            bn_tensors.append(module.running_mean.norm())
+                            bn_tensors.append(module.running_var.mean())
+
+            if bn_tensors:
+                bn_cpu = torch.stack(bn_tensors).cpu().tolist()
+                for i, bn_key in enumerate(bn_names):
+                    if bn_key not in self.bn_running_mean_norms:
+                        self.bn_running_mean_norms[bn_key] = MetricBuffer(5000)
+                        self.bn_running_var_means[bn_key] = MetricBuffer(5000)
+                    self.bn_running_mean_norms[bn_key].append(bn_cpu[2 * i], step)
+                    self.bn_running_var_means[bn_key].append(bn_cpu[2 * i + 1], step)
+
+            summary['layer_count'] = len(layer_summaries)
+            summary['total_params'] = sum(p.numel() for p in model.parameters())
+            summary['trainable_params'] = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            summary['layers'] = layer_summaries
+            return summary
+
+    # ===================================================================
+    # Score distribution (called from training loop)
+    # ===================================================================
+
+    @staticmethod
+    def compute_score_stats_padded(
+        scores: torch.Tensor, move_counts: torch.Tensor
+    ) -> Dict[str, float]:
+        """Vectorized score stats from padded (batch, max_moves) scores.
+
+        Padded positions must be -inf.  Only 4 CUDA syncs total
+        (mean, std, entropy, margin) vs O(batch_size) syncs in the
+        per-position loop.
+
+        Args:
+            scores: (batch, max_moves) padded output scores (-inf for padding).
+            move_counts: (batch,) number of valid moves per position.
+        """
+        result: Dict[str, float] = {}
+        with torch.no_grad():
+            max_moves = scores.shape[1]
+            arange = torch.arange(max_moves, device=scores.device)
+            valid_mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
+
+            valid_scores = scores[valid_mask]
+            if valid_scores.numel() == 0:
+                return result
+            finite_mask = torch.isfinite(valid_scores)
+            finite_scores = valid_scores[finite_mask]
+            if finite_scores.numel() == valid_scores.numel():
+                result['mean'] = finite_scores.mean().item()
+                result['std'] = (finite_scores.std().item()
+                                 if finite_scores.numel() > 1 else 0.0)
+            else:
+                # These summaries describe the complete sampled distribution.
+                # Finite rows cannot hide invalid forced-move scores, which
+                # supply no entropy observation of their own.
+                result['mean'] = result['std'] = float('nan')
+
+            # Filter to positions with >1 move for entropy / margin
+            multi = move_counts > 1
+            if not multi.any():
+                return result
+
+            ms = scores[multi].float()          # (N, max_moves)
+            mc = move_counts[multi]              # (N,)
+            mm = arange.unsqueeze(0) < mc.unsqueeze(1)  # (N, max_moves)
+
+            # softmax: -inf slots → prob 0 naturally
+            probs = torch.softmax(ms, dim=1)
+            log_probs = torch.log_softmax(ms, dim=1)
+            ent = -(probs * log_probs)
+            ent[~mm] = 0.0
+            result['entropy'] = ent.sum(dim=1).mean().item()
+
+            # top-1 margin
+            ss = ms.clone()
+            ss[~mm] = float('-inf')
+            sorted_s, _ = ss.sort(dim=1, descending=True)
+            result['top1_margin'] = (sorted_s[:, 0] - sorted_s[:, 1]).mean().item()
+
+        return result
+
+    @staticmethod
+    def compute_score_stats(
+        scores: torch.Tensor, move_counts: torch.Tensor
+    ) -> Dict[str, float]:
+        """Compute distribution statistics over model output scores.
+
+        Args:
+            scores: (total_moves,) flat raw output scores.
+            move_counts: (batch_size,) number of moves per position.
+
+        Returns:
+            Dict with mean, std, entropy, top1_margin.
+        """
+        result: Dict[str, float] = {}
+        with torch.no_grad():
+            if scores.numel() == 0:
+                return result
+            finite_scores = scores[torch.isfinite(scores)]
+            if finite_scores.numel() == scores.numel():
+                result['mean'] = finite_scores.mean().item()
+                result['std'] = (finite_scores.std().item()
+                                 if finite_scores.numel() > 1 else 0.0)
+            else:
+                # Preserve the same invalid-sample contract as the padded path.
+                result['mean'] = result['std'] = float('nan')
+
+            batch_size = move_counts.shape[0]
+            max_moves = move_counts.max().item()
+
+            multi = move_counts > 1
+            if not multi.any():
+                return result
+
+            # Pad flat scores into (batch, max_moves) matrix
+            padded = scores.new_full((batch_size, max_moves), float('-inf'))
+            arange = torch.arange(max_moves, device=scores.device)
+            mask = arange.unsqueeze(0) < move_counts.unsqueeze(1)
+
+            offsets = torch.zeros(batch_size, dtype=torch.long,
+                                 device=scores.device)
+            offsets[1:] = move_counts[:-1].cumsum(0)
+            flat_idx = (offsets.unsqueeze(1) + arange.unsqueeze(0)).clamp(
+                max=scores.shape[0] - 1)
+            padded[mask] = scores[flat_idx[mask]]
+
+            ms = padded[multi].float()
+            mc = move_counts[multi]
+            mm = arange.unsqueeze(0) < mc.unsqueeze(1)
+
+            probs = torch.softmax(ms, dim=1)
+            log_probs = torch.log_softmax(ms, dim=1)
+            ent = -(probs * log_probs)
+            ent[~mm] = 0.0
+            result['entropy'] = ent.sum(dim=1).mean().item()
+
+            ss = ms.clone()
+            ss[~mm] = float('-inf')
+            sorted_s, _ = ss.sort(dim=1, descending=True)
+            result['top1_margin'] = (sorted_s[:, 0] - sorted_s[:, 1]).mean().item()
+
+        return result
+
+    # ===================================================================
+    # Gradient analysis (called from training loop)
+    # ===================================================================
+
+    @staticmethod
+    def compute_gradient_stats(
+        model: torch.nn.Module,
+    ) -> Tuple[float, Dict[str, float]]:
+        """Compute global and per-layer gradient norms.
+
+        Should be called AFTER loss.backward() but BEFORE optimizer.step()
+        or grad clipping.  Uses a single CPU transfer for all parameter
+        norms instead of per-parameter .item() syncs.
+
+        Returns:
+            (global_grad_norm, per_layer_norms)
+        """
+        names: List[str] = []
+        norms: List[torch.Tensor] = []
+
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                names.append(name)
+                norms.append(param.grad.float().norm())
+
+        if not norms:
+            return 0.0, {}
+
+        # Single CUDA→CPU sync for all norms
+        norms_cpu = torch.stack(norms).cpu().tolist()
+        per_layer = dict(zip(names, norms_cpu))
+        global_norm = math.sqrt(sum(n * n for n in norms_cpu))
+        return global_norm, per_layer
+
+    # ===================================================================
+    # Self-play recording
+    # ===================================================================
+
+    def record_gpu_idle_wait(self, seconds: float, stale_epochs: int = 0) -> None:
+        """Record a GPU-idle interval spent blocked waiting for fresh self-play data.
+
+        Fired from the trainer's stale-data wait branch, which runs only when
+        self-play failed to refresh the replay buffer within ``max_stale_epochs``
+        and the GPU therefore sits idle. Aggregated into the session report
+        (``summary.gpu_idle_wait_*``) as the single at-a-glance signal of
+        self-play starvation: total≈0 ⇒ self-play keeps pace (leave cpu_workers
+        alone); large/high-pct ⇒ GPU is starved (raise cpu_workers).
+
+        ``stale_epochs`` is accepted for caller context (how stale the buffer was
+        when the wait began) but is not aggregated yet — reserved for future
+        per-event detail; passing it is harmless.
+        """
+        if seconds < 0:
+            seconds = 0.0
+        with self._lock:
+            self.gpu_idle_wait_count += 1
+            self.gpu_idle_wait_seconds += seconds
+            if seconds > self.gpu_idle_wait_max_seconds:
+                self.gpu_idle_wait_max_seconds = seconds
+
+    def record_selfplay_epoch(
+        self,
+        step: int,
+        epoch: int,
+        num_games: int,
+        num_entries: int,
+        elapsed_sec: float,
+        difficulty_distribution: Optional[Dict[str, int]] = None,
+        result_distribution: Optional[Dict[str, int]] = None,
+        game_lengths: Optional[List[int]] = None,
+        avg_moves_per_position: Optional[float] = None,
+        game_length_basis: Optional[str] = None,
+        phase_timing: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """Record statistics for a self-play data generation epoch.
+
+        ``phase_timing`` carries the trainer's per-cycle phase and resource
+        fields (``SELFPLAY_PHASE_FIELDS``); they are stored flat on the record
+        so the self-play CSV can export them as columns.
+        """
+        with self._lock:
+            record: Dict[str, Any] = {
+                'step': step,
+                'epoch': epoch,
+                'timestamp': datetime.now().isoformat(),
+                'num_games': num_games,
+                'num_entries': num_entries,
+                'elapsed_sec': elapsed_sec,
+                'games_per_sec': num_games / max(elapsed_sec, 1e-6),
+                'entries_per_sec': num_entries / max(elapsed_sec, 1e-6),
+            }
+            if difficulty_distribution:
+                record['difficulty_distribution'] = difficulty_distribution
+            if result_distribution:
+                record['result_distribution'] = result_distribution
+            if game_lengths:
+                sorted_lengths = sorted(game_lengths)
+                if game_length_basis is not None:
+                    record['game_length_basis'] = game_length_basis
+                record['game_length_stats'] = {
+                    'mean': _safe_mean(game_lengths),
+                    'median': _safe_median(game_lengths),
+                    'stdev': _safe_stdev(game_lengths),
+                    'min': min(game_lengths),
+                    'max': max(game_lengths),
+                    'p25': _percentile(sorted_lengths, 25),
+                    'p75': _percentile(sorted_lengths, 75),
+                    'p95': _percentile(sorted_lengths, 95),
+                }
+            if avg_moves_per_position is not None:
+                record['avg_legal_moves_per_position'] = avg_moves_per_position
+            if phase_timing:
+                for key in SELFPLAY_PHASE_FIELDS:
+                    if key in phase_timing:
+                        record[key] = phase_timing[key]
+
+            self.selfplay_records.append(record)
+            self._maybe_flush()
+
+    # ===================================================================
+    # Replay buffer recording
+    # ===================================================================
+
+    def record_replay_buffer_state(
+        self,
+        step: int,
+        total_entries: int,
+        num_files: int,
+        total_size_bytes: Optional[int] = None,
+        oldest_file_age_hours: Optional[float] = None,
+        result_balance: Optional[Dict[str, float]] = None,
+        corpus_metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Snapshot the state of the replay buffer."""
+        with self._lock:
+            record: Dict[str, Any] = {
+                'step': step,
+                'timestamp': datetime.now().isoformat(),
+                'total_entries': total_entries,
+                'num_files': num_files,
+            }
+            if total_size_bytes is not None:
+                record['total_size_mb'] = total_size_bytes / 1e6
+            if oldest_file_age_hours is not None:
+                record['oldest_file_age_hours'] = oldest_file_age_hours
+            if result_balance:
+                record['result_balance'] = result_balance
+            if corpus_metrics:
+                record['corpus_metrics'] = dict(corpus_metrics)
+
+            self.replay_records.append(record)
+
+    # ===================================================================
+    # Evaluation recording
+    # ===================================================================
+
+    def record_evaluation(
+        self,
+        step: int,
+        epoch: int,
+        test_record: Dict[str, Any],
+    ) -> None:
+        """Record a model-vs-algorithm evaluation result with derived metrics."""
+        with self._lock:
+            record = {
+                'step': step,
+                'epoch': epoch,
+                'timestamp': datetime.now().isoformat(),
+                **test_record,
+            }
+
+            # Compute ELO estimate
+            wr = test_record.get('ml_win_rate', 0.0)
+            dr = test_record.get('draw_rate', 0.0)
+            record['estimated_elo_diff'] = _elo_from_win_rate(wr, dr)
+
+            # Win rate trend (rolling over last 5 evaluations)
+            recent_wrs = [r.get('ml_win_rate', 0.0) for r in self.eval_records[-4:]]
+            recent_wrs.append(wr)
+            if len(recent_wrs) >= 2:
+                record['win_rate_trend'] = recent_wrs[-1] - recent_wrs[0]
+                record['win_rate_rolling_mean'] = _safe_mean(recent_wrs)
+        
+            self.eval_records.append(record)
+
+    # ===================================================================
+    # Epoch recording
+    # ===================================================================
+
+    def record_epoch(
+        self,
+        epoch: int,
+        step: int,
+        avg_loss: float,
+        num_batches: int,
+        epoch_time_sec: float,
+        data_refresh: bool = False,
+    ) -> None:
+        """Record epoch-level summary."""
+        with self._lock:
+            self.epoch_records.append({
+                'epoch': epoch,
+                'step': step,
+                'timestamp': datetime.now().isoformat(),
+                'avg_loss': avg_loss,
+                'num_batches': num_batches,
+                'epoch_time_sec': epoch_time_sec,
+                'batches_per_sec': num_batches / max(epoch_time_sec, 1e-6),
+                'data_refresh': data_refresh,
+            })
+
+    # ===================================================================
+    # Checkpoint recording
+    # ===================================================================
+
+    def record_checkpoint(
+        self,
+        step: int,
+        loss: float,
+        path: str,
+        save_time_sec: float = 0.0,
+        file_size_mb: float = 0.0,
+        resource_fields: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record checkpoint save event.
+
+        ``resource_fields`` carries the writer thread's CPU, fault, switch
+        and full-collection deltas when the host can measure them (Journal
+        Pass 574); the record keeps them flat beside ``save_time_sec``.
+        """
+        record = {
+            'step': step,
+            'loss': loss,
+            'path': path,
+            'timestamp': datetime.now().isoformat(),
+            'save_time_sec': save_time_sec,
+            'file_size_mb': file_size_mb,
+        }
+        if resource_fields:
+            record.update(resource_fields)
+        with self._lock:
+            self.checkpoint_records.append(record)
+
+    # ===================================================================
+    # Convergence / optimization signals
+    # ===================================================================
+
+    def get_convergence_metrics(self) -> Dict[str, Any]:
+        """Compute derived convergence and optimization signals."""
+        with self._lock:
+            metrics: Dict[str, Any] = {}
+
+            # Loss EMA and plateau detection
+            metrics['loss_ema'] = self._loss_ema
+            metrics['loss_plateau_steps'] = self._loss_plateau_steps
+            metrics['loss_plateau_observations'] = self._loss_plateau_observations
+            metrics['loss_is_plateauing'] = self._loss_plateau_steps > 500
+
+            # Keep the public step-window keys, using only observations within
+            # (latest_step - window, latest_step]. Sparse sampling cannot supply
+            # a short-window trend. A repeated/decreasing step begins a new
+            # history segment, so rollback observations cannot mix revisions.
+            entries = self.loss.all_entries()
+            latest_step = entries[-1]['step'] if entries else 0
+            recent_entries = []
+            next_step = latest_step + 1
+            for entry in reversed(entries):
+                step = entry['step']
+                if step >= next_step or step <= latest_step - 5000:
+                    break
+                recent_entries.append(entry)
+                next_step = step
+            metrics['loss_window_basis'] = 'optimizer_steps'
+            metrics['loss_window_sample_counts'] = {}
+            for window_name, n in [('100', 100), ('1000', 1000), ('5000', 5000)]:
+                recent = [entry for entry in recent_entries
+                          if entry['step'] > latest_step - n
+                          and math.isfinite(entry['value'])]
+                midpoint = latest_step - n / 2
+                first = [entry['value'] for entry in recent if entry['step'] <= midpoint]
+                second = [entry['value'] for entry in recent if entry['step'] > midpoint]
+                metrics['loss_window_sample_counts'][window_name] = len(recent)
+                metrics[f'loss_improvement_{window_name}'] = None
+                metrics[f'loss_improvement_pct_{window_name}'] = None
+                if len(recent) >= 10 and first and second:
+                    first_half = _safe_mean(first)
+                    second_half = _safe_mean(second)
+                    improvement = first_half - second_half  # positive = improving
+                    metrics[f'loss_improvement_{window_name}'] = improvement
+                    # Relative improvement
+                    if first_half > 0:
+                        metrics[f'loss_improvement_pct_{window_name}'] = improvement / first_half * 100
+
+            # Gradient health
+            grad_recent = self.grad_norm_global.last_n_values(100)
+            if grad_recent:
+                finite_grads = [g for g in grad_recent if math.isfinite(g)]
+                invalid_count = len(grad_recent) - len(finite_grads)
+                metrics['grad_norm_recent_finite_count'] = len(finite_grads)
+                metrics['grad_norm_recent_nonfinite_count'] = invalid_count
+                metrics['grad_norm_mean'] = (
+                    _safe_mean(finite_grads) if finite_grads else None)
+                metrics['grad_norm_stdev'] = (
+                    _safe_stdev(finite_grads) if finite_grads else None)
+                metrics['grad_norm_max'] = max(finite_grads, default=None)
+                # Invalid observations are stability evidence, not a measured
+                # zero or a finite explosion that ordinary clipping can fix.
+                metrics['grad_exploding'] = any(g > 100.0 for g in finite_grads)
+                metrics['grad_vanishing'] = bool(
+                    finite_grads and not invalid_count
+                    and metrics['grad_norm_mean'] < 1e-6)
+
+            # Throughput statistics
+            throughput_recent = self.throughput_samples_sec.last_n_values(100)
+            step_times = self.step_time_sec.last_n_values(100)
+            invalid_throughput = sum(not math.isfinite(value) for value in throughput_recent)
+            invalid_timings = sum(not math.isfinite(value) for value in step_times)
+            if throughput_recent:
+                finite_count = len(throughput_recent) - invalid_throughput
+                metrics['throughput_recent_finite_count'] = finite_count
+                metrics['throughput_recent_nonfinite_count'] = invalid_throughput
+                mean = _safe_mean(throughput_recent) if finite_count else None
+                stdev = _safe_stdev(throughput_recent) if finite_count else None
+                metrics['throughput_mean'] = mean
+                metrics['throughput_stdev'] = stdev
+                # Finite subsets remain descriptive, but invalid measurements
+                # in either series cannot support dataloader tuning.
+                metrics['throughput_cv'] = None
+                if finite_count and not (invalid_throughput or invalid_timings):
+                    metrics['throughput_cv'] = stdev / mean if mean > 0 else 0.0
+
+            # Step time statistics
+            if step_times:
+                finite_count = len(step_times) - invalid_timings
+                metrics['step_time_recent_finite_count'] = finite_count
+                metrics['step_time_recent_nonfinite_count'] = invalid_timings
+                metrics['step_time_mean_sec'] = _safe_mean(step_times) if finite_count else None
+                metrics['step_time_stdev_sec'] = _safe_stdev(step_times) if finite_count else None
+
+            # ELO progress from evaluations
+            if len(self.eval_records) >= 2:
+                elos = [r.get('estimated_elo_diff', 0) for r in self.eval_records]
+                metrics['elo_first'] = elos[0]
+                metrics['elo_latest'] = elos[-1]
+                metrics['elo_improvement'] = elos[-1] - elos[0]
+                metrics['elo_max'] = max(elos)
+
+            # Training efficiency
+            total_elapsed = (datetime.now() - self.session_start).total_seconds()
+            total_steps = self._completed_training_steps()
+            if total_elapsed > 0 and total_steps > 0:
+                metrics['overall_steps_per_sec'] = total_steps / total_elapsed
+                metrics['overall_steps_per_hour'] = total_steps / total_elapsed * 3600
+
+            # NaN/Inf stability
+            metrics['nan_inf_event_count'] = len(self.nan_inf_events)
+            if self.nan_inf_events:
+                metrics['last_nan_inf_step'] = self.nan_inf_events[-1].get('step')
+
+            return metrics
+
+    # ===================================================================
+    # Optimization recommendations
+    # ===================================================================
+
+    def generate_optimization_hints(self) -> List[Dict[str, str]]:
+        """Generate actionable hints based on collected metrics.
+        
+        Returns a list of dicts with 'area', 'severity', 'hint' keys.
+        Severity: 'info', 'warning', 'critical'.
+        """
+        with self._lock:
+            hints: List[Dict[str, str]] = []
+            conv = self.get_convergence_metrics()
+
+            # --- Loss plateau ---
+            loss_summary = self.loss.summary(100)
+            if loss_summary['nonfinite_count']:
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"{loss_summary['nonfinite_count']} nonfinite loss observations "
+                        "across the session. Inspect loss computation and numerical-"
+                        "stability events before interpreting convergence or tuning training."
+                    ),
+                })
+            elif conv.get('loss_is_plateauing'):
+                hints.append({
+                    'area': 'convergence',
+                    'severity': 'warning',
+                    'hint': (
+                        "Sampled loss EMA has stayed nearly constant across "
+                        f"{conv['loss_plateau_observations']} observations spanning "
+                        f"{conv['loss_plateau_steps']} optimizer steps. "
+                        "Consider: (1) reducing learning rate, (2) increasing self-play "
+                        "diversity (noise_prob), (3) adding data from harder difficulties."
+                    ),
+                })
+
+            # --- Gradient issues ---
+            if conv.get('grad_norm_recent_nonfinite_count', 0):
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"{conv['grad_norm_recent_nonfinite_count']} nonfinite gradient "
+                        "norm observations in the last 100 sampled records. Inspect "
+                        "backward-pass numerical stability and model weights before "
+                        "tuning the learning rate or gradient clipping."
+                    ),
+                })
+            elif conv.get('grad_exploding'):
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        "Gradient norms exceeding 100.0 detected. "
+                        "Consider: (1) reducing learning rate, (2) reducing grad_clip_norm, "
+                        "(3) checking for data quality issues."
+                    ),
+                })
+            if conv.get('grad_vanishing'):
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'warning',
+                    'hint': (
+                        "Very small gradient norms detected (< 1e-6). "
+                        "Consider: (1) increasing learning rate, (2) checking model architecture "
+                        "for dead layers, (3) reviewing activation functions."
+                    ),
+                })
+
+            # --- Throughput ---
+            cv = conv.get('throughput_cv')
+            if (conv.get('throughput_recent_nonfinite_count', 0)
+                    or conv.get('step_time_recent_nonfinite_count', 0)):
+                hints.append({
+                    'area': 'performance',
+                    'severity': 'warning',
+                    'hint': (
+                        "Nonfinite throughput or step-time observations in the last "
+                        "100 sampled records. Inspect timing and sample-count telemetry "
+                        "before tuning the dataloader."
+                    ),
+                })
+            elif cv is not None and cv > 0.5:
+                hints.append({
+                    'area': 'performance',
+                    'severity': 'warning',
+                    'hint': (
+                        f"Throughput is highly variable (CV={cv:.2f}). "
+                        "Possible causes: (1) dataloader bottleneck — increase num_workers or "
+                        "prefetch_factor, (2) GPU thermal throttling, (3) competing processes."
+                    ),
+                })
+
+            # --- GPU memory ---
+            gpu_recent = self.gpu_mem_allocated_mb.last_n_values(10)
+            invalid_gpu_count = sum(not math.isfinite(value) for value in gpu_recent)
+            if invalid_gpu_count:
+                hints.append({
+                    'area': 'performance',
+                    'severity': 'warning',
+                    'hint': (
+                        f"{invalid_gpu_count} nonfinite GPU allocated-memory observations "
+                        "in the last 10 sampled records. Inspect memory telemetry "
+                        "before tuning the training batch size."
+                    ),
+                })
+            elif gpu_recent and torch.cuda.is_available():
+                total_vram = torch.cuda.get_device_properties(0).total_memory / 1e6
+                # Unknown capacity cannot establish a measured utilization.
+                utilization = (max(gpu_recent) / total_vram
+                               if math.isfinite(total_vram) and total_vram > 0 else None)
+                if utilization is not None and utilization < 0.3:
+                    hints.append({
+                        'area': 'performance',
+                        'severity': 'info',
+                        'hint': (
+                            f"GPU VRAM utilization is only {utilization*100:.0f}%. "
+                            "You could increase batch_size to better utilize the GPU."
+                        ),
+                    })
+                elif utilization is not None and utilization > 0.95:
+                    hints.append({
+                        'area': 'performance',
+                        'severity': 'warning',
+                        'hint': (
+                            f"GPU VRAM utilization is {utilization*100:.0f}%, near capacity. "
+                            "Risk of OOM. Consider reducing batch_size slightly."
+                        ),
+                    })
+            elif gpu_recent and self._uses_mps():
+                # Unified memory: the ceiling is Metal's recommended working
+                # set, and it is shared with the CPU side (self-play workers,
+                # dataset cache). Only the near-capacity warning applies here;
+                # "raise batch_size to fill it" would take RAM from the CPU.
+                total_unified = _device.total_memory('mps') / 1e6
+                utilization = max(gpu_recent) / total_unified if total_unified > 0 else 0
+                if utilization > 0.95:
+                    hints.append({
+                        'area': 'performance',
+                        'severity': 'warning',
+                        'hint': (
+                            f"MPS unified-memory use is {utilization*100:.0f}% of Metal's "
+                            "recommended working set. Risk of OOM or swapping. "
+                            "Consider reducing batch_size slightly."
+                        ),
+                    })
+
+            # --- NaN/Inf frequency ---
+            if len(self.nan_inf_events) > 10:
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"{len(self.nan_inf_events)} NaN/Inf events recorded. "
+                        "This indicates numerical instability. Consider: (1) enabling AMP with "
+                        "bfloat16 instead of float16, (2) reducing learning rate, (3) increasing "
+                        "grad_clip_norm, (4) checking data for outliers."
+                    ),
+                })
+
+            # --- Self-play balance ---
+            if self.selfplay_records:
+                latest_sp = self.selfplay_records[-1]
+                rd = latest_sp.get('result_distribution', {})
+                total = sum(rd.values()) if rd else 0
+                if total > 0:
+                    wins = rd.get('ml_win', 0) + rd.get('p1_win', 0) + rd.get('p2_win', 0)
+                    draws_count = rd.get('draw', 0)
+                    draw_pct = draws_count / total
+                    if draw_pct > 0.5:
+                        hints.append({
+                            'area': 'data_quality',
+                            'severity': 'warning',
+                            'hint': (
+                                f"High draw rate ({draw_pct*100:.0f}%) in self-play. "
+                                "This may limit learning signal. Consider: (1) increasing "
+                                "max_moves_per_game, (2) using more aggressive difficulties."
+                            ),
+                        })
+
+            # Forced single-move batches have no entropy sample. Their invalid
+            # score summaries still override older confidence evidence.
+            invalid_score_counts = {
+                name: sum(not math.isfinite(value) for value in buffer.last_n_values(100))
+                for name, buffer in (("mean", self.score_mean), ("std", self.score_std))
+            }
+            invalid_score_counts = {
+                name: count for name, count in invalid_score_counts.items() if count
+            }
+            if invalid_score_counts:
+                detail = ", ".join(
+                    f"{name}: {count}" for name, count in invalid_score_counts.items())
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"Recorded nonfinite score distribution observations ({detail}) "
+                        "in the last 100 sampled records per metric. Inspect model "
+                        "scores and score statistics before tuning exploration."
+                    ),
+                })
+
+            # --- Score entropy ---
+            entropy_recent = self.score_entropy.last_n_values(100)
+            invalid_entropy_count = sum(
+                not math.isfinite(value) for value in entropy_recent)
+            if invalid_entropy_count:
+                hints.append({
+                    'area': 'stability',
+                    'severity': 'critical',
+                    'hint': (
+                        f"{invalid_entropy_count} nonfinite score entropy observations "
+                        "in the last 100 sampled records. Inspect model scores and "
+                        "entropy computation before tuning exploration."
+                    ),
+                })
+            elif entropy_recent and not invalid_score_counts:
+                avg_entropy = _safe_mean(entropy_recent)
+                if avg_entropy < 0.1:
+                    hints.append({
+                        'area': 'model_behavior',
+                        'severity': 'warning',
+                        'hint': (
+                            f"Average score entropy is very low ({avg_entropy:.3f}). "
+                            "The model is very confident — may be overfitting or not exploring. "
+                            "Consider: (1) increasing noise_prob, (2) adding temperature to scores."
+                        ),
+                    })
+
+            return hints
+
+    # ===================================================================
+    # Incremental flush (periodic save during training)
+    # ===================================================================
+
+    def flush_incremental(self) -> None:
+        """Save incremental stats to a JSONL file for crash recovery."""
+        with self._lock:
+            path = self.output_dir / f"incremental_{self.session_id}.jsonl"
+            try:
+                elapsed = max(
+                    0.0, (datetime.now() - self.session_start).total_seconds())
+
+                def _metric_snapshot(
+                    buffer: MetricBuffer, recent_n: int = 100,
+                ) -> Dict[str, Any]:
+                    latest = buffer.last_n(1)
+                    return {
+                        **buffer.summary(recent_n),
+                        'latest': dict(latest[-1]) if latest else None,
+                    }
+
+                # Write just the latest metrics snapshot
+                snapshot = {
+                    'timestamp': datetime.now().isoformat(),
+                    # A hard process/VM stop skips export_all(). Keep the
+                    # operational signals needed to diagnose that partial run
+                    # in this already-periodic crash-recovery stream.
+                    'session_summary': {
+                        'session_id': self.session_id,
+                        'start_time': self.session_start.isoformat(),
+                        'elapsed_seconds': elapsed,
+                        'training_start_step': self._training_start_step,
+                        'training_end_step': self._training_latest_step,
+                        'completed_training_steps': self._completed_training_steps(),
+                        'epochs_recorded': len(self.epoch_records),
+                        'selfplay_epochs_recorded': len(self.selfplay_records),
+                        'evaluations_recorded': len(self.eval_records),
+                        'checkpoints_recorded': len(self.checkpoint_records),
+                        'gpu_idle_wait_count': self.gpu_idle_wait_count,
+                        'gpu_idle_wait_seconds': self.gpu_idle_wait_seconds,
+                        'gpu_idle_wait_max_seconds': self.gpu_idle_wait_max_seconds,
+                        'gpu_idle_wait_pct': (
+                            min(100.0, 100.0 * self.gpu_idle_wait_seconds / elapsed)
+                            if elapsed > 0 else 0.0
+                        ),
+                    },
+                    # Keep crash-recovery diagnostics tied to the exact run
+                    # settings instead of borrowing a stale terminal report.
+                    'config': dict(self.config_snapshot),
+                    'loss_summary': self.loss.summary(100),
+                    'learning_rate_summary': self.learning_rate.summary(100),
+                    'grad_norm_summary': self.grad_norm_global.summary(100),
+                    'throughput_summary': self.throughput_samples_sec.summary(100),
+                    'step_time_summary': self.step_time_sec.summary(100),
+                    # Preserve sampled score evidence when shutdown skips the
+                    # terminal report. Match its 1000-observation summaries;
+                    # latest steps distinguish score cadence from loss cadence.
+                    'score_distribution': {
+                        'mean_summary': _metric_snapshot(self.score_mean, 1000),
+                        'std_summary': _metric_snapshot(self.score_std, 1000),
+                        'entropy_summary': _metric_snapshot(self.score_entropy, 1000),
+                        'top1_margin_summary': _metric_snapshot(self.top1_margin, 1000),
+                    },
+                    'system_summary': {
+                        'gpu_mem_allocated_mb': _metric_snapshot(
+                            self.gpu_mem_allocated_mb),
+                        'gpu_mem_reserved_mb': _metric_snapshot(
+                            self.gpu_mem_reserved_mb),
+                        'gpu_utilization_pct': _metric_snapshot(
+                            self.gpu_utilization_pct),
+                        'cpu_percent': _metric_snapshot(self.cpu_percent),
+                        'ram_used_gb': _metric_snapshot(self.ram_used_gb),
+                        'process_rss_gb': _metric_snapshot(self.process_rss_gb),
+                        'gpu_power_w': _metric_snapshot(self.gpu_power_w),
+                        'gpu_sm_clock_mhz': _metric_snapshot(
+                            self.gpu_sm_clock_mhz),
+                        'gpu_temp_c': _metric_snapshot(self.gpu_temp_c),
+                        'gpu_throttle_reasons': _metric_snapshot(
+                            self.gpu_throttle_reasons),
+                    },
+                    # Reuse already-sampled CPU values: interrupted runs may
+                    # never export the terminal model-health report. Latest
+                    # sample steps disclose the lower-frequency cadence.
+                    'model_health': {
+                        'param_norm_summaries': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.param_norms.items()
+                        },
+                        'weight_update_ratio_summaries': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.weight_update_ratios.items()
+                        },
+                        'bn_running_mean_norms': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.bn_running_mean_norms.items()
+                        },
+                        'bn_running_var_means': {
+                            name: _metric_snapshot(buf, 50)
+                            for name, buf in self.bn_running_var_means.items()
+                        },
+                    },
+                    'latest_records': {
+                        'selfplay': (
+                            dict(self.selfplay_records[-1])
+                            if self.selfplay_records else None
+                        ),
+                        'epoch': (
+                            dict(self.epoch_records[-1])
+                            if self.epoch_records else None
+                        ),
+                        'replay_buffer': (
+                            dict(self.replay_records[-1])
+                            if self.replay_records else None
+                        ),
+                        'evaluation': (
+                            dict(self.eval_records[-1])
+                            if self.eval_records else None
+                        ),
+                        'checkpoint': (
+                            dict(self.checkpoint_records[-1])
+                            if self.checkpoint_records else None
+                        ),
+                        'non_finite_event': (
+                            dict(self.nan_inf_events[-1])
+                            if self.nan_inf_events else None
+                        ),
+                    },
+                    'convergence': self.get_convergence_metrics(),
+                }
+                _append_jsonl_atomic(path, snapshot)
+            except Exception as exc:
+                self._incremental_flush_failures += 1
+                if self._incremental_flush_failures == 1:
+                    # Report the first failure in a streak without flooding
+                    # the console on every automatic retry. Keep telemetry
+                    # fail-open even when the console itself is unavailable.
+                    try:
+                        print(
+                            f"Warning: Could not flush incremental statistics {path}: "
+                            f"{type(exc).__name__}: {exc}. "
+                            "Training continues; will retry at the next flush."
+                        )
+                    except (OSError, ValueError):
+                        pass
+            else:
+                failures = self._incremental_flush_failures
+                self._incremental_flush_failures = 0
+                if failures:
+                    try:
+                        print(
+                            f"Incremental statistics recovered: {path} "
+                            f"({failures} failed flushes)."
+                        )
+                    except (OSError, ValueError):
+                        pass
+
+    # ===================================================================
+    # Session report generation
+    # ===================================================================
+
+    def generate_session_report(self) -> Dict[str, Any]:
+        """Generate a comprehensive session report for analysis.
+        
+        This is the main output — a single JSON object capturing the
+        full training session with all metrics, summaries, and
+        optimization hints.
+        """
+        with self._lock:
+            session_end = datetime.now()
+            elapsed = (session_end - self.session_start).total_seconds()
+            # Apple GPU (no CUDA): name the chip and report Metal's working-set
+            # limit in the VRAM slot, keeping the meta keys identical.
+            _on_mps = not torch.cuda.is_available() and self._uses_mps()
+
+            gpu_diagnostics = {}
+            for name, buffer in self._gpu_telemetry_buffers.items():
+                latest = buffer.last_n(1)
+                gpu_diagnostics[name] = {
+                    **buffer.summary(100),
+                    'latest': dict(latest[-1]) if latest else None,
+                }
+
+            memory_diagnostics = {}
+            for name in ('gpu_mem_allocated_mb', 'gpu_mem_reserved_mb',
+                         'process_rss_gb'):
+                buffer = getattr(self, name)
+                latest = buffer.last_n(1)
+                memory_diagnostics[name] = {
+                    **buffer.summary(100),
+                    'latest': dict(latest[-1]) if latest else None,
+                }
+
+            report: Dict[str, Any] = {
+                'meta': {
+                    'session_id': self.session_id,
+                    'start_time': self.session_start.isoformat(),
+                    'end_time': session_end.isoformat(),
+                    'elapsed_seconds': elapsed,
+                    'elapsed_human': str(timedelta(seconds=int(elapsed))),
+                    'platform': platform.platform(),
+                    'python_version': platform.python_version(),
+                    'torch_version': torch.__version__,
+                    'gpu_name': (
+                        torch.cuda.get_device_name() if torch.cuda.is_available()
+                        else _device.device_name('mps') if _on_mps else 'N/A'
+                    ),
+                    'gpu_vram_gb': (
+                        torch.cuda.get_device_properties(0).total_memory / 1e9
+                        if torch.cuda.is_available()
+                        else _device.total_memory('mps') / 1e9 if _on_mps else 0
+                    ),
+                },
+                'config': self.config_snapshot,
+                'summary': {
+                    'total_steps': self._completed_training_steps(),
+                    'training_start_step': self._training_start_step,
+                    'training_end_step': self._training_latest_step,
+                    'total_epochs': len(self.epoch_records),
+                    'total_selfplay_epochs': len(self.selfplay_records),
+                    'total_evaluations': len(self.eval_records),
+                    'total_checkpoints': len(self.checkpoint_records),
+                    'nan_inf_events': len(self.nan_inf_events),
+                    # GPU-idle self-play-starvation diagnostic (record_gpu_idle_wait).
+                    # The at-a-glance answer to "is self-play starving the GPU?":
+                    # pct≈0 ⇒ self-play keeps pace; high ⇒ raise cpu_workers.
+                    'gpu_idle_wait_count': self.gpu_idle_wait_count,
+                    'gpu_idle_wait_seconds': round(self.gpu_idle_wait_seconds, 3),
+                    'gpu_idle_wait_max_seconds': round(self.gpu_idle_wait_max_seconds, 3),
+                    'gpu_idle_wait_pct': (
+                        # min(100,…): idle is a subset of wall-clock so pct≤100 in
+                        # any real run; the clamp only guards a near-zero-elapsed
+                        # smoke test from printing a nonsense value.
+                        round(min(100.0, 100.0 * self.gpu_idle_wait_seconds / elapsed), 3)
+                        if elapsed > 0 else 0.0
+                    ),
+                },
+                'loss': {
+                    'summary': self.loss.summary(1000),
+                    'first_100': self.loss.last_n(100) if self.loss.count <= 100 else [],
+                    'last_100': self.loss.last_n(100),
+                },
+                'learning_rate': {
+                    'summary': self.learning_rate.summary(100),
+                    'last_10': self.learning_rate.last_n(10),
+                },
+                'gradient_norms': {
+                    'global_summary': self.grad_norm_global.summary(1000),
+                    'per_layer_summaries': {
+                        name: buf.summary(100)
+                        for name, buf in self.grad_norm_per_layer.items()
+                    },
+                },
+                'throughput': {
+                    'samples_per_sec': self.throughput_samples_sec.summary(1000),
+                    'step_time_sec': self.step_time_sec.summary(1000),
+                },
+                'score_distribution': {
+                    'mean_summary': self.score_mean.summary(1000),
+                    'std_summary': self.score_std.summary(1000),
+                    'entropy_summary': self.score_entropy.summary(1000),
+                    'top1_margin_summary': self.top1_margin.summary(1000),
+                },
+                'gpu_memory': {
+                    'allocated_mb': memory_diagnostics['gpu_mem_allocated_mb'],
+                    'reserved_mb': memory_diagnostics['gpu_mem_reserved_mb'],
+                },
+                'system': {
+                    'gpu_utilization': self.gpu_utilization_pct.summary(100),
+                    'cpu_percent': self.cpu_percent.summary(100),
+                    'ram_used_gb': self.ram_used_gb.summary(100),
+                    'process_rss_gb': memory_diagnostics['process_rss_gb'],
+                    # Throttle diagnostics (NVML; empty on ROCm/no-NVML).
+                    **gpu_diagnostics,
+                },
+                'model_health': {
+                    'param_norm_summaries': {
+                        name: buf.summary(50)
+                        for name, buf in self.param_norms.items()
+                    },
+                    'weight_update_ratio_summaries': {
+                        name: buf.summary(50)
+                        for name, buf in self.weight_update_ratios.items()
+                    },
+                    'bn_running_mean_norms': {
+                        name: buf.summary(50)
+                        for name, buf in self.bn_running_mean_norms.items()
+                    },
+                    'bn_running_var_means': {
+                        name: buf.summary(50)
+                        for name, buf in self.bn_running_var_means.items()
+                    },
+                },
+                'selfplay': self.selfplay_records,
+                'evaluations': self.eval_records,
+                'epochs': self.epoch_records,
+                'replay_buffer': self.replay_records,
+                'checkpoints': self.checkpoint_records,
+                'nan_inf_events': self.nan_inf_events,
+                'convergence': self.get_convergence_metrics(),
+                'optimization_hints': self.generate_optimization_hints(),
+            }
+
+            return report
+
+    # ===================================================================
+    # Export methods
+    # ===================================================================
+
+    def export_session_report(self) -> str:
+        """Generate and save the full session report as JSON.
+        
+        Returns the path to the saved report.
+        """
+        with self._lock:
+            report = self.generate_session_report()
+            path = self.output_dir / f"session_report_{self.session_id}.json"
+            with _atomic_text_writer(path) as f:
+                json.dump(report, f, indent=2, default=str)
+            return str(path)
+
+    def export_loss_csv(self) -> str:
+        """Export loss history to CSV for external analysis."""
+        with self._lock:
+            path = self.output_dir / f"loss_history_{self.session_id}.csv"
+            entries = self.loss.all_entries()
+            if not entries:
+                return str(path)
+
+            with _atomic_text_writer(path, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['step', 'value', 'timestamp'])
+                writer.writeheader()
+                for entry in entries:
+                    writer.writerow({
+                        'step': entry.get('step', ''),
+                        'value': entry.get('value', ''),
+                        'timestamp': entry.get('timestamp', ''),
+                    })
+            return str(path)
+
+    def export_gradient_csv(self) -> str:
+        """Export global gradient norm history to CSV."""
+        with self._lock:
+            path = self.output_dir / f"gradient_norms_{self.session_id}.csv"
+            entries = self.grad_norm_global.all_entries()
+            if not entries:
+                return str(path)
+
+            with _atomic_text_writer(path, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['step', 'value'])
+                writer.writeheader()
+                for entry in entries:
+                    writer.writerow({
+                        'step': entry.get('step', ''),
+                        'value': entry.get('value', ''),
+                    })
+            return str(path)
+
+    def export_throughput_csv(self) -> str:
+        """Export throughput history to CSV."""
+        with self._lock:
+            path = self.output_dir / f"throughput_{self.session_id}.csv"
+            entries = self.throughput_samples_sec.all_entries()
+            if not entries:
+                return str(path)
+
+            with _atomic_text_writer(path, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['step', 'value'])
+                writer.writeheader()
+                for entry in entries:
+                    writer.writerow({
+                        'step': entry.get('step', ''),
+                        'value': entry.get('value', ''),
+                    })
+            return str(path)
+
+    def export_evaluations_csv(self) -> str:
+        """Export evaluation results to CSV."""
+        with self._lock:
+            path = self.output_dir / f"evaluations_{self.session_id}.csv"
+            if not self.eval_records:
+                return str(path)
+
+            fieldnames = [
+                'step', 'epoch', 'timestamp', 'total_games',
+                'ml_wins', 'algo_wins', 'draws',
+                'ml_win_rate', 'ml_as_p1_win_rate', 'ml_as_p2_win_rate',
+                'avg_game_length', 'estimated_elo_diff',
+                'win_rate_trend', 'win_rate_rolling_mean',
+            ]
+            with _atomic_text_writer(path, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                for record in self.eval_records:
+                    writer.writerow(record)
+            return str(path)
+
+    def export_epochs_csv(self) -> str:
+        """Export epoch-level summary to CSV."""
+        with self._lock:
+            path = self.output_dir / f"epochs_{self.session_id}.csv"
+            if not self.epoch_records:
+                return str(path)
+
+            fieldnames = [
+                'epoch', 'step', 'timestamp', 'avg_loss', 'num_batches',
+                'epoch_time_sec', 'batches_per_sec', 'data_refresh',
+            ]
+            with _atomic_text_writer(path, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                for record in self.epoch_records:
+                    writer.writerow(record)
+            return str(path)
+
+    def export_selfplay_csv(self) -> str:
+        """Export self-play generation stats to CSV."""
+        with self._lock:
+            path = self.output_dir / f"selfplay_{self.session_id}.csv"
+            if not self.selfplay_records:
+                return str(path)
+
+            fieldnames = [
+                'step', 'epoch', 'timestamp', 'num_games', 'num_entries',
+                'elapsed_sec', 'games_per_sec', 'entries_per_sec',
+                *SELFPLAY_PHASE_FIELDS,
+            ]
+            with _atomic_text_writer(path, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                for record in self.selfplay_records:
+                    writer.writerow(record)
+            return str(path)
+
+    def export_system_csv(self) -> str:
+        """Export system metrics time series to CSV."""
+        with self._lock:
+            path = self.output_dir / f"system_metrics_{self.session_id}.csv"
+        
+            # Merge GPU and system metrics by step
+            gpu_entries = {e['step']: e for e in self.gpu_mem_allocated_mb.all_entries()}
+            cpu_entries = {e['step']: e for e in self.cpu_percent.all_entries()}
+            ram_entries = {e['step']: e for e in self.ram_used_gb.all_entries()}
+            rss_entries = {e['step']: e for e in self.process_rss_gb.all_entries()}
+            gpu_util_entries = {e['step']: e for e in self.gpu_utilization_pct.all_entries()}
+            gpu_reserved = {e['step']: e for e in self.gpu_mem_reserved_mb.all_entries()}
+            gpu_power = {e['step']: e for e in self.gpu_power_w.all_entries()}
+            gpu_clock = {e['step']: e for e in self.gpu_sm_clock_mhz.all_entries()}
+            gpu_temp = {e['step']: e for e in self.gpu_temp_c.all_entries()}
+            gpu_throttle = {e['step']: e for e in self.gpu_throttle_reasons.all_entries()}
+
+            all_steps = sorted(set(
+                list(gpu_entries.keys()) + list(cpu_entries.keys()) +
+                list(ram_entries.keys()) + list(rss_entries.keys()) +
+                list(gpu_util_entries.keys()) +
+                list(gpu_reserved.keys()) + list(gpu_power.keys()) +
+                list(gpu_clock.keys()) + list(gpu_temp.keys()) +
+                list(gpu_throttle.keys())
+            ))
+
+            if not all_steps:
+                return str(path)
+
+            with _atomic_text_writer(path, newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'step', 'gpu_mem_allocated_mb', 'gpu_mem_reserved_mb',
+                    'gpu_utilization_pct', 'cpu_percent', 'ram_used_gb',
+                    'process_rss_gb',
+                    'gpu_power_w', 'gpu_sm_clock_mhz', 'gpu_temp_c',
+                    'gpu_throttle_reasons',
+                ])
+                for step in all_steps:
+                    writer.writerow([
+                        step,
+                        gpu_entries.get(step, {}).get('value', ''),
+                        gpu_reserved.get(step, {}).get('value', ''),
+                        gpu_util_entries.get(step, {}).get('value', ''),
+                        cpu_entries.get(step, {}).get('value', ''),
+                        ram_entries.get(step, {}).get('value', ''),
+                        rss_entries.get(step, {}).get('value', ''),
+                        gpu_power.get(step, {}).get('value', ''),
+                        gpu_clock.get(step, {}).get('value', ''),
+                        gpu_temp.get(step, {}).get('value', ''),
+                        gpu_throttle.get(step, {}).get('value', ''),
+                    ])
+            return str(path)
+
+    def export_all(self) -> Dict[str, str]:
+        """Export all statistics to multiple files.
+        
+        Returns a dict mapping export name to file path.
+        """
+        exports = {}
+        exports['session_report'] = self.export_session_report()
+        exports['loss_csv'] = self.export_loss_csv()
+        exports['gradient_csv'] = self.export_gradient_csv()
+        exports['throughput_csv'] = self.export_throughput_csv()
+        exports['evaluations_csv'] = self.export_evaluations_csv()
+        exports['epochs_csv'] = self.export_epochs_csv()
+        exports['selfplay_csv'] = self.export_selfplay_csv()
+        exports['system_csv'] = self.export_system_csv()
+        return exports
+
+    # ===================================================================
+    # Summary for console output
+    # ===================================================================
+
+    def print_session_summary(self) -> None:
+        """Print a human-readable summary to stdout."""
+        with self._lock:
+            elapsed = (datetime.now() - self.session_start).total_seconds()
+            conv = self.get_convergence_metrics()
+
+            print("\n" + "=" * 60)
+            print("  TRAINING SESSION STATISTICS")
+            print("=" * 60)
+            print(f"  Session ID:     {self.session_id}")
+            print(f"  Duration:       {timedelta(seconds=int(elapsed))}")
+            print(f"  Total Steps:    {self._completed_training_steps():,}")
+            print(f"  Total Epochs:   {len(self.epoch_records)}")
+
+            # Loss
+            loss_s = self.loss.summary(100)
+            print(f"\n  Loss:")
+            recent_mean = (f"{loss_s['recent_mean']:.6f}"
+                           if loss_s['recent_finite_count'] else
+                           "Unavailable (no finite observations)")
+            recent_std = (f"{loss_s['recent_stdev']:.6f}"
+                          if loss_s['recent_finite_count'] else
+                          "Unavailable (no finite observations)")
+            best = (f"{loss_s['running_min']:.6f}" if loss_s['finite_count'] else
+                    "Unavailable (no finite observations)")
+            print(f"    Latest (avg 100):   {recent_mean}")
+            print(f"    Best:               {best}")
+            print(f"    Std (last 100):     {recent_std}")
+            if loss_s['nonfinite_count']:
+                print(f"    Nonfinite (all time): {loss_s['nonfinite_count']} "
+                      "(statistics use finite observations only)")
+                print(f"    Nonfinite (last 100): {loss_s['recent_nonfinite_count']}")
+            if self._loss_ema is not None and not loss_s['nonfinite_count']:
+                print(f"    EMA:                {self._loss_ema:.6f}")
+            imp = conv.get('loss_improvement_1000')
+            if imp is not None and not loss_s['nonfinite_count']:
+                print(f"    Improvement (1K):   {imp:+.6f}")
+
+            # Throughput
+            tp = self.throughput_samples_sec.summary(100)
+            timing = self.step_time_sec.summary(100)
+            if tp['total_count'] > 0 or timing['total_count'] > 0:
+                print(f"\n  Throughput:")
+                for label, summary in (('Samples/sec', tp), ('Step time (sec)', timing)):
+                    value = (f"{summary['recent_mean']:.1f} (std={summary['recent_stdev']:.1f})"
+                             if summary['recent_finite_count'] else
+                             "Unavailable (no finite observations)")
+                    print(f"    {label + ':':20s}{value}")
+                    if summary['recent_nonfinite_count']:
+                        print(f"    Nonfinite {label} (last 100): "
+                              f"{summary['recent_nonfinite_count']} "
+                              "(statistics use finite observations only)")
+                sps = conv.get('overall_steps_per_hour', 0)
+                if sps:
+                    print(f"    Steps/hour:         {sps:,.0f}")
+
+            # GPU-idle self-play starvation — prints only when it happened, so a
+            # healthy (self-play-keeps-pace) run stays quiet and a starved run is
+            # flagged loudly. This is the at-a-glance cpu_workers signal.
+            if self.gpu_idle_wait_count > 0:
+                _idle_pct = (min(100.0, 100.0 * self.gpu_idle_wait_seconds / elapsed)
+                             if elapsed > 0 else 0.0)
+                print(f"\n  GPU-idle (self-play starvation):")
+                print(f"    Wait events:        {self.gpu_idle_wait_count}")
+                print(f"    Total idle:         {self.gpu_idle_wait_seconds:.1f}s "
+                      f"({_idle_pct:.1f}% of session)")
+                print(f"    Longest wait:       {self.gpu_idle_wait_max_seconds:.1f}s")
+
+            # Gradients
+            gs = self.grad_norm_global.summary(100)
+            if gs['total_count'] > 0:
+                print(f"\n  Gradient Norms:")
+                if gs['recent_finite_count']:
+                    print(f"    Mean (last 100):    {gs['recent_mean']:.4f}")
+                    print(f"    Max (last 100):     {gs['recent_finite_max']:.4f}")
+                else:
+                    print("    Mean/Max:           Unavailable (no finite observations)")
+                if gs['recent_nonfinite_count']:
+                    print(f"    Nonfinite (last 100): {gs['recent_nonfinite_count']} "
+                          "(statistics use finite observations only)")
+
+            # GPU
+            gpu_s = self.gpu_mem_allocated_mb.summary(10)
+            if gpu_s['total_count'] > 0:
+                print(f"\n  GPU Memory:")
+                allocated = (f"{gpu_s['recent_mean']:.0f} MB"
+                             if gpu_s['recent_finite_count'] else
+                             "Unavailable (no finite observations)")
+                print(f"    Allocated:          {allocated}")
+                if gpu_s['recent_nonfinite_count']:
+                    print(f"    Nonfinite (last 10): {gpu_s['recent_nonfinite_count']} "
+                          "(statistics use finite observations only)")
+
+            # Evaluations
+            if self.eval_records:
+                latest = self.eval_records[-1]
+                print(f"\n  Evaluation (latest):")
+                print(f"    ML Win Rate:        {latest.get('ml_win_rate', 0)*100:.1f}%")
+                print(f"    Est. ELO diff:      {latest.get('estimated_elo_diff', 0):+.0f}")
+                if len(self.eval_records) >= 2:
+                    first_wr = self.eval_records[0].get('ml_win_rate', 0)
+                    last_wr = latest.get('ml_win_rate', 0)
+                    print(f"    WR Progress:        {first_wr*100:.1f}% → {last_wr*100:.1f}%")
+
+            # Stability
+            if self.nan_inf_events:
+                print(f"\n  Stability:")
+                print(f"    NaN/Inf Events:     {len(self.nan_inf_events)}")
+
+            # Optimization hints
+            hints = self.generate_optimization_hints()
+            if hints:
+                print(f"\n  Optimization Hints ({len(hints)}):")
+                for h in hints:
+                    severity_icon = {'info': 'ℹ', 'warning': '⚠', 'critical': '‼'}
+                    icon = severity_icon.get(h['severity'], '•')
+                    print(f"    {icon} [{h['area']}] {h['hint'][:120]}")
+
+            print("=" * 60)

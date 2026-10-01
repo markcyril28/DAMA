@@ -277,8 +277,9 @@ extensions = [
 ]
 
 # The corpus metadata helper uses POSIX stat(2) plus C11 threads. Native
-# Windows keeps the exact ThreadPoolExecutor fallback in corpus.py.
-if platform.system() != "Windows":
+# Windows keeps the exact ThreadPoolExecutor fallback in corpus.py. macOS has
+# no <threads.h>, so it takes the same fallback.
+if platform.system() not in ("Windows", "Darwin"):
     extensions.append(
         Extension("dama.ai.ml._fast_stat", sources=["dama/ai/ml/_fast_stat.pyx"])
     )
