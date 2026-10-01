@@ -4,14 +4,21 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
     QLabel, QComboBox, QPushButton, QColorDialog, QGroupBox,
     QFormLayout, QDialogButtonBox, QFileDialog, QSpinBox,
-    QDoubleSpinBox, QScrollArea, QFrame, QCheckBox
+    QDoubleSpinBox, QScrollArea, QFrame, QCheckBox, QLineEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from pathlib import Path
+from typing import Any, Sequence
+import math
 import multiprocessing
+import os
 
-from ..config import get_config, save_config, Config
+from ..config import get_config, save_config, Config, LayaAISettings
+from ..ai.laya.policy import DEVICES, PERSPECTIVES, STATE_FORMATS
+
+PLAYER_TYPES = ["human", "algorithmic", "ml", "laya"]
+LAYA_FALLBACKS = ("none", "algorithmic", "random")
 
 
 def discover_models() -> list[str]:
@@ -219,13 +226,13 @@ class SettingsDialog(QDialog):
         players_layout = QFormLayout(players_group)
 
         self.p1_type_combo = QComboBox()
-        self.p1_type_combo.addItems(["human", "algorithmic", "ml"])
-        self.p1_type_combo.setCurrentText(self.config.players.p1_type)
+        self.p1_type_combo.addItems(PLAYER_TYPES)
+        self.p1_type_combo.setCurrentText(str(self.config.players.p1_type))
         players_layout.addRow("Player 1:", self.p1_type_combo)
 
         self.p2_type_combo = QComboBox()
-        self.p2_type_combo.addItems(["human", "algorithmic", "ml"])
-        self.p2_type_combo.setCurrentText(self.config.players.p2_type)
+        self.p2_type_combo.addItems(PLAYER_TYPES)
+        self.p2_type_combo.setCurrentText(str(self.config.players.p2_type))
         players_layout.addRow("Player 2:", self.p2_type_combo)
 
         layout.addWidget(players_group)
@@ -372,6 +379,9 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(ml_group)
 
+        # Laya AI
+        layout.addWidget(self._create_laya_group())
+
         layout.addStretch()
         
         # Update custom params visibility
@@ -380,6 +390,135 @@ class SettingsDialog(QDialog):
         
         scroll.setWidget(widget)
         return scroll
+
+    def _create_laya_group(self) -> QGroupBox:
+        """Create the Laya AI settings group."""
+        laya = self.config.ai.laya
+        defaults = LayaAISettings()
+        group = QGroupBox("Laya AI")
+        form = QFormLayout(group)
+
+        python_row = QHBoxLayout()
+        self.laya_python_edit = QLineEdit(self._text_setting(laya.python))
+        self.laya_python_edit.setPlaceholderText("Auto: find the conda env below")
+        self.laya_python_edit.setToolTip("Python interpreter that has laya installed")
+        python_row.addWidget(self.laya_python_edit)
+        python_browse_btn = QPushButton("Browse...")
+        python_browse_btn.clicked.connect(self._browse_laya_python)
+        python_row.addWidget(python_browse_btn)
+        form.addRow("Python interpreter:", python_row)
+
+        self.laya_conda_env_edit = QLineEdit(self._text_setting(laya.conda_env))
+        self.laya_conda_env_edit.setToolTip("Conda env searched when no interpreter is set")
+        form.addRow("Conda env:", self.laya_conda_env_edit)
+
+        hf_row = QHBoxLayout()
+        self.laya_hf_home_edit = QLineEdit(self._text_setting(laya.hf_home))
+        self.laya_hf_home_edit.setPlaceholderText("Inherit HF_HOME")
+        self.laya_hf_home_edit.setToolTip("Hugging Face cache directory holding the Laya weights")
+        hf_row.addWidget(self.laya_hf_home_edit)
+        hf_browse_btn = QPushButton("Browse...")
+        hf_browse_btn.clicked.connect(self._browse_laya_hf_home)
+        hf_row.addWidget(hf_browse_btn)
+        form.addRow("HF cache dir:", hf_row)
+
+        self.laya_model_edit = QLineEdit(self._text_setting(laya.model))
+        self.laya_model_edit.setToolTip("Hub repo id or a local checkpoint directory")
+        form.addRow("Model:", self.laya_model_edit)
+
+        self.laya_subfolder_edit = QLineEdit(self._text_setting(laya.subfolder))
+        self.laya_subfolder_edit.setPlaceholderText("English root")
+        self.laya_subfolder_edit.setToolTip("Checkpoint subfolder, e.g. multilingual; empty = English root")
+        form.addRow("Subfolder:", self.laya_subfolder_edit)
+
+        self.laya_device_combo = self._choice_combo(DEVICES, laya.device)
+        form.addRow("Device:", self.laya_device_combo)
+
+        self.laya_state_format_combo = self._choice_combo(STATE_FORMATS, laya.state_format)
+        self.laya_state_format_combo.setToolTip("How the board is shown to Laya")
+        form.addRow("State format:", self.laya_state_format_combo)
+
+        self.laya_perspective_combo = self._choice_combo(PERSPECTIVES, laya.perspective)
+        self.laya_perspective_combo.setToolTip(
+            "side_to_move turns the board so Laya always moves toward rank 8")
+        form.addRow("Perspective:", self.laya_perspective_combo)
+
+        self.laya_shuffle_check = QCheckBox("Shuffle options")
+        self.laya_shuffle_check.setChecked(bool(laya.shuffle_options))
+        self.laya_shuffle_check.setToolTip("Present the moves in a fixed per-position shuffled order")
+        form.addRow("", self.laya_shuffle_check)
+
+        self.laya_fallback_combo = self._choice_combo(LAYA_FALLBACKS, laya.fallback)
+        self.laya_fallback_combo.setToolTip("What plays when Laya cannot answer; none shows the error")
+        form.addRow("Fallback:", self.laya_fallback_combo)
+
+        # Timeout minimums stay above 0: the bridge treats 0 as no limit
+        self.laya_request_timeout_spin = self._seconds_spin(
+            1.0, 3600.0, 5.0, laya.request_timeout_sec, defaults.request_timeout_sec)
+        form.addRow("Request timeout:", self.laya_request_timeout_spin)
+
+        self.laya_startup_timeout_spin = self._seconds_spin(
+            1.0, 3600.0, 10.0, laya.startup_timeout_sec, defaults.startup_timeout_sec)
+        self.laya_startup_timeout_spin.setToolTip("Time allowed for loading the model")
+        form.addRow("Startup timeout:", self.laya_startup_timeout_spin)
+
+        self.laya_idle_shutdown_spin = self._seconds_spin(
+            0.0, 86400.0, 60.0, laya.idle_shutdown_sec, defaults.idle_shutdown_sec)
+        self.laya_idle_shutdown_spin.setSpecialValueText("Never")
+        self.laya_idle_shutdown_spin.setToolTip("Stop the idle Laya worker after this long")
+        form.addRow("Idle shutdown:", self.laya_idle_shutdown_spin)
+
+        return group
+
+    @staticmethod
+    def _text_setting(value: Any) -> str:
+        """Text for a line edit; a null setting shows as empty."""
+        return "" if value is None else str(value)
+
+    @staticmethod
+    def _choice_combo(items: Sequence[str], current: Any) -> QComboBox:
+        """Combo of items showing current; an unlisted saved value is kept rather than replaced."""
+        combo = QComboBox()
+        combo.addItems(list(items))
+        current = "" if current is None else str(current)
+        if combo.findText(current) == -1:
+            combo.addItem(current)
+        combo.setCurrentText(current)
+        return combo
+
+    @staticmethod
+    def _seconds_spin(minimum: float, maximum: float, step: float, value: Any,
+                      default: float) -> QDoubleSpinBox:
+        """Seconds spin box; a malformed saved value shows the default."""
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            seconds = default
+        if not math.isfinite(seconds):
+            seconds = default
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setDecimals(1)
+        spin.setSingleStep(step)
+        spin.setSuffix(" sec")
+        spin.setValue(seconds)
+        return spin
+
+    def _browse_laya_python(self) -> None:
+        """Browse for the Python interpreter that has laya installed."""
+        current = os.path.expanduser(self.laya_python_edit.text().strip())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Python Interpreter", os.path.dirname(current), "All Files (*)"
+        )
+        if path:
+            self.laya_python_edit.setText(path)
+
+    def _browse_laya_hf_home(self) -> None:
+        """Browse for the Hugging Face cache directory."""
+        current = os.path.expanduser(self.laya_hf_home_edit.text().strip())
+        path = QFileDialog.getExistingDirectory(self, "Select Hugging Face Cache Directory", current)
+        if path:
+            self.laya_hf_home_edit.setText(path)
 
     def _browse_model(self) -> None:
         """Browse for model file."""
@@ -496,5 +635,21 @@ class SettingsDialog(QDialog):
             self.config.ai.ml.model_path = combo_model
         else:
             self.config.ai.ml.model_path = self.model_path_label.text()
+
+        # Laya AI (offline has no widget and keeps its saved value)
+        laya = self.config.ai.laya
+        laya.python = self.laya_python_edit.text().strip()
+        laya.conda_env = self.laya_conda_env_edit.text().strip()
+        laya.hf_home = self.laya_hf_home_edit.text().strip()
+        laya.model = self.laya_model_edit.text().strip()
+        laya.subfolder = self.laya_subfolder_edit.text().strip()
+        laya.device = self.laya_device_combo.currentText()
+        laya.state_format = self.laya_state_format_combo.currentText()
+        laya.perspective = self.laya_perspective_combo.currentText()
+        laya.shuffle_options = self.laya_shuffle_check.isChecked()
+        laya.fallback = self.laya_fallback_combo.currentText()
+        laya.request_timeout_sec = self.laya_request_timeout_spin.value()
+        laya.startup_timeout_sec = self.laya_startup_timeout_spin.value()
+        laya.idle_shutdown_sec = self.laya_idle_shutdown_spin.value()
 
         save_config()
