@@ -1,5 +1,6 @@
 """Game engine - orchestrates game play."""
 
+import random
 from enum import Enum
 from typing import Optional, Callable, List
 from dataclasses import dataclass
@@ -14,6 +15,16 @@ class PlayerType(Enum):
     HUMAN = "human"
     ALGORITHMIC = "algorithmic"
     ML = "ml"
+    LAYA = "laya"
+
+
+def player_type_from_config(value) -> PlayerType:
+    """Convert a saved player type, falling back to HUMAN for an unknown value."""
+    try:
+        return PlayerType(value)
+    except (ValueError, TypeError):
+        print(f"Warning: unknown player type {value!r} in config; using human")
+        return PlayerType.HUMAN
 
 
 @dataclass
@@ -40,8 +51,8 @@ class Engine:
         # Player types (default from config)
         config = get_config()
         self.player_types = {
-            Player.ONE: PlayerType(config.players.p1_type),
-            Player.TWO: PlayerType(config.players.p2_type),
+            Player.ONE: player_type_from_config(config.players.p1_type),
+            Player.TWO: player_type_from_config(config.players.p2_type),
         }
 
         # Callbacks
@@ -53,11 +64,15 @@ class Engine:
         self._algorithmic_ai = None
         self._ml_ai = None
 
+        # Details of the last Laya request (None after a fallback or a new game)
+        self.last_laya_decision = None
+
     def new_game(self) -> None:
         """Start a new game."""
         self.state = GameState.initial()
         self.move_history = []
         self.state_history = [self.state]
+        self.last_laya_decision = None
         self._notify_state_changed()
         self._request_move_if_ai()
 
@@ -132,6 +147,8 @@ class Engine:
             return self._get_algorithmic_move()
         elif player_type == PlayerType.ML:
             return self._get_ml_move()
+        elif player_type == PlayerType.LAYA:
+            return self._get_laya_move()
         return None
 
     def _get_algorithmic_move(self) -> Optional[Move]:
@@ -157,7 +174,6 @@ class Engine:
             # Fallback to random legal move
             moves = self.legal_moves()
             if moves:
-                import random
                 return random.choice(moves)
         return None
 
@@ -175,6 +191,29 @@ class Engine:
         except FileNotFoundError:
             print("ML model not found, falling back to algorithmic AI")
             return self._get_algorithmic_move()
+
+    def _get_laya_move(self) -> Optional[Move]:
+        """Get a move from the Laya decision model, applying its configured fallback."""
+        from .ai.laya.errors import LayaBudgetError, LayaUnavailableError
+        # One snapshot: the answer indexes this exact legal list.
+        state = self.state
+        legal = state.legal_moves()
+        settings = get_config().ai.laya
+        self.last_laya_decision = None
+        try:
+            from .ai.laya import policy
+            decision = policy.choose_laya_move(state, legal, settings)
+        except (ImportError, LayaUnavailableError, LayaBudgetError) as e:
+            fallback = getattr(settings, "fallback", "none")
+            if fallback == "algorithmic":
+                print(f"Laya AI failed ({e}); falling back to the algorithmic AI")
+                return self._get_algorithmic_move()
+            if fallback == "random":
+                print(f"Laya AI failed ({e}); falling back to a random legal move")
+                return random.choice(legal) if legal else None
+            raise
+        self.last_laya_decision = decision
+        return decision.move if decision is not None else None
 
     def _notify_state_changed(self) -> None:
         """Notify listeners of state change."""
