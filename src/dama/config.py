@@ -4,7 +4,7 @@ import os
 import yaml
 from pathlib import Path
 from typing import Any, Dict, Optional
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 
 
 def get_config_dir() -> Path:
@@ -90,17 +90,49 @@ class MLAISettings:
 
 
 @dataclass
+class LayaAISettings:
+    """Laya decision model settings."""
+    python: str = ""  # interpreter with laya installed; "" = find conda_env
+    conda_env: str = "laya-gpu"
+    model: str = "convaiinnovations/laya"  # hub repo id or a local checkpoint directory
+    subfolder: str = ""  # "" English root; "multilingual"; "typed-decisions"
+    hf_home: str = ""  # Hugging Face cache; "" = inherit HF_HOME
+    offline: bool = True  # never download weights implicitly
+    device: str = "auto"  # auto, cuda, cpu
+    state_format: str = "ascii"  # ascii, json
+    perspective: str = "side_to_move"  # side_to_move, absolute
+    shuffle_options: bool = True
+    request_timeout_sec: float = 60.0
+    startup_timeout_sec: float = 180.0
+    idle_shutdown_sec: float = 900.0
+    fallback: str = "none"  # none (show the error), algorithmic, random
+
+
+@dataclass
 class AISettings:
     """AI-related settings."""
     algorithmic: AlgorithmicAISettings = field(default_factory=AlgorithmicAISettings)
     ml: MLAISettings = field(default_factory=MLAISettings)
+    laya: LayaAISettings = field(default_factory=LayaAISettings)
 
 
 @dataclass
 class PlayerSettings:
     """Player configuration."""
-    p1_type: str = "human"  # human, algorithmic, ml
+    p1_type: str = "human"  # human, algorithmic, ml, laya
     p2_type: str = "human"
+
+
+def _laya_settings_from(data: Any) -> LayaAISettings:
+    """Build Laya settings from a loaded section, ignoring unknown keys.
+
+    A missing or malformed section falls back to defaults here, so it can never
+    make load() discard the other sections.
+    """
+    if not isinstance(data, dict):
+        return LayaAISettings()
+    known = {f.name for f in fields(LayaAISettings)}
+    return LayaAISettings(**{k: v for k, v in data.items() if k in known})
 
 
 @dataclass
@@ -124,6 +156,7 @@ class Config:
             'ai': {
                 'algorithmic': asdict(self.ai.algorithmic),
                 'ml': asdict(self.ai.ml),
+                'laya': asdict(self.ai.laya),
             },
             'players': asdict(self.players),
         }
@@ -151,6 +184,8 @@ class Config:
                 config.ai.algorithmic = AlgorithmicAISettings(**ai_data['algorithmic'])
             if 'ml' in ai_data:
                 config.ai.ml = MLAISettings(**ai_data['ml'])
+            if isinstance(ai_data, dict):
+                config.ai.laya = _laya_settings_from(ai_data.get('laya'))
 
         if 'players' in data:
             config.players = PlayerSettings(**data['players'])
